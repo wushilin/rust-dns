@@ -43,6 +43,7 @@ notify = []
 
 [follow]
 primary = "https://dns1.example.net:8053"  # the primary's web API (HTTPS required)
+instance_id = "dns2"                       # REQUIRED: this standby's name on the primary (a-z 0-9 -, unique)
 token = "rdns_..."                         # API token of an ADMINISTRATOR on the primary
 reconcile_interval_secs = 3600             # compare checksums with the primary
 allow_insecure_http = false                # never true across an untrusted network
@@ -53,3 +54,11 @@ timeout_secs = 30
 #
 # [peer]
 # url = "https://dns2.example.net:8053"
+#
+# and, on the primary, how its standbys are judged (Admin -> Replication, metrics):
+# [replication]
+# up_to_date_grace_secs = 10
+# max_lag_changes = 1000
+# max_lag_secs = 60
+# offline_after_secs = 75
+# forget_after_days = 30

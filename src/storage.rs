@@ -138,6 +138,13 @@ CREATE TABLE IF NOT EXISTS replication_state (
     key         TEXT PRIMARY KEY,
     value       TEXT NOT NULL
 );
+-- Standbys that follow this server (primary side). Local bookkeeping:
+-- not replicated, not changelogged (src/replication/replicas.rs).
+CREATE TABLE IF NOT EXISTS replicas (
+    instance    TEXT PRIMARY KEY,
+    data        TEXT NOT NULL,
+    last_seen   TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS api_tokens (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -375,6 +382,34 @@ impl Storage {
         let out = f(&conn);
         let _ = conn.execute_batch("COMMIT");
         out
+    }
+
+    /// Replica tracking (primary side): bookkeeping like token `last_used_at`,
+    /// written outside the mutation module and never replicated.
+    pub fn save_replica(&self, instance: &str, data: &str, last_seen: &str) -> Result<()> {
+        self.with_conn(|c| {
+            c.execute(
+                "INSERT INTO replicas (instance, data, last_seen) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(instance) DO UPDATE SET data = excluded.data, last_seen = excluded.last_seen",
+                params![instance, data, last_seen],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn load_replicas(&self) -> Result<Vec<String>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare("SELECT data FROM replicas ORDER BY instance")?;
+            let rows = stmt.query_map([], |r| r.get(0))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+    }
+
+    /// Bookkeeping: forget replicas not seen since `cutoff`.
+    pub fn prune_replicas(&self, cutoff: &str) -> Result<usize> {
+        self.with_conn(|c| {
+            Ok(c.execute("DELETE FROM replicas WHERE last_seen < ?1", params![cutoff])?)
+        })
     }
 
     /// The replication bookkeeping (`replication_state`) as key/value pairs.

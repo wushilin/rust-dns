@@ -270,12 +270,33 @@ pub struct Identity {
     pub history: History,
 }
 
+/// A standby stopped following because its data diverged from the primary
+/// (a bug: a standby never changes replicated data by itself). Kept until
+/// the operator rebuilds it with `rust-dns --prepare-standby --yes`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct HaltInfo {
+    /// `diverged` (reconcile mismatch), `apply_failed`, `txn_mismatch`,
+    /// `ahead_of_primary`.
+    pub reason: String,
+    /// What exactly differed (tables, zones, checksums, offsets).
+    pub detail: String,
+    #[schema(format = DateTime)]
+    pub at: String,
+    /// This standby's changelog offset when it halted.
+    pub offset: i64,
+    /// The divergence report written next to the database.
+    #[schema(required = true)]
+    pub report_file: Option<String>,
+}
+
 /// Standby side of `GET /replication/status`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct FollowStatus {
     /// The `[follow]` primary URL.
     pub primary: String,
-    /// connecting | bootstrapping | following | error | refused | stopped
+    /// This standby's `[follow].instance_id` (its name on the primary).
+    pub instance_id: String,
+    /// connecting | bootstrapping | following | error | refused | halted | stopped
     pub state: String,
     /// The last request to the primary succeeded.
     pub connected: bool,
@@ -307,17 +328,9 @@ pub struct FollowStatus {
     pub last_reconcile_result: Option<String>,
     pub reconnects: u64,
     pub rebootstraps: u64,
-}
-
-/// A standby polling this primary (in memory, recent contacts only).
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct StandbySeen {
-    pub address: String,
-    pub user: String,
-    /// The cursor of its last request.
-    pub after: i64,
-    #[schema(format = DateTime)]
-    pub last_seen_at: String,
+    /// Set when replication halted (terminal until `--prepare-standby`).
+    #[schema(required = true)]
+    pub halted: Option<HaltInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -327,6 +340,12 @@ pub struct PeerStatus {
     pub last_check_at: Option<String>,
     #[schema(required = true)]
     pub last_result: Option<String>,
+}
+
+/// `GET /replication/replicas`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ReplicaList {
+    pub replicas: Vec<super::replicas::ReplicaInfo>,
 }
 
 /// `GET /replication/status`.
@@ -349,8 +368,9 @@ pub struct ReplicationStatus {
     /// Present when `[peer]` is configured.
     #[schema(required = true)]
     pub peer: Option<PeerStatus>,
-    /// Standbys that polled this node in the last 10 minutes.
-    pub standbys: Vec<StandbySeen>,
+    /// Primary side: the standbys that follow this server, by instance id.
+    #[serde(default)]
+    pub replicas: Vec<super::replicas::ReplicaInfo>,
     /// A warning to show prominently (e.g. `[follow]` left in the config after promotion).
     #[schema(required = true)]
     pub warning: Option<String>,
@@ -397,4 +417,18 @@ pub struct ReplicationSummary {
     /// data and must be prepared with `--prepare-standby`), else null.
     #[schema(required = true)]
     pub problem: Option<String>,
+    /// Replication halted because the data diverged (see the status).
+    #[serde(default)]
+    pub halted: bool,
+}
+
+/// `POST /replication/replicas/{id}/report`: a standby tells its primary
+/// that it stopped (currently only `halted`).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[schema(example = json!({ "state": "halted", "reason": "diverged", "detail": "table users: differs (3 rows here, 3 on the primary)" }))]
+pub struct ReplicaReport {
+    /// `halted`.
+    pub state: String,
+    pub reason: String,
+    pub detail: String,
 }

@@ -564,6 +564,25 @@ impl<'a> AuditTx<'a> {
         Ok(n)
     }
 
+    // ---- replica list (local bookkeeping: not replicated) --------------------
+
+    /// An administrator forgets a standby in the primary's replica list.
+    pub fn forget_replica(&mut self, instance: &str) -> Result<bool> {
+        let n = self.conn.execute(
+            "DELETE FROM replicas WHERE instance = ?1",
+            params![instance],
+        )?;
+        if n > 0 {
+            self.push(
+                "replication.replica_forget",
+                None,
+                instance,
+                serde_json::json!({ "instance": instance }),
+            );
+        }
+        Ok(n > 0)
+    }
+
     // ---- API tokens ----------------------------------------------------------
 
     /// `tags` are normalized here too (callers should validate first to
@@ -767,6 +786,22 @@ impl Accounts {
         password_hash: &str,
         mfa_required: bool,
     ) -> Result<User> {
+        // On a standby every account except the config root mirrors the
+        // primary; renaming the root would change a replicated row (the
+        // previous root) and diverge. Refuse; the operator rebuilds.
+        if self.gate.get().is_some_and(|g| g.read_only()) {
+            let other_root: Option<String> = self.storage.read_tx(|c| {
+                Ok(data::users(c)?
+                    .into_iter()
+                    .find(|u| u.is_root && u.username != username)
+                    .map(|u| u.username))
+            })?;
+            if let Some(prev) = other_root {
+                anyhow::bail!(
+                    "[root].username changed from '{prev}' to '{username}' on a standby: the previous root is a replicated account and cannot be changed here. Keep the old name, or rebuild this standby (rust-dns --prepare-standby --yes)"
+                );
+            }
+        }
         let system = Actor {
             name: "system".into(),
             ip: "config".into(),

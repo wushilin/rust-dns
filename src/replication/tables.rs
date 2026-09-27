@@ -117,6 +117,8 @@ pub const TABLES: &[Table] = &[
     local("changelog"),
     // History id, lineage and standby bookkeeping.
     local("replication_state"),
+    // Primary side: the standbys that follow this server.
+    local("replicas"),
     // SQLite's AUTOINCREMENT counters.
     local("sqlite_sequence"),
 ];

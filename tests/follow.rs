@@ -279,9 +279,9 @@ fn status(node: &Node, a: &ureq::Agent) -> Value {
     )
 }
 
-fn follow_cfg(primary: &Node, token: &str) -> String {
+fn follow_cfg(primary: &Node, id: &str, token: &str) -> String {
     format!(
-        "[follow]\nprimary = \"{}\"\ntoken = \"{token}\"\nreconcile_interval_secs = 2\ntimeout_secs = 5\n",
+        "[follow]\nprimary = \"{}\"\ninstance_id = \"{id}\"\ntoken = \"{token}\"\nreconcile_interval_secs = 2\ntimeout_secs = 5\n",
         primary.url()
     )
 }
@@ -326,8 +326,10 @@ fn primary_standby_failover_and_rejoin() {
     let mut s = Node::new(&root_dir, "standby", "rootpass-standby");
 
     // ---- primary with [peer] = the standby ------------------------------------
+    let replication_cfg =
+        "[replication]\nup_to_date_grace_secs = 1\nmax_lag_secs = 3\noffline_after_secs = 8\n";
     p.configure(&format!(
-        "[peer]\nurl = \"{}\"\ncheck_interval_secs = 1\n",
+        "[peer]\nurl = \"{}\"\ncheck_interval_secs = 1\n{replication_cfg}",
         s.url()
     ));
     p.start();
@@ -367,7 +369,7 @@ fn primary_standby_failover_and_rejoin() {
         .to_string();
 
     // ---- a non-admin token is refused ------------------------------------------
-    s.configure(&follow_cfg(&p, &bob_token));
+    s.configure(&follow_cfg(&p, "dns2", &bob_token));
     s.start();
     let sr = s.root();
     wait_for("standby refuses a non-admin token", 15, || {
@@ -403,7 +405,7 @@ fn primary_standby_failover_and_rejoin() {
         ),
         "record",
     );
-    s.configure(&follow_cfg(&p, &admin_token));
+    s.configure(&follow_cfg(&p, "dns2", &admin_token));
     s.start();
     let sr = s.root();
     wait_for("standby bootstrapped", 15, || {
@@ -419,7 +421,100 @@ fn primary_standby_failover_and_rejoin() {
     let pst = status(&p, &pr);
     assert_eq!(pst["role"], "primary");
     assert_eq!(pst["history"]["history_id"], st["history"]["history_id"]);
-    assert!(!pst["standbys"].as_array().unwrap().is_empty(), "{pst}");
+    // ---- replica tracking on the primary ------------------------------------------
+    let p_replicas = p.api("/replication/replicas");
+    let replica = |pr: &ureq::Agent| -> Value {
+        let l = ok(
+            call(&Auth::Session(pr), "GET", &p_replicas, None),
+            "replicas",
+        );
+        l["replicas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["instance"] == "dns2")
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    wait_for("the primary lists dns2 up to date", 15, || {
+        replica(&pr)["state"] == "up_to_date"
+    });
+    let r = replica(&pr);
+    assert_eq!(r["lag_changes"], 0);
+    assert_eq!(r["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(r["address"], "127.0.0.1");
+    assert_eq!(r["conflict"], false);
+    assert!(pst["replicas"].to_string().contains("dns2"), "{pst}");
+    assert_eq!(
+        st["follow"]["instance_id"], "dns2",
+        "the standby shows its own id"
+    );
+    // Requests without an instance id are refused.
+    let (code, v) = call(
+        &Auth::Token(&admin_token),
+        "GET",
+        &p.api("/replication/changes?after=0"),
+        None,
+    );
+    assert_eq!(code, 400, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("X-Rust-DNS-Instance"));
+    // ... and so is a standby config without one.
+    let bad = root_dir.join("no-instance.toml");
+    std::fs::write(
+        &bad,
+        std::fs::read_to_string(s.config_path())
+            .unwrap()
+            .replace("instance_id = \"dns2\"\n", ""),
+    )
+    .unwrap();
+    let check = Command::new(env!("CARGO_BIN_EXE_rust-dns"))
+        .args(["--check", "--config"])
+        .arg(&bad)
+        .output()
+        .unwrap();
+    assert!(!check.status.success());
+    assert!(String::from_utf8_lossy(&check.stderr).contains("instance_id is required"));
+    // A stalled standby falls behind while writes continue, then catches up.
+    #[cfg(unix)]
+    {
+        let pid = s.child.as_ref().unwrap().id() as i32;
+        unsafe { libc::kill(pid, libc::SIGSTOP) };
+        ok(
+            call(
+                &Auth::Session(&pr),
+                "POST",
+                &p.api("/zones/z.test/records"),
+                Some(json!({ "name": "stall", "type": "A", "value": "192.0.2.66" })),
+            ),
+            "write while stalled",
+        );
+        wait_for("dns2 falling behind", 8, || {
+            replica(&pr)["state"] == "falling_behind"
+        });
+        let r = replica(&pr);
+        assert!(
+            r["lag_changes"].as_i64().unwrap() >= 2 && r["lag_seconds"].as_i64().unwrap() >= 3,
+            "{r}"
+        );
+        let metrics = ureq::get(&format!("{}/metrics", p.url()))
+            .set("Authorization", &format!("Bearer {admin_token}"))
+            .call()
+            .unwrap()
+            .into_string()
+            .unwrap();
+        assert!(
+            metrics.contains(
+                "rustdns_replication_replica_state{instance=\"dns2\",state=\"falling_behind\"} 1"
+            ),
+            "{metrics}"
+        );
+        assert!(metrics.contains("rustdns_replication_replica_lag_changes{instance=\"dns2\"}"));
+        assert!(metrics.contains("rustdns_replication_replicas{state=\"falling_behind\"} 1"));
+        unsafe { libc::kill(pid, libc::SIGCONT) };
+        wait_for("dns2 caught up again", 15, || {
+            replica(&pr)["state"] == "up_to_date"
+        });
+    }
     // The primary's root password is not the standby's: the local root wins.
     let (code, _) = call(
         &Auth::None,
@@ -914,6 +1009,9 @@ fn primary_standby_failover_and_rejoin() {
     );
     let pdiv_head = status(&p, &pr)["head"].as_i64().unwrap();
     assert!(pdiv_head > head_before);
+    wait_for("dns2 offline after it stopped", 15, || {
+        replica(&pr)["state"] == "offline"
+    });
     p.stop();
 
     // ---- standby alone: still answers, reports disconnected ---------------------
@@ -1031,6 +1129,19 @@ fn primary_standby_failover_and_rejoin() {
     // ---- the old primary comes back with [peer]: fenced ---------------------------
     p.start();
     let pr = p.root();
+    let r = replica(&pr);
+    assert_eq!(
+        r["state"], "offline",
+        "the replica list survived the restart: {r}"
+    );
+    // Forgetting is audited local bookkeeping.
+    let (code, _) = call(
+        &Auth::Session(&pr),
+        "DELETE",
+        &p.api("/replication/replicas/dns2"),
+        None,
+    );
+    assert_eq!(code, 409, "a fenced server is read-only");
     let pst = status(&p, &pr);
     assert_eq!(pst["role"], "fenced", "{pst}");
     assert_eq!(pst["writable"], false);
@@ -1045,7 +1156,7 @@ fn primary_standby_failover_and_rejoin() {
 
     // ---- the old primary is told to follow: refused, it has its own data -------
     p.stop();
-    p.configure(&follow_cfg(&s, &admin_token));
+    p.configure(&follow_cfg(&s, "dns1", &admin_token));
     p.start();
     let pr = p.root();
     wait_for(
@@ -1277,6 +1388,207 @@ fn primary_standby_failover_and_rejoin() {
     ] {
         assert!(!log.contains(secret_text), "a secret leaked into a log");
     }
+    drop(p);
+    drop(s);
+    let _ = std::fs::remove_dir_all(&root_dir);
+}
+
+/// Any divergence is a bug: the standby halts (terminal), reports it, keeps
+/// answering DNS from its last state, stays halted across restarts, and
+/// follows again only after `--prepare-standby --yes`.
+#[test]
+fn a_diverged_standby_halts_until_rebuilt() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root_dir =
+        std::env::temp_dir().join(format!("rust-dns-halt-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&root_dir).unwrap();
+    let mut p = Node::new(&root_dir, "primary", "rootpass-primary");
+    let mut s = Node::new(&root_dir, "standby", "rootpass-standby");
+    p.configure("");
+    p.start();
+    let pr = p.root();
+    let token = ok(
+        call(
+            &Auth::Session(&pr),
+            "POST",
+            &p.api("/tokens"),
+            Some(json!({ "name": "repl" })),
+        ),
+        "token",
+    )["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    ok(
+        call(
+            &Auth::Session(&pr),
+            "POST",
+            &p.api("/zones"),
+            Some(json!({ "name": "h.test" })),
+        ),
+        "zone",
+    );
+    ok(
+        call(
+            &Auth::Session(&pr),
+            "POST",
+            &p.api("/zones/h.test/records"),
+            Some(json!({ "name": "www", "type": "A", "value": "192.0.2.1" })),
+        ),
+        "record",
+    );
+    s.configure(&follow_cfg(&p, "dns2", &token));
+    s.start();
+    let replica = |pr: &ureq::Agent| -> Value {
+        ok(
+            call(
+                &Auth::Session(pr),
+                "GET",
+                &p.api("/replication/replicas"),
+                None,
+            ),
+            "replicas",
+        )["replicas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["instance"] == "dns2")
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    wait_for("dns2 up to date", 15, || {
+        let r = replica(&pr);
+        r["state"] == "up_to_date" && r["lag_changes"] == 0
+    });
+    let sr = s.root();
+    wait_for("standby has the data", 15, || {
+        record_names(&s, &sr, "h.test") == vec!["www A 192.0.2.1".to_string()]
+    });
+
+    // Corrupt a replicated row behind the standby's back (test only).
+    s.stop();
+    {
+        let c = rusqlite::Connection::open(s.dir.join("data.db")).unwrap();
+        c.execute(
+            "UPDATE records SET value = '192.0.2.250' WHERE name = 'www'",
+            [],
+        )
+        .unwrap();
+    }
+    s.start();
+    let sr = s.root();
+    wait_for("the standby halts at the next reconcile", 20, || {
+        status(&s, &sr)["follow"]["state"] == "halted"
+    });
+    let st = status(&s, &sr);
+    let h = &st["follow"]["halted"];
+    assert_eq!(h["reason"], "diverged", "{st}");
+    assert!(
+        h["detail"].as_str().unwrap().contains("h.test"),
+        "names the zone: {h}"
+    );
+    assert!(
+        h["detail"].as_str().unwrap().contains("records"),
+        "names the table: {h}"
+    );
+    let report = h["report_file"].as_str().unwrap().to_string();
+    let doc: Value = serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
+    assert_eq!(doc["reason"], "diverged");
+    assert!(
+        doc["evidence"]["local"]["tables"].is_array()
+            && doc["evidence"]["primary"]["tables"].is_array()
+    );
+    assert!(
+        !doc.to_string().contains("argon2"),
+        "no secrets in the report"
+    );
+    assert!(s.log().contains("REPLICATION HALTED"));
+    let summary = ok(
+        call(&Auth::Session(&sr), "GET", &s.api("/status"), None),
+        "status",
+    );
+    assert_eq!(summary["replication"]["halted"], true);
+    assert!(summary["replication"]["problem"]
+        .as_str()
+        .unwrap()
+        .contains("Replication halted"));
+    let metrics = ureq::get(&format!("{}/metrics", s.url()))
+        .set("Authorization", &format!("Bearer {token}"))
+        .call()
+        .unwrap()
+        .into_string()
+        .unwrap();
+    assert!(
+        metrics.contains("rustdns_replication_halted 1"),
+        "{metrics}"
+    );
+    // It keeps answering DNS from its last (diverged) state, and stops polling.
+    assert_eq!(answers(s.dns, "www.h.test.", RecordType::A).1.len(), 1);
+    wait_for("the primary shows dns2 halted", 15, || {
+        replica(&pr)["state"] == "halted"
+    });
+    assert!(replica(&pr)["halted_reason"]
+        .as_str()
+        .unwrap()
+        .contains("diverged"));
+    ok(
+        call(
+            &Auth::Session(&pr),
+            "POST",
+            &p.api("/zones/h.test/records"),
+            Some(json!({ "name": "new", "type": "A", "value": "192.0.2.2" })),
+        ),
+        "write on the primary",
+    );
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(
+        answers(s.dns, "new.h.test.", RecordType::A).1.is_empty(),
+        "a halted standby does not follow"
+    );
+
+    // Halted survives a restart (and is reported again).
+    s.stop();
+    let check = Command::new(env!("CARGO_BIN_EXE_rust-dns"))
+        .args(["--check", "--config"])
+        .arg(s.config_path())
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&check.stdout).contains("REPLICATION HALTED"),
+        "--check says so"
+    );
+    s.start();
+    let sr = s.root();
+    wait_for("still halted after a restart", 10, || {
+        status(&s, &sr)["follow"]["state"] == "halted"
+    });
+    assert_eq!(replica(&pr)["state"], "halted");
+
+    // Rebuild: --prepare-standby --yes, then it follows again.
+    s.stop();
+    let run = Command::new(env!("CARGO_BIN_EXE_rust-dns"))
+        .args(["--prepare-standby", "--yes", "--config"])
+        .arg(s.config_path())
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    s.start();
+    let sr = s.root();
+    wait_for("rebuilt standby follows", 20, || {
+        record_names(&s, &sr, "h.test")
+            == vec!["new A 192.0.2.2".to_string(), "www A 192.0.2.1".to_string()]
+    });
+    assert!(status(&s, &sr)["follow"]["halted"].is_null());
+    wait_for("dns2 up to date again", 15, || {
+        replica(&pr)["state"] == "up_to_date"
+    });
     drop(p);
     drop(s);
     let _ = std::fs::remove_dir_all(&root_dir);

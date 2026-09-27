@@ -303,6 +303,7 @@ at a time, and no automatic failover.
 ```toml
 [follow]
 primary = "https://dns1.example.net:8053"   # the primary's web API
+instance_id = "dns2"                        # required: this standby's name on the primary
 token = "rdns_..."                          # administrator token on the primary
 reconcile_interval_secs = 3600
 allow_insecure_http = false
@@ -360,11 +361,8 @@ state, so re-applying changes from an earlier offset is harmless.
 Every `reconcile_interval_secs` the standby compares a checksum of every
 replicated table (per-server columns such as token last use, and its own
 root account, left out) and of every zone with the primary at the same
-offset. A difference means a change was lost or misapplied: it is reported
-(error log, `last_reconcile_result` in the status, metric
-`rustdns_replication_reconcile_mismatches_total`) and following continues;
-the standby does not reload by itself. Rebuild it on purpose with
-`--prepare-standby`. Primary and standby must speak the same replication protocol
+offset. A difference means a change was lost or misapplied: replication
+**halts** (see "Halted" below). Primary and standby must speak the same replication protocol
 (2 since this version): a standby refuses an older primary with a clear
 error; upgrade the primary first.
 
@@ -460,6 +458,92 @@ read-only.
 A standby also refuses (state `refused`) to follow a server it was itself
 promoted away from (the stale old primary), so a leftover `[follow]` cannot
 make a promoted server discard its own writes.
+
+### Monitoring replicas (on the primary)
+
+Each standby names itself with `[follow].instance_id` (required; a-z, 0-9,
+`-`, unique per primary) and sends it, with its version and a per-process
+session id, on every replication request (`X-Rust-DNS-Instance`,
+`X-Rust-DNS-Version`, `X-Rust-DNS-Session`; data endpoints refuse requests
+without it with 400). The primary tracks each instance, Kafka style:
+
+- **applied offset**: the `after` of its last changes request (a standby
+  commits a batch before it asks for the next one, so that is what it has);
+- **lag** in changes (primary head minus applied offset) and in seconds
+  (since it was last caught up);
+- last seen, remote address (normal client-IP rules), version, token user.
+
+States, with thresholds in `[replication]` (primary side, reloadable):
+
+| State | Meaning |
+|---|---|
+| `up_to_date` | lag 0, or caught up within `up_to_date_grace_secs` (10) |
+| `catching_up` | behind, within the thresholds |
+| `falling_behind` | more than `max_lag_changes` (1000) behind, or not caught up for more than `max_lag_secs` (60) |
+| `offline` | no request for `offline_after_secs` (75; keep it above the 25 s long-poll) |
+| `bootstrapping` | a snapshot is being served / loaded |
+| `halted` | the standby reported that it stopped (divergence, see below) |
+
+`conflict: true` flags one instance id used by two processes at once
+(requests interleaving from two addresses or sessions; a restart or a move is
+not a conflict); a warning is logged. The list is kept in a local table
+(`replicas`, not replicated) so it survives restarts; entries not seen for
+`forget_after_days` (30) are dropped, and `DELETE /api/replication/replicas/{id}`
+forgets one (audited `replication.replica_forget`; local bookkeeping, not in
+the changelog). See **Admin -> Replication** (live table), `GET
+/api/replication/replicas`, and the metrics
+`rustdns_replication_replica_lag_changes{instance}`,
+`rustdns_replication_replica_lag_seconds{instance}`,
+`rustdns_replication_replica_state{instance,state}` (1 for the current
+state), `rustdns_replication_replicas{state}` and
+`rustdns_replication_replica_conflicts`. Example alerts (in
+`deploy/prometheus-alerts.yml`):
+
+```yaml
+- alert: RustDnsReplicaNotUpToDate
+  expr: max by (instance) (rustdns_replication_replica_state{state=~"falling_behind|offline|halted"}) == 1
+  for: 5m
+- alert: RustDnsReplicaHalted
+  expr: max by (instance) (rustdns_replication_replica_state{state="halted"}) == 1
+- alert: RustDnsStandbyHalted          # on the standby itself
+  expr: rustdns_replication_halted == 1
+```
+
+### Halted: divergence is a bug, the standby stops
+
+A standby never changes replicated data by itself (writes are refused by
+the write gate, the account tables are written only by the replay path, and
+its own sign-ins only touch per-server columns). So when its copy differs
+from the primary, that is a bug, and the standby **reports and aborts**
+instead of repairing it silently. It halts on:
+
+- `diverged`: the periodic reconcile found a table or zone whose checksum
+  differs from the primary's at the same offset;
+- `apply_failed`: a change from the primary did not apply;
+- `txn_mismatch`: on connecting, its change at its head offset is not the
+  primary's (same history, different data);
+- `ahead_of_primary`: it has offsets the primary does not (a primary restored
+  from an older backup).
+
+Network errors, timeouts and 5xx are ordinary reconnects, and a pruned
+offset (`gap`) within the same history is the automatic snapshot case; none
+of those halt.
+
+When halted, the standby stops talking to the primary except to report the
+halt once (at the halt and at each start; the primary then lists it as
+`halted` with the reason), keeps answering DNS from its last applied state,
+and shows it everywhere: a red console banner, `/api/status` and
+`/api/replication/status` (`follow.halted` with reason, detail, offset),
+`rust-dns --check`, the startup log (error), the metric
+`rustdns_replication_halted 1`, and a report `diverged-<time>.json` next to
+the database (what differed: tables, zones, both checksums, offsets; no
+secrets). The state is stored in the database, so it survives restarts.
+
+To investigate: keep the report and the logs (they are the bug report).
+To rebuild: stop the standby and run `rust-dns --prepare-standby --yes`
+(backs up the database, empties it); at the next start it copies the primary
+again. Promoting a halted standby is possible but promotes its diverged
+data; rebuild it first unless the primary is gone.
 
 ### Replication API
 

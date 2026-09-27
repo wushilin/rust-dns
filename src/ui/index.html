@@ -651,7 +651,9 @@ function renderBanner(r) {
       ? (r.lag_changes ? `${num(r.lag_changes)} change${r.lag_changes === 1 ? '' : 's'} behind` : 'in sync')
       : `primary unreachable${r.disconnected_since ? ' since ' + esc(fmtTime(r.disconnected_since)) : ''}`;
     b.className = r.connected && !r.problem ? '' : 'bad';
-    b.innerHTML = r.problem
+    b.innerHTML = r.halted
+      ? `${ico('warn', 's')}<span><b>Replication halted:</b> ${esc((r.problem || '').replace(/^Replication halted /, ''))} — this standby serves its last state and does not follow <b class="mono">${esc(r.primary || '')}</b>.</span>${link}`
+      : r.problem
       ? `${ico('warn', 's')}<span>Standby of <b class="mono">${esc(r.primary || '')}</b> — read-only · <b>not following:</b> ${esc(r.problem)}</span>${link}`
       : `${ico('servers', 's')}<span>Standby of <b class="mono">${esc(r.primary || '')}</b> — read-only · ${state}</span>${link}`;
   } else {
@@ -1705,6 +1707,7 @@ function replRoleText(r) {
   const role = { primary: 'primary', promoted: 'primary (promoted standby)', standby: 'standby (read-only)', fenced: 'old primary, fenced (read-only)' }[r.role] || r.role;
   return esc(role) + (r.primary ? ` · <span class="mono">${esc(r.primary)}</span>` : '');
 }
+const REPLICA_BADGE = { up_to_date: '<span class="badge ok">up to date</span>', catching_up: '<span class="badge warn">catching up</span>', falling_behind: '<span class="badge bad">falling behind</span>', offline: '<span class="badge bad">offline</span>', bootstrapping: '<span class="badge warn">loading snapshot</span>', halted: '<span class="badge bad">halted</span>' };
 const ROLE_BADGE = { primary: '<span class="badge ok">primary</span>', promoted: '<span class="badge ok">primary · promoted</span>', standby: '<span class="badge warn">standby · read-only</span>', fenced: '<span class="badge bad">fenced · read-only</span>' };
 let replTimer = null;
 async function viewReplication() {
@@ -1714,7 +1717,7 @@ async function viewReplication() {
   const h = r.history, f = r.follow;
   const when = t => t ? `<span title="${esc(fmtTime(t))}">${ago(t)}</span>` : '<span class="hint">never</span>';
   const opt = v => v == null || v === '' ? '<span class="hint">–</span>' : esc(v);
-  const stateBadge = s => ({ following: '<span class="badge ok">following</span>', bootstrapping: '<span class="badge warn">loading snapshot</span>', connecting: '<span class="badge warn">connecting</span>', starting: '<span class="badge warn">starting</span>', refused: '<span class="badge bad">refused</span>', error: '<span class="badge bad">error</span>', stopped: '<span class="badge muted">stopped</span>' }[s] || `<span class="badge">${esc(s)}</span>`);
+  const stateBadge = s => ({ following: '<span class="badge ok">following</span>', bootstrapping: '<span class="badge warn">loading snapshot</span>', connecting: '<span class="badge warn">connecting</span>', starting: '<span class="badge warn">starting</span>', refused: '<span class="badge bad">refused</span>', error: '<span class="badge bad">error</span>', stopped: '<span class="badge muted">stopped</span>', halted: '<span class="badge bad">halted</span>' }[s] || `<span class="badge">${esc(s)}</span>`);
   $('#main').innerHTML = `<div class="topbar"><h1>Replication</h1>${r.role === 'standby' ? '<button class="btn danger" id="rp-promote">Promote to primary…</button>' : ''}</div>
     ${r.warning ? `<div class="note warn" style="max-width:900px">${ico('warn', 's')}<span>${esc(r.warning)}</span></div>` : ''}
     <div class="grid two" style="max-width:1100px">
@@ -1729,6 +1732,8 @@ async function viewReplication() {
       </div></div>
       ${f ? `<div class="card panel"><h2>Primary</h2><div class="kv">
         <span class="k">URL</span><span class="mono">${esc(f.primary)}</span>
+        <span class="k">This instance</span><span class="mono">${esc(f.instance_id)}</span>
+        ${f.halted ? `<span class="k">Halted</span><span style="color:var(--danger)"><b>${esc(f.halted.reason)}</b> at offset ${num(f.halted.offset)}, ${when(f.halted.at)}: ${esc(f.halted.detail)}${f.halted.report_file ? `<br>Report: <span class="mono">${esc(f.halted.report_file)}</span>` : ''}<br>Rebuild: stop this server and run <code>rust-dns --prepare-standby --yes</code>.</span>` : ''}
         <span class="k">State</span><span>${stateBadge(f.state)} ${f.connected ? '<span class="badge ok">connected</span>' : '<span class="badge bad">not connected</span>'}</span>
         ${f.disconnected_since ? `<span class="k">Unreachable since</span><span>${esc(fmtTime(f.disconnected_since))}</span>` : ''}
         ${f.last_error ? `<span class="k">Last error</span><span style="color:var(--danger)">${esc(f.last_error)}</span>` : ''}
@@ -1738,7 +1743,7 @@ async function viewReplication() {
         <span class="k">Last snapshot</span><span>${when(f.last_snapshot_at)}${f.last_snapshot_result ? ` · ${opt(f.last_snapshot_result)}` : ''}</span>
         <span class="k">Last reconcile</span><span>${when(f.last_reconcile_at)}${f.last_reconcile_result ? ` · ${opt(f.last_reconcile_result)}` : ''}</span>
         <span class="k">Reconnects / snapshots</span><span>${num(f.reconnects)} / ${num(f.rebootstraps)}</span>
-      </div></div>` : `<div class="card panel"><h2>Standbys</h2>${r.standbys.length ? `<div class="tw"><table><thead><tr><th>Address</th><th>Token user</th><th>Cursor</th><th>Last poll</th></tr></thead><tbody>${r.standbys.map(x => `<tr><td class="mono">${esc(x.address)}</td><td>${esc(x.user)}</td><td>${num(x.after)}${x.after < r.head ? ` <span class="badge warn">${num(r.head - x.after)} behind</span>` : ''}</td><td>${when(x.last_seen_at)}</td></tr>`).join('')}</tbody></table></div>` : '<p class="hint">No standby polled this server in the last 10 minutes.</p>'}
+      </div></div>` : `<div class="card panel"><h2>Replicas</h2>${r.replicas.length ? `<div class="tw"><table><thead><tr><th>Instance</th><th>State</th><th>Applied</th><th>Lag</th><th>Last seen</th><th>Address</th><th>Version</th><th></th></tr></thead><tbody>${r.replicas.map(x => `<tr><td><b class="mono">${esc(x.instance)}</b></td><td>${REPLICA_BADGE[x.state] || esc(x.state)}${x.conflict ? ' <span class="badge bad" title="Two processes use this instance id">conflict</span>' : ''}${x.halted_reason ? `<div class="hint" style="color:var(--danger)">${esc(x.halted_reason)}</div>` : ''}</td><td>${num(x.applied_offset)}</td><td>${x.lag_changes ? `${num(x.lag_changes)} changes · ${num(x.lag_seconds)} s` : '<span class="hint">none</span>'}</td><td>${when(x.last_seen_at)}</td><td class="mono">${esc(x.address)}</td><td class="mono">${esc(x.version)}</td><td class="actions"><button class="btn sm ghost danger" data-forget="${esc(x.instance)}" title="Remove from this list (a running standby reappears)">Forget</button></td></tr>`).join('')}</tbody></table></div>` : '<p class="hint">No standby has followed this server yet.</p>'}
         ${r.peer ? `<div class="kv" style="margin-top:12px"><span class="k">[peer]</span><span class="mono">${esc(r.peer.url)}</span><span class="k">Last check</span><span>${when(r.peer.last_check_at)}${r.peer.last_result ? ` · ${esc(r.peer.last_result)}` : ''}</span></div>` : ''}</div>`}
     </div>
     ${r.role === 'standby' ? `<div class="card panel" style="margin-top:14px;max-width:1100px"><h2>What promotion does</h2>
@@ -1751,10 +1756,14 @@ async function viewReplication() {
       </ul></div>` : ''}
     ${r.role !== 'standby' ? `<div class="card panel" style="margin-top:14px;max-width:1100px"><h2>Add a standby</h2>
       <p class="hint">On the second server, create an API token of an administrator here (API tokens), then add to its configuration file and restart it. The replication stream carries password hashes, TOTP and TSIG secrets: use HTTPS (a TLS reverse proxy in front of this console).</p>
-      ${snip(`[follow]\nprimary = "https://${location.host}"\ntoken = "rdns_..."\nreconcile_interval_secs = 3600`, 'Copy example')}
+      ${snip(`[follow]\nprimary = "https://${location.host}"\ninstance_id = "dns2"\ntoken = "rdns_..."\nreconcile_interval_secs = 3600`, 'Copy example')}
       <p class="hint">And here, so this server stays read-only if it ever comes back after the standby was promoted:</p>
       ${snip(`[peer]\nurl = "https://standby.example.net:8053"`, 'Copy example')}</div>` : ''}`;
   const pb = $('#rp-promote'); if (pb) pb.onclick = () => promoteModal(r);
+  $$('[data-forget]').forEach(b => b.onclick = async () => {
+    if (b.dataset.armed !== '1') { b.dataset.armed = '1'; b.textContent = 'Click again to forget'; return; }
+    try { await DEL('/replication/replicas/' + encodeURIComponent(b.dataset.forget)); toast('Replica forgotten', 'ok'); viewReplication(); } catch (e) { toast(e.message, 'err'); }
+  });
   replTimer = setInterval(async () => { if (!location.hash.startsWith('#/replication')) { clearInterval(replTimer); return; } if (!modalOpen()) viewReplication().catch(() => {}); }, 5000);
 }
 function promoteModal(r) {

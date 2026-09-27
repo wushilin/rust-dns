@@ -351,6 +351,9 @@ fn api_router() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(replication::changes))
         .routes(routes!(replication::checksum))
         .routes(routes!(replication::promote))
+        .routes(routes!(replication::list_replicas))
+        .routes(routes!(replication::forget_replica))
+        .routes(routes!(replication::report_replica))
 }
 
 /// Documented routes mounted at the server root rather than under `/api`.

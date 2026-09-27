@@ -394,6 +394,16 @@ fn replication_note(cfg: &config::Config) -> Option<String> {
             out.push_str("\nthe database is fresh: the standby will copy the primary");
         }
     }
+    if let Some(h) = st.get("halted") {
+        let h: serde_json::Value = serde_json::from_str(h).unwrap_or_default();
+        out.push_str(&format!(
+            "\nREPLICATION HALTED since {}: {} ({}). The standby serves its last state and does not follow; see {}. Rebuild it: rust-dns --prepare-standby --yes --config <this config>",
+            h["at"].as_str().unwrap_or("?"),
+            h["reason"].as_str().unwrap_or("?"),
+            h["detail"].as_str().unwrap_or(""),
+            h["report_file"].as_str().unwrap_or("the divergence report next to the database"),
+        ));
+    }
     match (&cfg.follow, st.get("following")) {
         (None, Some(u)) => out.push_str(&format!(
             "\nnote: the database is a standby of {u} but the config has no [follow]: the next start records a promotion (new history id) and accepts writes"

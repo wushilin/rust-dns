@@ -33,3 +33,43 @@ groups:
           severity: warning
         annotations:
           summary: rust-dns is receiving invalid DNS cookies
+
+      # ---- standby (follow) mode -------------------------------------------
+      # On the primary: every standby by [follow].instance_id.
+      - alert: RustDnsReplicaNotUpToDate
+        expr: max by (instance) (rustdns_replication_replica_state{state=~"falling_behind|offline|halted"}) == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "standby {{ $labels.instance }} is falling behind, offline or halted"
+
+      - alert: RustDnsReplicaHalted
+        expr: max by (instance) (rustdns_replication_replica_state{state="halted"}) == 1
+        labels:
+          severity: critical
+        annotations:
+          summary: "standby {{ $labels.instance }} halted: its data diverged (see its Replication page); rebuild it with --prepare-standby"
+
+      - alert: RustDnsReplicaConflict
+        expr: rustdns_replication_replica_conflicts > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: two standbys use the same [follow].instance_id
+
+      # On a standby.
+      - alert: RustDnsStandbyHalted
+        expr: rustdns_replication_halted == 1
+        labels:
+          severity: critical
+        annotations:
+          summary: replication halted on this standby (divergence); it serves stale data
+
+      - alert: RustDnsStandbyDisconnected
+        expr: rustdns_replication_standby == 1 and rustdns_replication_connected == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: the standby cannot reach its primary

@@ -24,6 +24,7 @@
 
 pub mod data;
 pub mod lineage;
+pub mod replicas;
 pub mod tables;
 pub mod types;
 
@@ -57,12 +58,19 @@ enum CallError {
     /// 409 or similar: the server is not a writable primary.
     Refused(String),
     Other(String),
+    /// Divergence or an invariant violation: stop for good (see `halt`).
+    Halt {
+        reason: &'static str,
+        detail: String,
+        evidence: serde_json::Value,
+    },
 }
 
 impl std::fmt::Display for CallError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CallError::Auth(m) | CallError::Refused(m) | CallError::Other(m) => f.write_str(m),
+            CallError::Halt { reason, detail, .. } => write!(f, "{reason}: {detail}"),
         }
     }
 }
@@ -86,7 +94,9 @@ pub struct Replication {
     /// Ticks when an account transaction appended to the changelog
     /// (account changes are not on the event bus): wakes long-polls.
     changelog_tick: tokio::sync::watch::Sender<u64>,
-    standbys: Mutex<HashMap<String, (StandbySeen, Instant)>>,
+    replicas: replicas::Tracker,
+    /// Sent with every request as `X-Rust-DNS-Session` (conflict detection).
+    session: String,
     // Standby side.
     follower: Mutex<Option<tokio::task::JoinHandle<()>>>,
     promote_lock: tokio::sync::Mutex<()>,
@@ -123,6 +133,11 @@ impl Replication {
                 .as_ref()
                 .map(|f| f.primary.clone())
                 .unwrap_or_default(),
+            instance_id: cfg
+                .follow
+                .as_ref()
+                .map(|f| f.instance_id.trim().to_string())
+                .unwrap_or_default(),
             state: "starting".into(),
             ..Default::default()
         };
@@ -146,7 +161,8 @@ impl Replication {
             warning: RwLock::new(None),
             last_contact: Mutex::new(None),
             changelog_tick,
-            standbys: Mutex::new(HashMap::new()),
+            replicas: replicas::Tracker::default(),
+            session: crate::auth::random_token(8),
             follower: Mutex::new(None),
             promote_lock: tokio::sync::Mutex::new(()),
             reconnects: AtomicU64::new(0),
@@ -233,6 +249,7 @@ impl Replication {
                 .await
                 .map_err(|e| anyhow!("recording the promotion: {e}"))?;
         }
+        self.start_replica_tracking();
         let h = self.history();
         self.set_role(if h.promoted_at.is_some() {
             Role::Promoted
@@ -267,22 +284,67 @@ impl Replication {
         self.changelog_tick.subscribe()
     }
 
-    pub fn note_standby(&self, address: String, user: String, after: i64) {
-        let mut m = self.standbys.lock().unwrap();
-        m.retain(|_, (_, at)| at.elapsed() < Duration::from_secs(600));
-        let key = format!("{address} {user}");
-        m.insert(
-            key,
-            (
-                StandbySeen {
-                    address,
-                    user,
-                    after,
-                    last_seen_at: now_rfc3339(),
-                },
-                Instant::now(),
+    fn replication_cfg(&self) -> crate::config::ReplicationConfig {
+        self.reloader.current.load().replication.clone()
+    }
+
+    /// Load the persisted replica list and prune it now and daily.
+    fn start_replica_tracking(self: &Arc<Self>) {
+        match self.storage.load_replicas() {
+            Ok(rows) => self.replicas.load(
+                rows.iter()
+                    .filter_map(|r| serde_json::from_str::<replicas::Entry>(r).ok())
+                    .collect(),
             ),
-        );
+            Err(e) => tracing::warn!(error = %e, "cannot load the replica list"),
+        }
+        let me = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(3600));
+            loop {
+                tick.tick().await;
+                let days = me.replication_cfg().forget_after_days;
+                let now = chrono::Utc::now();
+                for id in me.replicas.prune(now, days) {
+                    tracing::info!(instance = %id, days, "forgetting a replica not seen for a long time");
+                }
+                let cutoff = (now - chrono::Duration::days(days as i64))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                let _ = me.storage.prune_replicas(&cutoff);
+            }
+        });
+    }
+
+    /// Record a standby's request (primary side).
+    pub fn note_replica(&self, seen: &replicas::Seen, report: replicas::Report) {
+        let cfg = self.replication_cfg();
+        let head = self.storage.changelog_head().unwrap_or(0);
+        let now = chrono::Utc::now();
+        let (save, conflict) = self.replicas.note(seen, report, head, now, &cfg);
+        if conflict {
+            tracing::warn!(instance = %seen.instance, address = %seen.address, "CONFLICT: two standbys use the same [follow].instance_id; give each a unique instance_id");
+        }
+        if let Some(e) = save {
+            if let Ok(json) = serde_json::to_string(&e) {
+                let at = e
+                    .last_seen
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                if let Err(err) = self.storage.save_replica(&e.instance, &json, &at) {
+                    tracing::warn!(error = %err, "cannot save the replica list");
+                }
+            }
+        }
+    }
+
+    pub fn replica_list(&self) -> Vec<replicas::ReplicaInfo> {
+        let head = self.storage.changelog_head().unwrap_or(0);
+        self.replicas
+            .list(head, chrono::Utc::now(), &self.replication_cfg())
+    }
+
+    /// Forget an instance (after the audited database delete).
+    pub fn forget_replica(&self, instance: &str) -> bool {
+        self.replicas.forget(instance)
     }
 
     // ---- status -------------------------------------------------------------
@@ -312,15 +374,6 @@ impl Replication {
 
     pub fn status(&self) -> ReplicationStatus {
         let role = self.role();
-        let mut standbys: Vec<StandbySeen> = self
-            .standbys
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|(_, at)| at.elapsed() < Duration::from_secs(600))
-            .map(|(s, _)| s.clone())
-            .collect();
-        standbys.sort_by(|a, b| a.address.cmp(&b.address));
         ReplicationStatus {
             protocol: REPLICATION_PROTOCOL,
             role,
@@ -330,17 +383,24 @@ impl Replication {
             read_only_reason: self.read_only_reason(),
             follow: (role == Role::Standby).then(|| self.follow_snapshot()),
             peer: self.peer_status.lock().unwrap().clone(),
-            standbys,
+            replicas: self.replica_list(),
             warning: self.warning.read().unwrap().clone(),
         }
     }
 
     pub fn summary(&self) -> ReplicationSummary {
         let role = self.role();
+        let mut halted = false;
         let (primary, connected, lag, since, problem) = match role {
             Role::Standby => {
                 let f = self.follow_snapshot();
-                let problem = if f.state == "refused" {
+                halted = f.halted.is_some();
+                let problem = if let Some(h) = &f.halted {
+                    Some(format!(
+                        "Replication halted ({}): {}. Rebuild with rust-dns --prepare-standby --yes",
+                        h.reason, h.detail
+                    ))
+                } else if f.state == "refused" {
                     f.last_error.clone()
                 } else {
                     None
@@ -371,6 +431,7 @@ impl Replication {
             disconnected_since: since,
             read_only_reason: self.read_only_reason(),
             problem,
+            halted,
         }
     }
 
@@ -395,8 +456,54 @@ impl Replication {
             "1 if this server is a standby ([follow])",
             (role == Role::Standby) as i64,
         );
+        let reps = self.replica_list();
+        if !reps.is_empty() || role != Role::Standby {
+            out.push_str("# HELP rustdns_replication_replica_lag_changes Changes a replica is behind this server\n# TYPE rustdns_replication_replica_lag_changes gauge\n");
+            for r in &reps {
+                out.push_str(&format!(
+                    "rustdns_replication_replica_lag_changes{{instance=\"{}\"}} {}\n",
+                    r.instance, r.lag_changes
+                ));
+            }
+            out.push_str("# HELP rustdns_replication_replica_lag_seconds Seconds since a replica was last caught up\n# TYPE rustdns_replication_replica_lag_seconds gauge\n");
+            for r in &reps {
+                out.push_str(&format!(
+                    "rustdns_replication_replica_lag_seconds{{instance=\"{}\"}} {}\n",
+                    r.instance, r.lag_seconds
+                ));
+            }
+            out.push_str("# HELP rustdns_replication_replica_state 1 for the current state of each replica\n# TYPE rustdns_replication_replica_state gauge\n");
+            for r in &reps {
+                for st in replicas::ReplicaState::ALL {
+                    out.push_str(&format!(
+                        "rustdns_replication_replica_state{{instance=\"{}\",state=\"{}\"}} {}\n",
+                        r.instance,
+                        st.as_str(),
+                        (r.state == st) as u8
+                    ));
+                }
+            }
+            out.push_str("# HELP rustdns_replication_replicas Replicas per state\n# TYPE rustdns_replication_replicas gauge\n");
+            for st in replicas::ReplicaState::ALL {
+                out.push_str(&format!(
+                    "rustdns_replication_replicas{{state=\"{}\"}} {}\n",
+                    st.as_str(),
+                    reps.iter().filter(|r| r.state == st).count()
+                ));
+            }
+            out.push_str(&format!(
+                "# HELP rustdns_replication_replica_conflicts Replicas whose instance id is used by two processes\n# TYPE rustdns_replication_replica_conflicts gauge\nrustdns_replication_replica_conflicts {}\n",
+                reps.iter().filter(|r| r.conflict).count()
+            ));
+        }
         if role == Role::Standby {
             let f = self.follow_snapshot();
+            g(
+                &mut out,
+                "rustdns_replication_halted",
+                "1 if replication halted because the data diverged (terminal until --prepare-standby)",
+                f.halted.is_some() as i64,
+            );
             g(
                 &mut out,
                 "rustdns_replication_connected",
@@ -451,7 +558,15 @@ impl Replication {
         timeout: Duration,
     ) -> std::result::Result<T, CallError> {
         let url = format!("{base}{path}");
-        let mut req = self.http.get(&url).timeout(timeout);
+        let mut req = self
+            .http
+            .get(&url)
+            .timeout(timeout)
+            .header(replicas::HEADER_VERSION, env!("CARGO_PKG_VERSION"))
+            .header(replicas::HEADER_SESSION, &self.session);
+        if let Some(f) = &self.follow {
+            req = req.header(replicas::HEADER_INSTANCE, f.instance_id.trim());
+        }
         if let Some(t) = token {
             req = req.bearer_auth(t);
         }
@@ -590,8 +705,9 @@ impl Replication {
             .replica_promote(actor, url.clone(), how)
             .await
             .map_err(|e| (500, format!("recording the promotion failed: {e}; the config no longer has [follow], so a restart completes the promotion")))?;
-        // 4. Writable now.
+        // 4. Writable now; standbys will report to this server.
         self.set_role(Role::Promoted);
+        self.start_replica_tracking();
         self.gate.open();
         self.update(|s| {
             s.state = "stopped".into();
@@ -624,10 +740,25 @@ impl Replication {
     // ---- standby side -----------------------------------------------------------
 
     async fn run_follower(self: Arc<Self>) {
+        if let Some(h) = crate::mutation::replica::halted(&self.storage) {
+            tracing::error!(reason = %h.reason, detail = %h.detail, since = %h.at, report = ?h.report_file, "REPLICATION HALTED: this standby's data diverged from the primary; it serves its last state read-only and does not follow. Investigate, then rebuild it: stop it and run rust-dns --prepare-standby --yes");
+            self.enter_halted(h).await;
+            return;
+        }
         let mut backoff = Duration::from_secs(1);
         loop {
             let started = Instant::now();
             let err = self.follow_session().await;
+            if let CallError::Halt {
+                reason,
+                detail,
+                evidence,
+            } = err
+            {
+                let h = self.halt(reason, detail, evidence).await;
+                self.enter_halted(h).await;
+                return;
+            }
             let refused = matches!(err, CallError::Auth(_) | CallError::Refused(_));
             tracing::error!(primary = %self.primary_url(), error = %err, "replication: not following the primary; retrying");
             self.reconnects.fetch_add(1, Ordering::Relaxed);
@@ -694,7 +825,7 @@ impl Replication {
                 &base,
                 Some(&token),
                 &format!(
-                    "/api/replication/changes?after={}&limit=1&wait=0",
+                    "/api/replication/changes?after={}&limit=1&wait=0&probe=true",
                     (local.head - 1).max(0)
                 ),
                 timeout,
@@ -723,6 +854,19 @@ impl Replication {
         let mut history_id = remote.history.history_id.clone();
         match lineage::plan(&local, &rv) {
             Plan::Refuse(why) => return Err(CallError::Refused(format!("{base}: {why}"))),
+            Plan::Diverged { reason, detail } => {
+                return Err(CallError::Halt {
+                    reason,
+                    detail,
+                    evidence: serde_json::json!({
+                        "local_history": local.history,
+                        "local_head": local.head,
+                        "primary_history": remote.history,
+                        "primary_head": rv.head,
+                        "primary_oldest": rv.oldest,
+                    }),
+                })
+            }
             Plan::Tail { adopt } => {
                 if adopt {
                     tracing::warn!(from = %local.history.history_id, to = %remote.history.history_id, "the primary was promoted from this server's history; continuing in its history");
@@ -781,12 +925,23 @@ impl Replication {
                 ));
             }
             if !resp.events.is_empty() {
-                // After the initial snapshot everything is changelog driven:
-                // a change that does not apply is an error to look at, not a
-                // reason to reload (the next session retries from our offset).
-                self.apply(&history_id, resp.events).await.map_err(|e| {
-                    CallError::Other(format!("a change from the primary did not apply: {e:#}"))
-                })?;
+                // After the initial snapshot everything is changelog driven.
+                // A change that does not apply means this copy is not the
+                // primary's: halt, never "fix" it by reloading.
+                let first = resp.events.first().map(|e| e.offset);
+                let last = resp.events.last().map(|e| e.offset);
+                if let Err(e) = self.apply(&history_id, resp.events).await {
+                    return Err(CallError::Halt {
+                        reason: "apply_failed",
+                        detail: format!("a change from the primary did not apply: {e:#}"),
+                        evidence: serde_json::json!({
+                            "local_head": self.storage.changelog_head().unwrap_or(0),
+                            "batch_first_offset": first,
+                            "batch_last_offset": last,
+                            "history_id": history_id,
+                        }),
+                    });
+                }
             }
             let caught_up = self.storage.changelog_head().unwrap_or(0) == resp.head;
             if caught_up && last_reconcile.elapsed() >= reconcile_every {
@@ -984,18 +1139,134 @@ impl Replication {
                 zones.len()
             )
         } else {
-            tracing::error!(differences = ?diffs, "replication reconcile: data differs from the primary at the same offset (a lost or misapplied change); following continues; to rebuild this standby run rust-dns --prepare-standby --yes with it stopped");
             self.reconcile_mismatches.fetch_add(1, Ordering::Relaxed);
-            format!(
-                "MISMATCH at offset {head}: {} (to rebuild this standby: stop it and run rust-dns --prepare-standby --yes)",
-                diffs.join("; ")
-            )
+            format!("MISMATCH at offset {head}: {}", diffs.join("; "))
         };
         self.update(|s| {
             s.last_reconcile_at = Some(now_rfc3339());
             s.last_reconcile_result = Some(result);
         });
-        Ok(())
+        if diffs.is_empty() {
+            return Ok(());
+        }
+        Err(CallError::Halt {
+            reason: "diverged",
+            detail: format!(
+                "reconcile at offset {head} found data that differs from the primary: {}",
+                diffs.join("; ")
+            ),
+            evidence: serde_json::json!({
+                "offset": head,
+                "history_id": remote.history_id,
+                "differences": diffs,
+                "local": { "tables": tables, "zones": zones },
+                "primary": { "tables": remote.tables, "zones": remote.zones },
+            }),
+        })
+    }
+
+    /// Record a halt: divergence report next to the database (no secrets:
+    /// names, offsets and checksums), the terminal state in the database,
+    /// the error log.
+    async fn halt(
+        &self,
+        reason: &'static str,
+        detail: String,
+        evidence: serde_json::Value,
+    ) -> HaltInfo {
+        let offset = self.storage.changelog_head().unwrap_or(0);
+        let db = self.reloader.current.load().database.path.clone();
+        let dir = db
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let path = dir.join(format!(
+            "diverged-{}.json",
+            chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ")
+        ));
+        let doc = serde_json::json!({
+            "written_at": now_rfc3339(),
+            "instance_id": self.follow.as_ref().map(|f| f.instance_id.clone()),
+            "primary": self.primary_url(),
+            "reason": reason,
+            "detail": detail,
+            "offset": offset,
+            "local_history": self.history(),
+            "evidence": evidence,
+            "what_now": "This standby stopped replicating because its copy differs from the primary (a bug: a standby never changes replicated data itself). It keeps answering DNS from its last state. Keep this file and the logs for the bug report, then rebuild the standby: stop it and run rust-dns --prepare-standby --yes --config <config>.",
+        });
+        let report_file = match serde_json::to_string_pretty(&doc)
+            .map_err(anyhow::Error::from)
+            .and_then(|t| crate::config::create_private(&path, &t))
+        {
+            Ok(()) => Some(path.display().to_string()),
+            Err(e) => {
+                tracing::error!(error = %e, "cannot write the divergence report");
+                None
+            }
+        };
+        let info = HaltInfo {
+            reason: reason.to_string(),
+            detail,
+            at: now_rfc3339(),
+            offset,
+            report_file,
+        };
+        tracing::error!(reason = %info.reason, detail = %info.detail, offset, report = ?info.report_file, "REPLICATION HALTED: this standby's data diverged from the primary; it stops following and serves its last state read-only. Investigate, then rebuild it: stop it and run rust-dns --prepare-standby --yes");
+        if let Err(e) = self.mutator.replica_halt(info.clone()).await {
+            tracing::error!(error = %e, "cannot record the halt in the database (it is re-detected at the next start)");
+        }
+        info
+    }
+
+    /// Halted: stop replicating; tell the primary (until it has heard it,
+    /// once per start).
+    async fn enter_halted(&self, h: HaltInfo) {
+        self.update(|s| {
+            s.state = "halted".into();
+            s.connected = false;
+            s.halted = Some(h.clone());
+            s.last_error = Some(format!("replication halted ({}): {}", h.reason, h.detail));
+        });
+        let (base, token, timeout, _) = self.follow_cfg();
+        let Some(f) = &self.follow else { return };
+        let body = ReplicaReport {
+            state: "halted".into(),
+            reason: h.reason.clone(),
+            detail: h.detail.clone(),
+        };
+        let url = format!(
+            "{base}/api/replication/replicas/{}/report",
+            url_encode(f.instance_id.trim())
+        );
+        let mut backoff = Duration::from_secs(1);
+        loop {
+            let r = self
+                .http
+                .post(&url)
+                .timeout(timeout)
+                .bearer_auth(&token)
+                .header(replicas::HEADER_INSTANCE, f.instance_id.trim())
+                .header(replicas::HEADER_VERSION, env!("CARGO_PKG_VERSION"))
+                .header(replicas::HEADER_SESSION, &self.session)
+                .json(&body)
+                .send()
+                .await;
+            match r {
+                Ok(resp) if resp.status().is_success() => {
+                    tracing::info!("reported the halt to the primary");
+                    return;
+                }
+                Ok(resp) if resp.status().is_client_error() => {
+                    tracing::warn!(status = %resp.status(), "the primary refused the halt report; not retrying");
+                    return;
+                }
+                _ => {}
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(300));
+        }
     }
 }
 

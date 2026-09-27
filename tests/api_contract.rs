@@ -909,6 +909,16 @@ impl Contract {
             Auth::Anon => (&anon, false, None),
         };
         let mut req = a.request(&method.to_uppercase(), &url);
+        // Documented header parameters get their example value.
+        let op = self.op(path, method).clone();
+        for p in op["parameters"].as_array().into_iter().flatten() {
+            let p = resolve(&self.spec, p, "parameters");
+            if p["in"] == "header" {
+                if let Some(ex) = p["example"].as_str().or(p["schema"]["example"].as_str()) {
+                    req = req.set(p["name"].as_str().unwrap(), ex);
+                }
+            }
+        }
         if csrf {
             req = req.set("X-Requested-With", "rust-dns");
         }
@@ -1209,6 +1219,9 @@ fn live_api_matches_spec() {
         .call(Auth::Session(&root), "get", "/me", &[], "", Body::None)
         .json();
     let root_id = me["user"]["id"].as_i64().unwrap().to_string();
+    // Replication requests carry the documented example instance id
+    // (header parameter examples), so that replica exists.
+    c.ctx.insert("replicas.id".into(), "dns2".into());
 
     // ---- generic driver: every non-dedicated operation, except deletes -------
     let mut ops: Vec<(String, String)> = spec_ops(&c.spec)
@@ -1914,7 +1927,7 @@ fn live_api_matches_spec() {
     c.expect("replication token", &r, 201);
     let token = r.json()["token"].as_str().unwrap().to_string();
     let standby = start_with(&format!(
-        "[follow]\nprimary = \"http://{}\"\ntoken = \"{token}\"\n",
+        "[follow]\nprimary = \"http://{}\"\ninstance_id = \"contract-standby\"\ntoken = \"{token}\"\n",
         srv.web
     ));
     let status_of = |web: &str| -> Value {

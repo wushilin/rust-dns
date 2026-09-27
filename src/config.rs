@@ -30,6 +30,37 @@ pub struct Config {
     /// this server stays read-only instead of accepting writes).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peer: Option<PeerConfig>,
+    /// Primary side: how standbys (replicas) are judged and remembered.
+    pub replication: ReplicationConfig,
+}
+
+/// `[replication]`: thresholds for the replica states shown on a primary
+/// (reloadable).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReplicationConfig {
+    /// A replica that was caught up this recently still counts as up to date.
+    pub up_to_date_grace_secs: u64,
+    /// More changes behind than this: falling behind.
+    pub max_lag_changes: u64,
+    /// Not caught up for longer than this: falling behind.
+    pub max_lag_secs: u64,
+    /// No request for this long: offline (a standby polls at least every 25 s).
+    pub offline_after_secs: u64,
+    /// Forget replicas not seen for this many days.
+    pub forget_after_days: u32,
+}
+
+impl Default for ReplicationConfig {
+    fn default() -> Self {
+        ReplicationConfig {
+            up_to_date_grace_secs: 10,
+            max_lag_changes: 1000,
+            max_lag_secs: 60,
+            offline_after_secs: 75,
+            forget_after_days: 30,
+        }
+    }
 }
 
 /// `[follow]`: this server is a read-only standby of `primary`.
@@ -38,6 +69,9 @@ pub struct Config {
 pub struct FollowConfig {
     /// Base URL of the primary's web API, e.g. `https://dns1.example.net:8053`.
     pub primary: String,
+    /// This standby's name as the primary shows it (required; 1-63 of
+    /// a-z, 0-9, '-', like a host name label). Must be unique per primary.
+    pub instance_id: String,
     /// API token of an administrator on the primary (`rdns_...`).
     pub token: String,
     /// How often zone serials/checksums and the account data are compared
@@ -55,6 +89,7 @@ impl Default for FollowConfig {
     fn default() -> Self {
         FollowConfig {
             primary: String::new(),
+            instance_id: String::new(),
             token: String::new(),
             reconcile_interval_secs: 3600,
             allow_insecure_http: false,
@@ -681,6 +716,7 @@ compress = true          # gzip rotated files
 # answers all DNS queries while the primary is down; promote it by hand).
 # [follow]
 # primary = "https://dns1.example.net:8053"  # the primary's web API (https required)
+# instance_id = "dns2"                       # required: this standby's name on the primary (a-z 0-9 -)
 # token = "rdns_..."                         # API token of an administrator on the primary
 # reconcile_interval_secs = 3600             # compare serials/checksums with the primary
 # allow_insecure_http = false                # plain http only on a trusted network (loopback always allowed)
@@ -692,6 +728,14 @@ compress = true          # gzip rotated files
 # url = "https://dns2.example.net:8053"
 # check_interval_secs = 60
 # allow_insecure_http = false
+
+# On a primary: how its standbys (replicas) are judged (reloadable).
+[replication]
+up_to_date_grace_secs = 10   # caught up this recently = up to date
+max_lag_changes = 1000       # more changes behind = falling behind
+max_lag_secs = 60            # not caught up for longer = falling behind
+offline_after_secs = 75      # no request for this long = offline
+forget_after_days = 30       # forget replicas not seen for this long
 "#;
 
 /// The sample configuration printed by `--print-sample-config`: the root
@@ -1046,6 +1090,10 @@ pub fn validate(cfg: &Config) -> Result<()> {
     if cfg.backup.interval_hours == 0 {
         errs.push("[backup].interval_hours must be greater than zero".into());
     }
+    let r = &cfg.replication;
+    if r.offline_after_secs == 0 || r.max_lag_secs == 0 || r.forget_after_days == 0 {
+        errs.push("[replication].offline_after_secs, max_lag_secs and forget_after_days must be greater than zero (keep offline_after_secs above the 25 s long-poll, e.g. 75)".into());
+    }
     if cfg.changelog.account_retention_days == 0 {
         errs.push("[changelog].account_retention_days must be greater than zero".into());
     }
@@ -1075,6 +1123,13 @@ pub fn validate(cfg: &Config) -> Result<()> {
                 "[follow].token must be an API token (rdns_...) of an administrator on the primary"
                     .into(),
             );
+        }
+        match crate::replication::replicas::instance_id_problem(f.instance_id.trim()) {
+            _ if f.instance_id.trim().is_empty() => errs.push(
+                "[follow].instance_id is required: this standby's name as the primary lists it, e.g. instance_id = \"dns2\" (a-z, 0-9, '-', 1-63 characters, unique per primary)".into(),
+            ),
+            Some(p) => errs.push(format!("[follow].instance_id '{}' {p}", f.instance_id)),
+            None => {}
         }
         if f.reconcile_interval_secs == 0 {
             errs.push("[follow].reconcile_interval_secs must be greater than zero".into());

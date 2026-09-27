@@ -45,6 +45,12 @@ pub enum Plan {
     NeedsFresh { why: String, data: Vec<String> },
     /// Never follow this primary (it is the stale old primary).
     Refuse(String),
+    /// This standby's copy of the primary's history differs from the
+    /// primary's: a bug (or a primary restored from an older backup). Halt.
+    Diverged {
+        reason: &'static str,
+        detail: String,
+    },
 }
 
 /// Can the local changelog continue from `head` given the primary's oldest
@@ -76,22 +82,22 @@ pub fn plan(local: &LocalView, remote: &RemoteView) -> Plan {
     let r = &remote.history;
     if l.history_id == r.history_id {
         if local.head > remote.head {
-            return fresh_or_refuse(
-                local,
-                format!(
-                    "this server has changes up to offset {} but the primary only up to {} (was the primary restored from an older backup?)",
-                    local.head, remote.head
+            return Plan::Diverged {
+                reason: "ahead_of_primary",
+                detail: format!(
+                    "this server has changes up to offset {} of history {} but the primary only up to {} (was the primary restored from an older backup?)",
+                    local.head, l.history_id, remote.head
                 ),
-            );
+            };
         }
         if remote.txn_matches_at_local_head == Some(false) {
-            return fresh_or_refuse(
-                local,
-                format!(
-                    "the change at offset {} differs from the primary's (same history id, different data)",
-                    local.head
+            return Plan::Diverged {
+                reason: "txn_mismatch",
+                detail: format!(
+                    "the change at offset {} differs from the primary's (same history {}, different transaction)",
+                    local.head, l.history_id
                 ),
-            );
+            };
         }
         if gap(local.head, remote.oldest, remote.head) {
             // Same lineage: the data being replaced is a copy of the primary's.
@@ -199,21 +205,26 @@ mod tests {
     }
 
     #[test]
-    fn divergent_data_is_never_replaced_implicitly() {
+    fn divergence_in_the_same_history_halts() {
         let r = remote(h("A", None, None), 20, Some(1));
         // Ahead of the primary (restored from a backup).
         assert!(matches!(
             plan(&local("A", None, 25), &r),
-            Plan::NeedsFresh { .. }
+            Plan::Diverged {
+                reason: "ahead_of_primary",
+                ..
+            }
         ));
         // Same offset, different transaction.
         let mut differs = r.clone();
         differs.txn_matches_at_local_head = Some(false);
-        let p = plan(&local("A", None, 10), &differs);
-        match p {
-            Plan::NeedsFresh { data, .. } => assert_eq!(data, vec!["1 zone".to_string()]),
-            other => panic!("{other:?}"),
-        }
+        assert!(matches!(
+            plan(&local("A", None, 10), &differs),
+            Plan::Diverged {
+                reason: "txn_mismatch",
+                ..
+            }
+        ));
     }
 
     #[test]

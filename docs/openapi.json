@@ -2959,8 +2959,23 @@
           "Replication"
         ],
         "summary": "Replication status (admin)",
-        "description": "Role (primary, promoted, standby, fenced), history, and on a standby the connection to the primary: applied offset, lag, last error, last snapshot and reconcile. On a primary: the standbys that polled it in the last 10 minutes. A standby also calls this on its primary to validate its token. Needs `replicate`.",
+        "description": "Role (primary, promoted, standby, fenced), history, and on a standby the connection to the primary: applied offset, lag, last error, last snapshot and reconcile. On a primary: its replicas (standbys by instance id, with state and lag). A standby also calls this on its primary to validate its token. Needs `replicate`.",
         "operationId": "get_replication_status",
+        "parameters": [
+          {
+            "name": "X-Rust-DNS-Instance",
+            "in": "header",
+            "description": "Sent by standbys (their `[follow].instance_id`): the call counts as a sign of life.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "example": "dns2"
+          }
+        ],
         "responses": {
           "200": {
             "description": "Status.",
@@ -2971,6 +2986,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
@@ -2989,6 +3007,44 @@
         "summary": "Consistent copy of all replicated data (admin, contains secrets)",
         "description": "Zones, records (with expiry state), zone members, users (password hashes, MFA secrets and last TOTP step, recovery code hashes), API token hashes and tags, console settings, TSIG keys, the history and the changelog offset it corresponds to, all read in one transaction. A standby loads it to start and whenever it cannot continue from the changelog (afterwards every change, account changes included, arrives through `/replication/changes`). Needs `replicate`; refused (409) on a server that is not a writable primary.",
         "operationId": "get_replication_snapshot",
+        "parameters": [
+          {
+            "name": "X-Rust-DNS-Instance",
+            "in": "header",
+            "description": "The standby's `[follow].instance_id` (a-z, 0-9, '-'; 1-63). Required.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "dns2"
+          },
+          {
+            "name": "X-Rust-DNS-Version",
+            "in": "header",
+            "description": "The standby's rust-dns version.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "example": "0.1.0"
+          },
+          {
+            "name": "X-Rust-DNS-Session",
+            "in": "header",
+            "description": "Random per standby process (detects two processes with one instance id).",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "example": "k3v9x2m1q8p0"
+          }
+        ],
         "responses": {
           "200": {
             "description": "Snapshot.",
@@ -2999,6 +3055,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
@@ -3018,7 +3077,7 @@
           "Replication"
         ],
         "summary": "Changes after an offset, long-poll (admin)",
-        "description": "Committed changelog entries after `after`, DNS and account changes in one sequence (account changes carry password hashes, TOTP and TSIG secrets and appear nowhere else), whole transactions only, with the history id and the latest offset. With `wait`, an answer without changes is held until a change commits or the wait ends. `gap: true`: entries after `after` were pruned or scrubbed; load a snapshot. Needs `replicate`; refused (409) on a server that is not a writable primary.",
+        "description": "Committed changelog entries after `after`, DNS and account changes in one sequence (account changes carry password hashes, TOTP and TSIG secrets and appear nowhere else), whole transactions only, with the history id and the latest offset. The `after` of each request is recorded as the standby's applied offset (a standby commits a batch before asking for the next), unless `probe=true`. With `wait`, an answer without changes is held until a change commits or the wait ends. `gap: true`: entries after `after` were pruned or scrubbed; load a snapshot. Needs `replicate`; refused (409) on a server that is not a writable primary.",
         "operationId": "get_replication_changes",
         "parameters": [
           {
@@ -3046,6 +3105,16 @@
             }
           },
           {
+            "name": "probe",
+            "in": "query",
+            "description": "Health probe of the standby: do not record `after` as its applied offset.",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          {
             "name": "wait",
             "in": "query",
             "description": "Seconds to wait for a change (or an account-data change) when there\nis none yet, 0-60.",
@@ -3057,6 +3126,42 @@
               "maximum": 60,
               "minimum": 0
             }
+          },
+          {
+            "name": "X-Rust-DNS-Instance",
+            "in": "header",
+            "description": "The standby's `[follow].instance_id` (a-z, 0-9, '-'; 1-63). Required.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "dns2"
+          },
+          {
+            "name": "X-Rust-DNS-Version",
+            "in": "header",
+            "description": "The standby's rust-dns version.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "example": "0.1.0"
+          },
+          {
+            "name": "X-Rust-DNS-Session",
+            "in": "header",
+            "description": "Random per standby process (detects two processes with one instance id).",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "example": "k3v9x2m1q8p0"
           }
         ],
         "responses": {
@@ -3103,6 +3208,42 @@
               "type": "string"
             },
             "example": "root"
+          },
+          {
+            "name": "X-Rust-DNS-Instance",
+            "in": "header",
+            "description": "The standby's `[follow].instance_id` (a-z, 0-9, '-'; 1-63). Required.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "dns2"
+          },
+          {
+            "name": "X-Rust-DNS-Version",
+            "in": "header",
+            "description": "The standby's rust-dns version.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "example": "0.1.0"
+          },
+          {
+            "name": "X-Rust-DNS-Session",
+            "in": "header",
+            "description": "Random per standby process (detects two processes with one instance id).",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "example": "k3v9x2m1q8p0"
           }
         ],
         "responses": {
@@ -3175,6 +3316,180 @@
           },
           "409": {
             "$ref": "#/components/responses/Conflict"
+          }
+        }
+      }
+    },
+    "/replication/replicas": {
+      "get": {
+        "tags": [
+          "Replication"
+        ],
+        "summary": "Standbys following this server (admin)",
+        "description": "Every standby known by its `[follow].instance_id`: state (`up_to_date`, `catching_up`, `falling_behind`, `offline`, `bootstrapping`; thresholds in `[replication]`), a `conflict` flag when two processes use one id, applied offset (the `after` of its last changes request), lag in changes and in seconds since it was last caught up, last seen, address, version. Kept in a local table across restarts; entries not seen for `[replication].forget_after_days` are dropped. Needs `replicate`.",
+        "operationId": "list_replicas",
+        "responses": {
+          "200": {
+            "description": "Replicas, by instance id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReplicaList"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
+    "/replication/replicas/{id}": {
+      "delete": {
+        "tags": [
+          "Replication"
+        ],
+        "summary": "Forget a standby (admin)",
+        "description": "Removes the instance from the replica list (e.g. a decommissioned standby). A standby that is still running reappears at its next request. Local bookkeeping: audited as `replication.replica_forget`, not in the changelog and not replicated. Needs `replicate`.",
+        "operationId": "forget_replica",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The standby's instance id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "dns2"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Forgotten.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/ReadOnly"
+          }
+        }
+      }
+    },
+    "/replication/replicas/{id}/report": {
+      "post": {
+        "tags": [
+          "Replication"
+        ],
+        "summary": "A standby reports that it stopped (admin)",
+        "description": "Sent by a standby whose replication halted (its data diverged from this primary: a bug), once when it halts and once at each start while halted, so the replica list shows it as `halted` with the reason. The `X-Rust-DNS-Instance` header must name the same instance. Local bookkeeping (not audited, not in the changelog). Needs `replicate`.",
+        "operationId": "report_replica",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The standby's instance id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "dns2"
+          },
+          {
+            "name": "X-Rust-DNS-Instance",
+            "in": "header",
+            "description": "The standby's `[follow].instance_id`; must equal `id`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "dns2"
+          },
+          {
+            "name": "X-Rust-DNS-Version",
+            "in": "header",
+            "description": "The standby's rust-dns version.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "example": "0.1.0"
+          },
+          {
+            "name": "X-Rust-DNS-Session",
+            "in": "header",
+            "description": "Random per standby process.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "example": "k3v9x2m1q8p0"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReplicaReport"
+              },
+              "example": {
+                "detail": "reconcile at offset 1834 found data that differs from the primary: table users: differs (3 rows here, 3 on the primary)",
+                "reason": "diverged",
+                "state": "halted"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Recorded.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/ReadOnly"
           }
         }
       }
@@ -3988,6 +4303,7 @@
         "description": "Standby side of `GET /replication/status`.",
         "required": [
           "primary",
+          "instance_id",
           "state",
           "connected",
           "last_applied_offset",
@@ -4003,16 +4319,21 @@
           "last_reconcile_at",
           "last_reconcile_result",
           "reconnects",
-          "rebootstraps"
+          "rebootstraps",
+          "halted"
         ],
         "properties": {
           "primary": {
             "type": "string",
             "description": "The `[follow]` primary URL."
           },
+          "instance_id": {
+            "type": "string",
+            "description": "This standby's `[follow].instance_id` (its name on the primary)."
+          },
           "state": {
             "type": "string",
-            "description": "connecting | bootstrapping | following | error | refused | stopped"
+            "description": "connecting | bootstrapping | following | error | refused | halted | stopped"
           },
           "connected": {
             "type": "boolean",
@@ -4108,6 +4429,17 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0
+          },
+          "halted": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/HaltInfo",
+                "description": "Set when replication halted (terminal until `--prepare-standby`)."
+              }
+            ]
           }
         }
       },
@@ -4440,6 +4772,43 @@
           },
           "requires_session": {
             "type": "boolean"
+          }
+        }
+      },
+      "HaltInfo": {
+        "type": "object",
+        "description": "A standby stopped following because its data diverged from the primary\n(a bug: a standby never changes replicated data by itself). Kept until\nthe operator rebuilds it with `rust-dns --prepare-standby --yes`.",
+        "required": [
+          "reason",
+          "detail",
+          "at",
+          "offset",
+          "report_file"
+        ],
+        "properties": {
+          "reason": {
+            "type": "string",
+            "description": "`diverged` (reconcile mismatch), `apply_failed`, `txn_mismatch`,\n`ahead_of_primary`."
+          },
+          "detail": {
+            "type": "string",
+            "description": "What exactly differed (tables, zones, checksums, offsets)."
+          },
+          "at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "offset": {
+            "type": "integer",
+            "format": "int64",
+            "description": "This standby's changelog offset when it halted."
+          },
+          "report_file": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The divergence report written next to the database."
           }
         }
       },
@@ -5317,6 +5686,162 @@
           }
         }
       },
+      "ReplicaInfo": {
+        "type": "object",
+        "description": "A replica as the API shows it.",
+        "required": [
+          "instance",
+          "state",
+          "conflict",
+          "applied_offset",
+          "head",
+          "lag_changes",
+          "lag_seconds",
+          "last_seen_at",
+          "last_caught_up_at",
+          "first_seen_at",
+          "address",
+          "version",
+          "user",
+          "bootstrapping",
+          "halted_reason"
+        ],
+        "properties": {
+          "instance": {
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/ReplicaState"
+          },
+          "conflict": {
+            "type": "boolean",
+            "description": "The same id is used by two processes (addresses or sessions) at once."
+          },
+          "applied_offset": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The offset the standby has applied (the `after` of its last request)."
+          },
+          "head": {
+            "type": "integer",
+            "format": "int64",
+            "description": "This server's latest offset now."
+          },
+          "lag_changes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "lag_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Seconds since the standby was last caught up (0 when it is)."
+          },
+          "last_seen_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "last_caught_up_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "first_seen_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "address": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          },
+          "user": {
+            "type": "string",
+            "description": "The token user the standby authenticates as."
+          },
+          "bootstrapping": {
+            "type": "boolean"
+          },
+          "halted_reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the standby halted (state `halted`)."
+          }
+        },
+        "example": {
+          "address": "192.0.2.53",
+          "applied_offset": 1834,
+          "bootstrapping": false,
+          "conflict": false,
+          "first_seen_at": "2026-01-10T08:00:00.000Z",
+          "halted_reason": null,
+          "head": 1834,
+          "instance": "dns2",
+          "lag_changes": 0,
+          "lag_seconds": 0,
+          "last_caught_up_at": "2026-01-15T09:30:00.000Z",
+          "last_seen_at": "2026-01-15T09:30:00.000Z",
+          "state": "up_to_date",
+          "user": "root",
+          "version": "0.1.0"
+        }
+      },
+      "ReplicaList": {
+        "type": "object",
+        "description": "`GET /replication/replicas`.",
+        "required": [
+          "replicas"
+        ],
+        "properties": {
+          "replicas": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReplicaInfo"
+            }
+          }
+        }
+      },
+      "ReplicaReport": {
+        "type": "object",
+        "description": "`POST /replication/replicas/{id}/report`: a standby tells its primary\nthat it stopped (currently only `halted`).",
+        "required": [
+          "state",
+          "reason",
+          "detail"
+        ],
+        "properties": {
+          "state": {
+            "type": "string",
+            "description": "`halted`."
+          },
+          "reason": {
+            "type": "string"
+          },
+          "detail": {
+            "type": "string"
+          }
+        },
+        "example": {
+          "detail": "table users: differs (3 rows here, 3 on the primary)",
+          "reason": "diverged",
+          "state": "halted"
+        }
+      },
+      "ReplicaState": {
+        "type": "string",
+        "enum": [
+          "up_to_date",
+          "catching_up",
+          "falling_behind",
+          "offline",
+          "bootstrapping",
+          "halted"
+        ]
+      },
       "ReplicationStatus": {
         "type": "object",
         "description": "`GET /replication/status`.",
@@ -5328,7 +5853,6 @@
           "read_only_reason",
           "follow",
           "peer",
-          "standbys",
           "warning"
         ],
         "properties": {
@@ -5381,12 +5905,12 @@
               }
             ]
           },
-          "standbys": {
+          "replicas": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/StandbySeen"
+              "$ref": "#/components/schemas/ReplicaInfo"
             },
-            "description": "Standbys that polled this node in the last 10 minutes."
+            "description": "Primary side: the standbys that follow this server, by instance id."
           },
           "warning": {
             "type": [
@@ -5453,6 +5977,10 @@
               "null"
             ],
             "description": "Why a standby is not following (state `refused`: e.g. it has local\ndata and must be prepared with `--prepare-standby`), else null."
+          },
+          "halted": {
+            "type": "boolean",
+            "description": "Replication halted because the data diverged (see the status)."
           }
         }
       },
@@ -5795,33 +6323,6 @@
               "type": "object"
             },
             "description": "Users first, then their credentials and tokens, settings, TSIG keys,\nzones, records and memberships (references come after their targets)."
-          }
-        }
-      },
-      "StandbySeen": {
-        "type": "object",
-        "description": "A standby polling this primary (in memory, recent contacts only).",
-        "required": [
-          "address",
-          "user",
-          "after",
-          "last_seen_at"
-        ],
-        "properties": {
-          "address": {
-            "type": "string"
-          },
-          "user": {
-            "type": "string"
-          },
-          "after": {
-            "type": "integer",
-            "format": "int64",
-            "description": "The cursor of its last request."
-          },
-          "last_seen_at": {
-            "type": "string",
-            "format": "date-time"
           }
         }
       },

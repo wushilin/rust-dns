@@ -68,6 +68,17 @@ pub(crate) const K_PROMOTED_FROM: &str = "promoted_from";
 /// promotion). A database with this key but no `[follow]` in the config was
 /// un-followed by hand: startup records a promotion.
 pub(crate) const K_FOLLOWING: &str = "following";
+/// Replication halted (JSON `HaltInfo`): terminal until `--prepare-standby`.
+pub(crate) const K_HALTED: &str = "halted";
+
+/// The recorded halt, if replication is halted.
+pub fn halted(storage: &crate::storage::Storage) -> Option<HaltInfo> {
+    storage
+        .replication_state()
+        .ok()?
+        .get(K_HALTED)
+        .and_then(|v| serde_json::from_str(v).ok())
+}
 
 fn set_state(c: &Connection, key: &str, value: Option<&str>) -> Result<()> {
     match value {
@@ -431,6 +442,22 @@ impl Mutator {
                 serde_json::json!({ "summary": sum, "history_id": snap.history.history_id }),
             );
             Ok((sum, Vec::new()))
+        })
+        .await
+    }
+
+    /// Standby: stop replicating for good (until `--prepare-standby`): the
+    /// data diverged from the primary. Local state only; audited.
+    pub async fn replica_halt(&self, info: HaltInfo) -> MResult<()> {
+        self.replica_write("replication_halt", system("halt"), move |t| {
+            set_state(t.conn, K_HALTED, Some(&serde_json::to_string(&info)?))?;
+            t.push(
+                "replication.halt",
+                None,
+                &info.reason,
+                serde_json::json!({ "reason": info.reason, "detail": info.detail, "offset": info.offset, "report_file": info.report_file }),
+            );
+            Ok(((), Vec::new()))
         })
         .await
     }
@@ -1061,6 +1088,88 @@ mod tests {
         .unwrap();
         assert_eq!(id.protocol, 1);
         assert_ne!(id.protocol, crate::replication::types::REPLICATION_PROTOCOL);
+    }
+
+    /// Nothing a standby does by itself changes replicated data: DNS
+    /// writes and the expiry sweeper are refused by the gate; sign-in state
+    /// of replicated users (TOTP step, used recovery code, sessions) lives
+    /// in per-server columns or local tables; its own root is local
+    /// (explicitly excluded from the checksums); renaming the root is refused.
+    #[tokio::test]
+    async fn local_writes_on_a_standby_never_change_replicated_data() {
+        let (ps, _pm, _pa) = populated_primary().await;
+        let (ss, sm, sa) = standby_node();
+        sm.replica_bootstrap(snapshot(&ps), standby_root(), "https://p".into())
+            .await
+            .unwrap();
+        let sums = |s: &Storage| {
+            s.read_tx(|c| crate::replication::tables::checksums(c, "root"))
+                .unwrap()
+        };
+        let before = sums(&ss);
+        assert_eq!(before, sums(&ps), "a fresh copy matches the primary");
+        // DNS writes and the sweeper's writes.
+        assert!(matches!(
+            sm.create_zone(actor(), zone_input("x.test"), None).await,
+            Err(MutationError::ReadOnly(_))
+        ));
+        assert!(matches!(
+            sm.expire_due(chrono::Utc::now() + chrono::Duration::days(365))
+                .await,
+            Err(MutationError::ReadOnly(_))
+        ));
+        assert!(matches!(
+            sm.reap_due(chrono::Utc::now() + chrono::Duration::days(365))
+                .await,
+            Err(MutationError::ReadOnly(_))
+        ));
+        // Sign-in of a replicated user: TOTP step, recovery code, session.
+        let alice = ss.get_user_by_name("alice").unwrap().unwrap();
+        sa.run(&actor(), "mfa_verify", |t| {
+            t.accept_totp_step(&alice, 99_999)?;
+            t.use_recovery_code(&alice, "rc-hash-2")?;
+            t.create_session(
+                &alice,
+                &Session {
+                    id: 0,
+                    token_hash: "sess".into(),
+                    user_id: alice.id,
+                    state: "active".into(),
+                    pending_secret: None,
+                    ip: "127.0.0.1".into(),
+                    user_agent: String::new(),
+                    created_at: now_rfc3339(),
+                    expires_at: "2999-01-01T00:00:00.000Z".into(),
+                    last_seen_at: now_rfc3339(),
+                },
+            )?;
+            t.delete_user_sessions(&alice, "admin sign-out")
+        })
+        .unwrap();
+        // The local root: new password and MFA setting from its config.
+        sa.sync_root("root", "$argon2id$standby-root-2", true)
+            .unwrap();
+        let root = ss.get_user_by_name("root").unwrap().unwrap();
+        assert_eq!(root.password_hash, "$argon2id$standby-root-2");
+        // Renaming the root on a standby is refused (the old one is replicated).
+        let err = sa.sync_root("admin", STANDBY_ROOT_HASH, false).unwrap_err();
+        assert!(err.to_string().contains("--prepare-standby"), "{err}");
+        assert_eq!(sums(&ss), before, "replicated tables unchanged");
+        // The exclusion of the local root is explicit: counted, it differs.
+        let with_root = |s: &Storage| {
+            s.read_tx(|c| crate::replication::tables::checksums(c, "nobody"))
+                .unwrap()
+        };
+        let users = |v: Vec<crate::replication::types::TableChecksum>| {
+            v.into_iter().find(|t| t.table == "users").unwrap()
+        };
+        assert_ne!(
+            users(with_root(&ss)).checksum,
+            users(with_root(&ps)).checksum,
+            "the standby's root differs from the primary's namesake, and that is excluded on purpose"
+        );
+        // Nothing was changelogged either.
+        assert_eq!(ss.changelog_head().unwrap(), ps.changelog_head().unwrap());
     }
 
     /// A buffer the test subscriber writes to.

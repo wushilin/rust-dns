@@ -2,6 +2,13 @@
 
 Status as of 2026-09-27. Deployed to dns-test (musl build, /opt/rust-dns) with everything below. Stages 1 to 3 (log rotation, DNS protocol completeness, console fixes) are implemented. The current workspace has additional Stage 4 changes in progress below.
 
+## Replica tracking and halting (2026-09-27, implemented, not committed)
+
+- [x] `[follow].instance_id` required (host label); standby sends `X-Rust-DNS-Instance/Version/Session` on every replication request; data endpoints 400 without it.
+- [x] Primary tracks replicas (`replication::replicas`): applied offset (= `after`), lag changes/seconds, last seen, address, version, user; states up_to_date/catching_up/falling_behind/offline/bootstrapping/halted; conflict flag; `[replication]` thresholds (reloadable); local `replicas` table (registry: Local), pruned after `forget_after_days`; `GET /api/replication/replicas`, audited `DELETE .../{id}`; metrics per instance; console table.
+- [x] Halt (terminal until `--prepare-standby`): reconcile mismatch, apply failure, txn mismatch at head, ahead of primary. Report file `diverged-*.json`, state in `replication_state`, audit row `replication.halt`, log, metric `rustdns_replication_halted`, banner, status, `--check`; reported to the primary (`POST /api/replication/replicas/{id}/report`) at the halt and at each start.
+- [x] Root rename on a standby refused (would change a replicated row).
+
 ## Account changes in the changelog (2026-09-27, implemented, not committed)
 
 - [x] `Change` gained the account family (user_created/updated/deleted, totp_step_accepted, recovery_codes_replaced, recovery_code_used, token_created/tags_set/revoked, tsig_key_set/deleted, setting_set/cleared): facts, applied by `mutation::acct_sql` (the only writer of those tables; source-scan test) on the primary through `AuditTx::record` and on a standby through the same `replay::apply` (local-root merge inside it).
