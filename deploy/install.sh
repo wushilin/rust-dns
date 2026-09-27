@@ -47,6 +47,9 @@ if [ ! -e "$CFG" ]; then
 else
   echo "keeping existing config $CFG"
 fi
+# Files written by older versions may be group/world readable: make every
+# file under etc, data and logs owner-only (the process now uses umask 0077).
+find "$PREFIX/etc" "$PREFIX/data" "$PREFIX/logs" -type f -perm /077 -exec chmod go-rwx {} +
 # Refuses the "change-me" placeholder and an empty root password.
 "$PREFIX/bin/rust-dns" --check --config "$CFG"
 
