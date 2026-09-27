@@ -450,6 +450,10 @@ pub struct RootConfig {
 #[serde(default)]
 pub struct ChangelogConfig {
     pub retention_days: u32,
+    /// Account, settings and TSIG changes carry password hashes, TOTP and
+    /// TSIG secrets: their payloads are scrubbed after this many days (a
+    /// standby further behind loads a snapshot).
+    pub account_retention_days: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -559,7 +563,10 @@ impl Default for RootConfig {
 }
 impl Default for ChangelogConfig {
     fn default() -> Self {
-        ChangelogConfig { retention_days: 30 }
+        ChangelogConfig {
+            retention_days: 30,
+            account_retention_days: 3,
+        }
     }
 }
 impl Default for LoggingConfig {
@@ -654,6 +661,7 @@ mfa_required = false
 
 [changelog]
 retention_days = 30
+account_retention_days = 3  # account/settings/TSIG change payloads (secrets) are scrubbed after this
 
 [expiry]
 retention_days = 30      # expired records stop answering at once and are deleted after this many days
@@ -1037,6 +1045,9 @@ pub fn validate(cfg: &Config) -> Result<()> {
     }
     if cfg.backup.interval_hours == 0 {
         errs.push("[backup].interval_hours must be greater than zero".into());
+    }
+    if cfg.changelog.account_retention_days == 0 {
+        errs.push("[changelog].account_retention_days must be greater than zero".into());
     }
     if cfg.expiry.sweep_interval_secs == 0 {
         errs.push("[expiry].sweep_interval_secs must be greater than zero".into());

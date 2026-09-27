@@ -5,12 +5,19 @@
 //! are written to `audit_log` in the same SQLite transaction as the data.
 //! A rolled-back operation leaves no audit row and is logged instead.
 //!
+//! Writes to replicated tables are typed `Change`s (see [`AuditTx::record`])
+//! committed to the changelog in the same transaction, so a standby replays
+//! them exactly like DNS changes.
+//!
 //! Deliberately not audited (operational bookkeeping in `storage.rs`):
 //! session `last_seen_at`, API token `last_used_at` / `last_used_ip`, and
 //! pruning of expired sessions and old log rows.
 
-use super::TOKEN;
+use super::acct_sql::{self, Ctx};
+use super::{Change, TOKEN};
 use crate::model::*;
+use crate::replication::data;
+use crate::replication::types::{Hidden, ReplToken, ReplUser};
 use crate::storage::{self as db, Storage, TokenInfo};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
@@ -62,10 +69,18 @@ pub struct UserChanges {
 }
 
 /// The only handle an account operation gets on the database.
+///
+/// Writes to replicated tables (users, recovery codes, API tokens, console
+/// settings, TSIG keys) go through [`AuditTx::record`]: it applies a typed
+/// [`Change`] with the same code a standby replays it with, and queues it
+/// for the changelog, which is written with the audit rows at commit.
+/// Sessions are local and written directly (bookkeeping, audited).
 pub struct AuditTx<'a> {
-    // Visible to sibling mutation modules (e.g. `settings`) that add audited writes.
+    // Reads for sibling mutation modules (settings, tsig); their writes go
+    // through `record`.
     pub(super) conn: &'a Connection,
     entries: Vec<AuditEntry>,
+    changes: Vec<Change>,
 }
 
 fn user_detail(u: &User) -> serde_json::Value {
@@ -78,6 +93,23 @@ fn user_detail(u: &User) -> serde_json::Value {
     })
 }
 
+fn to_user(u: &ReplUser) -> User {
+    User {
+        id: u.id,
+        username: u.username.clone(),
+        password_hash: u.password_hash.clone(),
+        display_name: u.display_name.clone(),
+        is_admin: u.is_admin,
+        is_root: u.is_root,
+        mfa_required: u.mfa_required,
+        totp_secret: u.totp_secret.clone(),
+        totp_enrolled_at: u.totp_enrolled_at.clone(),
+        disabled_at: u.disabled_at.clone(),
+        created_at: u.created_at.clone(),
+        updated_at: u.updated_at.clone(),
+    }
+}
+
 impl<'a> AuditTx<'a> {
     /// An audited transaction on `conn` for sibling mutation modules that
     /// combine audited writes with other writes in one SQLite transaction
@@ -86,12 +118,23 @@ impl<'a> AuditTx<'a> {
         AuditTx {
             conn,
             entries: Vec::new(),
+            changes: Vec::new(),
         }
     }
 
-    /// Write the collected audit rows (same transaction).
+    /// Write the collected audit rows (same transaction). Recorded changes
+    /// are not changelogged on this path (replication writes its own rows).
     pub(super) fn commit_entries(self, actor: &Actor, operation: &str) -> Result<Vec<AuditRecord>> {
-        self.finish(actor, operation)
+        let txn = crate::auth::random_token(9);
+        self.finish(actor, operation, &txn, false).map(|(a, _)| a)
+    }
+
+    /// Apply an account change and queue it for the changelog. The only
+    /// way to write a replicated account table.
+    pub(super) fn record(&mut self, change: Change) -> Result<()> {
+        super::replay::apply(self.conn, &change, &Ctx::verbatim())?;
+        self.changes.push(change);
+        Ok(())
     }
 
     pub(super) fn push(
@@ -109,16 +152,34 @@ impl<'a> AuditTx<'a> {
         });
     }
 
+    fn row(&self, id: i64) -> Result<ReplUser> {
+        data::user_row(self.conn, id)?.context("user not found")
+    }
+
     // ---- users -----------------------------------------------------------
 
     pub fn create_user(&mut self, u: &NewUser) -> Result<User> {
+        if data::user_by_name(self.conn, &u.username)?.is_some() {
+            anyhow::bail!("UNIQUE constraint failed: users.username");
+        }
         let now = now_rfc3339();
-        self.conn.execute(
-            "INSERT INTO users (username, password_hash, display_name, is_admin, is_root, mfa_required, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?6)",
-            params![u.username, u.password_hash, u.display_name, u.is_admin as i64, u.mfa_required as i64, now],
-        )?;
-        let user = db::get_user(self.conn, self.conn.last_insert_rowid())?.expect("just inserted");
+        let row = ReplUser {
+            id: acct_sql::next_id(self.conn, "users")?,
+            username: u.username.clone(),
+            password_hash: u.password_hash.clone(),
+            display_name: u.display_name.clone(),
+            is_admin: u.is_admin,
+            is_root: false,
+            mfa_required: u.mfa_required,
+            totp_secret: None,
+            totp_enrolled_at: None,
+            totp_last_step: None,
+            disabled_at: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        self.record(Change::UserCreated { user: row.clone() })?;
+        let user = to_user(&row);
         self.push(
             "user.create",
             Some(user.id),
@@ -129,7 +190,7 @@ impl<'a> AuditTx<'a> {
     }
 
     fn load_user(&self, id: i64) -> Result<User> {
-        db::get_user(self.conn, id)?.context("user not found")
+        Ok(to_user(&self.row(id)?))
     }
 
     /// Audit what changed between two versions of a user. Secrets are
@@ -186,50 +247,49 @@ impl<'a> AuditTx<'a> {
         }
     }
 
-    /// Administrator edit. Only the fields set in `ch` are written, each
-    /// as its own column update, and the audit "before" is read inside this
-    /// transaction: a concurrent self-service change (password, MFA) is
-    /// neither overwritten nor able to overwrite this one.
-    pub fn change_user(&mut self, user_id: i64, ch: &UserChanges) -> Result<User> {
-        let before = self.load_user(user_id)?;
-        let now = now_rfc3339();
-        if let Some(d) = &ch.display_name {
-            self.conn.execute(
-                "UPDATE users SET display_name = ?2, updated_at = ?3 WHERE id = ?1",
-                params![user_id, d, now],
-            )?;
+    /// Write a user's new row (when it differs) and audit the difference.
+    fn update_row(&mut self, before: ReplUser, mut after: ReplUser) -> Result<User> {
+        if after == before {
+            return Ok(to_user(&after));
         }
-        if let Some(a) = ch.is_admin {
-            self.conn.execute(
-                "UPDATE users SET is_admin = ?2, updated_at = ?3 WHERE id = ?1",
-                params![user_id, a as i64, now],
-            )?;
-        }
-        if let Some(m) = ch.mfa_required {
-            self.conn.execute(
-                "UPDATE users SET mfa_required = ?2, updated_at = ?3 WHERE id = ?1",
-                params![user_id, m as i64, now],
-            )?;
-        }
-        if let Some(d) = ch.disabled {
-            self.conn.execute(
-                "UPDATE users SET disabled_at = CASE WHEN ?2 THEN COALESCE(disabled_at, ?3) ELSE NULL END, updated_at = ?3 WHERE id = ?1",
-                params![user_id, d, now],
-            )?;
-        }
-        if let Some(h) = &ch.password_hash {
-            self.conn.execute(
-                "UPDATE users SET password_hash = ?2, updated_at = ?3 WHERE id = ?1",
-                params![user_id, h, now],
-            )?;
-        }
-        let user = self.load_user(user_id)?;
-        self.audit_user_change(&before, &user);
-        Ok(user)
+        after.updated_at = now_rfc3339();
+        self.record(Change::UserUpdated {
+            user: after.clone(),
+        })?;
+        let (b, a) = (to_user(&before), to_user(&after));
+        self.audit_user_change(&b, &a);
+        Ok(a)
     }
 
-    /// Set a new password hash (self-service or administrator). Touches only
-    /// `password_hash`.
+    /// Administrator edit. Only the fields set in `ch` change; the row is
+    /// read inside this transaction, so a concurrent self-service change
+    /// (password, MFA) is neither overwritten nor able to overwrite this one.
+    pub fn change_user(&mut self, user_id: i64, ch: &UserChanges) -> Result<User> {
+        let before = self.row(user_id)?;
+        let mut after = before.clone();
+        if let Some(d) = &ch.display_name {
+            after.display_name = d.clone();
+        }
+        if let Some(a) = ch.is_admin {
+            after.is_admin = a;
+        }
+        if let Some(m) = ch.mfa_required {
+            after.mfa_required = m;
+        }
+        if let Some(d) = ch.disabled {
+            after.disabled_at = if d {
+                after.disabled_at.clone().or_else(|| Some(now_rfc3339()))
+            } else {
+                None
+            };
+        }
+        if let Some(h) = &ch.password_hash {
+            after.password_hash = h.clone();
+        }
+        self.update_row(before, after)
+    }
+
+    /// Set a new password hash (self-service or administrator).
     pub fn set_password(&mut self, user_id: i64, password_hash: &str) -> Result<User> {
         self.change_user(
             user_id,
@@ -240,144 +300,139 @@ impl<'a> AuditTx<'a> {
         )
     }
 
-    /// Enroll (`Some(secret)`) or remove (`None`) TOTP. Touches only the MFA
-    /// columns; the replay marker starts over with the new secret.
+    /// Enroll (`Some(secret)`) or remove (`None`) TOTP; the replay marker
+    /// starts over with the new secret.
     pub fn set_mfa(&mut self, user_id: i64, secret: Option<&str>) -> Result<User> {
-        let before = self.load_user(user_id)?;
-        let enrolled_at = secret.map(|_| now_rfc3339());
-        self.conn.execute(
-            "UPDATE users SET totp_secret = ?2, totp_enrolled_at = ?3, totp_last_step = NULL, updated_at = ?4 WHERE id = ?1",
-            params![user_id, secret, enrolled_at, now_rfc3339()],
-        )?;
-        let user = self.load_user(user_id)?;
-        self.audit_user_change(&before, &user);
-        Ok(user)
+        let before = self.row(user_id)?;
+        let mut after = before.clone();
+        after.totp_secret = secret.map(str::to_string);
+        after.totp_enrolled_at = secret.map(|_| now_rfc3339());
+        after.totp_last_step = None;
+        self.update_row(before, after)
     }
 
     /// Record that a TOTP code of time step `step` was accepted for `user`.
     /// Returns false (and writes nothing) when that step or a later one was
-    /// already used: the code is a replay and must be refused. Security
-    /// state, so it is written and audited like any other account change.
+    /// already used: the code is a replay and must be refused.
     pub fn accept_totp_step(&mut self, user: &User, step: u64) -> Result<bool> {
         let step = step as i64;
-        let n = self.conn.execute(
-            "UPDATE users SET totp_last_step = ?2 WHERE id = ?1 AND totp_secret IS NOT NULL
-             AND (totp_last_step IS NULL OR totp_last_step < ?2)",
-            params![user.id, step],
-        )?;
-        if n > 0 {
-            self.push(
-                "totp.accept",
-                Some(user.id),
-                &user.username,
-                serde_json::json!({ "step": step }),
-            );
+        let row = self.row(user.id)?;
+        if row.totp_secret.is_none() || row.totp_last_step.is_some_and(|l| l >= step) {
+            return Ok(false);
         }
-        Ok(n > 0)
-    }
-
-    /// Disable an account (e.g. the previous root after a rename) and sign
-    /// it out everywhere.
-    pub fn disable_user(&mut self, user_id: i64, reason: &str) -> Result<User> {
-        let user = self.change_user(
-            user_id,
-            &UserChanges {
-                disabled: Some(true),
-                ..UserChanges::default()
-            },
-        )?;
-        self.delete_user_sessions(&user, reason)?;
-        Ok(user)
+        self.record(Change::TotpStepAccepted {
+            user_id: user.id,
+            step,
+        })?;
+        self.push(
+            "totp.accept",
+            Some(user.id),
+            &user.username,
+            serde_json::json!({ "step": step }),
+        );
+        Ok(true)
     }
 
     pub fn delete_user(&mut self, u: &User) -> Result<bool> {
-        let n = self.conn.execute(
-            "DELETE FROM users WHERE id = ?1 AND is_root = 0",
-            params![u.id],
-        )?;
-        if n > 0 {
-            self.push("user.delete", Some(u.id), &u.username, user_detail(u));
+        match data::user_row(self.conn, u.id)? {
+            Some(r) if !r.is_root => {
+                self.record(Change::UserDeleted {
+                    user_id: r.id,
+                    username: r.username.clone(),
+                })?;
+                self.push("user.delete", Some(u.id), &u.username, user_detail(u));
+                Ok(true)
+            }
+            _ => Ok(false),
         }
-        Ok(n > 0)
     }
 
-    /// Create or refresh the root user from configuration. Audited only when
-    /// something actually changed.
+    /// Create or refresh the root user from configuration. Written (and
+    /// audited) only when something actually changed.
     pub fn sync_root(
         &mut self,
         username: &str,
         password_hash: &str,
         mfa_required: bool,
     ) -> Result<User> {
-        let before = self
-            .conn
-            .query_row(
-                &format!("SELECT {} FROM users WHERE username = ?1", db::USER_COLS),
-                params![username],
-                db::row_to_user,
-            )
-            .ok();
         // A renamed root: the previous root account must not stay an
         // administrator with its old password. It loses root, is disabled
         // and signed out everywhere (re-enable it in the console if wanted).
-        let previous: Vec<(i64, String)> = {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT id, username FROM users WHERE is_root = 1 AND username <> ?1")?;
-            let rows = stmt.query_map(params![username], |r| Ok((r.get(0)?, r.get(1)?)))?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        let demoted = self.conn.execute(
-            "UPDATE users SET is_root = 0 WHERE is_root = 1 AND username <> ?1",
-            params![username],
-        )?;
-        for (id, name) in &previous {
-            tracing::warn!(previous = %name, new = %username, "the root account was renamed in the configuration; disabling the previous root account and signing it out");
-            self.disable_user(*id, "root renamed in the configuration")?;
+        let previous: Vec<ReplUser> = data::users(self.conn)?
+            .into_iter()
+            .filter(|u| u.is_root && u.username != username)
+            .collect();
+        for p in &previous {
+            tracing::warn!(previous = %p.username, new = %username, "the root account was renamed in the configuration; disabling the previous root account and signing it out");
+            let mut after = p.clone();
+            after.is_root = false;
+            after.disabled_at = after.disabled_at.clone().or_else(|| Some(now_rfc3339()));
+            self.update_row(p.clone(), after)?;
+            let u = self.load_user(p.id)?;
+            self.delete_user_sessions(&u, "root renamed in the configuration")?;
         }
-        let now = now_rfc3339();
-        self.conn.execute(
-            "INSERT INTO users (username, password_hash, display_name, is_admin, is_root, mfa_required, created_at, updated_at)
-             VALUES (?1, ?2, 'Root', 1, 1, ?3, ?4, ?4)
-             ON CONFLICT(username) DO UPDATE SET password_hash = excluded.password_hash, is_admin = 1, is_root = 1,
-                mfa_required = excluded.mfa_required, disabled_at = NULL,
-                updated_at = CASE WHEN users.password_hash <> excluded.password_hash OR users.mfa_required <> excluded.mfa_required
-                                    OR users.is_admin = 0 OR users.is_root = 0 OR users.disabled_at IS NOT NULL
-                                  THEN excluded.updated_at ELSE users.updated_at END",
-            params![username, password_hash, mfa_required as i64, now],
-        )?;
-        let user = self.conn.query_row(
-            &format!("SELECT {} FROM users WHERE username = ?1", db::USER_COLS),
-            params![username],
-            db::row_to_user,
-        )?;
+        let before = data::user_by_name(self.conn, username)?;
         let changed = match &before {
-            None => Some(serde_json::json!({ "created": true })),
+            None => {
+                let now = now_rfc3339();
+                let row = ReplUser {
+                    id: acct_sql::next_id(self.conn, "users")?,
+                    username: username.to_string(),
+                    password_hash: password_hash.to_string(),
+                    display_name: "Root".into(),
+                    is_admin: true,
+                    is_root: true,
+                    mfa_required,
+                    totp_secret: None,
+                    totp_enrolled_at: None,
+                    totp_last_step: None,
+                    disabled_at: None,
+                    created_at: now.clone(),
+                    updated_at: now,
+                };
+                self.record(Change::UserCreated { user: row })?;
+                Some(serde_json::json!({ "created": true }))
+            }
             Some(b) => {
+                let mut after = b.clone();
+                after.password_hash = password_hash.to_string();
+                after.is_admin = true;
+                after.is_root = true;
+                after.mfa_required = mfa_required;
+                after.disabled_at = None;
                 let mut m = serde_json::Map::new();
-                if b.password_hash != user.password_hash {
+                if b.password_hash != after.password_hash {
                     m.insert("password".into(), "changed".into());
                 }
-                if b.mfa_required != user.mfa_required {
+                if b.mfa_required != after.mfa_required {
                     m.insert(
                         "mfa_required".into(),
-                        serde_json::json!([b.mfa_required, user.mfa_required]),
+                        serde_json::json!([b.mfa_required, after.mfa_required]),
                     );
                 }
                 if !b.is_root || !b.is_admin || b.disabled_at.is_some() {
                     m.insert("restored".into(), true.into());
                 }
+                if after != *b {
+                    after.updated_at = now_rfc3339();
+                    self.record(Change::UserUpdated { user: after })?;
+                }
                 (!m.is_empty()).then_some(serde_json::Value::Object(m))
             }
         };
-        if demoted > 0 {
+        let user = self.load_user(
+            data::user_by_name(self.conn, username)?
+                .context("root user")?
+                .id,
+        )?;
+        if !previous.is_empty() {
             self.push(
                 "root.demote_previous",
                 None,
                 username,
                 serde_json::json!({
-                    "demoted": demoted,
-                    "disabled": previous.iter().map(|(_, n)| n).collect::<Vec<_>>(),
+                    "demoted": previous.len(),
+                    "disabled": previous.iter().map(|p| &p.username).collect::<Vec<_>>(),
                 }),
             );
         }
@@ -390,16 +445,10 @@ impl<'a> AuditTx<'a> {
     // ---- recovery codes --------------------------------------------------
 
     pub fn set_recovery_codes(&mut self, user: &User, hashes: &[String]) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM recovery_codes WHERE user_id = ?1",
-            params![user.id],
-        )?;
-        for h in hashes {
-            self.conn.execute(
-                "INSERT INTO recovery_codes (user_id, code_hash) VALUES (?1, ?2)",
-                params![user.id, h],
-            )?;
-        }
+        self.record(Change::RecoveryCodesReplaced {
+            user_id: user.id,
+            code_hashes: Hidden(hashes.to_vec()),
+        })?;
         self.push(
             "recovery_codes.replace",
             Some(user.id),
@@ -411,27 +460,34 @@ impl<'a> AuditTx<'a> {
 
     /// Consume an unused recovery code. Audited only when a code was used.
     pub fn use_recovery_code(&mut self, user: &User, hash: &str) -> Result<bool> {
-        let used = self.conn.execute(
-            "UPDATE recovery_codes SET used_at = ?3 WHERE user_id = ?1 AND code_hash = ?2 AND used_at IS NULL",
-            params![user.id, hash, now_rfc3339()],
-        )? > 0;
-        if used {
-            let left: i64 = self.conn.query_row(
-                "SELECT COUNT(*) FROM recovery_codes WHERE user_id = ?1 AND used_at IS NULL",
-                params![user.id],
-                |r| r.get(0),
-            )?;
-            self.push(
-                "recovery_code.use",
-                Some(user.id),
-                &user.username,
-                serde_json::json!({ "left": left }),
-            );
+        let unused: bool = self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM recovery_codes WHERE user_id = ?1 AND code_hash = ?2 AND used_at IS NULL)",
+            params![user.id, hash],
+            |r| r.get(0),
+        )?;
+        if !unused {
+            return Ok(false);
         }
-        Ok(used)
+        self.record(Change::RecoveryCodeUsed {
+            user_id: user.id,
+            code_hash: Hidden(hash.to_string()),
+            used_at: now_rfc3339(),
+        })?;
+        let left: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM recovery_codes WHERE user_id = ?1 AND used_at IS NULL",
+            params![user.id],
+            |r| r.get(0),
+        )?;
+        self.push(
+            "recovery_code.use",
+            Some(user.id),
+            &user.username,
+            serde_json::json!({ "left": left }),
+        );
+        Ok(true)
     }
 
-    // ---- sessions ----------------------------------------------------------
+    // ---- sessions (local bookkeeping: not replicated) ----------------------
 
     pub fn create_session(&mut self, user: &User, s: &Session) -> Result<i64> {
         self.conn.execute(
@@ -520,11 +576,18 @@ impl<'a> AuditTx<'a> {
         tags: &[String],
     ) -> Result<TokenInfo> {
         let tags = normalize_tags(tags)?;
-        self.conn.execute(
-            "INSERT INTO api_tokens (user_id, name, token_hash, created_at, tags) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![user.id, name, token_hash, now_rfc3339(), serde_json::to_string(&tags)?],
-        )?;
-        let id = self.conn.last_insert_rowid();
+        let id = acct_sql::next_id(self.conn, "api_tokens")?;
+        self.record(Change::TokenCreated {
+            token: ReplToken {
+                id,
+                user_id: user.id,
+                name: name.to_string(),
+                token_hash: token_hash.to_string(),
+                created_at: now_rfc3339(),
+                revoked_at: None,
+                tags: tags.clone(),
+            },
+        })?;
         self.push(
             "token.create",
             Some(user.id),
@@ -534,8 +597,8 @@ impl<'a> AuditTx<'a> {
         Ok(db::get_token(self.conn, id)?.expect("just inserted"))
     }
 
-    /// Replace a token's tags. Audited (`token.update`, before and after)
-    /// only when the normalized list actually changed.
+    /// Replace a token's tags. Written and audited (`token.update`, before
+    /// and after) only when the normalized list actually changed.
     pub fn update_token_tags(
         &mut self,
         owner: &User,
@@ -543,12 +606,12 @@ impl<'a> AuditTx<'a> {
         tags: &[String],
     ) -> Result<TokenInfo> {
         let tags = normalize_tags(tags)?;
-        self.conn.execute(
-            "UPDATE api_tokens SET tags = ?2 WHERE id = ?1",
-            params![t.id, serde_json::to_string(&tags)?],
-        )?;
-        let after = db::get_token(self.conn, t.id)?.context("token vanished")?;
-        if after.tags != t.tags {
+        let current = db::get_token(self.conn, t.id)?.context("token vanished")?;
+        if current.tags != tags {
+            self.record(Change::TokenTagsSet {
+                token_id: t.id,
+                tags: tags.clone(),
+            })?;
             self.push(
                 "token.update",
                 Some(owner.id),
@@ -556,31 +619,39 @@ impl<'a> AuditTx<'a> {
                 serde_json::json!({
                     "token_id": t.id,
                     "name": t.name,
-                    "tags": { "before": t.tags, "after": after.tags },
+                    "tags": { "before": current.tags, "after": tags },
                 }),
             );
         }
-        Ok(after)
+        db::get_token(self.conn, t.id)?.context("token vanished")
     }
 
     pub fn revoke_token(&mut self, owner: &User, t: &TokenInfo) -> Result<bool> {
-        let n = self.conn.execute(
-            "UPDATE api_tokens SET revoked_at = ?1 WHERE id = ?2 AND revoked_at IS NULL",
-            params![now_rfc3339(), t.id],
-        )?;
-        if n > 0 {
-            self.push(
-                "token.revoke",
-                Some(owner.id),
-                &owner.username,
-                serde_json::json!({ "token_id": t.id, "name": t.name }),
-            );
+        let current = db::get_token(self.conn, t.id)?;
+        if !current.is_some_and(|c| c.revoked_at.is_none()) {
+            return Ok(false);
         }
-        Ok(n > 0)
+        self.record(Change::TokenRevoked {
+            token_id: t.id,
+            revoked_at: now_rfc3339(),
+        })?;
+        self.push(
+            "token.revoke",
+            Some(owner.id),
+            &owner.username,
+            serde_json::json!({ "token_id": t.id, "name": t.name }),
+        );
+        Ok(true)
     }
 
-    fn finish(self, actor: &Actor, operation: &str) -> Result<Vec<AuditRecord>> {
-        let txn = crate::auth::random_token(9);
+    /// Audit rows and (when `changelog`) the recorded changes, one txn id.
+    fn finish(
+        self,
+        actor: &Actor,
+        operation: &str,
+        txn: &str,
+        changelog: bool,
+    ) -> Result<(Vec<AuditRecord>, usize)> {
         let ts = now_rfc3339();
         let mut out = Vec::with_capacity(self.entries.len());
         for e in self.entries {
@@ -593,7 +664,7 @@ impl<'a> AuditTx<'a> {
             out.push(AuditRecord {
                 id: self.conn.last_insert_rowid(),
                 ts: ts.clone(),
-                txn: txn.clone(),
+                txn: txn.to_string(),
                 operation: operation.to_string(),
                 actor: actor.name.clone(),
                 actor_ip: actor.ip.clone(),
@@ -603,18 +674,30 @@ impl<'a> AuditTx<'a> {
                 detail: e.detail,
             });
         }
-        Ok(out)
+        let mut logged = 0;
+        if changelog {
+            for c in &self.changes {
+                super::sql::append_changelog(self.conn, actor, operation, txn, c)?;
+                logged += 1;
+            }
+        }
+        Ok((out, logged))
     }
 }
 
-/// Entry point for account and security writes.
 /// Called after every committed account transaction with its audit rows
-/// (replication uses it to tell standbys that account data changed).
-pub type CommitHook = Box<dyn Fn(&[AuditRecord]) + Send + Sync>;
+/// and the number of changes it added to the changelog (replication uses it
+/// to wake long-polling standbys).
+pub type CommitHook = Box<dyn Fn(&[AuditRecord], usize) + Send + Sync>;
 
+/// Entry point for account and security writes.
 pub struct Accounts {
     storage: Arc<Storage>,
     on_commit: std::sync::OnceLock<CommitHook>,
+    /// Closed on a standby: account changes made there (its own root, TOTP
+    /// steps and recovery codes used at sign-in) stay local and are not
+    /// added to the changelog, which mirrors the primary's offsets.
+    gate: std::sync::OnceLock<Arc<super::WriteGate>>,
 }
 
 impl Accounts {
@@ -622,6 +705,7 @@ impl Accounts {
         Accounts {
             storage,
             on_commit: std::sync::OnceLock::new(),
+            gate: std::sync::OnceLock::new(),
         }
     }
 
@@ -630,32 +714,37 @@ impl Accounts {
         let _ = self.on_commit.set(hook);
     }
 
-    /// Run `f` as one transaction. Committed: data and audit rows are
-    /// durable. Rolled back: nothing is written and the failure is logged.
+    /// Share the server's write gate (once).
+    pub fn set_gate(&self, gate: Arc<super::WriteGate>) {
+        let _ = self.gate.set(gate);
+    }
+
+    /// Run `f` as one transaction. Committed: data, audit rows and the
+    /// account changes are durable. Rolled back: nothing is written and the
+    /// failure is logged.
     pub fn run<T>(
         &self,
         actor: &Actor,
         operation: &'static str,
         f: impl FnOnce(&mut AuditTx) -> Result<T>,
     ) -> Result<T> {
+        let changelog = !self.gate.get().is_some_and(|g| g.read_only());
         let result = self
             .storage
-            .write(&TOKEN, |conn| -> Result<(T, Vec<AuditRecord>)> {
-                let mut t = AuditTx {
-                    conn,
-                    entries: Vec::new(),
-                };
+            .write(&TOKEN, |conn| -> Result<(T, Vec<AuditRecord>, usize)> {
+                let mut t = AuditTx::begin(conn);
                 let out = f(&mut t)?;
-                let records = t.finish(actor, operation)?;
-                Ok((out, records))
+                let txn = crate::auth::random_token(9);
+                let (records, logged) = t.finish(actor, operation, &txn, changelog)?;
+                Ok((out, records, logged))
             });
         match result {
-            Ok((out, records)) => {
+            Ok((out, records, logged)) => {
                 for r in &records {
                     tracing::info!(audit_id = r.id, txn = %r.txn, operation, actor = %r.actor, ip = %r.actor_ip, action = %r.action, target = %r.target, "audit");
                 }
                 if let Some(hook) = self.on_commit.get() {
-                    hook(&records);
+                    hook(&records, logged);
                 }
                 Ok(out)
             }
@@ -664,11 +753,6 @@ impl Accounts {
                 Err(e)
             }
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn storage_for_tests(&self) -> Arc<Storage> {
-        self.storage.clone()
     }
 
     // ---- one-step conveniences -------------------------------------------------

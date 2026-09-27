@@ -142,13 +142,32 @@ fn members(c: &Connection, zone_id: Option<i64>) -> Result<Vec<ReplMember>> {
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
+const USER_COLS: &str =
+    "id, username, password_hash, display_name, is_admin, is_root, mfa_required, totp_secret,
+                totp_enrolled_at, totp_last_step, disabled_at, created_at, updated_at";
+
+/// One user, every column (None when absent).
+pub fn user_row(c: &Connection, id: i64) -> Result<Option<ReplUser>> {
+    Ok(users_where(c, "WHERE id = ?1", params![id])?
+        .into_iter()
+        .next())
+}
+
+pub fn user_by_name(c: &Connection, name: &str) -> Result<Option<ReplUser>> {
+    Ok(users_where(c, "WHERE username = ?1", params![name])?
+        .into_iter()
+        .next())
+}
+
 pub fn users(c: &Connection) -> Result<Vec<ReplUser>> {
-    let mut stmt = c.prepare(
-        "SELECT id, username, password_hash, display_name, is_admin, is_root, mfa_required, totp_secret,
-                totp_enrolled_at, totp_last_step, disabled_at, created_at, updated_at
-         FROM users ORDER BY id",
-    )?;
-    let rows = stmt.query_map([], |r| {
+    users_where(c, "", params![])
+}
+
+fn users_where(c: &Connection, filter: &str, p: &[&dyn rusqlite::ToSql]) -> Result<Vec<ReplUser>> {
+    let mut stmt = c.prepare(&format!(
+        "SELECT {USER_COLS} FROM users {filter} ORDER BY id"
+    ))?;
+    let rows = stmt.query_map(p, |r| {
         Ok(ReplUser {
             id: r.get(0)?,
             username: r.get(1)?,
@@ -183,10 +202,18 @@ pub fn recovery_codes(c: &Connection) -> Result<Vec<ReplRecoveryCode>> {
 }
 
 pub fn tokens(c: &Connection) -> Result<Vec<ReplToken>> {
-    let mut stmt = c.prepare(
-        "SELECT id, user_id, name, token_hash, created_at, revoked_at, tags FROM api_tokens ORDER BY id",
-    )?;
-    let rows = stmt.query_map([], |r| {
+    tokens_where(c, "", params![])
+}
+
+fn tokens_where(
+    c: &Connection,
+    filter: &str,
+    p: &[&dyn rusqlite::ToSql],
+) -> Result<Vec<ReplToken>> {
+    let mut stmt = c.prepare(&format!(
+        "SELECT id, user_id, name, token_hash, created_at, revoked_at, tags FROM api_tokens {filter} ORDER BY id"
+    ))?;
+    let rows = stmt.query_map(p, |r| {
         let tags: String = r.get(6)?;
         Ok(ReplToken {
             id: r.get(0)?,
@@ -215,64 +242,112 @@ pub fn settings(c: &Connection) -> Result<Vec<ReplSetting>> {
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
-pub fn tsig_keys(c: &Connection) -> Result<Vec<ReplTsigKey>> {
-    Ok(db::list_tsig_keys(c)?
-        .into_iter()
-        .map(|k| ReplTsigKey {
-            name: k.name,
-            algorithm: k.algorithm,
-            secret: data_encoding::BASE64.encode(&k.secret),
-            zones: k.zones,
-            created_by: k.created_by,
-            created_at: k.created_at,
-            updated_at: k.updated_at,
-        })
-        .collect())
+pub fn tsig_row(k: crate::storage::StoredTsigKey) -> ReplTsigKey {
+    ReplTsigKey {
+        name: k.name,
+        algorithm: k.algorithm,
+        secret: data_encoding::BASE64.encode(&k.secret),
+        zones: k.zones,
+        created_by: k.created_by,
+        created_at: k.created_at,
+        updated_at: k.updated_at,
+    }
 }
 
-fn sha256_json<T: serde::Serialize>(v: &T) -> Result<String> {
+pub fn tsig_keys(c: &Connection) -> Result<Vec<ReplTsigKey>> {
+    Ok(db::list_tsig_keys(c)?.into_iter().map(tsig_row).collect())
+}
+
+pub(crate) fn sha256_json<T: serde::Serialize>(v: &T) -> Result<String> {
     Ok(hex::encode(Sha256::digest(serde_json::to_vec(v)?)))
 }
 
-/// Checksum over the replicated account data, as the primary has it.
-pub fn accounts_checksum(
-    users: &[ReplUser],
-    codes: &[ReplRecoveryCode],
-    tokens: &[ReplToken],
-    settings: &[ReplSetting],
-    tsig: &[ReplTsigKey],
-) -> Result<String> {
-    sha256_json(&(users, codes, tokens, settings, tsig))
-}
-
-pub fn accounts(c: &Connection, generation: &str) -> Result<AccountsSnapshot> {
-    let users = users(c)?;
-    let recovery_codes = recovery_codes(c)?;
-    let tokens = tokens(c)?;
-    let settings = settings(c)?;
-    let tsig_keys = tsig_keys(c)?;
-    let checksum = accounts_checksum(&users, &recovery_codes, &tokens, &settings, &tsig_keys)?;
-    Ok(AccountsSnapshot {
-        users,
-        recovery_codes,
-        tokens,
-        settings,
-        tsig_keys,
-        checksum,
-        generation: generation.to_string(),
-    })
-}
-
-pub fn snapshot(c: &Connection, generation: &str) -> Result<Snapshot> {
+/// Everything replicated as logical entities (see [`Snapshot`]).
+pub fn snapshot(c: &Connection) -> Result<Snapshot> {
+    use crate::mutation::Change;
+    let mut e = Vec::new();
+    for u in users(c)? {
+        e.push(Change::UserCreated { user: u });
+    }
+    let codes = recovery_codes(c)?;
+    let mut by_user: std::collections::BTreeMap<i64, Vec<String>> = Default::default();
+    for rc in &codes {
+        by_user
+            .entry(rc.user_id)
+            .or_default()
+            .push(rc.code_hash.clone());
+    }
+    for (user_id, hashes) in by_user {
+        e.push(Change::RecoveryCodesReplaced {
+            user_id,
+            code_hashes: Hidden(hashes),
+        });
+    }
+    for rc in codes {
+        if let Some(used_at) = rc.used_at {
+            e.push(Change::RecoveryCodeUsed {
+                user_id: rc.user_id,
+                code_hash: Hidden(rc.code_hash),
+                used_at,
+            });
+        }
+    }
+    for t in tokens(c)? {
+        e.push(Change::TokenCreated { token: t });
+    }
+    for st in settings(c)? {
+        e.push(Change::SettingSet { setting: st });
+    }
+    for k in tsig_keys(c)? {
+        e.push(Change::TsigKeySet { key: k });
+    }
+    let zones = db::list_zones(c)?;
+    let names: std::collections::HashMap<i64, String> =
+        zones.iter().map(|z| (z.id, z.name.clone())).collect();
+    for z in zones {
+        e.push(Change::ZoneCreated { zone: z });
+    }
+    for r in records(c, None)? {
+        let zone = names.get(&r.zone_id).cloned().unwrap_or_default();
+        let record = crate::model::Record {
+            id: r.id,
+            zone_id: r.zone_id,
+            name: r.name,
+            rtype: r.rtype,
+            value: r.value,
+            ttl: r.ttl,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+            expires_at: r.expires_at,
+        };
+        let expired = r.expired_noted;
+        e.push(Change::RecordCreated {
+            zone: zone.clone(),
+            record: record.clone(),
+        });
+        if expired {
+            e.push(Change::RecordExpired { zone, record });
+        }
+    }
+    let usernames: std::collections::HashMap<i64, String> =
+        users(c)?.into_iter().map(|u| (u.id, u.username)).collect();
+    for m in members(c, None)? {
+        e.push(Change::MemberSet {
+            zone: names.get(&m.zone_id).cloned().unwrap_or_default(),
+            zone_id: m.zone_id,
+            user_id: m.user_id,
+            username: usernames.get(&m.user_id).cloned().unwrap_or_default(),
+            role: m.role,
+            previous: None,
+            created_at: m.created_at,
+        });
+    }
     Ok(Snapshot {
-        format: 1,
+        format: REPLICATION_PROTOCOL,
         history: history(c)?,
         offset: changelog_head(c)?,
         taken_at: crate::model::now_rfc3339(),
-        zones: db::list_zones(c)?,
-        records: records(c, None)?,
-        members: members(c, None)?,
-        accounts: accounts(c, generation)?,
+        entities: e,
     })
 }
 
@@ -301,4 +376,61 @@ pub fn dns_dump(c: &Connection) -> Result<serde_json::Value> {
         "records": records(c, None)?,
         "members": members(c, None)?,
     }))
+}
+
+/// What makes this database not fresh, for a standby that would load a
+/// snapshot over it: zones, records, zone members, TSIG keys, console
+/// settings (the forwarding override), API tokens, and users other than the
+/// local config root `root_username`. Empty = fresh: following cannot lose
+/// anything. (Sessions, the audit log and the changelog sequence do not
+/// count: they are local history, not data a snapshot would replace.)
+pub fn fresh_problems(c: &Connection, root_username: &str) -> Result<Vec<String>> {
+    super::tables::not_fresh(c, root_username)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::Storage;
+
+    fn exec(s: &Storage, sql: &str) {
+        s.read_tx(|c| Ok(c.execute_batch(sql)?)).unwrap();
+    }
+
+    #[test]
+    fn freshness_counts_every_kind_of_replicated_data() {
+        let s = Storage::open_memory().unwrap();
+        let fresh = |s: &Storage| s.read_tx(|c| fresh_problems(c, "root")).unwrap();
+        assert!(fresh(&s).is_empty(), "a new database is fresh");
+        // The config root, sessions, audit rows and an old changelog sequence do not count.
+        exec(
+            &s,
+            "INSERT INTO users (username, password_hash, is_admin, is_root, created_at, updated_at) VALUES ('root','h',1,1,'t','t');
+             INSERT INTO sessions (token_hash, user_id, ip, created_at, expires_at, last_seen_at) VALUES ('s',1,'ip','t','t','t');
+             INSERT INTO audit_log (ts, txn, operation, actor, actor_ip, action, target, detail) VALUES ('t','x','o','a','i','x','t','{}');
+             INSERT INTO sqlite_sequence (name, seq) VALUES ('changelog', 40);",
+        );
+        assert!(fresh(&s).is_empty(), "{:?}", fresh(&s));
+        let steps = [
+            ("INSERT INTO users (username, password_hash, created_at, updated_at) VALUES ('bob','h','t','t')", "1 user besides the config root"),
+            ("INSERT INTO api_tokens (user_id, name, token_hash, created_at) VALUES (1,'t','th','t')", "1 API token"),
+            ("INSERT INTO settings (key, value, updated_by, updated_at) VALUES ('forwarding','{}','a','t')", "1 console setting (forwarding override)"),
+            ("INSERT INTO tsig_keys (name, algorithm, secret, created_by, created_at, updated_at) VALUES ('k.','hmac-sha256',x'00','a','t','t')", "1 TSIG key"),
+            ("INSERT INTO zones (name, soa_mname, soa_rname, created_at, updated_at) VALUES ('a.test','n.','h.','t','t')", "1 zone"),
+            ("INSERT INTO records (zone_id, name, rtype, value, created_at, updated_at) VALUES (1,'www','A','192.0.2.1','t','t')", "1 record"),
+            ("INSERT INTO zone_members (zone_id, user_id, role, created_at) VALUES (1,2,'viewer','t')", "1 zone member"),
+        ];
+        for (sql, what) in steps {
+            exec(&s, sql);
+            assert!(
+                fresh(&s).contains(&what.to_string()),
+                "{what}: {:?}",
+                fresh(&s)
+            );
+        }
+        assert_eq!(fresh(&s).len(), 7, "{:?}", fresh(&s));
+        // Under another root name, 'root' itself is a foreign user.
+        let other = s.read_tx(|c| fresh_problems(c, "admin")).unwrap();
+        assert!(other.contains(&"2 users besides the config root".to_string()));
+    }
 }

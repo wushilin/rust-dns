@@ -9,24 +9,28 @@
 //!   database; promotion switches a standby to `promoted` at runtime.
 //! * The standby pulls from the primary's admin-only replication API
 //!   (`/api/replication/*`, see `api::replication`) over HTTPS: a snapshot
-//!   (one read transaction) to start, then a long-poll of the changelog
-//!   (whole transactions, applied with the primary's offsets) and the
-//!   account data whenever its generation changes, plus a periodic checksum
-//!   reconcile. All writes go through `mutation::replica`.
+//!   (logical entities read in one transaction) to start, then a long-poll
+//!   of the changelog (whole transactions of DNS and account/settings/TSIG
+//!   changes in one sequence, applied with the primary's offsets), plus a
+//!   periodic checksum reconcile. All writes go through `mutation::replica`.
 //! * Every database has a history id. A standby adopts its primary's; a
 //!   promotion starts a new one whose parent is the old one (forked at the
 //!   current offset). [`lineage::plan`] uses this to continue, adopt a
 //!   promoted primary's history, refuse to follow a stale old primary, or
-//!   re-bootstrap after saving divergent changes to a JSON file.
+//!   re-bootstrap within the same lineage (gap, reconcile mismatch) or
+//!   copy the primary into a fresh database. A database with other data is
+//!   never replaced implicitly: `--prepare-standby` backs it up and empties
+//!   it on the operator's explicit request.
 
 pub mod data;
 pub mod lineage;
+pub mod tables;
 pub mod types;
 
 use crate::config::{FollowConfig, PeerConfig};
 use crate::dns::DnsServer;
 use crate::model::{now_rfc3339, Actor};
-use crate::mutation::replica::{LocalRoot, K_ACCOUNTS_CHECKSUM, K_FOLLOWING};
+use crate::mutation::replica::{LocalRoot, K_FOLLOWING};
 use crate::mutation::{Mutator, WriteGate};
 use crate::storage::Storage;
 use anyhow::{anyhow, Context, Result};
@@ -44,15 +48,6 @@ const POLL_WAIT_SECS: u64 = 25;
 const POLL_LIMIT: usize = 2000;
 /// A primary contacted within this long counts as reachable for promotion.
 const REACHABLE_WITHIN: Duration = Duration::from_secs(60);
-
-/// Audit actions that change replicated account data (everything except
-/// sessions, reveals, cache flushes and replication bookkeeping).
-pub fn replicated_action(action: &str) -> bool {
-    !(action.starts_with("session.")
-        || action.starts_with("replication.")
-        || action == "tsig.reveal"
-        || action == "settings.forwarding.cache_flush")
-}
 
 /// Why a request to the primary failed.
 #[derive(Debug)]
@@ -88,14 +83,16 @@ pub struct Replication {
     warning: RwLock<Option<String>>,
     last_contact: Mutex<Option<Instant>>,
     // Primary side.
-    epoch: String,
-    generation: tokio::sync::watch::Sender<u64>,
+    /// Ticks when an account transaction appended to the changelog
+    /// (account changes are not on the event bus): wakes long-polls.
+    changelog_tick: tokio::sync::watch::Sender<u64>,
     standbys: Mutex<HashMap<String, (StandbySeen, Instant)>>,
     // Standby side.
     follower: Mutex<Option<tokio::task::JoinHandle<()>>>,
     promote_lock: tokio::sync::Mutex<()>,
     reconnects: AtomicU64,
     rebootstraps: AtomicU64,
+    reconcile_mismatches: AtomicU64,
     http: reqwest::Client,
 }
 
@@ -129,7 +126,7 @@ impl Replication {
             state: "starting".into(),
             ..Default::default()
         };
-        let (generation, _) = tokio::sync::watch::channel(0u64);
+        let (changelog_tick, _) = tokio::sync::watch::channel(0u64);
         Arc::new(Replication {
             gate: mutator.gate(),
             storage,
@@ -148,13 +145,13 @@ impl Replication {
             })),
             warning: RwLock::new(None),
             last_contact: Mutex::new(None),
-            epoch: crate::auth::random_token(6),
-            generation,
+            changelog_tick,
             standbys: Mutex::new(HashMap::new()),
             follower: Mutex::new(None),
             promote_lock: tokio::sync::Mutex::new(()),
             reconnects: AtomicU64::new(0),
             rebootstraps: AtomicU64::new(0),
+            reconcile_mismatches: AtomicU64::new(0),
             http,
         })
     }
@@ -189,8 +186,6 @@ impl Replication {
         let cfg = self.reloader.current.load();
         LocalRoot {
             username: cfg.root.username.clone(),
-            password_hash: cfg.root.password.clone(),
-            mfa_required: cfg.root.mfa_required,
         }
     }
 
@@ -264,16 +259,12 @@ impl Replication {
     // ---- primary side -------------------------------------------------------
 
     /// Account data changed: wake long-polling standbys.
-    pub fn bump_generation(&self) {
-        self.generation.send_modify(|g| *g += 1);
+    pub fn changelog_appended(&self) {
+        self.changelog_tick.send_modify(|g| *g += 1);
     }
 
-    pub fn generation(&self) -> String {
-        format!("{}-{}", self.epoch, *self.generation.borrow())
-    }
-
-    pub fn subscribe_generation(&self) -> tokio::sync::watch::Receiver<u64> {
-        self.generation.subscribe()
+    pub fn subscribe_changelog_tick(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changelog_tick.subscribe()
     }
 
     pub fn note_standby(&self, address: String, user: String, after: i64) {
@@ -298,6 +289,7 @@ impl Replication {
 
     pub fn identity(&self) -> Identity {
         Identity {
+            protocol: REPLICATION_PROTOCOL,
             role: self.role(),
             writable: self.writable(),
             history: self.history(),
@@ -330,6 +322,7 @@ impl Replication {
             .collect();
         standbys.sort_by(|a, b| a.address.cmp(&b.address));
         ReplicationStatus {
+            protocol: REPLICATION_PROTOCOL,
             role,
             writable: self.writable(),
             history: self.history(),
@@ -344,18 +337,30 @@ impl Replication {
 
     pub fn summary(&self) -> ReplicationSummary {
         let role = self.role();
-        let (primary, connected, lag, since) = match role {
+        let (primary, connected, lag, since, problem) = match role {
             Role::Standby => {
                 let f = self.follow_snapshot();
+                let problem = if f.state == "refused" {
+                    f.last_error.clone()
+                } else {
+                    None
+                };
                 (
                     Some(f.primary),
                     f.connected,
                     f.lag_changes,
                     f.disconnected_since,
+                    problem,
                 )
             }
-            Role::Fenced => (self.peer.as_ref().map(|p| p.url.clone()), false, None, None),
-            _ => (None, false, None, None),
+            Role::Fenced => (
+                self.peer.as_ref().map(|p| p.url.clone()),
+                false,
+                None,
+                None,
+                None,
+            ),
+            _ => (None, false, None, None, None),
         };
         ReplicationSummary {
             role,
@@ -365,6 +370,7 @@ impl Replication {
             lag_changes: lag,
             disconnected_since: since,
             read_only_reason: self.read_only_reason(),
+            problem,
         }
     }
 
@@ -416,6 +422,7 @@ impl Replication {
                 f.seconds_since_last_applied.unwrap_or(-1),
             );
             out.push_str(&format!("# HELP rustdns_replication_reconnects_total Connections to the primary lost or refused\n# TYPE rustdns_replication_reconnects_total counter\nrustdns_replication_reconnects_total {}\n", f.reconnects));
+            out.push_str(&format!("# HELP rustdns_replication_reconcile_mismatches_total Reconciles that found data differing from the primary\n# TYPE rustdns_replication_reconcile_mismatches_total counter\nrustdns_replication_reconcile_mismatches_total {}\n", self.reconcile_mismatches.load(Ordering::Relaxed)));
             out.push_str(&format!("# HELP rustdns_replication_rebootstraps_total Snapshots loaded from the primary\n# TYPE rustdns_replication_rebootstraps_total counter\nrustdns_replication_rebootstraps_total {}\n", f.rebootstraps));
         }
         out
@@ -605,7 +612,7 @@ impl Replication {
         } else {
             format!("{} had no [follow] section.", self.config_path.display())
         });
-        notes.push(format!("Keep the old primary ({url}) from accepting writes: stop it, or give it [peer] url = <this server> so it starts read-only, then make it a standby of this server ([follow] primary = <this server's URL>). Changes it made after offset {} are saved to a divergence file when it rejoins.", h.fork_offset.unwrap_or(0)));
+        notes.push(format!("Keep the old primary ({url}) from accepting writes: stop it, or give it [peer] url = <this server> so it starts read-only, then make it a standby of this server ([follow] primary = <this server's URL>, then rust-dns --prepare-standby --yes with it stopped). Its changes after offset {} are saved to a divergence file by --prepare-standby.", h.fork_offset.unwrap_or(0)));
         notes.push("Point zone secondaries (NOTIFY / AXFR) and the registrar's NS/glue at this server if they named the old primary.".into());
         Ok(PromoteResult {
             history: h,
@@ -665,6 +672,12 @@ impl Replication {
         let remote: ReplicationStatus = self
             .get(&base, Some(&token), "/api/replication/status", timeout)
             .await?;
+        if remote.protocol != REPLICATION_PROTOCOL {
+            return Err(CallError::Refused(format!(
+                "{base} speaks replication protocol {} and this server {}: run the same rust-dns version on both (upgrade the primary first)",
+                remote.protocol, REPLICATION_PROTOCOL
+            )));
+        }
         if !remote.writable {
             return Err(CallError::Refused(format!(
                 "{base} is not a writable primary (role {:?}); a standby can only follow a primary",
@@ -708,7 +721,6 @@ impl Replication {
             txn_matches_at_local_head: txn_matches,
         };
         let mut history_id = remote.history.history_id.clone();
-        let mut generation = String::new();
         match lineage::plan(&local, &rv) {
             Plan::Refuse(why) => return Err(CallError::Refused(format!("{base}: {why}"))),
             Plan::Tail { adopt } => {
@@ -720,21 +732,16 @@ impl Replication {
                         .map_err(|e| CallError::Other(e.to_string()))?;
                 }
             }
-            Plan::Bootstrap {
-                divergent,
-                fork,
-                reason,
-            } => {
-                if divergent {
-                    self.save_divergence(&reason, fork, &local, &remote.history)
-                        .map_err(|e| {
-                            CallError::Other(format!("saving divergent changes: {e:#}"))
-                        })?;
-                }
+            Plan::NeedsFresh { why, data } => {
+                return Err(CallError::Refused(format!(
+                    "refusing to follow {base}: {why}. This server has data that following would replace: {}. Nothing was changed and it stays read-only. To discard its data on purpose (a backup and a divergence report are written first), stop the server and run: rust-dns --prepare-standby --yes --config {}",
+                    data.join(", "),
+                    self.config_path.display()
+                )))
+            }
+            Plan::Bootstrap { reason } => {
                 tracing::info!(reason = %reason, "replication: loading a snapshot from the primary");
-                let (h, g) = self.bootstrap(&base, &token, &reason).await?;
-                history_id = h;
-                generation = g;
+                history_id = self.bootstrap(&base, &token, &reason).await?;
             }
         }
         let mut last_reconcile = Instant::now();
@@ -767,47 +774,23 @@ impl Replication {
             }
             self.update(|s| s.primary_head = Some(resp.head));
             if resp.gap {
-                let (h, g) = self
-                    .bootstrap(
-                        &base,
-                        &token,
-                        "the primary no longer has the changes this standby needs (retention)",
-                    )
-                    .await?;
-                history_id = h;
-                generation = g;
-                continue;
+                // Snapshots are loaded only when connecting: reconnect, and
+                // the connection decides (same lineage + gap = snapshot).
+                return Err(CallError::Other(
+                    "the primary no longer has the changes this standby needs (retention); reconnecting".into(),
+                ));
             }
             if !resp.events.is_empty() {
-                if let Err(e) = self.apply(&history_id, resp.events.clone()).await {
-                    // Usually a change that refers to a user the standby has
-                    // not seen yet: sync accounts and retry once.
-                    tracing::warn!(error = %e, "replication: a change did not apply; re-syncing accounts and retrying");
-                    generation = self.sync_accounts(&base, &token, timeout).await?;
-                    if let Err(e) = self.apply(&history_id, resp.events).await {
-                        let (h, g) = self
-                            .bootstrap(
-                                &base,
-                                &token,
-                                &format!("a change from the primary did not apply: {e}"),
-                            )
-                            .await?;
-                        history_id = h;
-                        generation = g;
-                        continue;
-                    }
-                }
-            }
-            if resp.accounts_generation != generation {
-                generation = self.sync_accounts(&base, &token, timeout).await?;
+                // After the initial snapshot everything is changelog driven:
+                // a change that does not apply is an error to look at, not a
+                // reason to reload (the next session retries from our offset).
+                self.apply(&history_id, resp.events).await.map_err(|e| {
+                    CallError::Other(format!("a change from the primary did not apply: {e:#}"))
+                })?;
             }
             let caught_up = self.storage.changelog_head().unwrap_or(0) == resp.head;
             if caught_up && last_reconcile.elapsed() >= reconcile_every {
-                if let Some(reason) = self.reconcile(&base, &token, timeout).await? {
-                    let (h, g) = self.bootstrap(&base, &token, &reason).await?;
-                    history_id = h;
-                    generation = g;
-                }
+                self.reconcile(&base, &token, timeout).await?;
                 last_reconcile = Instant::now();
             }
         }
@@ -815,35 +798,38 @@ impl Replication {
 
     async fn apply(&self, history_id: &str, events: Vec<crate::model::ChangeEvent>) -> Result<()> {
         let n = events.len();
-        let head = self
+        let (head, runtime) = self
             .mutator
-            .replica_apply(history_id.to_string(), events)
+            .replica_apply(history_id.to_string(), events, self.local_root())
             .await
             .map_err(|e| anyhow!("{e}"))?;
+        if runtime {
+            self.after_accounts_change();
+        }
         tracing::debug!(changes = n, head, "replication: applied");
         self.update(|s| s.last_applied_at = Some(now_rfc3339()));
         Ok(())
     }
 
     fn local_view(&self) -> Result<LocalView> {
+        let root = self.local_root().username;
         self.storage.read_tx(|c| {
             let head = data::changelog_head(c)?;
-            let zones: i64 = c.query_row("SELECT COUNT(*) FROM zones", [], |r| r.get(0))?;
             Ok(LocalView {
                 history: data::history(c)?,
                 head,
-                empty: head == 0 && zones == 0,
+                data: data::fresh_problems(c, &root)?,
             })
         })
     }
 
-    /// Load a snapshot. Returns (history id, account generation).
+    /// Load a snapshot. Returns its history id.
     async fn bootstrap(
         &self,
         base: &str,
         token: &str,
         reason: &str,
-    ) -> std::result::Result<(String, String), CallError> {
+    ) -> std::result::Result<String, CallError> {
         self.update(|s| s.state = "bootstrapping".into());
         let timeout = Duration::from_secs(
             self.follow
@@ -865,10 +851,13 @@ impl Replication {
                 return Err(e);
             }
         };
-        let (h, g) = (
-            snap.history.history_id.clone(),
-            snap.accounts.generation.clone(),
-        );
+        if snap.format != REPLICATION_PROTOCOL {
+            return Err(CallError::Refused(format!(
+                "{base} sent a snapshot of format {} and this server reads {}: run the same rust-dns version on both",
+                snap.format, REPLICATION_PROTOCOL
+            )));
+        }
+        let h = snap.history.history_id.clone();
         let result = self
             .mutator
             .replica_bootstrap(snap, self.local_root(), base.to_string())
@@ -881,7 +870,7 @@ impl Replication {
                     offset = sum.offset,
                     zones = sum.zones,
                     records = sum.records,
-                    users = sum.accounts.users,
+                    users = sum.users,
                     "replication: snapshot loaded"
                 );
                 self.after_accounts_change();
@@ -889,14 +878,13 @@ impl Replication {
                     s.last_snapshot_at = Some(now_rfc3339());
                     s.last_snapshot_result = Some(format!(
                         "ok: {} zones, {} records, {} users at offset {} ({reason})",
-                        sum.zones, sum.records, sum.accounts.users, sum.offset
+                        sum.zones, sum.records, sum.users, sum.offset
                     ));
-                    s.last_accounts_sync_at = Some(now_rfc3339());
                     s.last_applied_at = Some(now_rfc3339());
                     s.primary_head = Some(sum.offset);
                     s.state = "following".into();
                 });
-                Ok((h, g))
+                Ok(h)
             }
             Err(e) => {
                 self.update(|s| {
@@ -908,45 +896,6 @@ impl Replication {
                 )))
             }
         }
-    }
-
-    /// Fetch and apply the account data; returns its generation.
-    async fn sync_accounts(
-        &self,
-        base: &str,
-        token: &str,
-        timeout: Duration,
-    ) -> std::result::Result<String, CallError> {
-        let acc: AccountsSnapshot = self
-            .get(base, Some(token), "/api/replication/accounts", timeout)
-            .await?;
-        let generation = acc.generation.clone();
-        match self
-            .mutator
-            .replica_accounts(acc, self.local_root(), base.to_string())
-            .await
-        {
-            Ok(Some(sum)) => {
-                tracing::info!(
-                    users = sum.users,
-                    added = sum.users_added,
-                    updated = sum.users_updated,
-                    removed = sum.users_removed,
-                    tokens = sum.tokens,
-                    tsig_keys = sum.tsig_keys,
-                    "replication: account data synced"
-                );
-                self.after_accounts_change();
-            }
-            Ok(None) => {}
-            Err(e) => {
-                return Err(CallError::Other(format!(
-                    "applying account data failed: {e}"
-                )))
-            }
-        }
-        self.update(|s| s.last_accounts_sync_at = Some(now_rfc3339()));
-        Ok(generation)
     }
 
     /// Settings and TSIG keys may have changed: apply them to DNS now.
@@ -961,34 +910,52 @@ impl Replication {
         }
     }
 
-    /// Compare checksums with the primary. `Some(reason)`: re-bootstrap.
+    /// Compare checksums with the primary. A difference means a change was
+    /// lost or misapplied (a bug): it is reported (log, status, metric) and
+    /// following continues; the standby does not reload by itself (rebuild
+    /// it on purpose with `--prepare-standby`).
     async fn reconcile(
         &self,
         base: &str,
         token: &str,
         timeout: Duration,
-    ) -> std::result::Result<Option<String>, CallError> {
+    ) -> std::result::Result<(), CallError> {
+        let root = self.local_root().username;
         let remote: Checksums = self
-            .get(base, Some(token), "/api/replication/checksum", timeout)
+            .get(
+                base,
+                Some(token),
+                &format!(
+                    "/api/replication/checksum?exclude_user={}",
+                    url_encode(&root)
+                ),
+                timeout,
+            )
             .await?;
-        let (head, local) = self
+        let (head, tables, zones) = self
             .storage
-            .read_tx(|c| Ok((data::changelog_head(c)?, data::zone_checksums(c)?)))
+            .read_tx(|c| {
+                Ok((
+                    data::changelog_head(c)?,
+                    tables::checksums(c, &root)?,
+                    data::zone_checksums(c)?,
+                ))
+            })
             .map_err(|e| CallError::Other(e.to_string()))?;
         if remote.offset != head {
             // The primary moved on meanwhile; compare next time.
-            return Ok(None);
+            return Ok(());
         }
         let mut diffs = Vec::new();
         let lmap: HashMap<&str, &ZoneChecksum> =
-            local.iter().map(|z| (z.name.as_str(), z)).collect();
+            zones.iter().map(|z| (z.name.as_str(), z)).collect();
         let rmap: HashMap<&str, &ZoneChecksum> =
             remote.zones.iter().map(|z| (z.name.as_str(), z)).collect();
         for (n, r) in &rmap {
             match lmap.get(n) {
-                None => diffs.push(format!("{n}: missing here")),
+                None => diffs.push(format!("zone {n}: missing here")),
                 Some(l) if l.checksum != r.checksum => diffs.push(format!(
-                    "{n}: differs (serial here {}, primary {})",
+                    "zone {n}: differs (serial here {}, primary {})",
                     l.serial, r.serial
                 )),
                 _ => {}
@@ -996,87 +963,52 @@ impl Replication {
         }
         for n in lmap.keys() {
             if !rmap.contains_key(n) {
-                diffs.push(format!("{n}: not on the primary"));
+                diffs.push(format!("zone {n}: not on the primary"));
+            }
+        }
+        for t in &tables {
+            match remote.tables.iter().find(|r| r.table == t.table) {
+                Some(r) if r.checksum == t.checksum => {}
+                Some(r) => diffs.push(format!(
+                    "table {}: differs ({} rows here, {} on the primary)",
+                    t.table, t.rows, r.rows
+                )),
+                None => diffs.push(format!("table {}: unknown to the primary", t.table)),
             }
         }
         diffs.sort();
-        let accounts_ok = self
-            .storage
-            .replication_state()
-            .ok()
-            .and_then(|s| s.get(K_ACCOUNTS_CHECKSUM).cloned())
-            == Some(remote.accounts_checksum.clone());
-        if !accounts_ok {
-            tracing::warn!(
-                "replication reconcile: account data differs from the primary; re-syncing"
-            );
-            self.sync_accounts(base, token, timeout).await?;
-        }
         let result = if diffs.is_empty() {
             format!(
-                "ok: {} zones match at offset {head}{}",
-                local.len(),
-                if accounts_ok {
-                    ""
-                } else {
-                    "; account data re-synced"
-                }
+                "ok: {} tables and {} zones match at offset {head}",
+                tables.len(),
+                zones.len()
             )
         } else {
-            tracing::warn!(differences = ?diffs, "replication reconcile: zone data differs from the primary; re-bootstrapping");
-            format!("mismatch, re-bootstrapped: {}", diffs.join("; "))
+            tracing::error!(differences = ?diffs, "replication reconcile: data differs from the primary at the same offset (a lost or misapplied change); following continues; to rebuild this standby run rust-dns --prepare-standby --yes with it stopped");
+            self.reconcile_mismatches.fetch_add(1, Ordering::Relaxed);
+            format!(
+                "MISMATCH at offset {head}: {} (to rebuild this standby: stop it and run rust-dns --prepare-standby --yes)",
+                diffs.join("; ")
+            )
         };
         self.update(|s| {
             s.last_reconcile_at = Some(now_rfc3339());
             s.last_reconcile_result = Some(result);
         });
-        Ok((!diffs.is_empty())
-            .then(|| format!("reconcile found differences: {}", diffs.join("; "))))
+        Ok(())
     }
+}
 
-    /// Write the local changes the primary does not have (and the local DNS
-    /// data) to a JSON file next to the database, before a snapshot replaces
-    /// them. No account data or secrets.
-    fn save_divergence(
-        &self,
-        reason: &str,
-        fork: Option<i64>,
-        local: &LocalView,
-        remote: &History,
-    ) -> Result<PathBuf> {
-        let db = self.reloader.current.load().database.path.clone();
-        let dir = db
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        let (tail, dump) = self.storage.read_tx(|c| {
-            Ok((
-                data::changelog_tail(c, fork.unwrap_or(0))?,
-                data::dns_dump(c)?,
-            ))
-        })?;
-        let doc = serde_json::json!({
-            "written_at": now_rfc3339(),
-            "reason": reason,
-            "primary": self.primary_url(),
-            "local_history": local.history,
-            "local_head": local.head,
-            "primary_history": remote,
-            "fork_offset": fork,
-            "note": if fork.is_some() { "changes after fork_offset exist only on this server" } else { "fork point unknown: every retained local change is listed" },
-            "divergent_changes": tail,
-            "local_dns_data_before_rebootstrap": dump,
-        });
-        let path = dir.join(format!(
-            "divergent-{}.json",
-            chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ")
-        ));
-        crate::config::create_private(&path, &serde_json::to_string_pretty(&doc)?)
-            .with_context(|| format!("writing {}", path.display()))?;
-        tracing::warn!(path = %path.display(), changes = tail.len(), reason, "DIVERGED: this server's changes that the primary does not have were saved for manual review; re-bootstrapping from the primary");
-        Ok(path)
-    }
+/// Percent-encode a query value.
+fn url_encode(v: &str) -> String {
+    v.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 /// `reqwest` errors hide the useful part (connection refused, TLS) in the
@@ -1137,4 +1069,169 @@ pub async fn promote_offline(config_path: &std::path::Path) -> Result<History> {
         .await
         .map_err(|e| anyhow!("{e}"))?;
     Ok(h)
+}
+
+/// `rust-dns --prepare-standby [--yes]`: discard this server's data on
+/// purpose so it can follow the `[follow]` primary. Without `yes` it only
+/// prints what would be deleted and returns `Ok(false)`. With `yes` it
+/// writes a full online backup next to the database, a divergence report
+/// (the changes the primary does not have) when there is one, then empties
+/// the database (see `mutation::replica::prepare_standby`).
+pub async fn prepare_standby_offline(config_path: &std::path::Path, yes: bool) -> Result<bool> {
+    let cfg = crate::config::check(config_path)?;
+    let Some(follow) = cfg.follow.clone() else {
+        anyhow::bail!(
+            "{} has no [follow] section: add the [follow] section for the primary this server should mirror first",
+            config_path.display()
+        );
+    };
+    let db = cfg.database.path.clone();
+    if !db.exists() {
+        println!(
+            "{} does not exist yet: nothing to prepare, the server starts fresh",
+            db.display()
+        );
+        return Ok(true);
+    }
+    if let Err(e) = std::net::TcpListener::bind(cfg.web_console.bind) {
+        if e.kind() == std::io::ErrorKind::AddrInUse {
+            anyhow::bail!(
+                "the web console address {} is in use: stop rust-dns before preparing it as a standby",
+                cfg.web_console.bind
+            );
+        }
+    }
+    let root = cfg.root.username.clone();
+    // Inspect read-only: a dry run must not touch the database at all.
+    let (data_list, rows, head, local_hist, lineage_markers) = {
+        let ro =
+            rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let rows: i64 = ro.query_row("SELECT COUNT(*) FROM changelog", [], |r| r.get(0))?;
+        let st = crate::storage::replication_state(&ro).unwrap_or_default();
+        (
+            data::fresh_problems(&ro, &root)?,
+            rows,
+            data::changelog_head(&ro)?,
+            data::history(&ro).unwrap_or_default(),
+            st.keys().any(|k| k != "history_id"),
+        )
+    };
+    if data_list.is_empty() && rows == 0 && !lineage_markers {
+        println!("{} is already fresh: nothing to delete", db.display());
+        return Ok(true);
+    }
+    println!("--prepare-standby would delete from {}:", db.display());
+    for d in &data_list {
+        println!("  - {d}");
+    }
+    if rows > 0 {
+        println!(
+            "  - {rows} changelog rows (history {})",
+            local_hist.history_id
+        );
+    }
+    if lineage_markers {
+        println!("  - the replication lineage (history, promotion and standby records)");
+    }
+    println!("and keep: the config root '{root}', the audit log.");
+    if !yes {
+        println!(
+            "Nothing was changed. Re-run with --yes to back up the database and delete this data."
+        );
+        return Ok(false);
+    }
+    {
+        // Another process holding a write lock (or a crashed writer) refuses.
+        let probe = rusqlite::Connection::open(&db)?;
+        probe.busy_timeout(Duration::from_millis(0))?;
+        probe
+            .execute_batch("BEGIN EXCLUSIVE; ROLLBACK;")
+            .with_context(|| {
+                format!("{} is locked or in use; stop rust-dns first", db.display())
+            })?;
+    }
+    let storage = Storage::open(&db)?;
+    let dir = db
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ").to_string();
+    let stem = db
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "rust-dns.db".into());
+    let backup = dir.join(format!("{stem}.pre-standby-{stamp}"));
+    storage.backup_to(&backup)?;
+    Storage::open(&backup)
+        .and_then(|b| b.check())
+        .with_context(|| format!("verifying the backup {}", backup.display()))?;
+    println!("backup written: {}", backup.display());
+    // Divergence report: the local changes the primary does not have.
+    let mut divergence = None;
+    if rows > 0 {
+        ensure_crypto();
+        let base = follow.primary.trim().trim_end_matches('/').to_string();
+        let remote = reqwest::Client::new()
+            .get(format!("{base}/api/replication/identity"))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .ok()
+            .filter(|r| r.status().is_success());
+        let remote = match remote {
+            Some(r) => r.json::<Identity>().await.ok(),
+            None => None,
+        };
+        let (fork, note) = match &remote {
+            Some(id) if id.history.history_id == local_hist.history_id => {
+                (Some(head), "same history as the primary: no divergent changes")
+            }
+            Some(id) if id.history.parent_history_id.as_deref() == Some(local_hist.history_id.as_str()) => (
+                id.history.fork_offset,
+                "the primary was promoted from this server's history: changes after fork_offset exist only here",
+            ),
+            Some(_) => (None, "unrelated history: every retained local change is listed"),
+            None => (None, "the primary was not reachable, so the fork point is unknown: every retained local change is listed"),
+        };
+        let tail = storage.read_tx(|c| data::changelog_tail(c, fork.unwrap_or(0)))?;
+        if !tail.is_empty() {
+            let dump = storage.read_tx(data::dns_dump)?;
+            let doc = serde_json::json!({
+                "written_at": now_rfc3339(),
+                "primary": base,
+                "local_history": local_hist,
+                "local_head": head,
+                "primary_history": remote.as_ref().map(|r| &r.history),
+                "fork_offset": fork,
+                "note": note,
+                "divergent_changes": tail,
+                "local_dns_data": dump,
+                "backup": backup.display().to_string(),
+            });
+            let path = dir.join(format!("divergent-{stamp}.json"));
+            crate::config::create_private(&path, &serde_json::to_string_pretty(&doc)?)?;
+            println!(
+                "divergent changes ({}) written: {}",
+                tail.len(),
+                path.display()
+            );
+            divergence = Some(path.display().to_string());
+        }
+    }
+    let sum = crate::mutation::replica::prepare_standby(
+        &storage,
+        &root,
+        &backup.display().to_string(),
+        divergence.as_deref(),
+    )?;
+    println!(
+        "deleted: {} zones, {} records, {} zone members, {} changelog rows, {} TSIG keys, {} settings, {} API tokens, {} users, {} sessions",
+        sum.zones, sum.records, sum.zone_members, sum.changelog_rows, sum.tsig_keys, sum.settings, sum.api_tokens, sum.users, sum.sessions
+    );
+    println!(
+        "This server is fresh now. Start it: it will copy {base} and follow it.",
+        base = follow.primary
+    );
+    Ok(true)
 }

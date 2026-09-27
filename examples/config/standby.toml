@@ -4,6 +4,14 @@
 #
 # Start from your normal config (listeners, [forwarding], [transfer], logging are
 # local and NOT replicated) and add [follow].
+#
+# The database must be new or fresh (no zones, records, TSIG keys, console
+# settings, API tokens, or users besides [root]); otherwise the standby refuses
+# to follow and keeps its data read-only. To reuse a server that has data (for
+# example the old primary after a failover), stop it and run
+#   rust-dns --prepare-standby --yes --config <this file>
+# which backs the database up next to it, saves its divergent changes to
+# divergent-<time>.json, and empties it.
 
 [server]
 bind = ["::"]

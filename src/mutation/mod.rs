@@ -17,6 +17,7 @@
 //!   [`replay`] rebuilds identical data from it.
 
 pub mod accounts;
+mod acct_sql;
 pub mod replay;
 pub mod replica;
 pub mod settings;
@@ -26,6 +27,7 @@ pub mod tsig;
 use crate::cache::{Cache, Catalog};
 use crate::events::Bus;
 use crate::model::*;
+use crate::replication::types::{Hidden, ReplSetting, ReplToken, ReplTsigKey, ReplUser};
 use crate::storage::{self as db, Storage};
 use anyhow::Result;
 use rusqlite::Connection;
@@ -44,6 +46,16 @@ pub struct WriteToken {
 const TOKEN: WriteToken = WriteToken { _private: () };
 
 /// A committed fact. Serialized as the changelog payload.
+///
+/// One enum for DNS data and for accounts, settings and TSIG keys, so there
+/// is one ordered changelog (one cursor for a standby, and a user always
+/// exists before a change that refers to it), one exhaustive replay, and one
+/// serialization. [`Change::class`] separates the two families: account
+/// changes carry password hashes, TOTP and TSIG secrets and never leave
+/// through the user-facing changelog API or websocket.
+///
+/// Account facts are the resulting state (whole rows where a row changed),
+/// not intents, so replaying them reproduces identical rows.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Change {
@@ -104,7 +116,66 @@ pub enum Change {
         username: String,
         role: String,
     },
+    // ---- accounts, settings, TSIG (class "account") ----------------------
+    /// A new user (every column).
+    UserCreated {
+        user: ReplUser,
+    },
+    /// A user's row after any change (profile, admin flag, password, MFA
+    /// enrollment, disable, root sync).
+    UserUpdated {
+        user: ReplUser,
+    },
+    UserDeleted {
+        user_id: i64,
+        username: String,
+    },
+    /// A TOTP code of this time step was accepted (replay protection).
+    TotpStepAccepted {
+        user_id: i64,
+        step: i64,
+    },
+    RecoveryCodesReplaced {
+        user_id: i64,
+        code_hashes: Hidden<Vec<String>>,
+    },
+    RecoveryCodeUsed {
+        user_id: i64,
+        code_hash: Hidden<String>,
+        used_at: String,
+    },
+    /// A new API token (hash, not the secret; `last_used_*` is local).
+    TokenCreated {
+        token: ReplToken,
+    },
+    TokenTagsSet {
+        token_id: i64,
+        tags: Vec<String>,
+    },
+    TokenRevoked {
+        token_id: i64,
+        revoked_at: String,
+    },
+    /// A TSIG key created or its zones changed (the whole row).
+    TsigKeySet {
+        key: ReplTsigKey,
+    },
+    TsigKeyDeleted {
+        name: String,
+    },
+    /// A console setting stored (e.g. the forwarding override).
+    SettingSet {
+        setting: ReplSetting,
+    },
+    SettingCleared {
+        key: String,
+    },
 }
+
+/// Changelog row class: `dns` rows are visible in the changelog API and the
+/// websocket; `account` rows only to standbys (replication API).
+pub const CLASS_DNS: &str = "dns";
+pub const CLASS_ACCOUNT: &str = "account";
 
 impl Change {
     /// (action, entity, zone, entity id) columns of the changelog row.
@@ -125,7 +196,65 @@ impl Change {
             Change::MemberRemoved { zone, user_id, .. } => {
                 ("delete", "member", zone, Some(*user_id))
             }
+            Change::UserCreated { user } => ("create", "user", "", Some(user.id)),
+            Change::UserUpdated { user } => ("update", "user", "", Some(user.id)),
+            Change::UserDeleted { user_id, .. } => ("delete", "user", "", Some(*user_id)),
+            Change::TotpStepAccepted { user_id, .. } => ("update", "totp_step", "", Some(*user_id)),
+            Change::RecoveryCodesReplaced { user_id, .. } => {
+                ("update", "recovery_codes", "", Some(*user_id))
+            }
+            Change::RecoveryCodeUsed { user_id, .. } => {
+                ("update", "recovery_code", "", Some(*user_id))
+            }
+            Change::TokenCreated { token } => ("create", "token", "", Some(token.id)),
+            Change::TokenTagsSet { token_id, .. } => ("update", "token", "", Some(*token_id)),
+            Change::TokenRevoked { token_id, .. } => ("revoke", "token", "", Some(*token_id)),
+            Change::TsigKeySet { .. } => ("update", "tsig_key", "", None),
+            Change::TsigKeyDeleted { .. } => ("delete", "tsig_key", "", None),
+            Change::SettingSet { .. } => ("update", "setting", "", None),
+            Change::SettingCleared { .. } => ("delete", "setting", "", None),
         }
+    }
+
+    /// [`CLASS_DNS`] or [`CLASS_ACCOUNT`].
+    pub fn class(&self) -> &'static str {
+        match self {
+            Change::ZoneCreated { .. }
+            | Change::ZoneUpdated { .. }
+            | Change::ZoneDeleted { .. }
+            | Change::RecordCreated { .. }
+            | Change::RecordUpdated { .. }
+            | Change::RecordExpired { .. }
+            | Change::RecordReaped { .. }
+            | Change::RecordDeleted { .. }
+            | Change::SerialBumped { .. }
+            | Change::MemberSet { .. }
+            | Change::MemberRemoved { .. } => CLASS_DNS,
+            Change::UserCreated { .. }
+            | Change::UserUpdated { .. }
+            | Change::UserDeleted { .. }
+            | Change::TotpStepAccepted { .. }
+            | Change::RecoveryCodesReplaced { .. }
+            | Change::RecoveryCodeUsed { .. }
+            | Change::TokenCreated { .. }
+            | Change::TokenTagsSet { .. }
+            | Change::TokenRevoked { .. }
+            | Change::TsigKeySet { .. }
+            | Change::TsigKeyDeleted { .. }
+            | Change::SettingSet { .. }
+            | Change::SettingCleared { .. } => CLASS_ACCOUNT,
+        }
+    }
+
+    /// Settings or TSIG keys changed: the DNS server must reload them.
+    pub fn affects_dns_runtime(&self) -> bool {
+        matches!(
+            self,
+            Change::TsigKeySet { .. }
+                | Change::TsigKeyDeleted { .. }
+                | Change::SettingSet { .. }
+                | Change::SettingCleared { .. }
+        )
     }
 }
 
@@ -1804,21 +1933,33 @@ mod tests {
             .is_ok());
     }
 
-    /// Dump of all replicated state, for equality checks.
+    /// Full contents of every replicated table (all columns except the
+    /// per-server `last_used_*` of tokens), generic over the registry: a
+    /// column missing from a change payload makes the comparison fail.
     fn dump(s: &Storage) -> serde_json::Value {
-        let zones = s.list_zones().unwrap();
-        let mut records = s.all_records().unwrap();
-        records.sort_by_key(|r| r.id);
-        let members: Vec<_> = zones
-            .iter()
-            .map(|z| (z.id, s.list_members(z.id).unwrap()))
-            .collect();
-        serde_json::json!({ "zones": zones, "records": records, "members": members })
+        s.read_tx(|c| {
+            let mut v = serde_json::Map::new();
+            for t in crate::replication::tables::replicated_tables() {
+                v.insert(
+                    t.name.into(),
+                    crate::replication::tables::dump(
+                        c,
+                        t,
+                        &["last_used_at", "last_used_ip"],
+                        None,
+                    )?
+                    .into(),
+                );
+            }
+            Ok(serde_json::Value::Object(v))
+        })
+        .unwrap()
     }
 
     #[tokio::test]
     async fn replaying_the_changelog_rebuilds_identical_data() {
         let (s, m, a) = setup();
+        a.sync_root("root", "$argon2id$root-1", false).unwrap();
         let mut users = Vec::new();
         for i in 0..3 {
             users.push(
@@ -1844,9 +1985,10 @@ mod tests {
             (RecordType::CNAME, "c"),
         ];
         let mut failures = 0;
-        for step in 0..400 {
+        let mut extra_users: Vec<i64> = Vec::new();
+        for step in 0..600 {
             let z = zones[rng.random_range(0..zones.len())];
-            let res: MResult<()> = match rng.random_range(0..100) {
+            let res: MResult<()> = match rng.random_range(0..130) {
                 0..=4 => m
                     .create_zone(actor(), zone_input(z), Some(users[0].id))
                     .await
@@ -1945,14 +2087,13 @@ mod tests {
                     .await
                     .map(|_| ()),
                 96 => {
-                    // Simulated clock: expire and reap everything due within the next 10 s.
                     let later = chrono::Utc::now() + chrono::Duration::seconds(10);
                     match m.expire_due(later).await {
                         Ok(_) => m.reap_due(later).await.map(|_| ()),
                         Err(e) => Err(e),
                     }
                 }
-                _ => {
+                97..=99 => {
                     let recs = (0..rng.random_range(0..6))
                         .map(|i| ExportRecord {
                             name: format!("imp{i}"),
@@ -1988,11 +2129,149 @@ mod tests {
                         .await
                         .map(|_| ())
                 }
+                // ---- accounts, settings, TSIG ----
+                k => {
+                    let uid = users[rng.random_range(0..users.len())].id;
+                    let r: anyhow::Result<()> = a.run(&actor(), "random", |t| {
+                        match k {
+                            100..=102 => {
+                                let u = t.create_user(&NewUser {
+                                    username: format!("x{step}"),
+                                    password_hash: format!("h{step}"),
+                                    display_name: String::new(),
+                                    is_admin: step % 2 == 0,
+                                    mfa_required: false,
+                                })?;
+                                extra_users.push(u.id);
+                            }
+                            103 => {
+                                t.set_password(uid, &format!("p{step}"))?;
+                            }
+                            104 => {
+                                t.set_mfa(uid, if step % 3 == 0 { None } else { Some("SECRETSECRET") })?;
+                            }
+                            105..=106 => {
+                                let mut u = t.change_user(uid, &accounts::UserChanges::default())?;
+                                if u.totp_secret.is_none() {
+                                    u = t.set_mfa(uid, Some("SECRETSECRET"))?;
+                                }
+                                t.accept_totp_step(&u, step as u64)?;
+                            }
+                            107 => {
+                                let u = t.change_user(uid, &accounts::UserChanges::default())?;
+                                t.set_recovery_codes(&u, &[format!("c{step}a"), format!("c{step}b")])?;
+                            }
+                            108 => {
+                                let u = t.change_user(uid, &accounts::UserChanges::default())?;
+                                let hash: Option<String> = t.conn.query_row(
+                                    "SELECT code_hash FROM recovery_codes WHERE user_id = ?1 AND used_at IS NULL LIMIT 1",
+                                    [u.id],
+                                    |r| r.get(0),
+                                ).ok();
+                                if let Some(h) = hash {
+                                    t.use_recovery_code(&u, &h)?;
+                                }
+                            }
+                            109..=111 => {
+                                let u = t.change_user(uid, &accounts::UserChanges::default())?;
+                                t.create_token(&u, &format!("t{step}"), &format!("th{step}"), &["a".into()])?;
+                            }
+                            112..=113 => {
+                                let id: Option<i64> = t
+                                    .conn
+                                    .query_row(
+                                        "SELECT id FROM api_tokens WHERE revoked_at IS NULL ORDER BY id DESC LIMIT 1",
+                                        [],
+                                        |r| r.get(0),
+                                    )
+                                    .ok();
+                                if let Some(tk) = id.and_then(|id| db::get_token(t.conn, id).ok().flatten()) {
+                                    let owner = t.change_user(tk.user_id, &accounts::UserChanges::default())?;
+                                    if step % 2 == 0 {
+                                        t.revoke_token(&owner, &tk)?;
+                                    } else {
+                                        t.update_token_tags(&owner, &tk, &[format!("g{step}")])?;
+                                    }
+                                }
+                            }
+                            114..=116 => {
+                                let name = format!("k{}.", step % 3);
+                                match crate::storage::get_tsig_key(t.conn, &name)? {
+                                    None => {
+                                        t.create_tsig_key(
+                                            "tester",
+                                            &tsig::NewTsigKey {
+                                                name,
+                                                algorithm: crate::dns::tsig::Algorithm::HmacSha256,
+                                                secret: format!("secret-{step}").into_bytes(),
+                                                zones: vec![],
+                                                imported: true,
+                                            },
+                                        )?;
+                                    }
+                                    Some(k) if step % 2 == 0 => {
+                                        t.update_tsig_key_zones(&k, &[z.to_string()])?;
+                                    }
+                                    Some(k) => {
+                                        t.delete_tsig_key(&k)?;
+                                    }
+                                }
+                            }
+                            117..=119 => {
+                                let f = settings::ForwardingSettings {
+                                    upstreams: vec![format!("192.0.2.{}:53", step % 200 + 1).parse().unwrap()],
+                                    allowed_clients: vec!["10.0.0.0/8".into()],
+                                    timeout_ms: 1000 + step as u64,
+                                    cache_max_ttl: None,
+                                    cache_negative_max_ttl: None,
+                                };
+                                if step % 4 == 0 {
+                                    t.clear_forwarding(&f)?;
+                                } else {
+                                    t.set_forwarding("tester", None, &f)?;
+                                }
+                            }
+                            120..=121 => {
+                                if let Some(id) = extra_users.pop() {
+                                    let u = t.change_user(id, &accounts::UserChanges::default())?;
+                                    t.delete_user(&u)?;
+                                }
+                            }
+                            122..=124 => {
+                                t.change_user(
+                                    uid,
+                                    &accounts::UserChanges {
+                                        display_name: Some(format!("n{step}")),
+                                        is_admin: Some(step % 2 == 0),
+                                        disabled: Some(step % 5 == 0),
+                                        mfa_required: Some(step % 3 == 0),
+                                        ..Default::default()
+                                    },
+                                )?;
+                            }
+                            125 => {
+                                t.sync_root("root", &format!("$argon2id$root-{step}"), step % 2 == 0)?;
+                            }
+                            _ => {
+                                // A rolled-back account transaction: nothing may be logged.
+                                t.create_user(&NewUser {
+                                    username: format!("y{step}"),
+                                    password_hash: "h".into(),
+                                    display_name: String::new(),
+                                    is_admin: false,
+                                    mfa_required: false,
+                                })?;
+                                anyhow::bail!("rollback");
+                            }
+                        }
+                        Ok(())
+                    });
+                    r.map_err(MutationError::Internal)
+                }
             };
             if res.is_err() {
                 failures += 1;
             }
-            let _ = step;
         }
         assert!(
             failures > 0,
@@ -2000,24 +2279,11 @@ mod tests {
         );
         assert!(!s.list_zones().unwrap().is_empty());
 
-        // Replay into a fresh database that has the same users.
+        // Replay the whole changelog into an empty database.
         let target = Storage::open_memory().unwrap();
-        let ta = Accounts::new(Arc::new(target));
-        for u in &users {
-            ta.create_user(
-                &actor(),
-                &NewUser {
-                    username: u.username.clone(),
-                    password_hash: "h".into(),
-                    display_name: String::new(),
-                    is_admin: false,
-                    mfa_required: false,
-                },
-            )
+        let events = s
+            .read_tx(|c| crate::replication::data::changelog_tail(c, 0))
             .unwrap();
-        }
-        let target = ta_storage(&ta);
-        let events = log(&s);
         eprintln!(
             "replay test: {} changelog rows, {} rolled back, {} zones, {} records left",
             events.len(),
@@ -2025,13 +2291,8 @@ mod tests {
             s.list_zones().unwrap().len(),
             s.all_records().unwrap().len()
         );
-        assert!(
-            events.len() > 300,
-            "enough history to be meaningful: {}",
-            events.len()
-        );
+        assert!(events.len() > 500, "enough history: {}", events.len());
         assert!(failures >= 10, "rollbacks exercised: {failures}");
-        assert!(!s.all_records().unwrap().is_empty());
         for kind in [
             "zone_created",
             "zone_updated",
@@ -2044,6 +2305,19 @@ mod tests {
             "serial_bumped",
             "member_set",
             "member_removed",
+            "user_created",
+            "user_updated",
+            "user_deleted",
+            "totp_step_accepted",
+            "recovery_codes_replaced",
+            "recovery_code_used",
+            "token_created",
+            "token_tags_set",
+            "token_revoked",
+            "tsig_key_set",
+            "tsig_key_deleted",
+            "setting_set",
+            "setting_cleared",
         ] {
             assert!(
                 events.iter().any(|e| e.payload["kind"] == kind),
@@ -2055,27 +2329,11 @@ mod tests {
         assert_eq!(
             dump(&target),
             dump(&s),
-            "replayed data must equal the source"
+            "replayed data must equal the source in every replicated table"
         );
 
         // The comparison is sensitive: dropping the last committed change breaks equality.
-        let partial = ta_storage(&{
-            let a2 = Accounts::new(Arc::new(Storage::open_memory().unwrap()));
-            for u in &users {
-                a2.create_user(
-                    &actor(),
-                    &NewUser {
-                        username: u.username.clone(),
-                        password_hash: "h".into(),
-                        display_name: String::new(),
-                        is_admin: false,
-                        mfa_required: false,
-                    },
-                )
-                .unwrap();
-            }
-            a2
-        });
+        let partial = Storage::open_memory().unwrap();
         replay::replay(&partial, &events[..events.len() - 1]).unwrap();
         assert_ne!(dump(&partial), dump(&s));
 
@@ -2085,9 +2343,6 @@ mod tests {
         let fresh = Storage::open_memory().unwrap();
         assert!(replay::replay(&fresh, &[old]).is_err());
         assert!(fresh.list_zones().unwrap().is_empty());
-    }
-
-    fn ta_storage(a: &Accounts) -> Arc<Storage> {
-        a.storage_for_tests()
+        let _ = &a;
     }
 }

@@ -3,9 +3,30 @@
 //! token hashes, TSIG secrets): `Debug` is implemented by hand where a
 //! secret could otherwise end up in a log line.
 
-use crate::model::{ChangeEvent, RecordType, Zone};
+use crate::model::{ChangeEvent, RecordType};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
+
+/// Version of the replication wire format. 2: account, settings and TSIG
+/// changes travel in the changelog (1 = rust-dns b17f229, which synced them
+/// as snapshots). A standby refuses a primary with another version.
+pub const REPLICATION_PROTOCOL: u32 = 2;
+
+fn protocol_1() -> u32 {
+    1
+}
+
+/// A value that is serialized as-is but never printed by `Debug` (hashes of
+/// recovery codes in change payloads, and similar).
+#[derive(Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Hidden<T>(pub T);
+
+impl<T> std::fmt::Debug for Hidden<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<hidden>")
+    }
+}
 
 /// Where a database's data comes from. A primary gets a random
 /// `history_id` on first start; a standby adopts its primary's lineage at
@@ -156,52 +177,43 @@ impl std::fmt::Debug for ReplTsigKey {
     }
 }
 
-/// Everything replicated that is not in the DNS changelog: accounts,
-/// console settings and TSIG keys.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct AccountsSnapshot {
-    pub users: Vec<ReplUser>,
-    pub recovery_codes: Vec<ReplRecoveryCode>,
-    pub tokens: Vec<ReplToken>,
-    pub settings: Vec<ReplSetting>,
-    pub tsig_keys: Vec<ReplTsigKey>,
-    /// SHA-256 over the content above (see `GET /replication/checksum`).
-    pub checksum: String,
-    /// Changes whenever any of the above changes on the primary (per
-    /// process; a restart starts a new epoch).
-    pub generation: String,
-}
-
-/// A consistent copy of everything replicated, read in one transaction.
+/// A consistent copy of everything replicated, read in one transaction,
+/// as logical entities: the same facts as changelog changes (`user_created`,
+/// `token_created`, `recovery_codes_replaced`, `tsig_key_set`,
+/// `setting_set`, `zone_created`, `record_created`, `record_expired`,
+/// `member_set`, ...). A standby loads it through the same replay code as
+/// the changelog, so the format does not depend on the storage engine.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Snapshot {
-    /// Format version (1).
+    /// Replication protocol version (2).
     pub format: u32,
     pub history: History,
     /// The changelog offset this snapshot corresponds to: tail from here.
     pub offset: i64,
     #[schema(format = DateTime)]
     pub taken_at: String,
-    pub zones: Vec<Zone>,
-    pub records: Vec<ReplRecord>,
-    pub members: Vec<ReplMember>,
-    pub accounts: AccountsSnapshot,
+    /// Users first, then their credentials and tokens, settings, TSIG keys,
+    /// zones, records and memberships (references come after their targets).
+    #[schema(value_type = Vec<Object>)]
+    pub entities: Vec<crate::mutation::Change>,
 }
 
 /// One long-poll answer: committed changes after the cursor (whole
-/// transactions only) and the account-data generation.
+/// transactions only), DNS and account changes in one sequence.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ChangesResponse {
+    /// Replication protocol version (2).
+    pub protocol: u32,
     pub history_id: String,
     /// Latest assigned offset.
     pub head: i64,
     #[schema(required = true)]
     pub oldest_offset: Option<i64>,
-    /// The cursor fell behind retention: the changes in between are gone,
-    /// fetch a snapshot.
+    /// The cursor fell behind retention (changelog pruned, or account
+    /// changes scrubbed after `[changelog].account_retention_days`): fetch a
+    /// snapshot.
     pub gap: bool,
     pub events: Vec<ChangeEvent>,
-    pub accounts_generation: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
@@ -213,13 +225,22 @@ pub struct ZoneChecksum {
     pub checksum: String,
 }
 
-/// Per-zone checksums and the account-data checksum at one offset.
+/// Checksum of one replicated table (local columns and the standby's own
+/// root account left out).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct TableChecksum {
+    pub table: String,
+    pub rows: i64,
+    pub checksum: String,
+}
+
+/// Checksums of every replicated table, and per zone, at one offset.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Checksums {
     pub history_id: String,
     pub offset: i64,
+    pub tables: Vec<TableChecksum>,
     pub zones: Vec<ZoneChecksum>,
-    pub accounts_checksum: String,
 }
 
 /// This node's replication role.
@@ -239,8 +260,11 @@ pub enum Role {
 /// Public identity (no authentication): lets a returning old primary find
 /// out whether its peer was promoted away from its history.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[schema(example = json!({ "role": "promoted", "writable": true, "history": { "history_id": "q3V9xY2mWk8pTf1a", "parent_history_id": "Hk2mP9sLq0ZwX4bN", "fork_offset": 1834, "promoted_at": "2026-01-15T09:30:00.000Z", "promoted_from": "https://dns1.example.net:8053" } }))]
+#[schema(example = json!({ "protocol": 2, "role": "promoted", "writable": true, "history": { "history_id": "q3V9xY2mWk8pTf1a", "parent_history_id": "Hk2mP9sLq0ZwX4bN", "fork_offset": 1834, "promoted_at": "2026-01-15T09:30:00.000Z", "promoted_from": "https://dns1.example.net:8053" } }))]
 pub struct Identity {
+    /// Replication protocol version (absent before version 2).
+    #[serde(default = "protocol_1")]
+    pub protocol: u32,
     pub role: Role,
     pub writable: bool,
     pub history: History,
@@ -281,8 +305,6 @@ pub struct FollowStatus {
     pub last_reconcile_at: Option<String>,
     #[schema(required = true)]
     pub last_reconcile_result: Option<String>,
-    #[schema(required = true, format = DateTime)]
-    pub last_accounts_sync_at: Option<String>,
     pub reconnects: u64,
     pub rebootstraps: u64,
 }
@@ -310,6 +332,9 @@ pub struct PeerStatus {
 /// `GET /replication/status`.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ReplicationStatus {
+    /// Replication protocol version (absent before version 2).
+    #[serde(default = "protocol_1")]
+    pub protocol: u32,
     pub role: Role,
     pub writable: bool,
     pub history: History,
@@ -368,4 +393,8 @@ pub struct ReplicationSummary {
     pub disconnected_since: Option<String>,
     #[schema(required = true)]
     pub read_only_reason: Option<String>,
+    /// Why a standby is not following (state `refused`: e.g. it has local
+    /// data and must be prepared with `--prepare-standby`), else null.
+    #[schema(required = true)]
+    pub problem: Option<String>,
 }

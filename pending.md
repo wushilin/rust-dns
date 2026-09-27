@@ -2,7 +2,22 @@
 
 Status as of 2026-09-27. Deployed to dns-test (musl build, /opt/rust-dns) with everything below. Stages 1 to 3 (log rotation, DNS protocol completeness, console fixes) are implemented. The current workspace has additional Stage 4 changes in progress below.
 
-## Standby / follow mode (2026-09-27, implemented, not committed)
+## Account changes in the changelog (2026-09-27, implemented, not committed)
+
+- [x] `Change` gained the account family (user_created/updated/deleted, totp_step_accepted, recovery_codes_replaced, recovery_code_used, token_created/tags_set/revoked, tsig_key_set/deleted, setting_set/cleared): facts, applied by `mutation::acct_sql` (the only writer of those tables; source-scan test) on the primary through `AuditTx::record` and on a standby through the same `replay::apply` (local-root merge inside it).
+- [x] One changelog sequence; column `class` ('dns'|'account'); changelog API/websocket show `dns` only; account payloads scrubbed after `[changelog].account_retention_days` (default 3) -> gap -> snapshot.
+- [x] Snapshot = logical entities (the same facts) loaded through replay; accounts endpoint, generation counter and account checksum removed; reconcile = per-table checksums from the table registry (`replication::tables`) + per-zone.
+- [x] Replication protocol 2 (status/identity/changes/snapshot); a standby refuses a protocol-1 primary. Existing databases migrate in place (class column, old rows 'dns').
+- [x] Standby-local account writes (its root, TOTP steps / recovery codes used there) are applied but not changelogged (gate closed before the root sync at startup).
+- [x] Snapshot only when connecting (fresh database, or same-lineage gap); afterwards changelog only. Replay is idempotent (upserts, `INSERT OR REPLACE` of changelog rows), overlapping batches are accepted. Reconcile mismatch is reported (log, status, metric), no automatic reload.
+
+## Standby: follow only a fresh database (2026-09-27, implemented, not committed)
+
+- [x] `[follow]` follows only when the database is in the primary's lineage (restart/reconnect; gap or reconcile re-bootstrap stays automatic) or fresh (`replication::data::fresh_problems`: no zones, records, members, TSIG keys, settings, tokens, users besides the config root). Otherwise state `refused`, read-only, error names the data and `--prepare-standby`; shown in status (`replication.problem` in `/api/status`), banner, Replication page, `--check`, log.
+- [x] `rust-dns --prepare-standby [--yes]` (server stopped; web port in use or DB locked = refused): dry run lists and exits 2; `--yes` writes `<db>.pre-standby-<time>` (online backup, integrity-checked), `divergent-<time>.json` when there are local changes the primary lacks, empties replicated tables and lineage, audit row `replication.prepare_standby`.
+- [x] The automatic divergence save on follow was removed; tests updated (`tests/follow.rs` rejoin via --prepare-standby, standby restart resumes without a snapshot).
+
+## Standby / follow mode (2026-09-27, committed b17f229)
 
 - [x] `[follow] primary/token/reconcile_interval_secs/allow_insecure_http/timeout_secs` (https required, loopback exempt; validated by `--check`); `[peer] url/check_interval_secs` on the primary fences a returning old primary (read-only).
 - [x] Primary API (`GlobalPerm::Replicate`, admin): `GET /api/replication/{status,snapshot,accounts,changes,checksum}`, public `identity`, `POST promote`. Snapshot = one read transaction; changes = long-poll, whole transactions; account-data generation bumped by the `Accounts` commit hook.

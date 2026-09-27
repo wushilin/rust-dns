@@ -91,7 +91,10 @@ CREATE TABLE IF NOT EXISTS changelog (
     payload     TEXT NOT NULL,
     txn         TEXT NOT NULL DEFAULT '',
     command     TEXT NOT NULL DEFAULT '',
-    schema      INTEGER NOT NULL DEFAULT 1
+    schema      INTEGER NOT NULL DEFAULT 1,
+    -- 'dns': shown by the changelog API and websocket. 'account': account,
+    -- settings and TSIG changes (contain secrets): replication API only.
+    class       TEXT NOT NULL DEFAULT 'dns'
 );
 CREATE INDEX IF NOT EXISTS changelog_ts ON changelog(ts);
 CREATE TABLE IF NOT EXISTS audit_log (
@@ -238,6 +241,10 @@ fn migrate(conn: &Connection) -> Result<()> {
         (
             "schema",
             "ALTER TABLE changelog ADD COLUMN schema INTEGER NOT NULL DEFAULT 1",
+        ),
+        (
+            "class",
+            "ALTER TABLE changelog ADD COLUMN class TEXT NOT NULL DEFAULT 'dns'",
         ),
     ] {
         if !cols.iter().any(|c| c == col) {
@@ -459,7 +466,7 @@ impl Storage {
         self.with_conn(|c| {
             let mut stmt = c.prepare(
                 "SELECT offset, ts, actor, actor_ip, action, entity, zone, entity_id, payload, txn, command
-                 FROM changelog WHERE offset > ?1 ORDER BY offset ASC LIMIT ?2",
+                 FROM changelog WHERE offset > ?1 AND class = 'dns' ORDER BY offset ASC LIMIT ?2",
             )?;
             let rows = stmt.query_map(params![after, limit as i64], row_to_change)?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -470,7 +477,7 @@ impl Storage {
         self.with_conn(|c| {
             let mut stmt = c.prepare(
                 "SELECT offset, ts, actor, actor_ip, action, entity, zone, entity_id, payload, txn, command
-                 FROM changelog ORDER BY offset DESC LIMIT ?1",
+                 FROM changelog WHERE class = 'dns' ORDER BY offset DESC LIMIT ?1",
             )?;
             let rows = stmt.query_map(params![limit as i64], row_to_change)?;
             let mut v = rows.collect::<Result<Vec<_>, _>>()?;
@@ -482,10 +489,11 @@ impl Storage {
     /// `(oldest_retained_offset, latest_offset)`; both `None` when empty.
     pub fn changelog_bounds(&self) -> Result<(Option<i64>, Option<i64>)> {
         self.with_conn(|c| {
-            let r: (Option<i64>, Option<i64>) =
-                c.query_row("SELECT MIN(offset), MAX(offset) FROM changelog", [], |r| {
-                    Ok((r.get(0)?, r.get(1)?))
-                })?;
+            let r: (Option<i64>, Option<i64>) = c.query_row(
+                "SELECT MIN(offset), MAX(offset) FROM changelog WHERE class = 'dns'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
             Ok(r)
         })
     }
@@ -501,6 +509,21 @@ impl Storage {
                 )
                 .optional()?;
             Ok(seq.unwrap_or(0))
+        })
+    }
+
+    /// Retention for account changes (they carry password hashes, TOTP and
+    /// TSIG secrets): replace the payload of those older than `older_than`
+    /// with `{"kind":"scrubbed"}`. Offsets stay; a standby that still needs
+    /// such a row gets `gap` and loads a snapshot. Bookkeeping, like pruning.
+    pub fn scrub_account_changes(&self, older_than: DateTime<Utc>) -> Result<usize> {
+        let cutoff = older_than.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        self.with_conn(|c| {
+            Ok(c.execute(
+                "UPDATE changelog SET payload = '{\"kind\":\"scrubbed\"}'
+                 WHERE class = 'account' AND ts < ?1 AND payload <> '{\"kind\":\"scrubbed\"}'",
+                params![cutoff],
+            )?)
         })
     }
 
@@ -995,6 +1018,10 @@ mod tests {
                 Ok((r.get(0)?, r.get(1)?))
             })
             .unwrap();
+        let class: String = conn
+            .query_row("SELECT class FROM changelog", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(class, "dns", "old rows are DNS changes");
         assert_eq!(
             (txn.as_str(), schema),
             ("", 1),

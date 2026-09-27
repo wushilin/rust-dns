@@ -730,7 +730,96 @@ fn primary_standby_failover_and_rejoin() {
         "{metrics}"
     );
 
+    // ---- a standby restart resumes without any command -------------------------
+    s.stop();
+    ok(
+        call(
+            &Auth::Session(&pr),
+            "POST",
+            &p.api("/zones/z.test/records"),
+            Some(json!({ "name": "while-down", "type": "A", "value": "192.0.2.44" })),
+        ),
+        "write while the standby is down",
+    );
+    s.start();
+    let sr = s.root();
+    wait_for("restarted standby caught up", 15, || {
+        record_names(&s, &sr, "z.test").contains(&"while-down A 192.0.2.44".to_string())
+    });
+    let st = status(&s, &sr);
+    assert_eq!(
+        st["follow"]["rebootstraps"], 0,
+        "resumed from its offset, no snapshot: {st}"
+    );
+    assert_eq!(st["follow"]["state"], "following");
+
     // ---- carol signs in on the primary with TOTP (step X) ---------------------
+    let account_rows = |node: &Node| -> Vec<(i64, String)> {
+        let c = rusqlite::Connection::open_with_flags(
+            node.dir.join("data.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let mut st = c
+            .prepare("SELECT offset, json_extract(payload, '$.kind') FROM changelog WHERE class = 'account' ORDER BY offset")
+            .unwrap();
+        st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    };
+    // A password change and a token revocation on the primary replicate.
+    let bobtok = ok(
+        call(
+            &Auth::Session(&pr),
+            "POST",
+            &p.api("/tokens"),
+            Some(json!({ "name": "short-lived" })),
+        ),
+        "token to revoke",
+    );
+    let bobtok_secret = bobtok["token"].as_str().unwrap().to_string();
+    ok(
+        call(
+            &Auth::Session(&pr),
+            "DELETE",
+            &p.api(&format!("/tokens/{}", bobtok["info"]["id"])),
+            None,
+        ),
+        "revoke",
+    );
+    let bob_id = ok(
+        call(&Auth::Session(&pr), "GET", &p.api("/users"), None),
+        "users",
+    )["users"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["username"] == "bob")
+        .unwrap()["id"]
+        .clone();
+    ok(
+        call(
+            &Auth::Session(&pr),
+            "PUT",
+            &p.api(&format!("/users/{bob_id}")),
+            Some(json!({ "password": "bob-password-2" })),
+        ),
+        "bob password",
+    );
+    wait_for("password change replicated", 10, || {
+        call(
+            &Auth::None,
+            "POST",
+            &s.api("/auth/login"),
+            Some(json!({ "username": "bob", "password": "bob-password-2" })),
+        )
+        .0 == 200
+    });
+    let (code, _) = call(&Auth::Token(&bobtok_secret), "GET", &s.api("/me"), None);
+    assert_eq!(code, 401, "revoked on the standby too");
+    let snapshots_before = status(&s, &sr)["follow"]["rebootstraps"].clone();
+    let rows_before = account_rows(&s).len();
     let x = step_now();
     let carol2 = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(10))
@@ -754,8 +843,62 @@ fn primary_standby_failover_and_rejoin() {
         ),
         "carol mfa on primary",
     );
-    // Let the used step reach the standby.
-    std::thread::sleep(Duration::from_millis(1500));
+    // The used step reaches the standby as exactly one incremental change.
+    wait_for("TOTP step replicated", 10, || {
+        account_rows(&s).len() > rows_before
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    let new_rows: Vec<String> = account_rows(&s)[rows_before..]
+        .iter()
+        .map(|r| r.1.clone())
+        .collect();
+    assert_eq!(
+        new_rows,
+        vec!["totp_step_accepted".to_string()],
+        "one change, no full sync"
+    );
+    let first = account_rows(&s)[0].0;
+    let primary_rows: Vec<(i64, String)> = account_rows(&p)
+        .into_iter()
+        .filter(|r| r.0 >= first)
+        .collect();
+    assert_eq!(
+        account_rows(&s),
+        primary_rows,
+        "same account rows, same offsets (since the snapshot)"
+    );
+    assert_eq!(
+        status(&s, &sr)["follow"]["rebootstraps"],
+        snapshots_before,
+        "no snapshot was loaded"
+    );
+    // Account changes never appear in the user-facing changelog, not even for admins.
+    for (node, agent) in [(&p, &pr), (&s, &sr)] {
+        let cl = ok(
+            call(
+                &Auth::Session(agent),
+                "GET",
+                &node.api("/changelog?after=0&limit=2000"),
+                None,
+            ),
+            "changelog",
+        );
+        let text = cl.to_string();
+        for kind in [
+            "user_created",
+            "user_updated",
+            "totp_step_accepted",
+            "token_created",
+            "tsig_key_set",
+            "setting_set",
+        ] {
+            assert!(!text.contains(kind), "{kind} leaked into /api/changelog");
+        }
+        assert!(
+            !text.contains("argon2"),
+            "no password hashes in /api/changelog"
+        );
+    }
     let head_before = status(&s, &sr)["head"].as_i64().unwrap();
 
     // ---- split: standby down, the primary writes, then the primary dies --------
@@ -900,29 +1043,137 @@ fn primary_standby_failover_and_rejoin() {
     assert_eq!(code, 409, "{v}");
     assert!(v["error"].as_str().unwrap().contains(&s.url()), "{v}");
 
-    // ---- the old primary rejoins as a standby of the promoted server ------------
+    // ---- the old primary is told to follow: refused, it has its own data -------
     p.stop();
     p.configure(&follow_cfg(&s, &admin_token));
     p.start();
     let pr = p.root();
     wait_for(
-        "old primary re-bootstrapped from the new primary",
+        "the old primary refuses to follow while it has data",
         20,
         || {
-            let recs = record_names(&p, &pr, "z.test");
-            recs.contains(&"after A 192.0.2.77".to_string())
+            let st = status(&p, &pr);
+            st["follow"]["state"] == "refused"
+                && st["follow"]["last_error"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("--prepare-standby")
         },
     );
-    let div: Vec<PathBuf> = std::fs::read_dir(&p.dir)
+    let st = status(&p, &pr);
+    let err = st["follow"]["last_error"].as_str().unwrap();
+    assert!(err.contains("zone"), "names the data: {err}");
+    assert_eq!(st["writable"], false, "still read-only");
+    let summary = ok(
+        call(&Auth::Session(&pr), "GET", &p.api("/status"), None),
+        "status",
+    );
+    assert!(summary["replication"]["problem"]
+        .as_str()
+        .is_some_and(|m| m.contains("--prepare-standby")));
+    ok(
+        call(
+            &Auth::Session(&pr),
+            "GET",
+            &p.api("/zones/diverged.test"),
+            None,
+        ),
+        "its own data is untouched",
+    );
+    let (code, _) = call(
+        &Auth::Session(&pr),
+        "POST",
+        &p.api("/zones"),
+        Some(json!({ "name": "x.test" })),
+    );
+    assert_eq!(code, 409);
+    p.stop();
+    let check = Command::new(env!("CARGO_BIN_EXE_rust-dns"))
+        .args(["--check", "--config"])
+        .arg(p.config_path())
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&check.stdout).contains("--prepare-standby"),
+        "--check warns: {}",
+        String::from_utf8_lossy(&check.stdout)
+    );
+
+    // ---- --prepare-standby: without --yes nothing changes ------------------------
+    let files = |dir: &Path, prefix: &str| -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with(prefix))
+            .collect()
+    };
+    let db_bytes = |p: &Node| {
+        (
+            std::fs::read(p.dir.join("data.db")).unwrap(),
+            std::fs::read(p.dir.join("data.db-wal")).unwrap_or_default(),
+        )
+    };
+    let before = db_bytes(&p);
+    let dry = Command::new(env!("CARGO_BIN_EXE_rust-dns"))
+        .args(["--prepare-standby", "--config"])
+        .arg(p.config_path())
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&dry.stdout).to_string();
+    assert!(
+        !dry.status.success(),
+        "without --yes it exits non-zero: {out}"
+    );
+    assert!(
+        out.contains("would delete") && out.contains("zones"),
+        "{out}"
+    );
+    assert!(
+        files(&p.dir, "data.db.pre-standby-").is_empty(),
+        "no backup written"
+    );
+    assert!(files(&p.dir, "divergent-").is_empty());
+    assert!(db_bytes(&p) == before, "database untouched");
+
+    // ---- with --yes: backup, divergence report, fresh database ------------------
+    let run = Command::new(env!("CARGO_BIN_EXE_rust-dns"))
+        .args(["--prepare-standby", "--yes", "--config"])
+        .arg(p.config_path())
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&run.stdout).to_string();
+    assert!(
+        run.status.success(),
+        "{out}{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let backups = files(&p.dir, "data.db.pre-standby-");
+    assert_eq!(backups.len(), 1, "{out}");
+    assert!(
+        out.contains(&backups[0].display().to_string()),
+        "prints the backup path"
+    );
+    let bk = rusqlite::Connection::open_with_flags(
+        &backups[0],
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let zones: Vec<String> = bk
+        .prepare("SELECT name FROM zones")
         .unwrap()
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| {
-            p.file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with("divergent-")
-        })
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
         .collect();
+    assert!(
+        zones.contains(&"diverged.test".to_string()),
+        "the backup has the old data: {zones:?}"
+    );
+    let integrity: String = bk
+        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(integrity, "ok");
+    let div = files(&p.dir, "divergent-");
     assert_eq!(div.len(), 1, "one divergence file");
     let doc: Value = serde_json::from_str(&std::fs::read_to_string(&div[0]).unwrap()).unwrap();
     assert!(
@@ -932,10 +1183,34 @@ fn primary_standby_failover_and_rejoin() {
         "the old primary's change after the fork is saved: {doc}"
     );
     assert!(
+        doc["fork_offset"].is_i64(),
+        "fork point known from the new primary: {doc}"
+    );
+    assert!(
         !doc.to_string().contains("argon2"),
         "no password hashes in the divergence file"
     );
-    assert!(p.log().contains("DIVERGED"), "logged");
+
+    // ---- now it follows the new primary --------------------------------------------
+    p.start();
+    let pr = p.root();
+    wait_for("old primary copied the new primary", 20, || {
+        let recs = record_names(&p, &pr, "z.test");
+        recs.contains(&"after A 192.0.2.77".to_string())
+    });
+    let audit = ok(
+        call(
+            &Auth::Session(&pr),
+            "GET",
+            &p.api("/audit?after=0&limit=1000"),
+            None,
+        ),
+        "audit",
+    );
+    assert!(
+        audit.to_string().contains("replication.prepare_standby"),
+        "audited"
+    );
     // The old primary's divergent zone is gone; data converged.
     let (code, _) = call(
         &Auth::Session(&pr),

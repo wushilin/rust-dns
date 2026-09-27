@@ -348,7 +348,6 @@ fn api_router() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(replication::identity))
         .routes(routes!(replication::status))
         .routes(routes!(replication::snapshot))
-        .routes(routes!(replication::accounts))
         .routes(routes!(replication::changes))
         .routes(routes!(replication::checksum))
         .routes(routes!(replication::promote))

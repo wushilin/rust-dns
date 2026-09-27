@@ -4,11 +4,12 @@
 //! These methods skip the per-user permission checks of the API (the data
 //! comes from the primary, where they were enforced) but keep the
 //! structure of every other write:
-//! - DNS changes from the primary are applied with [`replay::apply`] and
+//! - Changes from the primary (DNS and account) are applied with [`replay::apply`] and
 //!   written to the local changelog with the primary's offsets, payloads,
 //!   actors and transaction ids, in the same SQLite transaction (so a
 //!   promoted standby continues the same offset sequence).
-//! - Snapshot loads, account syncs, history adoption and promotions write
+//! - A snapshot is a list of the same facts, applied with the same code.
+//! - Snapshot loads, history adoption and promotions write
 //!   an audit row (`replication.*`, counts only, never secrets) in the same
 //!   transaction as the data.
 //!
@@ -30,46 +31,30 @@ use crate::replication::types::*;
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection};
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
 
-/// The standby's `[root]` from its own config file.
-#[derive(Clone)]
+/// The standby's `[root]` from its own config file (its credentials stay
+/// in the local row, which replication never overwrites).
+#[derive(Clone, Debug)]
 pub struct LocalRoot {
     pub username: String,
-    pub password_hash: String,
-    pub mfa_required: bool,
 }
 
-impl std::fmt::Debug for LocalRoot {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LocalRoot")
-            .field("username", &self.username)
-            .finish_non_exhaustive()
-    }
-}
-
-/// What an account sync changed (counts only; goes into the audit row).
-#[derive(Debug, Default, Clone, Serialize)]
-pub struct AccountsSyncSummary {
-    pub users: usize,
-    pub users_added: usize,
-    pub users_updated: usize,
-    pub users_removed: usize,
-    pub tokens: usize,
-    pub recovery_codes: usize,
-    pub tsig_keys: usize,
-    pub settings: Vec<String>,
-    /// `merged` (the primary has a user named like the local root) or `local`.
-    pub local_root: &'static str,
-}
-
+/// What a snapshot load did (counts only; goes into the audit row).
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct BootstrapSummary {
     pub offset: i64,
+    pub entities: usize,
     pub zones: usize,
     pub records: usize,
     pub members: usize,
-    pub accounts: AccountsSyncSummary,
+    pub users: usize,
+    pub tokens: usize,
+    pub tsig_keys: usize,
+    pub settings: usize,
+    /// Replicated users that this server had and the primary does not.
+    pub users_removed: usize,
+    /// `merged` (the primary has a user named like the local root) or `local`.
+    pub local_root: &'static str,
 }
 
 // ---- replication_state ----------------------------------------------------
@@ -83,8 +68,6 @@ pub(crate) const K_PROMOTED_FROM: &str = "promoted_from";
 /// promotion). A database with this key but no `[follow]` in the config was
 /// un-followed by hand: startup records a promotion.
 pub(crate) const K_FOLLOWING: &str = "following";
-/// Checksum of the account data last applied from the primary.
-pub(crate) const K_ACCOUNTS_CHECKSUM: &str = "accounts_checksum";
 
 fn set_state(c: &Connection, key: &str, value: Option<&str>) -> Result<()> {
     match value {
@@ -123,10 +106,10 @@ fn set_changelog_seq(c: &Connection, offset: i64) -> Result<()> {
 }
 
 /// A changelog row exactly as the primary committed it.
-fn insert_changelog_row(c: &Connection, ev: &ChangeEvent) -> Result<()> {
+fn insert_changelog_row(c: &Connection, ev: &ChangeEvent, class: &str) -> Result<()> {
     c.execute(
-        "INSERT INTO changelog (offset, ts, actor, actor_ip, action, entity, zone, entity_id, payload, txn, command, schema)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        "INSERT OR REPLACE INTO changelog (offset, ts, actor, actor_ip, action, entity, zone, entity_id, payload, txn, command, schema, class)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             ev.offset,
             ev.ts,
@@ -139,306 +122,100 @@ fn insert_changelog_row(c: &Connection, ev: &ChangeEvent) -> Result<()> {
             serde_json::to_string(&ev.payload)?,
             ev.txn,
             ev.command,
-            sql::CHANGELOG_SCHEMA
+            sql::CHANGELOG_SCHEMA,
+            class
         ],
     )?;
     Ok(())
 }
 
-/// Give a user a new id, carrying every reference along (foreign keys are
-/// deferred for the transaction).
-fn move_user_id(c: &Connection, from: i64, to: i64) -> Result<()> {
-    for (table, col) in [
-        ("sessions", "user_id"),
-        ("recovery_codes", "user_id"),
-        ("api_tokens", "user_id"),
-        ("zone_members", "user_id"),
-        ("zones", "owner_id"),
-    ] {
-        c.execute(
-            &format!("UPDATE {table} SET {col} = ?2 WHERE {col} = ?1"),
-            params![from, to],
-        )?;
-    }
-    c.execute("UPDATE users SET id = ?2 WHERE id = ?1", params![from, to])?;
-    Ok(())
-}
+use super::acct_sql::Ctx;
 
-// ---- account data -----------------------------------------------------------
+// ---- snapshot ------------------------------------------------------------------
 
-/// Replace the local account data with the primary's (see the module docs
-/// for the local root). Local-only state is kept: sessions, token
-/// `last_used_*`, a later TOTP step accepted here, recovery codes used here.
-fn apply_accounts(
-    t: &mut AuditTx,
-    acc: &AccountsSnapshot,
-    root: &LocalRoot,
-    source: &str,
-) -> Result<AccountsSyncSummary> {
-    let c = t.conn;
+/// Load a snapshot: forget the replicated data (users are kept until the
+/// end so their sessions survive, the local root always), then apply every
+/// entity with the same replay code as the changelog, then remove users the
+/// primary no longer has. Local sign-in state survives: a later TOTP step
+/// (merged by `put_user`) and recovery codes used on this server.
+fn load_snapshot(c: &Connection, snap: &Snapshot, root: &str) -> Result<BootstrapSummary> {
     c.execute_batch("PRAGMA defer_foreign_keys = ON")?;
-    let before: HashMap<i64, ReplUser> = data::users(c)?.into_iter().map(|u| (u.id, u)).collect();
-    let snap_ids: HashSet<i64> = acc.users.iter().map(|u| u.id).collect();
-    let mut root_id = before
-        .values()
-        .find(|u| u.username == root.username)
-        .map(|u| u.id);
-    let merged_id = acc
-        .users
-        .iter()
-        .find(|u| u.username == root.username)
-        .map(|u| u.id);
-    let mut sum = AccountsSyncSummary {
-        local_root: if merged_id.is_some() {
-            "merged"
-        } else {
-            "local"
-        },
+    let used_here: Vec<(i64, String, String)> = data::recovery_codes(c)?
+        .into_iter()
+        .filter_map(|r| r.used_at.map(|u| (r.user_id, r.code_hash, u)))
+        .collect();
+    crate::replication::tables::delete_for_snapshot(c, root)?;
+    let ctx = Ctx {
+        local_root: Some(root),
+    };
+    let mut sum = BootstrapSummary {
+        offset: snap.offset,
+        entities: snap.entities.len(),
+        local_root: "local",
         ..Default::default()
     };
-
-    // 1. Put the local root at its final id.
-    match (root_id, merged_id) {
-        (Some(r), Some(m)) if r != m => {
-            c.execute("DELETE FROM users WHERE id = ?1", params![m])?;
-            move_user_id(c, r, m)?;
-            root_id = Some(m);
+    let mut ids = std::collections::HashSet::new();
+    for e in &snap.entities {
+        match e {
+            Change::UserCreated { user } => {
+                sum.users += 1;
+                ids.insert(user.id);
+                if user.username == root {
+                    sum.local_root = "merged";
+                }
+            }
+            Change::ZoneCreated { .. } => sum.zones += 1,
+            Change::RecordCreated { .. } => sum.records += 1,
+            Change::MemberSet { .. } => sum.members += 1,
+            Change::TokenCreated { .. } => sum.tokens += 1,
+            Change::TsigKeySet { .. } => sum.tsig_keys += 1,
+            Change::SettingSet { .. } => sum.settings += 1,
+            _ => {}
         }
-        (Some(r), None) if snap_ids.contains(&r) => {
-            let lowest = snap_ids
-                .iter()
-                .chain(before.keys())
-                .copied()
-                .min()
-                .unwrap_or(0)
-                .min(0);
-            move_user_id(c, r, lowest - 1)?;
-            root_id = Some(lowest - 1);
-        }
-        _ => {}
+        replay::apply(c, e, &ctx).with_context(|| format!("snapshot entity {e:?}"))?;
     }
-
-    // 2. Users the primary does not have (the local root stays).
-    let now_ids: Vec<i64> = {
-        let mut stmt = c.prepare("SELECT id FROM users")?;
-        let rows = stmt.query_map([], |r| r.get(0))?;
-        rows.collect::<rusqlite::Result<_>>()?
-    };
-    for id in now_ids {
-        if !snap_ids.contains(&id) && Some(id) != root_id {
-            c.execute("DELETE FROM users WHERE id = ?1", params![id])?;
+    // Users the primary does not have (its merged root keeps our id).
+    for u in data::users(c)? {
+        if !ids.contains(&u.id) && u.username != root {
+            replay::apply(
+                c,
+                &Change::UserDeleted {
+                    user_id: u.id,
+                    username: u.username,
+                },
+                &ctx,
+            )?;
             sum.users_removed += 1;
         }
     }
-
-    // 3. Insert or update every other user with the primary's values.
-    for u in &acc.users {
-        sum.users += 1;
-        if Some(u.id) == root_id {
-            continue; // the merged local root keeps its local credentials
-        }
-        // A stale row holding this username (ids swapped) gives it up; it
-        // is rewritten with its own values in its own iteration.
-        c.execute(
-            "UPDATE users SET username = '~replica-' || id WHERE username = ?1 AND id <> ?2",
-            params![u.username, u.id],
-        )?;
-        let prev = before.get(&u.id).filter(|p| p.username == u.username);
-        // TOTP replay protection: a later step accepted on this node stays.
-        let last_step = match prev {
-            Some(p) if p.totp_secret == u.totp_secret => {
-                match (p.totp_last_step, u.totp_last_step) {
-                    (Some(a), Some(b)) => Some(a.max(b)),
-                    (a, b) => a.or(b),
-                }
-            }
-            _ => u.totp_last_step,
-        };
-        match prev {
-            None => sum.users_added += 1,
-            Some(p) => {
-                let mut cmp = u.clone();
-                cmp.is_root = p.is_root;
-                cmp.totp_last_step = p.totp_last_step;
-                if &cmp != p {
-                    sum.users_updated += 1;
-                }
-            }
-        }
-        c.execute(
-            "INSERT INTO users (id, username, password_hash, display_name, is_admin, is_root, mfa_required, totp_secret,
-                                totp_enrolled_at, totp_last_step, disabled_at, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-             ON CONFLICT(id) DO UPDATE SET username = excluded.username, password_hash = excluded.password_hash,
-                display_name = excluded.display_name, is_admin = excluded.is_admin, is_root = 0,
-                mfa_required = excluded.mfa_required, totp_secret = excluded.totp_secret,
-                totp_enrolled_at = excluded.totp_enrolled_at, totp_last_step = excluded.totp_last_step,
-                disabled_at = excluded.disabled_at, created_at = excluded.created_at, updated_at = excluded.updated_at",
-            params![
-                u.id,
-                u.username,
-                u.password_hash,
-                u.display_name,
-                u.is_admin as i64,
-                u.mfa_required as i64,
-                u.totp_secret,
-                u.totp_enrolled_at,
-                last_step,
-                u.disabled_at,
-                u.created_at,
-                u.updated_at
-            ],
-        )?;
-    }
-    // A disabled replicated user is signed out here too.
-    c.execute(
-        "DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE disabled_at IS NOT NULL)",
-        [],
-    )?;
-
-    // 4. Recovery codes (the local root's stay local). A code already used
-    // on this node stays used.
-    let used_here: HashMap<(i64, String), String> = data::recovery_codes(c)?
-        .into_iter()
-        .filter_map(|r| r.used_at.map(|u| ((r.user_id, r.code_hash), u)))
-        .collect();
-    c.execute(
-        "DELETE FROM recovery_codes WHERE user_id IS NOT ?1",
-        params![root_id],
-    )?;
-    for rc in &acc.recovery_codes {
-        if Some(rc.user_id) == root_id {
-            continue;
-        }
-        let used = rc
-            .used_at
-            .clone()
-            .or_else(|| used_here.get(&(rc.user_id, rc.code_hash.clone())).cloned());
-        c.execute(
-            "INSERT INTO recovery_codes (user_id, code_hash, used_at) VALUES (?1, ?2, ?3)",
-            params![rc.user_id, rc.code_hash, used],
-        )?;
-        sum.recovery_codes += 1;
-    }
-
-    // 5. API tokens (last_used_* is local bookkeeping and kept).
-    let token_ids: HashSet<i64> = acc.tokens.iter().map(|t| t.id).collect();
-    let local_tokens: Vec<i64> = {
-        let mut stmt = c.prepare("SELECT id FROM api_tokens")?;
-        let rows = stmt.query_map([], |r| r.get(0))?;
-        rows.collect::<rusqlite::Result<_>>()?
-    };
-    for id in local_tokens {
-        if !token_ids.contains(&id) {
-            c.execute("DELETE FROM api_tokens WHERE id = ?1", params![id])?;
-        }
-    }
-    for tk in &acc.tokens {
-        c.execute(
-            "INSERT INTO api_tokens (id, user_id, name, token_hash, created_at, revoked_at, tags)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(id) DO UPDATE SET user_id = excluded.user_id, name = excluded.name,
-                token_hash = excluded.token_hash, created_at = excluded.created_at,
-                revoked_at = excluded.revoked_at, tags = excluded.tags",
-            params![
-                tk.id,
-                tk.user_id,
-                tk.name,
-                tk.token_hash,
-                tk.created_at,
-                tk.revoked_at,
-                serde_json::to_string(&tk.tags)?
-            ],
-        )?;
-        sum.tokens += 1;
-    }
-
-    // 6. Console settings and TSIG keys: the primary's, wholesale.
-    c.execute("DELETE FROM settings", [])?;
-    for st in &acc.settings {
-        c.execute(
-            "INSERT INTO settings (key, value, updated_by, updated_at) VALUES (?1, ?2, ?3, ?4)",
-            params![st.key, st.value, st.updated_by, st.updated_at],
-        )?;
-        sum.settings.push(st.key.clone());
-    }
-    c.execute("DELETE FROM tsig_keys", [])?;
-    for k in &acc.tsig_keys {
-        let secret = data_encoding::BASE64
-            .decode(k.secret.as_bytes())
-            .with_context(|| format!("TSIG key {}: secret is not base64", k.name))?;
-        c.execute(
-            "INSERT INTO tsig_keys (name, algorithm, secret, zones, created_by, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                k.name,
-                k.algorithm,
-                secret,
-                serde_json::to_string(&k.zones)?,
-                k.created_by,
-                k.created_at,
-                k.updated_at
-            ],
-        )?;
-        sum.tsig_keys += 1;
-    }
-
-    // The local root keeps its config credentials whatever row it now is.
-    if let Some(r) = root_id {
-        c.execute(
-            "UPDATE users SET password_hash = ?2, mfa_required = ?3, is_admin = 1, is_root = 1, disabled_at = NULL
-             WHERE id = ?1",
-            params![r, root.password_hash, root.mfa_required as i64],
-        )?;
-    }
-    set_state(c, K_ACCOUNTS_CHECKSUM, Some(&acc.checksum))?;
-    t.push(
-        "replication.accounts_sync",
-        None,
-        source,
-        serde_json::to_value(&sum)?,
-    );
-    Ok(sum)
-}
-
-/// Replace zones, records and members with the snapshot's.
-fn apply_dns(c: &Connection, snap: &Snapshot) -> Result<()> {
-    c.execute_batch("DELETE FROM zone_members; DELETE FROM records; DELETE FROM zones;")?;
-    for z in &snap.zones {
-        sql::insert_zone(c, z)?;
-    }
-    for r in &snap.records {
-        sql::insert_record(
+    for (user_id, hash, used_at) in used_here {
+        replay::apply(
             c,
-            &crate::model::Record {
-                id: r.id,
-                zone_id: r.zone_id,
-                name: r.name.clone(),
-                rtype: r.rtype,
-                value: r.value.clone(),
-                ttl: r.ttl,
-                created_at: r.created_at.clone(),
-                updated_at: r.updated_at.clone(),
-                expires_at: r.expires_at.clone(),
+            &Change::RecoveryCodeUsed {
+                user_id,
+                code_hash: crate::replication::types::Hidden(hash),
+                used_at,
             },
+            &ctx,
         )?;
-        if r.expired_noted {
-            sql::mark_expired(c, r.id)?;
-        }
     }
-    for m in &snap.members {
-        sql::upsert_member(c, m.zone_id, m.user_id, &m.role, &m.created_at)?;
-    }
-    Ok(())
+    Ok(sum)
 }
 
 /// Apply a batch of the primary's changes: each change and its changelog
 /// row (same offset) in one transaction with the others.
+/// Returns the new head and whether settings or TSIG keys changed.
 pub(crate) fn apply_changes(
     c: &Connection,
     expected_history: &str,
     events: &[ChangeEvent],
-) -> Result<i64> {
+    local_root: &str,
+) -> Result<(i64, bool)> {
+    c.execute_batch("PRAGMA defer_foreign_keys = ON")?;
+    let ctx = Ctx {
+        local_root: Some(local_root),
+    };
+    let mut runtime = false;
     let h = data::history(c)?;
     if h.history_id != expected_history {
         bail!(
@@ -447,23 +224,108 @@ pub(crate) fn apply_changes(
             expected_history
         );
     }
+    // Facts are complete new state, so re-applying changes from an earlier
+    // offset is harmless: a batch may start at or before our head, but not
+    // after it (a gap), and must be contiguous.
     let mut head = data::changelog_head(c)?;
-    for ev in events {
-        if ev.offset != head + 1 {
+    if let Some(first) = events.first() {
+        if first.offset > head + 1 {
             bail!(
                 "offset gap: expected {} after {}, got {}",
                 head + 1,
                 head,
-                ev.offset
+                first.offset
             );
         }
+    }
+    let mut prev: Option<i64> = None;
+    for ev in events {
+        if prev.is_some_and(|p| ev.offset != p + 1) {
+            bail!(
+                "offset gap inside a batch: {} after {}",
+                ev.offset,
+                prev.unwrap_or(0)
+            );
+        }
+        prev = Some(ev.offset);
         let change: Change = serde_json::from_value(ev.payload.clone())
             .with_context(|| format!("offset {} is not a structured change", ev.offset))?;
-        replay::apply(c, &change).with_context(|| format!("applying offset {}", ev.offset))?;
-        insert_changelog_row(c, ev)?;
-        head = ev.offset;
+        replay::apply(c, &change, &ctx)
+            .with_context(|| format!("applying offset {}", ev.offset))?;
+        insert_changelog_row(c, ev, change.class())?;
+        runtime |= change.affects_dns_runtime();
+        head = head.max(ev.offset);
     }
-    Ok(head)
+    Ok((head, runtime))
+}
+
+/// What `--prepare-standby` removed (counts only; goes into the audit row).
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct PrepareSummary {
+    pub zones: i64,
+    pub records: i64,
+    pub zone_members: i64,
+    pub changelog_rows: i64,
+    pub tsig_keys: i64,
+    pub settings: i64,
+    pub api_tokens: i64,
+    pub users: i64,
+    pub sessions: i64,
+}
+
+/// `rust-dns --prepare-standby` (server stopped): make this database fresh
+/// so it may follow a primary. Empties zones, records, zone members, the
+/// changelog, TSIG keys, console settings, API tokens, every session and
+/// every user except the config root `root_username`, and forgets the
+/// replication lineage (a new history id). The audit log is kept (local
+/// history) and gets a `replication.prepare_standby` row naming the backup.
+/// The caller writes the backup first.
+pub fn prepare_standby(
+    storage: &crate::storage::Storage,
+    root_username: &str,
+    backup: &str,
+    divergence: Option<&str>,
+) -> Result<PrepareSummary> {
+    storage.write(&TOKEN, |c| -> Result<PrepareSummary> {
+        let count = |sql: &str| -> Result<i64> { Ok(c.query_row(sql, [], |r| r.get(0))?) };
+        let users: i64 = c.query_row(
+            "SELECT COUNT(*) FROM users WHERE username <> ?1",
+            params![root_username],
+            |r| r.get(0),
+        )?;
+        let sum = PrepareSummary {
+            zones: count("SELECT COUNT(*) FROM zones")?,
+            records: count("SELECT COUNT(*) FROM records")?,
+            zone_members: count("SELECT COUNT(*) FROM zone_members")?,
+            changelog_rows: count("SELECT COUNT(*) FROM changelog")?,
+            tsig_keys: count("SELECT COUNT(*) FROM tsig_keys")?,
+            settings: count("SELECT COUNT(*) FROM settings")?,
+            api_tokens: count("SELECT COUNT(*) FROM api_tokens")?,
+            users,
+            sessions: count("SELECT COUNT(*) FROM sessions")?,
+        };
+        let old = data::history(c)?;
+        // Replicated tables per the registry; then the local stream and state.
+        crate::replication::tables::delete_replicated(c, root_username)?;
+        c.execute_batch(
+            "DELETE FROM changelog; DELETE FROM sessions; DELETE FROM replication_state;",
+        )?;
+        set_state(c, K_HISTORY, Some(&crate::auth::random_token(12)))?;
+        let mut t = AuditTx::begin(c);
+        let mut detail = serde_json::to_value(&sum)?;
+        detail["backup"] = backup.into();
+        detail["divergence_file"] = divergence.into();
+        detail["old_history_id"] = old.history_id.into();
+        t.push("replication.prepare_standby", None, backup, detail);
+        t.commit_entries(
+            &Actor {
+                name: "cli".into(),
+                ip: "local".into(),
+            },
+            "prepare_standby",
+        )?;
+        Ok(sum)
+    })
 }
 
 fn system(what: &str) -> Actor {
@@ -521,17 +383,28 @@ impl Mutator {
     /// Standby: apply whole transactions of the primary's changelog.
     /// Returns the new local head. Fails (nothing written) on a gap, a
     /// history mismatch or a change that does not apply.
+    /// Returns the new head and whether settings or TSIG keys changed.
+    /// Only DNS changes are published on the event bus (account changes
+    /// carry secrets).
     pub async fn replica_apply(
         &self,
         primary_history: String,
         events: Vec<ChangeEvent>,
-    ) -> MResult<i64> {
+        root: LocalRoot,
+    ) -> MResult<(i64, bool)> {
         if events.is_empty() {
-            return Ok(self.storage.changelog_head()?);
+            return Ok((self.storage.changelog_head()?, false));
         }
         self.replica_write("replication_apply", system("apply"), move |t| {
-            let head = apply_changes(t.conn, &primary_history, &events)?;
-            Ok((head, events))
+            let out = apply_changes(t.conn, &primary_history, &events, &root.username)?;
+            let dns = events
+                .into_iter()
+                .filter(|e| {
+                    serde_json::from_value::<Change>(e.payload.clone())
+                        .is_ok_and(|c| c.class() == super::CLASS_DNS)
+                })
+                .collect();
+            Ok((out, dns))
         })
         .await
     }
@@ -545,48 +418,19 @@ impl Mutator {
         source: String,
     ) -> MResult<BootstrapSummary> {
         self.replica_write("replication_bootstrap", system("bootstrap"), move |t| {
-            let accounts = apply_accounts(t, &snap.accounts, &root, &source)?;
             let c = t.conn;
-            apply_dns(c, &snap)?;
+            let sum = load_snapshot(c, &snap, &root.username)?;
             c.execute("DELETE FROM changelog", [])?;
             set_changelog_seq(c, snap.offset)?;
             set_history(c, &snap.history)?;
             set_state(c, K_FOLLOWING, Some(&source))?;
-            let sum = BootstrapSummary {
-                offset: snap.offset,
-                zones: snap.zones.len(),
-                records: snap.records.len(),
-                members: snap.members.len(),
-                accounts,
-            };
             t.push(
                 "replication.bootstrap",
                 None,
                 &source,
-                serde_json::json!({
-                    "offset": sum.offset, "zones": sum.zones, "records": sum.records, "members": sum.members,
-                    "history_id": snap.history.history_id,
-                }),
+                serde_json::json!({ "summary": sum, "history_id": snap.history.history_id }),
             );
             Ok((sum, Vec::new()))
-        })
-        .await
-    }
-
-    /// Standby: apply the primary's account data, settings and TSIG keys.
-    /// `None`: already up to date (same checksum), nothing written.
-    pub async fn replica_accounts(
-        &self,
-        acc: AccountsSnapshot,
-        root: LocalRoot,
-        source: String,
-    ) -> MResult<Option<AccountsSyncSummary>> {
-        let st = self.storage.replication_state()?;
-        if st.get(K_ACCOUNTS_CHECKSUM) == Some(&acc.checksum) {
-            return Ok(None);
-        }
-        self.replica_write("replication_accounts_sync", system("accounts"), move |t| {
-            Ok((Some(apply_accounts(t, &acc, &root, &source)?), Vec::new()))
         })
         .await
     }
@@ -645,7 +489,7 @@ impl Mutator {
 
 #[cfg(test)]
 mod tests {
-    use super::super::accounts::Accounts;
+    use super::super::accounts::{Accounts, UserChanges};
     use super::super::{ExportDoc, ExportRecord, ExportZone, ImportMode};
     use super::*;
     use crate::cache::{Cache, Catalog};
@@ -667,10 +511,27 @@ mod tests {
         (storage, m, a)
     }
 
+    /// A standby: write gate closed (its own account writes stay local),
+    /// config root synced.
+    fn standby_node() -> (Arc<Storage>, Mutator, Accounts) {
+        let (s, m, a) = node();
+        a.set_gate(m.gate());
+        m.gate().close("standby");
+        a.sync_root("root", STANDBY_ROOT_HASH, false).unwrap();
+        (s, m, a)
+    }
+
     fn actor() -> Actor {
         Actor {
             name: "tester".into(),
             ip: "127.0.0.1".into(),
+        }
+    }
+
+    fn zone_input(name: &str) -> ZoneInput {
+        ZoneInput {
+            name: Some(name.into()),
+            ..Default::default()
         }
     }
 
@@ -689,8 +550,6 @@ mod tests {
     fn standby_root() -> LocalRoot {
         LocalRoot {
             username: "root".into(),
-            password_hash: STANDBY_ROOT_HASH.into(),
-            mfa_required: false,
         }
     }
 
@@ -777,70 +636,61 @@ mod tests {
     }
 
     fn snapshot(s: &Storage) -> Snapshot {
-        s.read_tx(|c| data::snapshot(c, "g-1")).unwrap()
+        s.read_tx(data::snapshot).unwrap()
     }
 
-    /// The replicated state of a database, normalised the way the standby
-    /// legitimately differs (its root's credentials, is_root, token use).
+    /// Every replicated table as both sides must have it (the registry's
+    /// checksum view: per-server columns and the standby's root left out),
+    /// plus history and head.
     fn replicated(s: &Storage) -> serde_json::Value {
-        let snap = snapshot(s);
-        let users: Vec<serde_json::Value> = snap
-            .accounts
-            .users
-            .iter()
-            .map(|u| {
-                let mut v = serde_json::to_value(u).unwrap();
-                if u.username == "root" {
-                    for k in ["password_hash", "display_name", "created_at", "updated_at"] {
-                        v[k] = serde_json::Value::Null;
-                    }
-                }
-                v["is_root"] = serde_json::Value::Null;
-                v
-            })
-            .collect();
-        let codes: Vec<_> = snap
-            .accounts
-            .recovery_codes
-            .iter()
-            .filter(|c| c.user_id != 1)
-            .cloned()
-            .collect();
-        serde_json::json!({
-            "offset": snap.offset, "history": snap.history, "zones": snap.zones, "records": snap.records,
-            "members": snap.members, "users": users, "codes": codes, "tokens": snap.accounts.tokens,
-            "settings": snap.accounts.settings, "tsig": snap.accounts.tsig_keys,
-            "checksums": s.read_tx(data::zone_checksums).unwrap(),
+        s.read_tx(|c| {
+            let mut v = serde_json::Map::new();
+            for t in crate::replication::tables::replicated_tables() {
+                v.insert(
+                    t.name.into(),
+                    crate::replication::tables::dump(c, t, t.node_columns, Some("root"))?.into(),
+                );
+            }
+            v.insert("history".into(), serde_json::to_value(data::history(c)?)?);
+            v.insert("head".into(), data::changelog_head(c)?.into());
+            Ok(serde_json::Value::Object(v))
         })
+        .unwrap()
+    }
+
+    /// Tail everything the primary has after the standby's head.
+    async fn tail(ps: &Storage, ss: &Storage, sm: &Mutator) -> bool {
+        let history = ps.read_tx(data::history).unwrap().history_id;
+        let after = ss.changelog_head().unwrap();
+        let batch = ps
+            .read_tx(|c| data::changes_after(c, after, 100_000))
+            .unwrap();
+        sm.replica_apply(history, batch, standby_root())
+            .await
+            .unwrap()
+            .1
     }
 
     #[tokio::test]
     async fn snapshot_then_changes_reproduce_the_primary() {
         let (ps, pm, pa) = populated_primary().await;
         // The standby has its own root (different password) and a fresh history.
-        let (ss, sm, sa) = node();
-        sa.sync_root("root", STANDBY_ROOT_HASH, false).unwrap();
-        assert_ne!(
-            ps.read_tx(data::history).unwrap().history_id,
-            ss.read_tx(data::history).unwrap().history_id
-        );
+        let (ss, sm, sa) = standby_node();
         let sum = sm
             .replica_bootstrap(snapshot(&ps), standby_root(), "https://p".into())
             .await
             .unwrap();
-        assert_eq!(sum.accounts.local_root, "merged");
+        assert_eq!(sum.local_root, "merged");
         assert_eq!(replicated(&ss), replicated(&ps));
         // The standby's root keeps its own password; the primary's root token works for it.
         let root = ss.get_user_by_name("root").unwrap().unwrap();
         assert_eq!(root.password_hash, STANDBY_ROOT_HASH);
         assert!(root.is_root && root.id == ps.get_user_by_name("root").unwrap().unwrap().id);
-        assert!(ss.list_tokens(Some(root.id), None).unwrap().len() == 1);
+        assert_eq!(ss.list_tokens(Some(root.id), None).unwrap().len(), 1);
         let alice = ss.get_user_by_name("alice").unwrap().unwrap();
         assert!(!alice.is_root && alice.totp_secret.as_deref() == Some("ALICETOTPSECRET"));
-        assert_eq!(ss.changelog_head().unwrap(), ps.changelog_head().unwrap());
 
-        // More changes on the primary, tailed and applied as whole batches.
-        let history = ps.read_tx(data::history).unwrap().history_id;
+        // DNS changes on the primary, tailed as whole batches.
         pm.create_record(actor(), "a.test", rec("mail", RecordType::A, "192.0.2.3"))
             .await
             .unwrap();
@@ -858,33 +708,19 @@ mod tests {
         pm.reap_due(chrono::Utc::now() + chrono::Duration::seconds(5))
             .await
             .unwrap();
-        pm.create_zone(
-            actor(),
-            ZoneInput {
-                name: Some("b.test".into()),
-                ..Default::default()
-            },
-            None,
-        )
-        .await
-        .unwrap();
-        pm.delete_zone(actor(), "b.test").await.unwrap();
         let after = ss.changelog_head().unwrap();
-        let batch = ps.read_tx(|c| data::changes_after(c, after, 1000)).unwrap();
-        assert!(batch.iter().any(|e| e.payload["kind"] == "record_reaped"));
-        sm.replica_apply(history.clone(), batch).await.unwrap();
+        tail(&ps, &ss, &sm).await;
         assert_eq!(replicated(&ss), replicated(&ps));
-        // Identical changelog rows (offset, txn, payload) on both sides.
         let rows = |s: &Storage| {
-            s.changelog_after(after, 1000)
+            s.read_tx(|c| data::changelog_tail(c, after))
                 .unwrap()
                 .into_iter()
                 .map(|e| (e.offset, e.txn, e.payload, e.actor, e.command))
                 .collect::<Vec<_>>()
         };
-        assert_eq!(rows(&ss), rows(&ps));
+        assert_eq!(rows(&ss), rows(&ps), "identical changelog rows");
 
-        // Account changes: a user deleted, a token revoked, a code used here survives.
+        // Account changes arrive the same way, incrementally.
         let bob = pa
             .create_user(
                 &actor(),
@@ -897,34 +733,61 @@ mod tests {
                 },
             )
             .unwrap();
-        let acc = ps.read_tx(|c| data::accounts(c, "g-2")).unwrap();
-        sm.replica_accounts(acc, standby_root(), "https://p".into())
+        pm.set_member(actor(), "a.test", bob.id, ZoneRole::Editor)
             .await
-            .unwrap()
-            .expect("changed");
+            .unwrap();
+        let before = ss.changelog_head().unwrap();
+        assert!(!tail(&ps, &ss, &sm).await, "no settings or TSIG change");
         assert!(ss.get_user_by_name("bob").unwrap().is_some());
+        assert_eq!(replicated(&ss), replicated(&ps));
+        let kinds: Vec<String> = ss
+            .read_tx(|c| data::changelog_tail(c, before))
+            .unwrap()
+            .iter()
+            .map(|e| e.payload["kind"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["user_created", "member_set"],
+            "user before its membership, one stream"
+        );
+        // Local sign-in state on the standby: a later TOTP step and a used code.
         sa.run(&actor(), "mfa_verify", |t| {
             t.use_recovery_code(&alice, "rc-hash-1")?;
             t.accept_totp_step(&alice, 2000)
         })
         .unwrap();
+        assert_eq!(
+            ss.changelog_head().unwrap(),
+            ps.changelog_head().unwrap(),
+            "local account writes are not changelogged on a standby"
+        );
         pa.run(&actor(), "delete_user", |t| t.delete_user(&bob))
             .unwrap();
         let tok = ps.list_tokens(None, Some("ci")).unwrap().remove(0);
         let alice_p = ps.get_user(tok.user_id).unwrap().unwrap();
         pa.run(&actor(), "revoke", |t| t.revoke_token(&alice_p, &tok))
             .unwrap();
-        let acc = ps.read_tx(|c| data::accounts(c, "g-3")).unwrap();
-        let same = acc.clone();
-        sm.replica_accounts(acc, standby_root(), "https://p".into())
-            .await
-            .unwrap()
-            .expect("changed");
+        pa.run(&actor(), "password", |t| {
+            t.set_password(alice_p.id, "$argon2id$new")
+        })
+        .unwrap();
+        pa.run(&actor(), "tsig", |t| {
+            let k = crate::storage::get_tsig_key(t.conn, "k1.")?.unwrap();
+            t.update_tsig_key_zones(&k, &["a.test".into()])
+        })
+        .unwrap();
+        assert!(tail(&ps, &ss, &sm).await, "TSIG change reported");
         assert!(ss.get_user_by_name("bob").unwrap().is_none());
         assert!(
             ss.list_tokens(None, Some("ci")).unwrap().is_empty(),
             "revoked"
         );
+        assert_eq!(
+            ss.get_user(alice.id).unwrap().unwrap().password_hash,
+            "$argon2id$new"
+        );
+        assert_eq!(replicated(&ss), replicated(&ps));
         // Local security state wins where it is later: the TOTP step and the used code.
         let last: i64 = ss
             .read_tx(|c| {
@@ -937,12 +800,14 @@ mod tests {
             .unwrap();
         assert_eq!(last, 2000);
         assert_eq!(ss.recovery_codes_left(alice.id).unwrap(), 1);
-        // Same checksum again: nothing to do.
-        assert!(sm
-            .replica_accounts(same, standby_root(), "https://p".into())
-            .await
-            .unwrap()
-            .is_none());
+        // The standby's root is untouched by the primary's root changes.
+        pa.sync_root("root", "$argon2id$primary-root-2", false)
+            .unwrap();
+        tail(&ps, &ss, &sm).await;
+        assert_eq!(
+            ss.get_user_by_name("root").unwrap().unwrap().password_hash,
+            STANDBY_ROOT_HASH
+        );
     }
 
     #[tokio::test]
@@ -957,7 +822,7 @@ mod tests {
             .replica_bootstrap(snapshot(&ps), standby_root(), "https://p".into())
             .await
             .unwrap();
-        assert_eq!(sum.accounts.local_root, "local");
+        assert_eq!(sum.local_root, "local");
         let root = ss.get_user_by_name("root").unwrap().unwrap();
         assert!(root.id < 0 && root.is_root && root.password_hash == STANDBY_ROOT_HASH);
         let admin = ss.get_user_by_name("admin").unwrap().unwrap();
@@ -971,8 +836,7 @@ mod tests {
     #[tokio::test]
     async fn gaps_and_foreign_histories_are_refused_without_writing() {
         let (ps, pm, _) = populated_primary().await;
-        let (ss, sm, sa) = node();
-        sa.sync_root("root", STANDBY_ROOT_HASH, false).unwrap();
+        let (ss, sm, _sa) = standby_node();
         sm.replica_bootstrap(snapshot(&ps), standby_root(), "https://p".into())
             .await
             .unwrap();
@@ -992,19 +856,21 @@ mod tests {
         // Missing the first transaction: a gap.
         let skip = batch.iter().position(|e| e.txn != batch[0].txn).unwrap();
         let err = sm
-            .replica_apply(history.clone(), batch[skip..].to_vec())
+            .replica_apply(history.clone(), batch[skip..].to_vec(), standby_root())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("gap"), "{err}");
         assert_eq!(ss.changelog_head().unwrap(), head, "nothing written");
         // Another history.
         assert!(sm
-            .replica_apply("other".into(), batch.clone())
+            .replica_apply("other".into(), batch.clone(), standby_root())
             .await
             .is_err());
         assert_eq!(ss.changelog_head().unwrap(), head);
         // The right batch applies.
-        sm.replica_apply(history, batch).await.unwrap();
+        sm.replica_apply(history, batch, standby_root())
+            .await
+            .unwrap();
         assert_eq!(ss.changelog_head().unwrap(), ps.changelog_head().unwrap());
     }
 
@@ -1090,6 +956,113 @@ mod tests {
         assert_eq!(s.changelog_after(head, 10).unwrap()[0].offset, head + 1);
     }
 
+    /// Facts are complete new state: replaying from an earlier offset (an
+    /// overlap with what the standby already has) changes nothing.
+    #[tokio::test]
+    async fn replaying_from_an_earlier_offset_is_idempotent() {
+        let (ps, pm, pa) = populated_primary().await;
+        let (ss, sm, _sa) = standby_node();
+        let start = ps.changelog_head().unwrap();
+        sm.replica_bootstrap(snapshot(&ps), standby_root(), "https://p".into())
+            .await
+            .unwrap();
+        pm.create_record(actor(), "a.test", rec("x", RecordType::A, "192.0.2.50"))
+            .await
+            .unwrap();
+        pm.create_zone(actor(), zone_input("b.test"), None)
+            .await
+            .unwrap();
+        pm.delete_record(actor(), "a.test", 1).await.unwrap();
+        let u = pa
+            .create_user(
+                &actor(),
+                &NewUser {
+                    username: "zed".into(),
+                    password_hash: "h".into(),
+                    display_name: String::new(),
+                    is_admin: false,
+                    mfa_required: false,
+                },
+            )
+            .unwrap();
+        pa.run(&actor(), "pw", |t| t.set_password(u.id, "h2"))
+            .unwrap();
+        tail(&ps, &ss, &sm).await;
+        let want = replicated(&ps);
+        assert_eq!(replicated(&ss), want);
+        // Everything since the snapshot again, twice.
+        let history = ps.read_tx(data::history).unwrap().history_id;
+        let again = ps
+            .read_tx(|c| data::changes_after(c, start, 100_000))
+            .unwrap();
+        for _ in 0..2 {
+            sm.replica_apply(history.clone(), again.clone(), standby_root())
+                .await
+                .unwrap();
+            assert_eq!(replicated(&ss), want, "overlapping replay changed nothing");
+        }
+    }
+
+    #[tokio::test]
+    async fn account_change_payloads_are_scrubbed_after_retention() {
+        let (ps, pm, pa) = populated_primary().await;
+        pm.create_record(actor(), "a.test", rec("keep", RecordType::A, "192.0.2.9"))
+            .await
+            .unwrap();
+        let before = ps.read_tx(|c| data::changes_after(c, 0, 100_000)).unwrap();
+        assert!(before
+            .iter()
+            .any(|e| e.payload.to_string().contains("alice-hash")));
+        // Nothing is old enough yet.
+        assert_eq!(
+            ps.scrub_account_changes(chrono::Utc::now() - chrono::Duration::days(1))
+                .unwrap(),
+            0
+        );
+        let n = ps
+            .scrub_account_changes(chrono::Utc::now() + chrono::Duration::days(1))
+            .unwrap();
+        assert!(n > 5, "{n}");
+        let after = ps.read_tx(|c| data::changes_after(c, 0, 100_000)).unwrap();
+        assert_eq!(after.len(), before.len(), "offsets stay");
+        let text = serde_json::to_string(&after).unwrap();
+        for secret in [
+            "alice-hash",
+            "ALICETOTPSECRET",
+            "token-hash-alice",
+            "rc-hash-1",
+        ] {
+            assert!(!text.contains(secret), "{secret} survived the scrub");
+        }
+        assert!(after
+            .iter()
+            .filter(|e| e.payload["kind"] == "scrubbed")
+            .all(|e| e.entity != "record" && e.entity != "zone"));
+        assert!(
+            after.iter().any(|e| e.payload["kind"] == "record_created"),
+            "DNS rows untouched"
+        );
+        // A standby can never misapply a scrubbed row: it does not parse.
+        let (_ss, sm, _sa) = standby_node();
+        let history = ps.read_tx(data::history).unwrap().history_id;
+        assert!(sm
+            .replica_apply(history, after, standby_root())
+            .await
+            .is_err());
+        let _ = pa;
+    }
+
+    #[test]
+    fn older_servers_report_protocol_1() {
+        let id: Identity = serde_json::from_value(serde_json::json!({
+            "role": "primary", "writable": true,
+            "history": { "history_id": "x", "parent_history_id": null, "fork_offset": null, "promoted_at": null, "promoted_from": null }
+        }))
+        .unwrap();
+        assert_eq!(id.protocol, 1);
+        assert_ne!(id.protocol, crate::replication::types::REPLICATION_PROTOCOL);
+    }
+
     /// A buffer the test subscriber writes to.
     #[derive(Clone, Default)]
     struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
@@ -1107,8 +1080,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn replication_never_logs_or_audits_secrets() {
         let (ps, _pm, _pa) = populated_primary().await;
-        let (ss, sm, sa) = node();
-        sa.sync_root("root", STANDBY_ROOT_HASH, false).unwrap();
+        let (ss, sm, _sa) = standby_node();
         let cap = Captured::default();
         let w = cap.clone();
         let sub = tracing_subscriber::fmt()
@@ -1124,13 +1096,22 @@ mod tests {
         sm.replica_bootstrap(snap, standby_root(), "https://p".into())
             .await
             .unwrap();
-        let mut acc = ps.read_tx(|c| data::accounts(c, "g-9")).unwrap();
-        acc.checksum = "changed".into();
-        sm.replica_accounts(acc, standby_root(), "https://p".into())
-            .await
-            .unwrap();
+        // More account changes, applied from the changelog.
+        _pa.run(&actor(), "mfa_enroll", |t| {
+            let u = t.change_user(2, &UserChanges::default())?;
+            t.set_mfa(u.id, Some("ALICETOTPSECRET2"))
+        })
+        .unwrap();
+        tail(&ps, &ss, &sm).await;
         let logs = String::from_utf8(cap.0.lock().unwrap().clone()).unwrap();
-        assert!(logs.contains("replication.accounts_sync"), "{logs}");
+        assert!(
+            logs.contains("debug output of a snapshot"),
+            "the capture works: {logs}"
+        );
+        // Neither the user-facing changelog nor the event bus carries account changes.
+        let visible = serde_json::to_string(&ss.changelog_after(0, 100_000).unwrap()).unwrap()
+            + &serde_json::to_string(&ps.changelog_after(0, 100_000).unwrap()).unwrap();
+        assert!(!visible.contains("user_created") && !visible.contains("tsig_key_set"));
         let audit = serde_json::to_string(&ss.audit_after(0, 1000).unwrap()).unwrap();
         let tsig_b64 = data_encoding::BASE64.encode(b"tsig-secret-bytes");
         for secret in [
@@ -1138,12 +1119,14 @@ mod tests {
             PRIMARY_ROOT_HASH,
             STANDBY_ROOT_HASH,
             "ALICETOTPSECRET",
+            "ALICETOTPSECRET2",
             "rc-hash-1",
             "token-hash-alice",
             tsig_b64.as_str(),
         ] {
             assert!(!logs.contains(secret), "log leaks {secret}");
             assert!(!audit.contains(secret), "audit leaks {secret}");
+            assert!(!visible.contains(secret), "changelog API leaks {secret}");
         }
     }
 }

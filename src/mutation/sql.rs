@@ -7,17 +7,28 @@ use crate::storage::{self as db};
 use anyhow::Result;
 use rusqlite::{params, Connection};
 
-/// Insert a zone. `z.id == 0` allocates a new id; a non-zero id is kept (replay).
+/// Insert a zone. `z.id == 0` allocates a new id; a non-zero id is kept
+/// (replay), and replaying an existing zone overwrites it with the fact
+/// (idempotent: a standby may re-apply changes from an earlier offset).
 pub(super) fn insert_zone(c: &Connection, z: &Zone) -> Result<Zone> {
     c.execute(
         "INSERT INTO zones (id, name, serial, soa_mname, soa_rname, refresh, retry, expire, minimum, default_ttl, created_at, updated_at, owner_id)
-         VALUES (NULLIF(?1, 0), ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+         VALUES (NULLIF(?1, 0), ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+         ON CONFLICT(id) DO UPDATE SET name = excluded.name, serial = excluded.serial, soa_mname = excluded.soa_mname,
+            soa_rname = excluded.soa_rname, refresh = excluded.refresh, retry = excluded.retry, expire = excluded.expire,
+            minimum = excluded.minimum, default_ttl = excluded.default_ttl, created_at = excluded.created_at,
+            updated_at = excluded.updated_at, owner_id = excluded.owner_id",
         params![
             z.id, z.name, z.serial as i64, z.soa_mname, z.soa_rname, z.refresh as i64, z.retry as i64,
             z.expire as i64, z.minimum as i64, z.default_ttl as i64, z.created_at, z.updated_at, z.owner_id
         ],
     )?;
-    Ok(db::get_zone_by_id(c, c.last_insert_rowid())?.expect("zone just inserted"))
+    let id = if z.id != 0 {
+        z.id
+    } else {
+        c.last_insert_rowid()
+    };
+    Ok(db::get_zone_by_id(c, id)?.expect("zone just inserted"))
 }
 
 pub(super) fn update_zone(c: &Connection, z: &Zone) -> Result<Zone> {
@@ -50,14 +61,23 @@ pub(super) fn set_serial(
     Ok(())
 }
 
-/// Insert a record. `r.id == 0` allocates a new id; a non-zero id is kept (replay).
+/// Insert a record. `r.id == 0` allocates a new id; a non-zero id is kept
+/// (replay; an existing record is overwritten with the fact: idempotent).
 pub(super) fn insert_record(c: &Connection, r: &Record) -> Result<Record> {
     c.execute(
         "INSERT INTO records (id, zone_id, name, rtype, value, ttl, created_at, updated_at, expires_at)
-         VALUES (NULLIF(?1, 0), ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+         VALUES (NULLIF(?1, 0), ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(id) DO UPDATE SET zone_id = excluded.zone_id, name = excluded.name, rtype = excluded.rtype,
+            value = excluded.value, ttl = excluded.ttl, created_at = excluded.created_at,
+            updated_at = excluded.updated_at, expires_at = excluded.expires_at",
         params![r.id, r.zone_id, r.name, r.rtype.as_str(), r.value, r.ttl.map(|t| t as i64), r.created_at, r.updated_at, r.expires_at],
     )?;
-    Ok(db::get_record(c, c.last_insert_rowid())?.expect("record just inserted"))
+    let id = if r.id != 0 {
+        r.id
+    } else {
+        c.last_insert_rowid()
+    };
+    Ok(db::get_record(c, id)?.expect("record just inserted"))
 }
 
 /// Update a record. A cleared or future expiry makes it eligible to expire again.
@@ -151,8 +171,8 @@ pub(super) fn append_changelog(
     let (action, entity, zone, entity_id) = change.meta();
     let payload = serde_json::to_value(change)?;
     c.execute(
-        "INSERT INTO changelog (ts, actor, actor_ip, action, entity, zone, entity_id, payload, txn, command, schema)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        "INSERT INTO changelog (ts, actor, actor_ip, action, entity, zone, entity_id, payload, txn, command, schema, class)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             ts,
             actor.name,
@@ -164,7 +184,8 @@ pub(super) fn append_changelog(
             serde_json::to_string(&payload)?,
             txn,
             command,
-            CHANGELOG_SCHEMA
+            CHANGELOG_SCHEMA,
+            change.class()
         ],
     )?;
     Ok(ChangeEvent {

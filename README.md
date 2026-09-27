@@ -149,6 +149,7 @@ mfa_required = false
 
 [changelog]
 retention_days = 30
+account_retention_days = 3   # payloads of account/settings/TSIG changes (secrets) are scrubbed after this
 
 [logging]
 format = "text"               # or "json"
@@ -308,7 +309,7 @@ allow_insecure_http = false
 timeout_secs = 30
 ```
 
-4. Start it. It loads a snapshot of the primary, then tails its changelog
+4. Start it (its database must be new or fresh, see below). It loads a snapshot of the primary, then tails its changelog
    (a long-poll, answered as soon as a change commits) and shows a banner on
    every console page: *Standby of https://dns1... - read-only - in sync*.
    **Admin -> Replication** shows the details (applied offset, lag, last
@@ -331,16 +332,41 @@ timeout_secs = 30
 | Forwarding settings saved from the console (the `settings` override) | The audit log (each server audits its own actions; the standby adds `replication.*` rows) |
 | TSIG keys | The standby's own `[root]` (see below) |
 
-DNS changes arrive through the primary's changelog and are stored in the
-standby's changelog with the **same offsets**, so a promoted standby continues
-the same sequence and changelog clients can switch servers. Account data,
-settings and TSIG keys are not in the changelog: the standby fetches them
-whenever the primary's account-data generation moves (any audited account,
-token, settings or TSIG change) and compares checksums periodically. Every
-`reconcile_interval_secs` the standby compares each zone's serial and a
-checksum of its records and members, and the account data, with the primary;
-a difference is logged with the zones that differ and fixed by loading a
-snapshot.
+**Every mutation is a change.** DNS changes *and* account, settings and TSIG
+changes (users, password and MFA changes, accepted TOTP steps, recovery
+codes, API tokens, the forwarding override, TSIG keys) are typed facts written
+to the changelog in the same transaction as the data and its audit row, in one
+ordered sequence. The standby replays them in order and stores them with the
+**same offsets**, so a promoted standby continues the same sequence. A
+snapshot (used to start, and after a gap) is the same kind of facts
+(`user_created`, `zone_created`, `record_created`, ...) loaded through the
+same replay code, so its format does not depend on the storage engine.
+
+Account changes carry password hashes, TOTP and TSIG secrets. They never
+appear in `GET /api/changelog` or the websocket (not even for
+administrators), only in the admin-only replication API, and their payloads
+are scrubbed after `[changelog].account_retention_days` (default 3); a
+standby further behind than that loads a snapshot. The changelog API
+therefore shows DNS offsets with holes where account changes were.
+
+**Snapshot once, then the changelog.** A standby loads a snapshot only when
+it connects and cannot continue from its own offset (a fresh database, or
+the changes it needs were pruned); the snapshot carries the offset it
+corresponds to, and from there everything is fetched by offset from
+`GET /api/replication/changes` in batches of whole transactions (a standby
+that is far behind fast-forwards batch by batch). Facts are complete new
+state, so re-applying changes from an earlier offset is harmless.
+
+Every `reconcile_interval_secs` the standby compares a checksum of every
+replicated table (per-server columns such as token last use, and its own
+root account, left out) and of every zone with the primary at the same
+offset. A difference means a change was lost or misapplied: it is reported
+(error log, `last_reconcile_result` in the status, metric
+`rustdns_replication_reconcile_mismatches_total`) and following continues;
+the standby does not reload by itself. Rebuild it on purpose with
+`--prepare-standby`. Primary and standby must speak the same replication protocol
+(2 since this version): a standby refuses an older primary with a clear
+error; upgrade the primary first.
 
 Record expiry is decided by the primary: `record_expired` / `record_reaped`
 arrive in its changelog (expired records stop being served at their
@@ -393,21 +419,43 @@ key, and promotion.
 ### Bringing the old primary back
 
 With `[peer]` pointing at the promoted server, the old primary starts
-**fenced** (read-only, role `fenced`) and says why. Make it a standby of the
-new primary: replace `[peer]` with a `[follow]` section pointing at the new
-primary (an administrator token; tokens made on the old primary still work,
-they were replicated) and restart it. It then:
+**fenced** (read-only, role `fenced`) and says why. To make it a standby of
+the new primary:
 
-- sees that the new primary was promoted from its own history,
-- writes the changes it made after the fork (offsets after the fork point, and
-  a copy of its DNS data) to `divergent-<time>.json` next to its database for
-  manual review (logged as `DIVERGED` with the path; no account data or
-  secrets in the file),
-- loads a snapshot from the new primary and follows it.
+1. Stop it. Replace `[peer]` with a `[follow]` section pointing at the new
+   primary (an administrator token; tokens made on the old primary still work,
+   they were replicated).
+2. Run `rust-dns --prepare-standby --config /opt/rust-dns/etc/rust-dns.toml`.
+   Without `--yes` it only lists what would be deleted and exits with status 2.
+   With `--yes` it:
+   - writes a full online backup next to the database
+     (`<db>.pre-standby-<time>`, path printed),
+   - writes the changes the new primary does not have to
+     `divergent-<time>.json` next to the database (the fork point is asked from
+     the new primary's public identity; when it is unknown every retained local
+     change is listed; DNS data only, no account data or secrets),
+   - deletes zones, records, zone members, the changelog, TSIG keys, console
+     settings, API tokens, sessions and every user except the config root, and
+     forgets the replication lineage; the audit log is kept and gets a
+     `replication.prepare_standby` row naming the backup.
+3. Start it: it is fresh, so it copies the new primary and follows it.
 
 Re-apply anything from the divergence file that you still want on the new
 primary. To fail back later, promote the old primary the same way and make
-the other server its standby.
+the other server its standby (again with `--prepare-standby`).
+
+**Following never discards data implicitly.** A server with `[follow]`
+starts following only if its database is a copy of that primary's history
+(a standby restarting or reconnecting; a snapshot after a changelog gap
+within the same lineage stays automatic, since that data came from the
+primary) or if it is **fresh**: no zones, records, zone members,
+TSIG keys, console settings, API tokens, and no users besides the config
+root. Anything else (an old primary with changes after the fork, a server that
+was used on its own, a primary restored from an older backup) is refused:
+state `refused`, the error names the data found and the command to run, it is
+shown in `/api/replication/status`, the console banner and Replication page,
+the log and `rust-dns --check`, and the server keeps serving its local data
+read-only.
 
 A standby also refuses (state `refused`) to follow a server it was itself
 promoted away from (the stale old primary), so a leftover `[follow]` cannot
@@ -416,7 +464,7 @@ make a promoted server discard its own writes.
 ### Replication API
 
 All under `/api/replication/`, admin only (`replicate`) except `identity`:
-`GET status` (both roles), `GET snapshot`, `GET accounts`,
+`GET status` (both roles), `GET snapshot` (logical entities),
 `GET changes?after=&limit=&wait=` (long-poll), `GET checksum` (served only by
 a writable primary; 409 otherwise), `POST promote`, and the public
 `GET identity` (role and history ids, no data) used by the `[peer]` check.
@@ -424,7 +472,8 @@ Metrics: `rustdns_replication_writable`, `rustdns_replication_standby`, and on
 a standby `rustdns_replication_connected`, `rustdns_replication_lag_changes`,
 `rustdns_replication_last_applied_offset`,
 `rustdns_replication_seconds_since_last_applied`,
-`rustdns_replication_reconnects_total`, `rustdns_replication_rebootstraps_total`.
+`rustdns_replication_reconnects_total`, `rustdns_replication_rebootstraps_total`,
+`rustdns_replication_reconcile_mismatches_total`.
 
 ## API
 
@@ -459,7 +508,7 @@ curl -H "Authorization: Bearer rdns_…" -H "content-type: application/json" \
 | POST | `/api/me/mfa/recovery` | regenerate recovery codes with TOTP |
 | GET | `/api/status`, `/metrics`, `/api/health` | |
 | GET/PUT/DELETE | `/api/settings/forwarding`, POST `/api/settings/forwarding/cache/flush` | forwarding upstreams, ACL, cache caps; cache stats and flush (admin) |
-| GET/POST | `/api/replication/status`, `snapshot`, `accounts`, `changes`, `checksum`, `identity`, `promote` | standby mode (see [Standby / follow mode](#standby--follow-mode)) |
+| GET/POST | `/api/replication/status`, `snapshot`, `changes`, `checksum`, `identity`, `promote` | standby mode (see [Standby / follow mode](#standby--follow-mode)) |
 
 The zone records endpoint accepts `q`, `offset`, and `limit` for server side
 search and paging. The console displays 500 records per page by default.
@@ -516,6 +565,11 @@ are accepted.
   record a change; the commit writes those changes to the changelog or audit
   log, and bumps SOA serials, in the same SQLite transaction. A failure
   anywhere rolls everything back and is logged as a warning instead.
+- Account, settings and TSIG writes are typed changes too (`AuditTx::record`,
+  the only writer of those tables, checked by a test), logged in the same
+  changelog sequence (class `account`, never shown by the changelog API).
+  Every table is classified as replicated or local in
+  `src/replication/tables.rs` (a test fails on an unclassified table).
 - The only writes outside that path are bookkeeping: session `last_seen_at`,
   API token `last_used_at`, retention pruning, and schema migration.
 - Offsets are exact and never reused, even after retention pruning. Replaying

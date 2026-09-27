@@ -1,0 +1,343 @@
+//! The only SQL that writes the replicated account tables (users, recovery
+//! codes, API tokens, console settings, TSIG keys), one function per
+//! account `Change`. Private to the mutation module.
+//!
+//! The same functions run on the primary (called by `AuditTx::record`, which
+//! also queues the change for the changelog) and on a standby (called by
+//! `replay::apply` for the primary's changes), so both write identical rows.
+//! On a standby, [`Ctx::local_root`] names the account from its own config:
+//! that account keeps its local password, MFA and recovery codes (see
+//! `mutation::replica`).
+//!
+//! `tests::only_acct_sql_writes_account_tables` scans the mutation sources
+//! and fails if any other file writes these tables (the snapshot loader and
+//! `--prepare-standby` in `replica.rs` excepted).
+
+use crate::replication::data;
+use crate::replication::types::{ReplSetting, ReplToken, ReplTsigKey, ReplUser};
+use anyhow::{Context, Result};
+use rusqlite::{params, Connection, OptionalExtension};
+
+/// How a change is applied.
+#[derive(Clone, Copy, Default)]
+pub struct Ctx<'a> {
+    /// On a standby: the username of its own config root.
+    pub local_root: Option<&'a str>,
+}
+
+impl Ctx<'_> {
+    /// On the primary (or in tests): write the fact as it is.
+    pub fn verbatim() -> Ctx<'static> {
+        Ctx { local_root: None }
+    }
+}
+
+/// Next id for a new row of an AUTOINCREMENT table (ids are part of the facts).
+pub(super) fn next_id(c: &Connection, table: &str) -> Result<i64> {
+    let seq: i64 = c
+        .query_row(
+            "SELECT seq FROM sqlite_sequence WHERE name = ?1",
+            params![table],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    let max: i64 = c.query_row(
+        &format!("SELECT COALESCE(MAX(id), 0) FROM {table}"),
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(seq.max(max) + 1)
+}
+
+/// Give a user a new id, carrying every reference along (foreign keys are
+/// deferred for the transaction).
+pub(super) fn move_user_id(c: &Connection, from: i64, to: i64) -> Result<()> {
+    c.execute_batch("PRAGMA defer_foreign_keys = ON")?;
+    for (table, col) in [
+        ("sessions", "user_id"),
+        ("recovery_codes", "user_id"),
+        ("api_tokens", "user_id"),
+        ("zone_members", "user_id"),
+        ("zones", "owner_id"),
+    ] {
+        c.execute(
+            &format!("UPDATE {table} SET {col} = ?2 WHERE {col} = ?1"),
+            params![from, to],
+        )?;
+    }
+    c.execute("UPDATE users SET id = ?2 WHERE id = ?1", params![from, to])?;
+    Ok(())
+}
+
+/// Is `user_id` the standby's own root account?
+fn is_local_root(c: &Connection, ctx: &Ctx, user_id: i64) -> Result<bool> {
+    let Some(root) = ctx.local_root else {
+        return Ok(false);
+    };
+    let name: Option<String> = c
+        .query_row(
+            "SELECT username FROM users WHERE id = ?1",
+            params![user_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(name.as_deref() == Some(root))
+}
+
+/// UserCreated / UserUpdated: the row becomes `u`.
+pub(super) fn put_user(c: &Connection, ctx: &Ctx, u: &ReplUser) -> Result<()> {
+    if let Some(root) = ctx.local_root {
+        let local = data::user_by_name(c, root)?;
+        if u.username == root {
+            // The primary's namesake of our root: same id, local credentials.
+            if let Some(r) = local {
+                if r.id != u.id {
+                    c.execute("DELETE FROM users WHERE id = ?1", params![u.id])?;
+                    move_user_id(c, r.id, u.id)?;
+                }
+                return Ok(());
+            }
+        } else if let Some(r) = local.filter(|r| r.id == u.id) {
+            // Our local-only root sits on an id the primary now uses.
+            let lowest: i64 =
+                c.query_row("SELECT min(COALESCE(MIN(id), 0), 0) FROM users", [], |r| {
+                    r.get(0)
+                })?;
+            move_user_id(c, r.id, lowest - 1)?;
+        }
+    }
+    // A stale row holding this username (ids swapped) gives it up.
+    c.execute(
+        "UPDATE users SET username = '~replica-' || id WHERE username = ?1 AND id <> ?2",
+        params![u.username, u.id],
+    )?;
+    let prev = data::user_row(c, u.id)?.filter(|p| p.username == u.username);
+    // TOTP replay protection: a later step accepted here is kept.
+    let last_step = match &prev {
+        Some(p) if p.totp_secret == u.totp_secret => match (p.totp_last_step, u.totp_last_step) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        },
+        _ => u.totp_last_step,
+    };
+    // Only the local config root is `root` on a standby.
+    let is_root = u.is_root && ctx.local_root.is_none();
+    c.execute(
+        "INSERT INTO users (id, username, password_hash, display_name, is_admin, is_root, mfa_required, totp_secret,
+                            totp_enrolled_at, totp_last_step, disabled_at, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+         ON CONFLICT(id) DO UPDATE SET username = excluded.username, password_hash = excluded.password_hash,
+            display_name = excluded.display_name, is_admin = excluded.is_admin, is_root = excluded.is_root,
+            mfa_required = excluded.mfa_required, totp_secret = excluded.totp_secret,
+            totp_enrolled_at = excluded.totp_enrolled_at, totp_last_step = excluded.totp_last_step,
+            disabled_at = excluded.disabled_at, created_at = excluded.created_at, updated_at = excluded.updated_at",
+        params![
+            u.id,
+            u.username,
+            u.password_hash,
+            u.display_name,
+            u.is_admin as i64,
+            is_root as i64,
+            u.mfa_required as i64,
+            u.totp_secret,
+            u.totp_enrolled_at,
+            last_step,
+            u.disabled_at,
+            u.created_at,
+            u.updated_at
+        ],
+    )?;
+    if u.disabled_at.is_some() {
+        // A disabled account is signed out (sessions are local bookkeeping).
+        c.execute("DELETE FROM sessions WHERE user_id = ?1", params![u.id])?;
+    }
+    Ok(())
+}
+
+pub(super) fn delete_user(c: &Connection, ctx: &Ctx, user_id: i64, username: &str) -> Result<()> {
+    if ctx.local_root == Some(username) {
+        return Ok(()); // our root stays (as a local-only account)
+    }
+    c.execute(
+        "DELETE FROM users WHERE id = ?1 AND username = ?2",
+        params![user_id, username],
+    )?;
+    Ok(())
+}
+
+pub(super) fn totp_step(c: &Connection, ctx: &Ctx, user_id: i64, step: i64) -> Result<()> {
+    if is_local_root(c, ctx, user_id)? {
+        return Ok(());
+    }
+    c.execute(
+        "UPDATE users SET totp_last_step = ?2 WHERE id = ?1 AND (totp_last_step IS NULL OR totp_last_step < ?2)",
+        params![user_id, step],
+    )?;
+    Ok(())
+}
+
+pub(super) fn recovery_codes(
+    c: &Connection,
+    ctx: &Ctx,
+    user_id: i64,
+    hashes: &[String],
+) -> Result<()> {
+    if is_local_root(c, ctx, user_id)? {
+        return Ok(());
+    }
+    c.execute(
+        "DELETE FROM recovery_codes WHERE user_id = ?1",
+        params![user_id],
+    )?;
+    for h in hashes {
+        c.execute(
+            "INSERT INTO recovery_codes (user_id, code_hash) VALUES (?1, ?2)",
+            params![user_id, h],
+        )?;
+    }
+    Ok(())
+}
+
+pub(super) fn recovery_code_used(
+    c: &Connection,
+    ctx: &Ctx,
+    user_id: i64,
+    hash: &str,
+    used_at: &str,
+) -> Result<()> {
+    if is_local_root(c, ctx, user_id)? {
+        return Ok(());
+    }
+    c.execute(
+        "UPDATE recovery_codes SET used_at = ?3 WHERE user_id = ?1 AND code_hash = ?2 AND used_at IS NULL",
+        params![user_id, hash, used_at],
+    )?;
+    Ok(())
+}
+
+pub(super) fn put_token(c: &Connection, t: &ReplToken) -> Result<()> {
+    c.execute(
+        "INSERT INTO api_tokens (id, user_id, name, token_hash, created_at, revoked_at, tags)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(id) DO UPDATE SET user_id = excluded.user_id, name = excluded.name,
+            token_hash = excluded.token_hash, created_at = excluded.created_at,
+            revoked_at = excluded.revoked_at, tags = excluded.tags",
+        params![
+            t.id,
+            t.user_id,
+            t.name,
+            t.token_hash,
+            t.created_at,
+            t.revoked_at,
+            serde_json::to_string(&t.tags)?
+        ],
+    )?;
+    Ok(())
+}
+
+pub(super) fn token_tags(c: &Connection, id: i64, tags: &[String]) -> Result<()> {
+    c.execute(
+        "UPDATE api_tokens SET tags = ?2 WHERE id = ?1",
+        params![id, serde_json::to_string(tags)?],
+    )?;
+    Ok(())
+}
+
+pub(super) fn token_revoked(c: &Connection, id: i64, at: &str) -> Result<()> {
+    c.execute(
+        "UPDATE api_tokens SET revoked_at = ?2 WHERE id = ?1 AND revoked_at IS NULL",
+        params![id, at],
+    )?;
+    Ok(())
+}
+
+pub(super) fn put_tsig_key(c: &Connection, k: &ReplTsigKey) -> Result<()> {
+    let secret = data_encoding::BASE64
+        .decode(k.secret.as_bytes())
+        .with_context(|| format!("TSIG key {}: secret is not base64", k.name))?;
+    c.execute(
+        "INSERT INTO tsig_keys (name, algorithm, secret, zones, created_by, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(name) DO UPDATE SET algorithm = excluded.algorithm, secret = excluded.secret,
+            zones = excluded.zones, created_by = excluded.created_by, created_at = excluded.created_at,
+            updated_at = excluded.updated_at",
+        params![
+            k.name,
+            k.algorithm,
+            secret,
+            serde_json::to_string(&k.zones)?,
+            k.created_by,
+            k.created_at,
+            k.updated_at
+        ],
+    )?;
+    Ok(())
+}
+
+pub(super) fn delete_tsig_key(c: &Connection, name: &str) -> Result<()> {
+    c.execute("DELETE FROM tsig_keys WHERE name = ?1", params![name])?;
+    Ok(())
+}
+
+pub(super) fn put_setting(c: &Connection, s: &ReplSetting) -> Result<()> {
+    c.execute(
+        "INSERT INTO settings (key, value, updated_by, updated_at) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_by = excluded.updated_by, updated_at = excluded.updated_at",
+        params![s.key, s.value, s.updated_by, s.updated_at],
+    )?;
+    Ok(())
+}
+
+pub(super) fn delete_setting(c: &Connection, key: &str) -> Result<()> {
+    c.execute("DELETE FROM settings WHERE key = ?1", params![key])?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// Structural guarantee: no file of the mutation module other than this
+    /// one (and the snapshot loader / `--prepare-standby` in replica.rs)
+    /// writes an account table.
+    #[test]
+    fn only_acct_sql_writes_account_tables() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mutation");
+        let tables = [
+            "users",
+            "recovery_codes",
+            "api_tokens",
+            "settings",
+            "tsig_keys",
+        ];
+        for e in std::fs::read_dir(&dir).unwrap() {
+            let path = e.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            if matches!(name.as_str(), "acct_sql.rs" | "replica.rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).unwrap();
+            // Test modules may seed data directly.
+            let src = src
+                .split("#[cfg(test)]")
+                .next()
+                .unwrap()
+                .to_ascii_uppercase();
+            for t in tables {
+                let t = t.to_ascii_uppercase();
+                for w in [
+                    format!("INSERT INTO {t} "),
+                    format!("INSERT INTO {t}("),
+                    format!("UPDATE {t} "),
+                    format!("DELETE FROM {t} "),
+                    format!("DELETE FROM {t}\""),
+                    format!("DELETE FROM {t};"),
+                ] {
+                    assert!(
+                        !src.contains(&w),
+                        "{name} writes {t} directly ({w:?}): record a Change through AuditTx::record instead"
+                    );
+                }
+            }
+        }
+    }
+}

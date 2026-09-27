@@ -79,7 +79,7 @@ pub async fn status(State(s): St, caller: Caller) -> ApiResult<Json<ReplicationS
     tag = "Replication",
     operation_id = "get_replication_snapshot",
     summary = "Consistent copy of all replicated data (admin, contains secrets)",
-    description = "Zones, records (with expiry state), zone members, users (password hashes, MFA secrets and last TOTP step, recovery code hashes), API token hashes and tags, console settings, TSIG keys, the history and the changelog offset it corresponds to, all read in one transaction. A standby loads it to start and whenever it cannot continue from the changelog. Needs `replicate`; refused (409) on a server that is not a writable primary.",
+    description = "Zones, records (with expiry state), zone members, users (password hashes, MFA secrets and last TOTP step, recovery code hashes), API token hashes and tags, console settings, TSIG keys, the history and the changelog offset it corresponds to, all read in one transaction. A standby loads it to start and whenever it cannot continue from the changelog (afterwards every change, account changes included, arrives through `/replication/changes`). Needs `replicate`; refused (409) on a server that is not a writable primary.",
     responses(
         (status = 200, description = "Snapshot.", body = Snapshot),
         (status = 401, response = Unauthorized),
@@ -90,36 +90,12 @@ pub async fn status(State(s): St, caller: Caller) -> ApiResult<Json<ReplicationS
 pub async fn snapshot(State(s): St, caller: Caller) -> ApiResult<Response> {
     s.require(&caller, GlobalPerm::Replicate)?;
     require_primary(&s)?;
-    let generation = s.repl.generation();
     let storage = s.storage.clone();
-    let snap =
-        tokio::task::spawn_blocking(move || storage.read_tx(|c| data::snapshot(c, &generation)))
-            .await
-            .map_err(ApiError::internal)??;
-    tracing::info!(user = %caller.user.username, ip = %caller.ip, offset = snap.offset, zones = snap.zones.len(), records = snap.records.len(), "replication snapshot served");
+    let snap = tokio::task::spawn_blocking(move || storage.read_tx(data::snapshot))
+        .await
+        .map_err(ApiError::internal)??;
+    tracing::info!(user = %caller.user.username, ip = %caller.ip, offset = snap.offset, entities = snap.entities.len(), "replication snapshot served");
     Ok(no_store(snap))
-}
-
-#[utoipa::path(
-    get,
-    path = "/replication/accounts",
-    tag = "Replication",
-    operation_id = "get_replication_accounts",
-    summary = "Account data, settings and TSIG keys (admin, contains secrets)",
-    description = "The replicated data that is not in the DNS changelog. A standby fetches it whenever `accounts_generation` in a changes answer moves. Needs `replicate`; refused (409) on a server that is not a writable primary.",
-    responses(
-        (status = 200, description = "Account data.", body = AccountsSnapshot),
-        (status = 401, response = Unauthorized),
-        (status = 403, response = Forbidden),
-        (status = 409, response = Conflict),
-    ),
-)]
-pub async fn accounts(State(s): St, caller: Caller) -> ApiResult<Response> {
-    s.require(&caller, GlobalPerm::Replicate)?;
-    require_primary(&s)?;
-    let generation = s.repl.generation();
-    let acc = s.storage.read_tx(|c| data::accounts(c, &generation))?;
-    Ok(no_store(acc))
 }
 
 #[derive(Deserialize, IntoParams)]
@@ -144,7 +120,7 @@ pub struct ChangesQuery {
     tag = "Replication",
     operation_id = "get_replication_changes",
     summary = "Changes after an offset, long-poll (admin)",
-    description = "Committed changelog entries after `after`, whole transactions only, with the history id, the latest offset, and the account-data generation. With `wait`, an answer without changes is held until a change commits, account data changes, or the wait ends. `gap: true`: the entries after `after` were pruned; load a snapshot. Needs `replicate`; refused (409) on a server that is not a writable primary.",
+    description = "Committed changelog entries after `after`, DNS and account changes in one sequence (account changes carry password hashes, TOTP and TSIG secrets and appear nowhere else), whole transactions only, with the history id and the latest offset. With `wait`, an answer without changes is held until a change commits or the wait ends. `gap: true`: entries after `after` were pruned or scrubbed; load a snapshot. Needs `replicate`; refused (409) on a server that is not a writable primary.",
     params(ChangesQuery),
     responses(
         (status = 200, description = "Changes.", body = ChangesResponse),
@@ -171,12 +147,11 @@ pub async fn changes(
         .note_standby(caller.ip.to_string(), caller.user.username.clone(), after);
     // Subscribe first so a commit between the read and the wait is not missed.
     let changes_rx = s.bus.subscribe_changes();
-    let mut gen_rx = s.repl.subscribe_generation();
-    gen_rx.borrow_and_update();
+    let mut tick = s.repl.subscribe_changelog_tick();
+    tick.borrow_and_update();
     let deadline = tokio::time::Instant::now() + wait;
     loop {
-        let generation = s.repl.generation();
-        let (history_id, head, oldest, events) = s.storage.read_tx(|c| {
+        let (history_id, head, oldest, mut events) = s.storage.read_tx(|c| {
             Ok((
                 data::history(c)?.history_id,
                 data::changelog_head(c)?,
@@ -184,19 +159,26 @@ pub async fn changes(
                 data::changes_after(c, after, limit)?,
             ))
         })?;
-        let gap = match oldest {
-            Some(o) => after + 1 < o,
-            None => after < head,
-        };
+        // A needed account change whose payload was scrubbed after
+        // `[changelog].account_retention_days` is gone too.
+        let scrubbed = events.iter().any(|e| e.payload["kind"] == "scrubbed");
+        let gap = scrubbed
+            || match oldest {
+                Some(o) => after + 1 < o,
+                None => after < head,
+            };
+        if gap {
+            events.clear();
+        }
         let done = !events.is_empty() || gap || tokio::time::Instant::now() >= deadline;
         if done {
             return Ok(Json(ChangesResponse {
+                protocol: REPLICATION_PROTOCOL,
                 history_id,
                 head,
                 oldest_offset: oldest,
                 gap,
                 events,
-                accounts_generation: generation,
             }));
         }
         let changes_wait = async {
@@ -209,20 +191,8 @@ pub async fn changes(
         };
         tokio::select! {
             _ = changes_wait => {}
-            r = gen_rx.changed() => {
-                if r.is_ok() {
-                    // Account data changed: answer now (no events) so the
-                    // standby fetches it.
-                    return Ok(Json(ChangesResponse {
-                        history_id,
-                        head,
-                        oldest_offset: oldest,
-                        gap,
-                        events: Vec::new(),
-                        accounts_generation: s.repl.generation(),
-                    }));
-                }
-            }
+            // Account changes are not on the event bus (they carry secrets).
+            _ = tick.changed() => {}
             _ = tokio::time::sleep_until(deadline) => {}
         }
         // Stop serving if this server stopped being a primary meanwhile.
@@ -230,32 +200,46 @@ pub async fn changes(
     }
 }
 
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct ChecksumQuery {
+    /// Leave this account out (the standby's own config root).
+    #[param(example = "root")]
+    pub exclude_user: Option<String>,
+}
+
 #[utoipa::path(
     get,
     path = "/replication/checksum",
     tag = "Replication",
     operation_id = "get_replication_checksum",
-    summary = "Per-zone and account-data checksums (admin)",
-    description = "Serial and SHA-256 of every zone (zone row, records with expiry state, members) and of the account data, at one changelog offset. A standby compares them periodically (`[follow].reconcile_interval_secs`) and re-bootstraps on a mismatch. Needs `replicate`; refused (409) on a server that is not a writable primary.",
+    summary = "Checksums of every replicated table and zone (admin)",
+    description = "SHA-256 of every replicated table (per-server columns such as token last use left out, and the rows of the account named `exclude_user`: the standby's own root, which is local there) and serial and SHA-256 of every zone, at one changelog offset. A standby compares them periodically (`[follow].reconcile_interval_secs`) and re-bootstraps on a mismatch. Needs `replicate`; refused (409) on a server that is not a writable primary.",
+    params(ChecksumQuery),
     responses(
         (status = 200, description = "Checksums.", body = Checksums),
+        (status = 400, response = InvalidRequest),
         (status = 401, response = Unauthorized),
         (status = 403, response = Forbidden),
         (status = 409, response = Conflict),
     ),
 )]
-pub async fn checksum(State(s): St, caller: Caller) -> ApiResult<Json<Checksums>> {
+pub async fn checksum(
+    State(s): St,
+    caller: Caller,
+    Query(q): Query<ChecksumQuery>,
+) -> ApiResult<Json<Checksums>> {
     s.require(&caller, GlobalPerm::Replicate)?;
     require_primary(&s)?;
-    let generation = s.repl.generation();
     let storage = s.storage.clone();
+    let root = q.exclude_user.unwrap_or_default();
     let out = tokio::task::spawn_blocking(move || {
         storage.read_tx(|c| {
             Ok(Checksums {
                 history_id: data::history(c)?.history_id,
                 offset: data::changelog_head(c)?,
+                tables: crate::replication::tables::checksums(c, &root)?,
                 zones: data::zone_checksums(c)?,
-                accounts_checksum: data::accounts(c, &generation)?.checksum,
             })
         })
     })

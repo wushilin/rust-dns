@@ -152,11 +152,14 @@ impl AuditTx<'_> {
         before: Option<&ForwardingSettings>,
         after: &ForwardingSettings,
     ) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO settings (key, value, updated_by, updated_at) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_by = excluded.updated_by, updated_at = excluded.updated_at",
-            params![FORWARDING_KEY, serde_json::to_string(after)?, actor, crate::model::now_rfc3339()],
-        )?;
+        self.record(crate::mutation::Change::SettingSet {
+            setting: crate::replication::types::ReplSetting {
+                key: FORWARDING_KEY.into(),
+                value: serde_json::to_string(after)?,
+                updated_by: actor.to_string(),
+                updated_at: crate::model::now_rfc3339(),
+            },
+        })?;
         self.push(
             "settings.forwarding.update",
             None,
@@ -178,10 +181,16 @@ impl AuditTx<'_> {
 
     /// Remove the override: the config file applies again.
     pub fn clear_forwarding(&mut self, before: &ForwardingSettings) -> Result<bool> {
-        let n = self.conn.execute(
-            "DELETE FROM settings WHERE key = ?1",
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM settings WHERE key = ?1",
             params![FORWARDING_KEY],
+            |r| r.get(0),
         )?;
+        if n > 0 {
+            self.record(crate::mutation::Change::SettingCleared {
+                key: FORWARDING_KEY.into(),
+            })?;
+        }
         if n > 0 {
             self.push(
                 "settings.forwarding.reset",

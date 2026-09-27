@@ -47,6 +47,16 @@ struct Cli {
     /// database. (A running standby: the console or POST /api/replication/promote.)
     #[arg(long)]
     promote: bool,
+    /// Make this server fresh so it can follow its [follow] primary (server
+    /// stopped): backs the database up next to it, writes a report of the
+    /// changes the primary does not have, then deletes zones, records,
+    /// users (except the config root), tokens, settings, TSIG keys and the
+    /// changelog. Without --yes it only prints what would be deleted.
+    #[arg(long)]
+    prepare_standby: bool,
+    /// Confirm --prepare-standby.
+    #[arg(long)]
+    yes: bool,
 }
 
 #[tokio::main]
@@ -92,6 +102,16 @@ async fn main() -> anyhow::Result<()> {
             println!("{note}");
         }
         return Ok(());
+    }
+    if cli.prepare_standby {
+        match replication::prepare_standby_offline(&cli.config, cli.yes).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => std::process::exit(2),
+            Err(e) => {
+                eprintln!("rust-dns: --prepare-standby failed: {e:#}");
+                std::process::exit(1);
+            }
+        }
     }
     if cli.promote {
         match replication::promote_offline(&cli.config).await {
@@ -140,6 +160,24 @@ async fn main() -> anyhow::Result<()> {
     let storage = Arc::new(storage::Storage::open(&cfg.database.path)?);
     backup::spawn(storage.clone(), cfg.backup.clone());
     let accounts = Arc::new(mutation::accounts::Accounts::new(storage.clone()));
+    let cache = Arc::new(cache::Cache::new(cache::Catalog::empty()));
+    let bus = Arc::new(events::Bus::new(1024, 4096));
+    let mutator = Arc::new(mutation::Mutator::new(
+        storage.clone(),
+        cache.clone(),
+        bus.clone(),
+        &cfg.server.default_primary_ns,
+        &cfg.server.default_hostmaster,
+    ));
+    // Account changes on a standby stay local (its changelog mirrors the
+    // primary's offsets): close the write gate before the root sync.
+    accounts.set_gate(mutator.gate());
+    if let Some(f) = &cfg.follow {
+        mutator.gate().close(format!(
+            "this server is a read-only standby of {}; make changes on the primary",
+            f.primary.trim().trim_end_matches('/')
+        ));
+    }
     let root = accounts.sync_root(
         &cfg.root.username,
         &cfg.root.password,
@@ -150,15 +188,6 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!(username = %root.username, config = %cli.config.display(), "generated a new configuration with a random root password (printed once on stderr, not logged)");
         eprintln!("\n  Root login: {}  /  {}\n  (the plaintext is only shown once; the config now holds a hash)\n", root.username, pw);
     }
-    let cache = Arc::new(cache::Cache::new(cache::Catalog::empty()));
-    let bus = Arc::new(events::Bus::new(1024, 4096));
-    let mutator = Arc::new(mutation::Mutator::new(
-        storage.clone(),
-        cache.clone(),
-        bus.clone(),
-        &cfg.server.default_primary_ns,
-        &cfg.server.default_hostmaster,
-    ));
     mutator.rebuild()?;
     let (zc, rc) = storage.counts()?;
     tracing::info!(zones = zc, records = rc, "catalog loaded");
@@ -212,12 +241,9 @@ async fn main() -> anyhow::Result<()> {
     );
     {
         let r = repl.clone();
-        accounts.set_commit_hook(Box::new(move |records| {
-            if records
-                .iter()
-                .any(|a| replication::replicated_action(&a.action))
-            {
-                r.bump_generation();
+        accounts.set_commit_hook(Box::new(move |_records, logged| {
+            if logged > 0 {
+                r.changelog_appended();
             }
         }));
     }
@@ -286,6 +312,7 @@ async fn main() -> anyhow::Result<()> {
     {
         let storage = storage.clone();
         let days = cfg.changelog.retention_days;
+        let account_days = cfg.changelog.account_retention_days;
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(600));
             loop {
@@ -294,6 +321,16 @@ async fn main() -> anyhow::Result<()> {
                 match storage.prune_changelog(cutoff) {
                     Ok(n) if n > 0 => tracing::info!(pruned = n, "changelog retention applied"),
                     Err(e) => tracing::warn!(error = %e, "changelog prune failed"),
+                    _ => {}
+                }
+                let acutoff =
+                    chrono::Utc::now() - chrono::Duration::days(account_days.max(1) as i64);
+                match storage.scrub_account_changes(acutoff) {
+                    Ok(n) if n > 0 => tracing::info!(
+                        scrubbed = n,
+                        "account change payloads scrubbed after [changelog].account_retention_days"
+                    ),
+                    Err(e) => tracing::warn!(error = %e, "scrubbing account changes failed"),
                     _ => {}
                 }
                 match storage.prune_audit(cutoff) {
@@ -343,6 +380,19 @@ fn replication_note(cfg: &config::Config) -> Option<String> {
             "; promoted on {at} from {}",
             st.get("promoted_from").map(String::as_str).unwrap_or("?")
         ));
+    }
+    if let Some(f) = &cfg.follow {
+        let url = f.primary.trim().trim_end_matches('/');
+        let same = st.get("following").map(|s| s.trim_end_matches('/')) == Some(url);
+        let data = replication::data::fresh_problems(&conn, &cfg.root.username).unwrap_or_default();
+        if !same && !data.is_empty() {
+            out.push_str(&format!(
+                "\nwarning: the database has data ({}) and is not a standby of {url}: following will be refused unless it is a copy of that primary's history. To discard the data on purpose (backed up first), run with the server stopped: rust-dns --prepare-standby --yes --config <this config>",
+                data.join(", ")
+            ));
+        } else if data.is_empty() {
+            out.push_str("\nthe database is fresh: the standby will copy the primary");
+        }
     }
     match (&cfg.follow, st.get("following")) {
         (None, Some(u)) => out.push_str(&format!(

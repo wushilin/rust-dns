@@ -9,7 +9,6 @@ use crate::model::{normalize_domain, normalize_zone_name, now_rfc3339, Invalid};
 use crate::storage::{self as db, StoredTsigKey};
 use anyhow::Result;
 use rand::RngCore;
-use rusqlite::params;
 
 /// Longest secret we accept on import (bytes). HMAC hashes longer keys first.
 pub const MAX_SECRET_BYTES: usize = 512;
@@ -110,18 +109,17 @@ impl AuditTx<'_> {
             return Ok(None);
         }
         let now = now_rfc3339();
-        self.conn.execute(
-            "INSERT INTO tsig_keys (name, algorithm, secret, zones, created_by, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
-            params![
-                k.name,
-                k.algorithm.name(),
-                k.secret,
-                serde_json::to_string(&k.zones)?,
-                actor,
-                now
-            ],
-        )?;
+        self.record(crate::mutation::Change::TsigKeySet {
+            key: crate::replication::types::ReplTsigKey {
+                name: k.name.clone(),
+                algorithm: k.algorithm.name().to_string(),
+                secret: data_encoding::BASE64.encode(&k.secret),
+                zones: k.zones.clone(),
+                created_by: actor.to_string(),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        })?;
         let key = db::get_tsig_key(self.conn, &k.name)?.expect("just inserted");
         let mut d = detail(&key);
         d["source"] = serde_json::json!(if k.imported { "imported" } else { "generated" });
@@ -135,10 +133,12 @@ impl AuditTx<'_> {
         before: &StoredTsigKey,
         zones: &[String],
     ) -> Result<StoredTsigKey> {
-        self.conn.execute(
-            "UPDATE tsig_keys SET zones = ?2, updated_at = ?3 WHERE name = ?1",
-            params![before.name, serde_json::to_string(zones)?, now_rfc3339()],
-        )?;
+        if before.zones != zones {
+            let mut row = crate::replication::data::tsig_row(before.clone());
+            row.zones = zones.to_vec();
+            row.updated_at = now_rfc3339();
+            self.record(crate::mutation::Change::TsigKeySet { key: row })?;
+        }
         let after = db::get_tsig_key(self.conn, &before.name)?.expect("exists");
         if before.zones != after.zones {
             self.push(
@@ -152,9 +152,12 @@ impl AuditTx<'_> {
     }
 
     pub fn delete_tsig_key(&mut self, k: &StoredTsigKey) -> Result<bool> {
-        let n = self
-            .conn
-            .execute("DELETE FROM tsig_keys WHERE name = ?1", params![k.name])?;
+        let n = usize::from(db::get_tsig_key(self.conn, &k.name)?.is_some());
+        if n > 0 {
+            self.record(crate::mutation::Change::TsigKeyDeleted {
+                name: k.name.clone(),
+            })?;
+        }
         if n > 0 {
             self.push("tsig.delete", None, &k.name, detail(k));
         }

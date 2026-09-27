@@ -650,8 +650,10 @@ function renderBanner(r) {
     const state = r.connected
       ? (r.lag_changes ? `${num(r.lag_changes)} change${r.lag_changes === 1 ? '' : 's'} behind` : 'in sync')
       : `primary unreachable${r.disconnected_since ? ' since ' + esc(fmtTime(r.disconnected_since)) : ''}`;
-    b.className = r.connected ? '' : 'bad';
-    b.innerHTML = `${ico('servers', 's')}<span>Standby of <b class="mono">${esc(r.primary || '')}</b> — read-only · ${state}</span>${link}`;
+    b.className = r.connected && !r.problem ? '' : 'bad';
+    b.innerHTML = r.problem
+      ? `${ico('warn', 's')}<span>Standby of <b class="mono">${esc(r.primary || '')}</b> — read-only · <b>not following:</b> ${esc(r.problem)}</span>${link}`
+      : `${ico('servers', 's')}<span>Standby of <b class="mono">${esc(r.primary || '')}</b> — read-only · ${state}</span>${link}`;
   } else {
     b.className = 'bad';
     b.innerHTML = `${ico('warn', 's')}<span><b>Read-only:</b> ${esc(r.read_only_reason || 'this server does not accept changes')}</span>${link}`;
@@ -1735,7 +1737,6 @@ async function viewReplication() {
         <span class="k">Last contact</span><span>${when(f.last_contact_at)}</span>
         <span class="k">Last snapshot</span><span>${when(f.last_snapshot_at)}${f.last_snapshot_result ? ` · ${opt(f.last_snapshot_result)}` : ''}</span>
         <span class="k">Last reconcile</span><span>${when(f.last_reconcile_at)}${f.last_reconcile_result ? ` · ${opt(f.last_reconcile_result)}` : ''}</span>
-        <span class="k">Accounts synced</span><span>${when(f.last_accounts_sync_at)}</span>
         <span class="k">Reconnects / snapshots</span><span>${num(f.reconnects)} / ${num(f.rebootstraps)}</span>
       </div></div>` : `<div class="card panel"><h2>Standbys</h2>${r.standbys.length ? `<div class="tw"><table><thead><tr><th>Address</th><th>Token user</th><th>Cursor</th><th>Last poll</th></tr></thead><tbody>${r.standbys.map(x => `<tr><td class="mono">${esc(x.address)}</td><td>${esc(x.user)}</td><td>${num(x.after)}${x.after < r.head ? ` <span class="badge warn">${num(r.head - x.after)} behind</span>` : ''}</td><td>${when(x.last_seen_at)}</td></tr>`).join('')}</tbody></table></div>` : '<p class="hint">No standby polled this server in the last 10 minutes.</p>'}
         ${r.peer ? `<div class="kv" style="margin-top:12px"><span class="k">[peer]</span><span class="mono">${esc(r.peer.url)}</span><span class="k">Last check</span><span>${when(r.peer.last_check_at)}${r.peer.last_result ? ` · ${esc(r.peer.last_result)}` : ''}</span></div>` : ''}</div>`}
@@ -1745,7 +1746,7 @@ async function viewReplication() {
         <li>This server stops following <span class="mono">${esc(f.primary)}</span> and accepts writes at once (zones, records, users, tokens, settings, TSIG keys). Nothing is restarted; DNS answers continue.</li>
         <li><code>[follow]</code> is removed from its configuration file, and it starts a new history (forked from the current one at offset ${num(r.head)}), so the old primary can tell it was replaced.</li>
         <li>Users sign in with their usual passwords, MFA codes and API tokens (replicated). Sessions are not replicated: everyone signs in again.</li>
-        <li>Stop the old primary first if it is still running, or give it <code>[peer] url</code> pointing here so it starts read-only. Then make it a standby of this server; its changes after the fork are saved to a file for review.</li>
+        <li>Stop the old primary first if it is still running, or give it <code>[peer] url</code> pointing here so it starts read-only. Then make it a standby of this server: stop it and run <code>rust-dns --prepare-standby --yes</code> on it (backs up its database and saves its changes after the fork to a file for review).</li>
         <li>Update zone secondaries and the registrar's NS/glue if they name the old primary.</li>
       </ul></div>` : ''}
     ${r.role !== 'standby' ? `<div class="card panel" style="margin-top:14px;max-width:1100px"><h2>Add a standby</h2>
