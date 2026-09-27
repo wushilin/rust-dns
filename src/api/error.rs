@@ -20,6 +20,9 @@ pub enum ErrorCode {
     /// 400: the request could not be parsed (malformed JSON, wrong field type
     /// or value, unparsable path or query parameter, missing JSON content type).
     InvalidRequest,
+    /// 409: this server is a read-only standby (or an old primary fenced
+    /// after a failover); the message names the primary to use.
+    ReadOnlyStandby,
 }
 
 /// Every non-2xx JSON error has this shape.
@@ -33,6 +36,8 @@ pub struct ErrorBody {
     /// without `X-Requested-With: rust-dns`). `invalid_request`: the request
     /// could not be parsed (malformed JSON, wrong field type or value,
     /// unparsable path or query parameter, missing JSON content type).
+    /// `read_only_standby` (409): this server is a read-only standby; write
+    /// to the primary named in the message.
     #[schema(required = true)]
     pub code: Option<ErrorCode>,
 }
@@ -81,6 +86,10 @@ impl ApiError {
     pub fn conflict(m: impl Into<String>) -> Self {
         Self::new(StatusCode::CONFLICT, m)
     }
+    /// 409 `read_only_standby`.
+    pub fn read_only(m: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, m).with_code(ErrorCode::ReadOnlyStandby)
+    }
     pub fn internal(e: impl std::fmt::Display) -> Self {
         tracing::error!(error = %e, "internal error");
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
@@ -115,6 +124,7 @@ impl From<crate::auth::KdfBusy> for ApiError {
 impl From<MutationError> for ApiError {
     fn from(e: MutationError) -> Self {
         match e {
+            MutationError::ReadOnly(m) => ApiError::read_only(m),
             MutationError::Invalid(m) => ApiError::bad_request(m),
             MutationError::NotFound(m) => ApiError::not_found(m),
             MutationError::Conflict(m) => ApiError::conflict(m),

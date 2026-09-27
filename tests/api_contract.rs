@@ -94,6 +94,8 @@ const DEDICATED: &[&str] = &[
     "revoke_my_session",
     "revoke_other_sessions",
     "websocket",
+    // Needs a second server following this one (see the promotion flow).
+    "promote_standby",
 ];
 
 // ---------------------------------------------------------------------------
@@ -640,6 +642,11 @@ fn free_port() -> u16 {
 }
 
 fn start() -> Server {
+    start_with("")
+}
+
+/// A server whose config has `extra` appended (e.g. a `[follow]` section).
+fn start_with(extra: &str) -> Server {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -675,6 +682,7 @@ password = "rootpass123"
 level = "warn"
 [backup]
 dir = ""
+{extra}
 "#,
         db = dir.join("test.db").display()
     );
@@ -1883,6 +1891,94 @@ fn live_api_matches_spec() {
     c.expect("signed out after logout", &r, 401);
     let r = c.call(Auth::Anon, "post", "/auth/logout", &[], "", Body::None);
     c.expect("anonymous logout", &r, 200);
+
+    // ---- standby promotion: a second server follows this one ------------------
+    let admin = agent();
+    let r = c.call(
+        Auth::Session(&admin),
+        "post",
+        "/auth/login",
+        &[],
+        "",
+        Body::Json(&serde_json::json!({ "username": "root", "password": "rootpass123" })),
+    );
+    c.expect("root login for the standby flow", &r, 200);
+    let r = c.call(
+        Auth::Session(&admin),
+        "post",
+        "/tokens",
+        &[],
+        "",
+        Body::Json(&serde_json::json!({ "name": "standby" })),
+    );
+    c.expect("replication token", &r, 201);
+    let token = r.json()["token"].as_str().unwrap().to_string();
+    let standby = start_with(&format!(
+        "[follow]\nprimary = \"http://{}\"\ntoken = \"{token}\"\n",
+        srv.web
+    ));
+    let status_of = |web: &str| -> Value {
+        ureq::get(&format!("http://{web}/api/replication/status"))
+            .set("Authorization", &format!("Bearer {token}"))
+            .timeout(Duration::from_secs(5))
+            .call()
+            .ok()
+            .and_then(|r| r.into_json().ok())
+            .unwrap_or(Value::Null)
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while status_of(&standby.web)["follow"]["state"] != "following" {
+        assert!(Instant::now() < deadline, "standby did not start following");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    // The primary goes away; then the standby is promoted with the spec's example.
+    let mut srv = srv;
+    let _ = srv.child.kill();
+    let _ = srv.child.wait();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while status_of(&standby.web)["follow"]["connected"] != false {
+        assert!(
+            Instant::now() < deadline,
+            "standby did not notice the primary is gone"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    c.web = standby.web.clone();
+    let sroot = agent();
+    let r = c.call(
+        Auth::Session(&sroot),
+        "post",
+        "/auth/login",
+        &[],
+        "",
+        Body::Json(&serde_json::json!({ "username": "root", "password": "rootpass123" })),
+    );
+    c.expect("standby root login", &r, 200);
+    let ex = c.example("/replication/promote", "post");
+    let r = c.send_example(
+        Auth::Session(&sroot),
+        "post",
+        "/replication/promote",
+        &[],
+        "",
+        &ex,
+    );
+    c.expect("promote the standby", &r, 200);
+    c.capture("/replication/promote", &r);
+    let r = c.call(
+        Auth::Session(&sroot),
+        "get",
+        "/replication/status",
+        &[],
+        "",
+        Body::None,
+    );
+    c.expect("status after promotion", &r, 200);
+    if r.json()["role"] != "promoted" {
+        c.failures
+            .push(format!("promoted standby reports {}", r.text));
+    }
+    drop(standby);
 
     // ---- coverage ------------------------------------------------------------
     let all = spec_ops(&c.spec);

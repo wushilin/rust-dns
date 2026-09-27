@@ -128,6 +128,13 @@ CREATE TABLE IF NOT EXISTS tsig_keys (
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL
 );
+-- Replication (standby / follow mode) state: this database's history id and
+-- lineage, and standby bookkeeping. Written only by src/mutation/replica.rs
+-- (and the history id once, at migration).
+CREATE TABLE IF NOT EXISTS replication_state (
+    key         TEXT PRIMARY KEY,
+    value       TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS api_tokens (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -260,6 +267,24 @@ fn migrate(conn: &Connection) -> Result<()> {
         }
     }
     conn.execute_batch("CREATE INDEX IF NOT EXISTS records_expiry ON records(expires_at) WHERE expires_at IS NOT NULL")?;
+    ensure_history_id(conn)?;
+    Ok(())
+}
+
+/// Every database carries a random history id (see `replication`): created
+/// once, here, and replaced only by a standby bootstrap or a promotion.
+fn ensure_history_id(conn: &Connection) -> Result<()> {
+    let has_table: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'replication_state')",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_table {
+        conn.execute(
+            "INSERT OR IGNORE INTO replication_state (key, value) VALUES ('history_id', ?1)",
+            params![crate::auth::random_token(12)],
+        )?;
+    }
     Ok(())
 }
 
@@ -333,6 +358,21 @@ impl Storage {
         let out = f(&tx)?;
         tx.commit()?;
         Ok(out)
+    }
+
+    /// Run `f` inside one read transaction, so everything it reads is one
+    /// consistent state (replication snapshots and checksums).
+    pub fn read_tx<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.execute_batch("BEGIN DEFERRED")?;
+        let out = f(&conn);
+        let _ = conn.execute_batch("COMMIT");
+        out
+    }
+
+    /// The replication bookkeeping (`replication_state`) as key/value pairs.
+    pub fn replication_state(&self) -> Result<std::collections::BTreeMap<String, String>> {
+        self.with_conn(replication_state)
     }
 
     fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
@@ -883,6 +923,12 @@ pub fn get_zone(c: &Connection, name: &str) -> Result<Option<Zone>> {
         )
         .optional()?;
     Ok(z)
+}
+
+pub fn replication_state(c: &Connection) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut stmt = c.prepare("SELECT key, value FROM replication_state")?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.collect::<Result<_, _>>()?)
 }
 
 pub fn get_zone_by_id(c: &Connection, id: i64) -> Result<Option<Zone>> {

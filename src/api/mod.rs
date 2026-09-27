@@ -6,6 +6,7 @@ pub mod error;
 pub mod guard;
 pub mod openapi;
 pub mod proxy;
+pub mod replication;
 pub mod routes;
 pub mod session;
 pub mod settings;
@@ -54,6 +55,61 @@ pub struct AppState {
     pub clock: crate::auth::Clock,
     pub trusted: Vec<Cidr>,
     pub started: Instant,
+    /// Replication role and standby/primary state.
+    pub repl: Arc<crate::replication::Replication>,
+}
+
+/// Non-GET operations that still work on a read-only standby (method, path
+/// under `/api`): signing in and out, local sessions, reloading the local
+/// config, forwarding tests and cache flushes, TSIG reveals (a read with a
+/// local audit row) and promotion. Every other non-GET operation is refused
+/// with 409 `read_only_standby` by [`read_only_guard`] and documented so by
+/// `openapi::finish` — a new route is read-only by default.
+pub const STANDBY_WRITABLE: &[(&str, &str)] = &[
+    ("POST", "/auth/login"),
+    ("POST", "/auth/mfa"),
+    ("POST", "/auth/enroll"),
+    ("POST", "/auth/logout"),
+    ("DELETE", "/me/sessions/{id}"),
+    ("POST", "/me/sessions/revoke-others"),
+    ("POST", "/users/{id}/sessions/revoke"),
+    ("POST", "/admin/reload"),
+    ("POST", "/settings/forwarding/test"),
+    ("POST", "/settings/forwarding/cache/flush"),
+    ("POST", "/tsig/keys/{name}/reveal"),
+    ("POST", "/replication/promote"),
+];
+
+/// Whether `path` (concrete, under `/api`) matches `template` (`{x}` = one segment).
+pub fn path_matches(template: &str, path: &str) -> bool {
+    let t: Vec<&str> = template.trim_end_matches('/').split('/').collect();
+    let p: Vec<&str> = path.trim_end_matches('/').split('/').collect();
+    t.len() == p.len()
+        && t.iter()
+            .zip(&p)
+            .all(|(a, b)| (a.starts_with('{') && a.ends_with('}') && !b.is_empty()) || a == b)
+}
+
+/// Is this API request allowed while the server is read-only?
+pub fn allowed_when_read_only(method: &str, path: &str) -> bool {
+    matches!(method, "GET" | "HEAD" | "OPTIONS")
+        || STANDBY_WRITABLE
+            .iter()
+            .any(|(m, t)| *m == method && path_matches(t, path))
+}
+
+/// Refuse mutations on a standby / fenced server before any handler runs.
+async fn read_only_guard(
+    axum::extract::State(s): axum::extract::State<Arc<AppState>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if let Some(why) = s.repl.read_only_reason() {
+        if !allowed_when_read_only(req.method().as_str(), req.uri().path()) {
+            return error::ApiError::read_only(why).into_response();
+        }
+    }
+    next.run(req).await
 }
 
 /// Whether the client reached us over HTTPS, as reported by a trusted
@@ -289,6 +345,13 @@ fn api_router() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(tsig::update_tsig_key, tsig::delete_tsig_key))
         .routes(routes!(tsig::reveal_tsig_key))
         .routes(routes!(tsig::get_transfer_settings))
+        .routes(routes!(replication::identity))
+        .routes(routes!(replication::status))
+        .routes(routes!(replication::snapshot))
+        .routes(routes!(replication::accounts))
+        .routes(routes!(replication::changes))
+        .routes(routes!(replication::checksum))
+        .routes(routes!(replication::promote))
 }
 
 /// Documented routes mounted at the server root rather than under `/api`.
@@ -310,7 +373,14 @@ pub fn router(state: Arc<AppState>) -> Router {
     openapi::spec_json();
     // Console pages are not part of the API document.
     let mut app = Router::new()
-        .nest("/api", api.layer(middleware::from_fn(json_errors)))
+        .nest(
+            "/api",
+            api.layer(middleware::from_fn(json_errors))
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    read_only_guard,
+                )),
+        )
         .merge(root);
     if state.cfg.web_console.enabled {
         app = app

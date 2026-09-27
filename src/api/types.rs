@@ -495,6 +495,8 @@ pub struct ServerStatus {
     /// When the in-memory zone catalog was last rebuilt.
     #[schema(format = DateTime)]
     pub catalog_built_at: String,
+    /// Standby / primary role (the console shows a banner on a standby).
+    pub replication: crate::replication::types::ReplicationSummary,
 }
 
 #[derive(Debug, Serialize, ToSchema)]

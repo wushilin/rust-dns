@@ -360,10 +360,11 @@ pub enum GlobalPerm {
     ChangeOwnPassword,
     ManageOwnMfa,
     ManageOwnSessions,
+    Replicate,
 }
 
 impl GlobalPerm {
-    pub const ALL: [GlobalPerm; 9] = [
+    pub const ALL: [GlobalPerm; 10] = [
         GlobalPerm::CreateZones,
         GlobalPerm::TransferOwnership,
         GlobalPerm::ManageUsers,
@@ -373,6 +374,7 @@ impl GlobalPerm {
         GlobalPerm::ChangeOwnPassword,
         GlobalPerm::ManageOwnMfa,
         GlobalPerm::ManageOwnSessions,
+        GlobalPerm::Replicate,
     ];
 
     pub fn requires_admin(self) -> bool {
@@ -383,6 +385,7 @@ impl GlobalPerm {
                 | GlobalPerm::ManageUsers
                 | GlobalPerm::ViewAudit
                 | GlobalPerm::ServerAdmin
+                | GlobalPerm::Replicate
         )
     }
 
@@ -411,6 +414,9 @@ impl GlobalPerm {
             GlobalPerm::ChangeOwnPassword => "Change own password",
             GlobalPerm::ManageOwnMfa => "Enroll, disable or reset own MFA and recovery codes",
             GlobalPerm::ManageOwnSessions => "Sign out own sessions",
+            GlobalPerm::Replicate => {
+                "Replication: read the full data set (including password hashes, TOTP and TSIG secrets) as a standby, see the replication status, promote a standby"
+            }
         }
     }
 
@@ -1122,7 +1128,8 @@ mod permission_tests {
                 ManageUsers,
                 ViewAudit,
                 ServerAdmin,
-                ManageOwnTokens
+                ManageOwnTokens,
+                Replicate
             ]
         );
         assert!(

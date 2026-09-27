@@ -3,7 +3,7 @@
 
 use super::client_ip::ClientIp;
 use super::error::{ApiError, ApiResult, ErrorCode};
-use super::openapi::{BadRequest, ServiceUnavailable, TooManyRequests, Unauthorized};
+use super::openapi::{BadRequest, ReadOnly, ServiceUnavailable, TooManyRequests, Unauthorized};
 use super::types::*;
 use super::AppState;
 use crate::auth;
@@ -530,12 +530,13 @@ pub async fn mfa_verify(
     tag = "Auth",
     operation_id = "login_enroll",
     summary = "Complete forced MFA enrollment",
-    description = "For a session in `enroll_required` state: confirm the secret from the login response with a TOTP code.",
+    description = "For a session in `enroll_required` state: confirm the secret from the login response with a TOTP code. On a read-only standby only the local root account can enroll here (other accounts are replicated from the primary: enroll there).",
     request_body(content = CodeBody, example = json!({ "code": "123456" })),
     responses(
         (status = 200, description = "Enrolled; session active. Recovery codes are shown once.", body = EnrollVerifyResponse),
         (status = 400, response = BadRequest),
         (status = 401, response = Unauthorized),
+        (status = 409, response = ReadOnly),
         (status = 429, response = TooManyRequests),
     ),
     security(("cookie" = [])),
@@ -555,6 +556,13 @@ pub async fn enroll_verify(
     };
     if sess.state != "enroll_pending" {
         return Err(ApiError::bad_request("session is not enrolling"));
+    }
+    if let Some(why) = state.repl.read_only_reason() {
+        if !user.is_root {
+            return Err(ApiError::read_only(format!(
+                "{why}: MFA enrollment of replicated accounts happens on the primary"
+            )));
+        }
     }
     let secret = sess
         .pending_secret

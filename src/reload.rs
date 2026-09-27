@@ -82,6 +82,12 @@ impl Reloader {
                 "[web_console] proxy settings",
             ),
             (
+                serde_json::to_string(&cfg.follow).ok() != serde_json::to_string(&old.follow).ok()
+                    || serde_json::to_string(&cfg.peer).ok()
+                        != serde_json::to_string(&old.peer).ok(),
+                "[follow] / [peer] (standby mode)",
+            ),
+            (
                 cfg.backup.dir != old.backup.dir
                     || cfg.backup.interval_hours != old.backup.interval_hours
                     || cfg.backup.keep != old.backup.keep,

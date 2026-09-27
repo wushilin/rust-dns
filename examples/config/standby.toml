@@ -1,0 +1,47 @@
+# Standby (follow mode): a second rust-dns that mirrors the primary so it can
+# answer every DNS query while the primary is down. It refuses changes (409
+# read_only_standby) and is promoted by hand. See README "Standby / follow mode".
+#
+# Start from your normal config (listeners, [forwarding], [transfer], logging are
+# local and NOT replicated) and add [follow].
+
+[server]
+bind = ["::"]
+port = 53
+default_primary_ns = "ns1.example.net"
+default_hostmaster = "hostmaster@example.net"
+
+[database]
+path = "/opt/rust-dns/data/rust-dns.db"
+
+[web_console]
+bind = "127.0.0.1:8053"      # behind a TLS reverse proxy, like the primary
+
+[root]
+# This server's own root: always able to sign in to this console, even while
+# the primary is down. If the primary has a user with the same name, that
+# account is merged with this one (its tokens and zone ownership apply here,
+# the password and MFA below stay local).
+username = "root"
+password = "set-a-password"   # hashed in place at the first start
+
+[transfer]
+# Secondaries that should also be able to transfer from this server after a
+# failover. NOTIFY is sent to these targets when replicated changes arrive;
+# leave notify empty if the secondaries only know the primary.
+allow = []
+require_tsig = true
+notify = []
+
+[follow]
+primary = "https://dns1.example.net:8053"  # the primary's web API (HTTPS required)
+token = "rdns_..."                         # API token of an ADMINISTRATOR on the primary
+reconcile_interval_secs = 3600             # compare checksums with the primary
+allow_insecure_http = false                # never true across an untrusted network
+timeout_secs = 30
+
+# On the PRIMARY (not here), add the peer check so a returning old primary
+# stays read-only after this standby was promoted:
+#
+# [peer]
+# url = "https://dns2.example.net:8053"

@@ -53,11 +53,12 @@ This document is generated from the server's code, so it always matches the runn
         (name = "Tokens", description = "API tokens for scripts and automation."),
         (name = "Server", description = "Health, status, metrics and server administration."),
         (name = "TSIG", description = "TSIG keys (RFC 8945) that authenticate zone transfers and NOTIFY for secondaries, and the transfer policy in effect (administrators)."),
+        (name = "Replication", description = "Standby (follow) mode: what a standby pulls from its primary, replication status, and promotion of a standby. A standby refuses every mutating operation with 409 `read_only_standby`."),
     ),
     security(("bearer" = []), ("cookie" = [])),
     components(
         schemas(ErrorBody, crate::model::QueryEvent),
-        responses(BadRequest, InvalidRequest, Unauthorized, Forbidden, NotFound, Conflict, TooManyRequests, ServiceUnavailable),
+        responses(BadRequest, InvalidRequest, Unauthorized, Forbidden, NotFound, Conflict, ReadOnly, ConflictOrReadOnly, TooManyRequests, ServiceUnavailable),
     ),
     modifiers(&Security),
 )]
@@ -139,6 +140,15 @@ error_response!(
 );
 error_response!(Conflict, "Conflicts with existing data.");
 error_response!(
+    ReadOnly,
+    "This server is a read-only standby (or an old primary fenced after a failover): `code: read_only_standby`; the message names the primary to use.",
+    Some(serde_json::json!({ "error": "this server is a read-only standby of https://dns1.example.net:8053; make changes on the primary", "code": "read_only_standby" }))
+);
+error_response!(
+    ConflictOrReadOnly,
+    "Conflicts with existing data, or this server is a read-only standby (`code: read_only_standby`; the message names the primary to use)."
+);
+error_response!(
     TooManyRequests,
     "Too many attempts: the per-client rate limit (an IPv4 address or IPv6 /64), the account's failed-attempt back-off, or the session's code-attempt limit. `Retry-After` says when to try again.",
     Some(serde_json::json!({ "error": "too many failed attempts for this account; try again in 4 seconds", "code": null }))
@@ -161,6 +171,33 @@ pub fn finish(mut api: OpenApiDoc, root: OpenApiDoc) -> OpenApiDoc {
     for (path, mut item) in root.paths.paths {
         item.servers = Some(vec![root_server.clone()]);
         api.paths.paths.insert(path, item);
+    }
+    // Every mutating operation not on the standby allowlist answers 409
+    // `read_only_standby` on a standby (see `super::read_only_guard`).
+    for (path, item) in api.paths.paths.iter_mut() {
+        for (method, op) in [
+            ("PUT", item.put.as_mut()),
+            ("POST", item.post.as_mut()),
+            ("DELETE", item.delete.as_mut()),
+            ("PATCH", item.patch.as_mut()),
+        ] {
+            let Some(op) = op else { continue };
+            if super::STANDBY_WRITABLE
+                .iter()
+                .any(|(m, t)| *m == method && t == path)
+            {
+                continue;
+            }
+            let name = if op.responses.responses.contains_key("409") {
+                "ConflictOrReadOnly"
+            } else {
+                "ReadOnly"
+            };
+            op.responses.responses.insert(
+                "409".into(),
+                RefOr::Ref(Ref::new(format!("#/components/responses/{name}"))),
+            );
+        }
     }
     for item in api.paths.paths.values_mut() {
         for op in operations_mut(item) {

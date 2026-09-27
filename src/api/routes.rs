@@ -251,6 +251,7 @@ pub async fn status(State(s): St, caller: Caller) -> ApiResult<Json<ServerStatus
         cookies: rt.cookies,
         nsid: rt.nsid.clone(),
         catalog_built_at: s.cache.load().built_at.clone(),
+        replication: s.repl.summary(),
     }))
 }
 
@@ -371,6 +372,7 @@ pub async fn metrics(State(s): St, _caller: Caller) -> ApiResult<Response> {
         "# TYPE rustdns_uptime_seconds gauge\nrustdns_uptime_seconds {}\n",
         s.started.elapsed().as_secs()
     ));
+    out.push_str(&s.repl.metrics_text());
     Ok(([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], out).into_response())
 }
 

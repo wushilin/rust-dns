@@ -10,6 +10,7 @@ mod model;
 mod mutation;
 mod ratelimit;
 mod reload;
+mod replication;
 mod storage;
 mod ui;
 mod zones;
@@ -41,6 +42,11 @@ struct Cli {
     /// Validate the selected configuration and exit without starting listeners.
     #[arg(long)]
     check: bool,
+    /// Promote this standby to primary while the server is stopped: removes
+    /// [follow] from the config file and records a new history in the
+    /// database. (A running standby: the console or POST /api/replication/promote.)
+    #[arg(long)]
+    promote: bool,
 }
 
 #[tokio::main]
@@ -72,9 +78,40 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     if cli.check {
-        config::check(&cli.config)?;
+        let cfg = config::check(&cli.config)?;
         println!("configuration {} is valid", cli.config.display());
+        if let Some(f) = &cfg.follow {
+            println!(
+                "role: standby of {} (read-only; promote with --promote or from the console)",
+                f.primary
+            );
+        } else if let Some(p) = &cfg.peer {
+            println!("role: primary; [peer] {} is checked so this server stays read-only if it was promoted", p.url);
+        }
+        if let Some(note) = replication_note(&cfg) {
+            println!("{note}");
+        }
         return Ok(());
+    }
+    if cli.promote {
+        match replication::promote_offline(&cli.config).await {
+            Ok(h) => {
+                println!("promoted: {} is now a primary", cli.config.display());
+                println!(
+                    "new history id {} (parent {}, forked at offset {})",
+                    h.history_id,
+                    h.parent_history_id.unwrap_or_default(),
+                    h.fork_offset.unwrap_or(0)
+                );
+                println!("[follow] was removed from the config file; start the server normally.");
+                println!("Keep the old primary from accepting writes (stop it, or give it [peer] url = <this server>), then make it a standby of this server.");
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("rust-dns: promotion failed: {e:#}");
+                std::process::exit(1);
+            }
+        }
     }
     // Logging is needed before config load (it logs), so bootstrap with defaults
     // and re-read the level from the file afterwards via RUST_LOG if set.
@@ -94,6 +131,8 @@ async fn main() -> anyhow::Result<()> {
             tracing::warn!(entry = %e, "{section}.proxy_trust trusts a whole network: any host on it (e.g. every container on a Docker bridge) can claim to be any client; list only the proxy's own address");
         }
     }
+    // TLS for the standby's client: rustls with the ring provider.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let cfg = Arc::new(cfg);
     tracing::info!(version = env!("CARGO_PKG_VERSION"), config = %cli.config.display(), "starting rust-dns");
 
@@ -163,6 +202,26 @@ async fn main() -> anyhow::Result<()> {
         mutator: mutator.clone(),
         accounts: accounts.clone(),
     });
+    // Replication role (standby / primary / fenced) before anything can write.
+    let repl = replication::Replication::new(
+        storage.clone(),
+        mutator.clone(),
+        dns.clone(),
+        reloader.clone(),
+        cli.config.clone(),
+    );
+    {
+        let r = repl.clone();
+        accounts.set_commit_hook(Box::new(move |records| {
+            if records
+                .iter()
+                .any(|a| replication::replicated_action(&a.action))
+            {
+                r.bump_generation();
+            }
+        }));
+    }
+    repl.start().await?;
     // Record expiry: stop serving at expires_at, delete after [expiry].retention_days.
     {
         let r = reloader.clone();
@@ -208,6 +267,7 @@ async fn main() -> anyhow::Result<()> {
         clock: auth::system_clock(),
         trusted: cfg.web_console.proxy.trusted_cidrs(),
         started: std::time::Instant::now(),
+        repl: repl.clone(),
     });
     let web_task = tokio::spawn(api::serve(state.clone()));
 
@@ -252,4 +312,46 @@ async fn main() -> anyhow::Result<()> {
         _ = tokio::signal::ctrl_c() => { tracing::info!("shutting down"); bus.shutdown(); }
     }
     Ok(())
+}
+
+/// `--check`: what the database says about replication, if it can be read
+/// without changing it.
+fn replication_note(cfg: &config::Config) -> Option<String> {
+    let path = &cfg.database.path;
+    if !path.exists() {
+        return None;
+    }
+    let conn =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .ok()?;
+    let mut stmt = conn
+        .prepare("SELECT key, value FROM replication_state")
+        .ok()?;
+    let st: std::collections::HashMap<String, String> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .ok()?
+        .filter_map(|r| r.ok())
+        .collect();
+    let mut out = format!(
+        "database history id {}",
+        st.get("history_id")
+            .map(String::as_str)
+            .unwrap_or("(none yet)")
+    );
+    if let Some(at) = st.get("promoted_at") {
+        out.push_str(&format!(
+            "; promoted on {at} from {}",
+            st.get("promoted_from").map(String::as_str).unwrap_or("?")
+        ));
+    }
+    match (&cfg.follow, st.get("following")) {
+        (None, Some(u)) => out.push_str(&format!(
+            "\nnote: the database is a standby of {u} but the config has no [follow]: the next start records a promotion (new history id) and accepts writes"
+        )),
+        (Some(f), _) if st.get("promoted_from").map(|s| s.trim_end_matches('/')) == Some(f.primary.trim().trim_end_matches('/')) => out.push_str(
+            "\nwarning: this server was promoted away from the primary that [follow] names; it will refuse to follow that old primary (remove [follow])",
+        ),
+        _ => {}
+    }
+    Some(out)
 }

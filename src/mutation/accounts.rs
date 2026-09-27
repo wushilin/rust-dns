@@ -79,6 +79,21 @@ fn user_detail(u: &User) -> serde_json::Value {
 }
 
 impl<'a> AuditTx<'a> {
+    /// An audited transaction on `conn` for sibling mutation modules that
+    /// combine audited writes with other writes in one SQLite transaction
+    /// (replication). Must be closed with [`AuditTx::commit_entries`].
+    pub(super) fn begin(conn: &'a Connection) -> Self {
+        AuditTx {
+            conn,
+            entries: Vec::new(),
+        }
+    }
+
+    /// Write the collected audit rows (same transaction).
+    pub(super) fn commit_entries(self, actor: &Actor, operation: &str) -> Result<Vec<AuditRecord>> {
+        self.finish(actor, operation)
+    }
+
     pub(super) fn push(
         &mut self,
         action: &'static str,
@@ -593,13 +608,26 @@ impl<'a> AuditTx<'a> {
 }
 
 /// Entry point for account and security writes.
+/// Called after every committed account transaction with its audit rows
+/// (replication uses it to tell standbys that account data changed).
+pub type CommitHook = Box<dyn Fn(&[AuditRecord]) + Send + Sync>;
+
 pub struct Accounts {
     storage: Arc<Storage>,
+    on_commit: std::sync::OnceLock<CommitHook>,
 }
 
 impl Accounts {
     pub fn new(storage: Arc<Storage>) -> Self {
-        Accounts { storage }
+        Accounts {
+            storage,
+            on_commit: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Install the commit hook (once).
+    pub fn set_commit_hook(&self, hook: CommitHook) {
+        let _ = self.on_commit.set(hook);
     }
 
     /// Run `f` as one transaction. Committed: data and audit rows are
@@ -625,6 +653,9 @@ impl Accounts {
             Ok((out, records)) => {
                 for r in &records {
                     tracing::info!(audit_id = r.id, txn = %r.txn, operation, actor = %r.actor, ip = %r.actor_ip, action = %r.action, target = %r.target, "audit");
+                }
+                if let Some(hook) = self.on_commit.get() {
+                    hook(&records);
                 }
                 Ok(out)
             }

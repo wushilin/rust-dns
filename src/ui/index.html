@@ -61,7 +61,11 @@ input:focus, select:focus, textarea:focus { border-color: var(--accent); box-sha
 .qr svg { width: 100%; height: 100%; display: block; }
 
 /* ---- shell ---- */
-#app { display: grid; grid-template-columns: var(--side-w, 236px) minmax(0, 1fr); grid-template-areas: "side main"; min-height: 100%; }
+#app { display: grid; grid-template-columns: var(--side-w, 236px) minmax(0, 1fr); grid-template-areas: "side banner" "side main"; grid-template-rows: auto 1fr; min-height: 100%; }
+#repl-banner { grid-area: banner; display: flex; align-items: center; gap: 8px 14px; flex-wrap: wrap; padding: 9px 28px; font-size: 13px; background: color-mix(in srgb, var(--warn) 15%, var(--panel)); border-bottom: 1px solid color-mix(in srgb, var(--warn) 45%, var(--line)); }
+#repl-banner.bad { background: color-mix(in srgb, var(--danger) 13%, var(--panel)); border-bottom-color: color-mix(in srgb, var(--danger) 45%, var(--line)); }
+#repl-banner .ico { color: var(--warn); } #repl-banner.bad .ico { color: var(--danger); }
+#repl-banner a { font-weight: 600; margin-left: auto; }
 #side { grid-area: side; background: var(--panel); border-right: 1px solid var(--line); padding: 14px 10px 10px; display: flex; flex-direction: column; position: sticky; top: 0; height: 100vh; height: 100dvh; overflow-y: auto; overflow-x: hidden; z-index: 41; }
 #side .side-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 2px 2px 8px 6px; }
 #side .brand { min-width: 0; white-space: nowrap; }
@@ -299,7 +303,8 @@ textarea { resize: vertical; }
 @keyframes fade { from { background: color-mix(in srgb, var(--accent) 14%, transparent); } to { background: transparent; } }
 
 @media (max-width: 860px) {
-  #app { grid-template-columns: minmax(0, 1fr); grid-template-areas: "mtop" "main"; grid-template-rows: auto 1fr; }
+  #app { grid-template-columns: minmax(0, 1fr); grid-template-areas: "mtop" "banner" "main"; grid-template-rows: auto auto 1fr; }
+  #repl-banner { padding: 8px 16px; }
   #mtop { grid-area: mtop; display: flex; align-items: center; gap: 10px; padding: 10px 12px; background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 30; }
   #mtop .brand { font-size: 16px; flex: 1; }
   #mtop .brand .logo { width: 26px; height: 26px; }
@@ -377,6 +382,7 @@ textarea { resize: vertical; }
       <a href="#/audit" data-nav="audit" data-admin title="Audit log"><span class="nav-ico" data-ico="shield"></span><span class="lbl">Audit log</span></a>
       <a href="#/server" data-nav="server" data-admin title="Server settings"><span class="nav-ico" data-ico="sliders"></span><span class="lbl">Server settings</span></a>
       <a href="#/tsig" data-nav="tsig" data-admin title="TSIG keys"><span class="nav-ico" data-ico="lock"></span><span class="lbl">TSIG keys</span></a>
+      <a href="#/replication" data-nav="replication" data-admin title="Replication"><span class="nav-ico" data-ico="servers"></span><span class="lbl">Replication</span></a>
       <div class="nav-sec">Account</div>
       <a href="#/tokens" data-nav="tokens" title="API tokens"><span class="nav-ico" data-ico="key"></span><span class="lbl">API tokens</span></a>
       <a href="#/api" data-nav="api" title="API explorer"><span class="nav-ico" data-ico="code"></span><span class="lbl">API explorer</span></a>
@@ -389,6 +395,7 @@ textarea { resize: vertical; }
     </div>
   </aside>
   <div id="nav-backdrop"></div>
+  <div id="repl-banner" class="hidden" role="status"></div>
   <main id="main"></main>
 </div>
 
@@ -434,6 +441,7 @@ const ICONS = {
   deleg: '<path d="M3 12h10M9 7l5 5-5 5"/><path d="M16 4h4v16h-4"/>',
   term: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M13 15h4"/>',
   lock: '<rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>',
+  servers: '<rect x="3" y="4" width="18" height="6.5" rx="1.5"/><rect x="3" y="13.5" width="18" height="6.5" rx="1.5"/><path d="M7 7.25h.01M7 16.75h.01" stroke-width="2.6"/>',
   back: '<path d="M15 6l-6 6 6 6"/>',
 };
 const ico = (name, cls = '') => `<span class="ico ${cls}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name] || ''}</svg></span>`;
@@ -552,7 +560,7 @@ $('#nav').addEventListener('click', e => { if (e.target.closest('a')) $('#app').
 // ---------------------------------------------------------------------------
 // state
 // ---------------------------------------------------------------------------
-const S = { user: null, zones: [], zone: null, panel: null, status: null, queries: [], changes: [], lastOffset: null, ws: null, wsTimer: null, paused: false, filter: '' };
+const S = { user: null, zones: [], zone: null, panel: null, status: null, queries: [], changes: [], lastOffset: null, ws: null, wsTimer: null, paused: false, filter: '', repl: null, readOnly: false };
 const RTYPES = ['A', 'AAAA', 'CNAME', 'DNAME', 'PTR', 'NS', 'MX', 'TXT', 'SRV', 'CAA', 'HTTPS', 'SVCB', 'TLSA', 'SSHFP', 'NAPTR', 'HINFO'];
 const VALUE_HINT = { A: '10.0.0.1', AAAA: '2001:db8::1', CNAME: 'target.example.com', DNAME: 'other.example.com', PTR: 'host.example.com', NS: 'ns1.example.com', MX: '10 mail.example.com', TXT: 'v=spf1 -all', SRV: '10 20 5060 sip.example.com', CAA: '0 issue "letsencrypt.org"', HTTPS: '1 . alpn=h2,h3', SVCB: '1 svc.example.com. port=8443', TLSA: '3 1 1 <sha256 hex>', SSHFP: '4 2 <sha256 hex>', NAPTR: '100 10 "S" "SIP+D2U" "" _sip._udp.example.com.', HINFO: '"x86_64" "Linux"' };
 
@@ -612,9 +620,43 @@ async function enterApp() {
   $('#login').classList.add('hidden'); $('#app').classList.remove('hidden');
   $('#who-name').textContent = S.user.username + (S.user.is_admin ? ' · admin' : '');
   $$('[data-admin]').forEach(a => a.classList.toggle('hidden', !S.user.is_admin));
+  await pollRepl();
+  clearInterval(enterApp.replTimer); enterApp.replTimer = setInterval(pollRepl, 10000);
   await refreshZones();
   connectWs();
   route();
+}
+
+// ---------------------------------------------------------------------------
+// standby (read-only) mode: banner on every page, write controls disabled
+// ---------------------------------------------------------------------------
+const WRITE_SEL = '#z-new,#z-edit,#z-del,#u-new,#tk-new,#tk-save,#tk-del,#t-new,#soa-edit,#rf-save,#r-add,#m-add,#im-go,#fw-save,#fw-reset,#pw-btn,#mfa-on,#mfa-off,#mfa-regen,[data-edit],[data-del],[data-rm],[data-rev],[data-tab="import"]';
+function applyReadOnly() {
+  if (!S.readOnly) return;
+  $$(WRITE_SEL).forEach(b => { if (!b.disabled) { b.disabled = true; b.dataset.ro = '1'; b.title = 'Read-only: make changes on the primary'; } });
+}
+new MutationObserver(applyReadOnly).observe(document.body, { childList: true, subtree: true });
+async function pollRepl() {
+  if (!S.user) return;
+  try { const st = await GET('/status'); S.status = st; renderBanner(st.replication); } catch {}
+}
+function renderBanner(r) {
+  const b = $('#repl-banner'), was = S.readOnly;
+  S.repl = r; S.readOnly = !!r && !r.writable;
+  $('#app').classList.toggle('read-only', S.readOnly);
+  if (!S.readOnly) { b.classList.add('hidden'); b.innerHTML = ''; if (was) route(); return; }
+  const link = S.user && S.user.is_admin ? '<a href="#/replication">Replication</a>' : '';
+  if (r.role === 'standby') {
+    const state = r.connected
+      ? (r.lag_changes ? `${num(r.lag_changes)} change${r.lag_changes === 1 ? '' : 's'} behind` : 'in sync')
+      : `primary unreachable${r.disconnected_since ? ' since ' + esc(fmtTime(r.disconnected_since)) : ''}`;
+    b.className = r.connected ? '' : 'bad';
+    b.innerHTML = `${ico('servers', 's')}<span>Standby of <b class="mono">${esc(r.primary || '')}</b> — read-only · ${state}</span>${link}`;
+  } else {
+    b.className = 'bad';
+    b.innerHTML = `${ico('warn', 's')}<span><b>Read-only:</b> ${esc(r.read_only_reason || 'this server does not accept changes')}</span>${link}`;
+  }
+  if (!was) applyReadOnly();
 }
 window.addEventListener('hashchange', route);
 async function route() {
@@ -624,7 +666,7 @@ async function route() {
   $$('#side nav a').forEach(a => a.classList.toggle('active', a.dataset.nav === page));
   $('#app').classList.remove('nav-open');
   if (S.panel && !(page === 'zones' && arg === S.panel.zone)) closeDrawer();
-  const views = { dashboard: viewDashboard, zones: arg ? () => viewZone(arg) : viewZones, queries: viewQueries, changelog: viewChangelog, audit: viewAudit, server: viewServer, tsig: viewTsig, api: viewApi, users: viewUsers, tokens: viewTokens, account: viewAccount };
+  const views = { dashboard: viewDashboard, zones: arg ? () => viewZone(arg) : viewZones, queries: viewQueries, changelog: viewChangelog, audit: viewAudit, server: viewServer, tsig: viewTsig, replication: viewReplication, api: viewApi, users: viewUsers, tokens: viewTokens, account: viewAccount };
   const v = views[page] || viewDashboard;
   try { await v(); } catch (e) { if (e.code !== 'login_required') { $('#main').innerHTML = `<div class="empty">${esc(e.message)}</div>`; } }
 }
@@ -710,6 +752,7 @@ async function viewDashboard() {
         <span class="k">Rate limit</span><span>${num(st.rate_limit.max_resolutions_per_second_per_address)} q/s per address · tracking ${num(st.rate_limit.tracked_addresses)} / ${num(st.rate_limit.max_tracked_addresses)}</span>
         <span class="k">Changelog</span><span>offsets ${st.changelog.oldest_offset ?? '–'} … ${st.changelog.latest_offset ?? '–'} · ${st.changelog.retention_days} day retention</span>
         <span class="k">Catalog built</span><span>${fmtTime(st.catalog_built_at)}</span>
+        <span class="k">Replication</span><span>${replRoleText(st.replication)}</span>
       </div></div>
       <div class="card panel"><h2>Recent changes</h2><div id="recent" class="tw"></div></div>
     </div>`;
@@ -1652,6 +1695,95 @@ function wireZonePicker(m) {
   m.querySelectorAll('[name=tk-scope]').forEach(r => r.onchange = () => $('#tk-zones').classList.toggle('hidden', m.querySelector('[name=tk-scope]:checked').value === 'all'));
   return () => m.querySelector('[name=tk-scope]:checked').value === 'all' ? [] : [...m.querySelectorAll('#tk-zones input:checked')].map(i => i.value);
 }
+// ---------------------------------------------------------------------------
+// replication (standby / follow mode)
+// ---------------------------------------------------------------------------
+function replRoleText(r) {
+  if (!r) return '';
+  const role = { primary: 'primary', promoted: 'primary (promoted standby)', standby: 'standby (read-only)', fenced: 'old primary, fenced (read-only)' }[r.role] || r.role;
+  return esc(role) + (r.primary ? ` · <span class="mono">${esc(r.primary)}</span>` : '');
+}
+const ROLE_BADGE = { primary: '<span class="badge ok">primary</span>', promoted: '<span class="badge ok">primary · promoted</span>', standby: '<span class="badge warn">standby · read-only</span>', fenced: '<span class="badge bad">fenced · read-only</span>' };
+let replTimer = null;
+async function viewReplication() {
+  if (!S.user.is_admin) { location.hash = '#/dashboard'; return; }
+  clearInterval(replTimer);
+  const r = await GET('/replication/status');
+  const h = r.history, f = r.follow;
+  const when = t => t ? `<span title="${esc(fmtTime(t))}">${ago(t)}</span>` : '<span class="hint">never</span>';
+  const opt = v => v == null || v === '' ? '<span class="hint">–</span>' : esc(v);
+  const stateBadge = s => ({ following: '<span class="badge ok">following</span>', bootstrapping: '<span class="badge warn">loading snapshot</span>', connecting: '<span class="badge warn">connecting</span>', starting: '<span class="badge warn">starting</span>', refused: '<span class="badge bad">refused</span>', error: '<span class="badge bad">error</span>', stopped: '<span class="badge muted">stopped</span>' }[s] || `<span class="badge">${esc(s)}</span>`);
+  $('#main').innerHTML = `<div class="topbar"><h1>Replication</h1>${r.role === 'standby' ? '<button class="btn danger" id="rp-promote">Promote to primary…</button>' : ''}</div>
+    ${r.warning ? `<div class="note warn" style="max-width:900px">${ico('warn', 's')}<span>${esc(r.warning)}</span></div>` : ''}
+    <div class="grid two" style="max-width:1100px">
+      <div class="card panel"><h2>This server</h2><div class="kv">
+        <span class="k">Role</span><span>${ROLE_BADGE[r.role] || esc(r.role)}</span>
+        <span class="k">Accepts writes</span><span>${r.writable ? 'yes' : 'no'}</span>
+        ${r.read_only_reason ? `<span class="k">Why read-only</span><span>${esc(r.read_only_reason)}</span>` : ''}
+        <span class="k">History id</span><span class="mono">${esc(h.history_id)}</span>
+        <span class="k">Parent history</span><span>${h.parent_history_id ? `<span class="mono">${esc(h.parent_history_id)}</span> at offset ${num(h.fork_offset)}` : '<span class="hint">none (original primary)</span>'}</span>
+        ${h.promoted_at ? `<span class="k">Promoted</span><span>${when(h.promoted_at)} · was a standby of <span class="mono">${esc(h.promoted_from || '')}</span></span>` : ''}
+        <span class="k">Changelog offset</span><span>${num(r.head)}</span>
+      </div></div>
+      ${f ? `<div class="card panel"><h2>Primary</h2><div class="kv">
+        <span class="k">URL</span><span class="mono">${esc(f.primary)}</span>
+        <span class="k">State</span><span>${stateBadge(f.state)} ${f.connected ? '<span class="badge ok">connected</span>' : '<span class="badge bad">not connected</span>'}</span>
+        ${f.disconnected_since ? `<span class="k">Unreachable since</span><span>${esc(fmtTime(f.disconnected_since))}</span>` : ''}
+        ${f.last_error ? `<span class="k">Last error</span><span style="color:var(--danger)">${esc(f.last_error)}</span>` : ''}
+        <span class="k">Applied offset</span><span>${num(f.last_applied_offset)}${f.primary_head != null ? ` of ${num(f.primary_head)} · ${f.lag_changes ? `<b>${num(f.lag_changes)} behind</b>` : 'in sync'}` : ''}</span>
+        <span class="k">Last change applied</span><span>${when(f.last_applied_at)}</span>
+        <span class="k">Last contact</span><span>${when(f.last_contact_at)}</span>
+        <span class="k">Last snapshot</span><span>${when(f.last_snapshot_at)}${f.last_snapshot_result ? ` · ${opt(f.last_snapshot_result)}` : ''}</span>
+        <span class="k">Last reconcile</span><span>${when(f.last_reconcile_at)}${f.last_reconcile_result ? ` · ${opt(f.last_reconcile_result)}` : ''}</span>
+        <span class="k">Accounts synced</span><span>${when(f.last_accounts_sync_at)}</span>
+        <span class="k">Reconnects / snapshots</span><span>${num(f.reconnects)} / ${num(f.rebootstraps)}</span>
+      </div></div>` : `<div class="card panel"><h2>Standbys</h2>${r.standbys.length ? `<div class="tw"><table><thead><tr><th>Address</th><th>Token user</th><th>Cursor</th><th>Last poll</th></tr></thead><tbody>${r.standbys.map(x => `<tr><td class="mono">${esc(x.address)}</td><td>${esc(x.user)}</td><td>${num(x.after)}${x.after < r.head ? ` <span class="badge warn">${num(r.head - x.after)} behind</span>` : ''}</td><td>${when(x.last_seen_at)}</td></tr>`).join('')}</tbody></table></div>` : '<p class="hint">No standby polled this server in the last 10 minutes.</p>'}
+        ${r.peer ? `<div class="kv" style="margin-top:12px"><span class="k">[peer]</span><span class="mono">${esc(r.peer.url)}</span><span class="k">Last check</span><span>${when(r.peer.last_check_at)}${r.peer.last_result ? ` · ${esc(r.peer.last_result)}` : ''}</span></div>` : ''}</div>`}
+    </div>
+    ${r.role === 'standby' ? `<div class="card panel" style="margin-top:14px;max-width:1100px"><h2>What promotion does</h2>
+      <ul class="hint" style="line-height:1.7;margin:0;padding-left:18px">
+        <li>This server stops following <span class="mono">${esc(f.primary)}</span> and accepts writes at once (zones, records, users, tokens, settings, TSIG keys). Nothing is restarted; DNS answers continue.</li>
+        <li><code>[follow]</code> is removed from its configuration file, and it starts a new history (forked from the current one at offset ${num(r.head)}), so the old primary can tell it was replaced.</li>
+        <li>Users sign in with their usual passwords, MFA codes and API tokens (replicated). Sessions are not replicated: everyone signs in again.</li>
+        <li>Stop the old primary first if it is still running, or give it <code>[peer] url</code> pointing here so it starts read-only. Then make it a standby of this server; its changes after the fork are saved to a file for review.</li>
+        <li>Update zone secondaries and the registrar's NS/glue if they name the old primary.</li>
+      </ul></div>` : ''}
+    ${r.role !== 'standby' ? `<div class="card panel" style="margin-top:14px;max-width:1100px"><h2>Add a standby</h2>
+      <p class="hint">On the second server, create an API token of an administrator here (API tokens), then add to its configuration file and restart it. The replication stream carries password hashes, TOTP and TSIG secrets: use HTTPS (a TLS reverse proxy in front of this console).</p>
+      ${snip(`[follow]\nprimary = "https://${location.host}"\ntoken = "rdns_..."\nreconcile_interval_secs = 3600`, 'Copy example')}
+      <p class="hint">And here, so this server stays read-only if it ever comes back after the standby was promoted:</p>
+      ${snip(`[peer]\nurl = "https://standby.example.net:8053"`, 'Copy example')}</div>` : ''}`;
+  const pb = $('#rp-promote'); if (pb) pb.onclick = () => promoteModal(r);
+  replTimer = setInterval(async () => { if (!location.hash.startsWith('#/replication')) { clearInterval(replTimer); return; } if (!modalOpen()) viewReplication().catch(() => {}); }, 5000);
+}
+function promoteModal(r) {
+  const reachable = !!(r.follow && r.follow.connected);
+  openModal(`<h2>Promote this standby to primary</h2>
+    <p>This server will stop following <span class="mono">${esc(r.follow.primary)}</span> and <b>accept writes immediately</b>. <code>[follow]</code> is removed from its configuration file and a new history starts.</p>
+    ${reachable ? `<div class="note warn">${ico('warn', 's')}<span>The primary is <b>reachable right now</b>. Promoting makes two writable servers until the old primary is stopped or fenced. Only continue if you are replacing it on purpose.</span></div>
+      <label style="display:flex;gap:8px;align-items:center;margin-top:10px"><input type="checkbox" id="pr-force"> Promote anyway; I will stop the old primary</label>` : `<p class="hint">The primary has not been reachable${r.follow.disconnected_since ? ' since ' + esc(fmtTime(r.follow.disconnected_since)) : ''}. ${r.follow.lag_changes ? `This standby was ${num(r.follow.lag_changes)} change(s) behind at the last contact; those are not here.` : ''}</p>`}
+    <div class="error" id="m-err"></div>
+    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="rp-go">Promote</button></div>`, m => {
+    const go = $('#rp-go');
+    const disarm = () => { delete go.dataset.armed; go.classList.remove('danger'); go.classList.add('primary'); go.textContent = 'Promote'; };
+    if (reachable) $('#pr-force').onchange = disarm;
+    go.onclick = async () => {
+      $('#m-err').textContent = '';
+      if (reachable && !$('#pr-force').checked) { $('#m-err').textContent = 'The primary is reachable: tick the box to promote anyway.'; return; }
+      if (go.dataset.armed !== '1') { go.dataset.armed = '1'; go.classList.remove('primary'); go.classList.add('danger'); go.textContent = 'Click again: this server becomes the primary'; return; }
+      go.disabled = true;
+      try {
+        const res = await POST('/replication/promote', { confirm: true, force: reachable });
+        closeModal();
+        toast('Promoted: this server now accepts writes', 'ok');
+        await pollRepl();
+        openModal(`<h2>Promoted</h2><ul style="line-height:1.7;padding-left:18px">${res.notes.map(n => `<li>${esc(n)}</li>`).join('')}</ul><div class="foot"><button class="btn primary" data-close>Done</button></div>`);
+        viewReplication();
+      } catch (e) { $('#m-err').textContent = e.message; go.disabled = false; disarm(); }
+    };
+  });
+}
+
 async function viewTsig() {
   if (!S.user.is_admin) { location.hash = '#/dashboard'; return; }
   const [{ keys }, pol] = await Promise.all([GET('/tsig/keys'), GET('/settings/transfer')]);

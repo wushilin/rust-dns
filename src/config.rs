@@ -21,6 +21,110 @@ pub struct Config {
     pub changelog: ChangelogConfig,
     pub expiry: ExpiryConfig,
     pub logging: LoggingConfig,
+    /// Standby mode: mirror another rust-dns (the primary) and refuse
+    /// mutations. Absent = this server is a primary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub follow: Option<FollowConfig>,
+    /// On a primary: the standby to ask, at startup and periodically,
+    /// whether it has been promoted away from this server's history (then
+    /// this server stays read-only instead of accepting writes).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer: Option<PeerConfig>,
+}
+
+/// `[follow]`: this server is a read-only standby of `primary`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FollowConfig {
+    /// Base URL of the primary's web API, e.g. `https://dns1.example.net:8053`.
+    pub primary: String,
+    /// API token of an administrator on the primary (`rdns_...`).
+    pub token: String,
+    /// How often zone serials/checksums and the account data are compared
+    /// with the primary; a mismatch re-bootstraps from a snapshot.
+    pub reconcile_interval_secs: u64,
+    /// Allow a plain `http://` primary URL. The replication stream carries
+    /// password hashes, TOTP secrets and TSIG secrets, so this is refused
+    /// unless set (loopback addresses are always allowed, for tests).
+    pub allow_insecure_http: bool,
+    /// Timeout of one request to the primary (the snapshot gets at least 120 s).
+    pub timeout_secs: u64,
+}
+
+impl Default for FollowConfig {
+    fn default() -> Self {
+        FollowConfig {
+            primary: String::new(),
+            token: String::new(),
+            reconcile_interval_secs: 3600,
+            allow_insecure_http: false,
+            timeout_secs: 30,
+        }
+    }
+}
+
+/// `[peer]`: fencing check on a primary (see [`Config::peer`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PeerConfig {
+    /// Base URL of the standby's web API.
+    pub url: String,
+    pub check_interval_secs: u64,
+    pub allow_insecure_http: bool,
+}
+
+impl Default for PeerConfig {
+    fn default() -> Self {
+        PeerConfig {
+            url: String::new(),
+            check_interval_secs: 60,
+            allow_insecure_http: false,
+        }
+    }
+}
+
+/// Problems with a replication URL (`key` names it in messages).
+pub fn replication_url_problems(key: &str, url: &str, allow_insecure_http: bool) -> Vec<String> {
+    let mut errs = Vec::new();
+    let u = match reqwest::Url::parse(url.trim()) {
+        Ok(u) => u,
+        Err(e) => {
+            errs.push(format!(
+                "{key} '{url}' is not a URL ({e}); example: https://dns1.example.net:8053"
+            ));
+            return errs;
+        }
+    };
+    match u.scheme() {
+        "https" => {}
+        "http" => {
+            if !allow_insecure_http && !url_is_loopback(&u) {
+                errs.push(format!(
+                    "{key} '{url}' uses plain http: replication carries password hashes, TOTP and TSIG secrets; use https (set allow_insecure_http = true only on a trusted network)"
+                ));
+            }
+        }
+        other => errs.push(format!("{key} '{url}': scheme must be https (got {other})")),
+    }
+    if u.host_str().is_none_or(|h| h.is_empty()) {
+        errs.push(format!("{key} '{url}' has no host"));
+    }
+    if !u.username().is_empty() || u.password().is_some() {
+        errs.push(format!(
+            "{key} must not contain credentials (use the token setting)"
+        ));
+    }
+    if u.query().is_some() || u.fragment().is_some() {
+        errs.push(format!("{key} '{url}' must not have a query or fragment"));
+    }
+    errs
+}
+
+/// `localhost` or a loopback address.
+pub fn url_is_loopback(u: &reqwest::Url) -> bool {
+    let Some(h) = u.host_str() else { return false };
+    let h = h.trim_start_matches('[').trim_end_matches(']');
+    h.eq_ignore_ascii_case("localhost") || h.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Records with `expires_at`: stop answering at expiry, deleted after the retention period.
@@ -564,6 +668,22 @@ query_log_file = ""      # separate query log file; empty = queries go to the ma
 max_size_mb = 50         # rotate when the file exceeds this size
 max_files = 10           # rotated files to keep per log
 compress = true          # gzip rotated files
+
+# Standby mode: uncomment on the second server to mirror a primary (read-only,
+# answers all DNS queries while the primary is down; promote it by hand).
+# [follow]
+# primary = "https://dns1.example.net:8053"  # the primary's web API (https required)
+# token = "rdns_..."                         # API token of an administrator on the primary
+# reconcile_interval_secs = 3600             # compare serials/checksums with the primary
+# allow_insecure_http = false                # plain http only on a trusted network (loopback always allowed)
+# timeout_secs = 30
+
+# On the primary: the standby to ask whether it has been promoted, so a returning
+# old primary stays read-only instead of accepting writes (split brain).
+# [peer]
+# url = "https://dns2.example.net:8053"
+# check_interval_secs = 60
+# allow_insecure_http = false
 "#;
 
 /// The sample configuration printed by `--print-sample-config`: the root
@@ -692,6 +812,31 @@ pub fn load_or_init(path: &Path) -> Result<(Config, Option<String>)> {
     }
     warn_if_world_readable(path);
     Ok((cfg, generated_password))
+}
+
+/// Promotion: remove the `[follow]` section from the config file (atomic,
+/// owner-only rewrite), leaving a comment that says what happened. The
+/// token is not copied into the comment. Returns false when there was no
+/// `[follow]` section.
+pub fn remove_follow_section(path: &Path, note: &str) -> Result<bool> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut doc: toml_edit::DocumentMut = text.parse().context("parsing config for rewrite")?;
+    if doc.remove("follow").is_none() {
+        return Ok(false);
+    }
+    let mut out = doc.to_string();
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "\n# [follow] was removed: {note}\n# To make this server a standby again, add a [follow] section (see the README, \"Standby / follow mode\").\n"
+    ));
+    // The result must still be a valid configuration.
+    let cfg: Config = toml::from_str(&out).context("config after removing [follow]")?;
+    validate(&cfg)?;
+    rewrite_private(path, &out)?;
+    Ok(true)
 }
 
 fn warn_if_world_readable(path: &Path) {
@@ -900,6 +1045,51 @@ pub fn validate(cfg: &Config) -> Result<()> {
     // [root]
     if cfg.root.username.trim().is_empty() {
         errs.push("[root].username must not be empty".into());
+    }
+
+    // [follow] / [peer]
+    if let Some(f) = &cfg.follow {
+        if f.primary.trim().is_empty() {
+            errs.push("[follow].primary must be set to the primary's web API URL, e.g. \"https://dns1.example.net:8053\"".into());
+        } else {
+            errs.extend(replication_url_problems(
+                "[follow].primary",
+                &f.primary,
+                f.allow_insecure_http,
+            ));
+        }
+        let t = f.token.trim();
+        if t.is_empty() || t.contains("...") || !t.starts_with("rdns_") {
+            errs.push(
+                "[follow].token must be an API token (rdns_...) of an administrator on the primary"
+                    .into(),
+            );
+        }
+        if f.reconcile_interval_secs == 0 {
+            errs.push("[follow].reconcile_interval_secs must be greater than zero".into());
+        }
+        if f.timeout_secs == 0 {
+            errs.push("[follow].timeout_secs must be greater than zero".into());
+        }
+        if cfg.peer.is_some() {
+            errs.push(
+                "[peer] is for a primary; remove it from a standby (a [follow] config)".into(),
+            );
+        }
+    }
+    if let Some(p) = &cfg.peer {
+        if p.url.trim().is_empty() {
+            errs.push("[peer].url must be set to the standby's web API URL".into());
+        } else {
+            errs.extend(replication_url_problems(
+                "[peer].url",
+                &p.url,
+                p.allow_insecure_http,
+            ));
+        }
+        if p.check_interval_secs == 0 {
+            errs.push("[peer].check_interval_secs must be greater than zero".into());
+        }
     }
 
     // [logging]

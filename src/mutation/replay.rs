@@ -4,7 +4,7 @@
 //! serials), so applying the payloads in offset order to an empty database
 //! reproduces the zones, records and zone members of the source. This is the
 //! basis for a follower server and is checked by the replay tests.
-// Not called by the server yet: used by the tests and intended for follower mode.
+// `apply` is used by standby mode (mutation::replica); `replay` by the tests.
 #![allow(dead_code)]
 
 use super::{sql, Change, TOKEN};

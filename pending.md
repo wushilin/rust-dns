@@ -2,6 +2,18 @@
 
 Status as of 2026-09-27. Deployed to dns-test (musl build, /opt/rust-dns) with everything below. Stages 1 to 3 (log rotation, DNS protocol completeness, console fixes) are implemented. The current workspace has additional Stage 4 changes in progress below.
 
+## Standby / follow mode (2026-09-27, implemented, not committed)
+
+- [x] `[follow] primary/token/reconcile_interval_secs/allow_insecure_http/timeout_secs` (https required, loopback exempt; validated by `--check`); `[peer] url/check_interval_secs` on the primary fences a returning old primary (read-only).
+- [x] Primary API (`GlobalPerm::Replicate`, admin): `GET /api/replication/{status,snapshot,accounts,changes,checksum}`, public `identity`, `POST promote`. Snapshot = one read transaction; changes = long-poll, whole transactions; account-data generation bumped by the `Accounts` commit hook.
+- [x] Standby: snapshot bootstrap, tail with the primary's offsets (`mutation::replica`, changelog rows copied), accounts/settings/TSIG sync with an audit row `replication.accounts_sync`, periodic checksum reconcile, gap / history / divergence handling (`replication::lineage`), divergent tail saved to `divergent-*.json`.
+- [x] Local root merged with the primary's namesake (local credentials) or kept local (negative id on collision); TOTP last step and used recovery codes merged (max / keep used).
+- [x] Read-only: `WriteGate` in `Mutator::execute` + API middleware with an explicit allowlist (`STANDBY_WRITABLE`); 409 `read_only_standby` added to the OpenAPI document for every other mutating operation; expiry sweeper paused.
+- [x] Promotion: console (Admin -> Replication, two-click), API, `--promote` (stopped server), or removing `[follow]` by hand (recorded at next start). New history id with parent + fork offset; `[follow]` removed from the config file.
+- [x] Console: banner on every page, write controls disabled, Replication page; checked in Chrome (banner in sync / unreachable, disabled edits, promote flow, no console errors).
+- [x] Tests: `tests/follow.rs` (two binaries, full failover and rejoin), unit tests in `mutation::replica`, `replication::lineage`, `api::tests` (every mutating route refused), contract test promotes a real standby.
+- [ ] Not done: cascading standbys (a standby refuses to serve replication), gzip of snapshots, custom CA file for the primary's certificate (OS trust store only), websocket signal for account changes (long-poll used instead).
+
 ## Security review fixes (2026-09-27)
 
 - [x] H3 TCP pinning: per-write timeout (`tcp_write_timeout_secs`), connection age and query caps, per-client (IPv4 / IPv6 /64) connection cap; regression `tests/hardening.rs`.
@@ -73,7 +85,7 @@ Status as of 2026-09-27. Deployed to dns-test (musl build, /opt/rust-dns) with e
 - [x] `replay` rebuilds identical data from the changelog (randomized test: 645 rows, 81 rollbacks, all change kinds).
 - [x] Account and security writes go through `AuditTx` into `audit_log`, same guarantee; `GET /api/audit` and an admin Audit page.
 - [x] Existing databases are migrated in place; old changelog rows are kept as schema 1 and are not replayable.
-- [ ] Follower mode: a second server that tails `/api/changelog` or the websocket and calls `replay`.
+- [x] Follower mode: see "Standby / follow mode" above.
 
 ## Effective rights (2026-09-27, verified)
 
@@ -119,7 +131,7 @@ Status as of 2026-09-27. Deployed to dns-test (musl build, /opt/rust-dns) with e
 
 - [ ] DNSSEC signing (NSEC/NSEC3, key management, DS publication). Largest remaining item.
 - [ ] TSIG for AXFR and NOTIFY. Transfers are currently restricted by client network only.
-- [ ] Changelog-based follower mode (a second rust-dns replaying `/api/ws?after=` events) as an alternative to AXFR secondaries.
+- [x] Changelog-based follower mode (standby mode, 2026-09-27).
 - [ ] Inbound NOTIFY / acting as a secondary for zones hosted elsewhere.
 - [ ] DNS over TLS / HTTPS (inbound and upstream). Deliberately deferred.
 - [ ] Response Rate Limiting per response tuple in addition to per-client limiting.

@@ -18,6 +18,7 @@
 
 pub mod accounts;
 pub mod replay;
+pub mod replica;
 pub mod settings;
 mod sql;
 pub mod tsig;
@@ -477,8 +478,58 @@ impl<'a> Tx<'a> {
     }
 }
 
+/// Whether this server accepts writes. Closed on a standby (and on a fenced
+/// old primary): [`Mutator::execute`] refuses every DNS operation, so no
+/// background writer (the expiry sweeper) or forgotten route can write. The
+/// replication apply path (`replica`) is the only DNS writer then.
+pub struct WriteGate {
+    read_only: std::sync::atomic::AtomicBool,
+    reason: std::sync::RwLock<String>,
+}
+
+impl Default for WriteGate {
+    fn default() -> Self {
+        WriteGate {
+            read_only: std::sync::atomic::AtomicBool::new(false),
+            reason: std::sync::RwLock::new(String::new()),
+        }
+    }
+}
+
+impl WriteGate {
+    pub fn read_only(&self) -> bool {
+        self.read_only.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The message given to refused writers.
+    pub fn reason(&self) -> String {
+        self.reason
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    pub fn close(&self, reason: impl Into<String>) {
+        *self.reason.write().unwrap_or_else(|p| p.into_inner()) = reason.into();
+        self.read_only
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn open(&self) {
+        self.read_only
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.reason
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum MutationError {
+    /// This server is a read-only standby (or a fenced old primary).
+    #[error("{0}")]
+    ReadOnly(String),
     #[error("{0}")]
     Invalid(String),
     #[error("{0}")]
@@ -518,6 +569,8 @@ pub struct Mutator {
     zone_defaults: std::sync::RwLock<(Option<String>, Option<String>)>,
     /// Woken after every commit so the expiry sweeper can reschedule.
     expiry_wake: Arc<tokio::sync::Notify>,
+    /// Closed on a standby: DNS operations are refused.
+    gate: Arc<WriteGate>,
 }
 
 /// JSON export / import document.
@@ -757,6 +810,7 @@ impl Mutator {
             lock: Mutex::new(()),
             zone_defaults: std::sync::RwLock::new((None, None)),
             expiry_wake: Arc::new(tokio::sync::Notify::new()),
+            gate: Arc::new(WriteGate::default()),
         };
         m.set_zone_defaults(default_primary_ns, default_hostmaster);
         m
@@ -768,6 +822,16 @@ impl Mutator {
             .map(|n| format!("{n}."));
         let rname = normalize_rname(default_hostmaster).ok();
         *self.zone_defaults.write().unwrap() = (mname, rname);
+    }
+
+    /// The write gate shared with the replication runtime.
+    pub fn gate(&self) -> Arc<WriteGate> {
+        self.gate.clone()
+    }
+
+    /// Wake the expiry sweeper (e.g. after a promotion made this node writable).
+    pub fn wake_expiry(&self) {
+        self.expiry_wake.notify_one();
     }
 
     fn defaults(&self) -> (Option<String>, Option<String>) {
@@ -794,6 +858,11 @@ impl Mutator {
         f: impl for<'t> FnOnce(&mut Tx<'t>) -> MResult<T> + Send + 'static,
     ) -> MResult<T> {
         let _guard = self.lock.lock().await;
+        if self.gate.read_only() {
+            let why = self.gate.reason();
+            tracing::warn!(command, actor = %actor.name, ip = %actor.ip, reason = %why, "write refused: read-only server");
+            return Err(MutationError::ReadOnly(why));
+        }
         let storage = self.storage.clone();
         let tx_actor = actor.clone();
         let joined = tokio::task::spawn_blocking(move || {
@@ -1097,6 +1166,15 @@ impl Mutator {
         tokio::spawn(async move {
             loop {
                 let cfg = settings();
+                // A standby does not expire records itself: RecordExpired /
+                // RecordReaped arrive in the primary's changelog.
+                if m.gate.read_only() {
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(cfg.sweep_interval_secs.max(1))) => {}
+                        _ = m.expiry_wake.notified() => {}
+                    }
+                    continue;
+                }
                 let now = chrono::Utc::now();
                 if m.storage
                     .next_expiry()

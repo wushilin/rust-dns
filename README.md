@@ -69,6 +69,10 @@ Single static binary, one SQLite file, one TOML config. Zero JavaScript build.
   `X-Real-IP`, then the socket address, honoured only from the proxies listed
   in `proxy_trust` (nothing is trusted by default).
 - Prometheus metrics at `/metrics`, structured logs (text or JSON).
+- Standby (follow) mode: a second server mirrors zones, records, users,
+  MFA, API tokens, settings and TSIG keys over HTTPS, answers DNS while the
+  primary is down, and is promoted by hand (see
+  [Standby / follow mode](#standby--follow-mode)).
 
 ## Quick start
 
@@ -272,6 +276,156 @@ zone "example.com" {
 Test from an allowed address with
 `dig -y hmac-sha256:hn-secondary.:<secret> @192.0.2.1 example.com AXFR`.
 
+## Standby / follow mode
+
+A second rust-dns can mirror the primary so that it answers **all DNS
+queries while the primary is down**. The standby refuses every change and is
+promoted to primary by hand when you decide the primary is gone. It is a
+failover standby, not a load-balanced cluster: there is one writable server
+at a time, and no automatic failover.
+
+### Setting up a standby
+
+1. On the primary, sign in as an administrator and create an API token
+   (*API tokens -> New token*). The token must belong to an **administrator**
+   (the `replicate` permission): the standby checks this on every connection
+   and stops (state `refused`) when the token is invalid, revoked or not an
+   admin's.
+2. Put the primary's console behind HTTPS (the TLS reverse proxy you already
+   use). The replication stream carries password hashes, TOTP secrets, token
+   hashes and TSIG secrets, so a plain `http://` primary URL is refused unless
+   `allow_insecure_http = true` (loopback addresses are always allowed).
+   Certificates are checked against the operating system's trust store.
+3. On the second server, start from a normal config (see
+   `examples/config/standby.toml`) and add:
+
+```toml
+[follow]
+primary = "https://dns1.example.net:8053"   # the primary's web API
+token = "rdns_..."                          # administrator token on the primary
+reconcile_interval_secs = 3600
+allow_insecure_http = false
+timeout_secs = 30
+```
+
+4. Start it. It loads a snapshot of the primary, then tails its changelog
+   (a long-poll, answered as soon as a change commits) and shows a banner on
+   every console page: *Standby of https://dns1... - read-only - in sync*.
+   **Admin -> Replication** shows the details (applied offset, lag, last
+   error, last snapshot and reconcile).
+5. On the primary, add `[peer] url = "https://dns2.example.net:8053"` (the
+   standby). A primary with `[peer]` asks the standby at startup and every
+   `check_interval_secs` whether it was promoted away from its history; if so
+   it runs **read-only** ("fenced") instead of accepting writes. Without it, an
+   old primary that comes back after a failover accepts writes (split brain).
+
+`rust-dns --check` prints the role a config gives the server.
+
+### What is replicated
+
+| Replicated | Not replicated (local to each server) |
+|---|---|
+| Zones, records (including expiry state), zone members | Sessions (users sign in again on the standby) |
+| Users: password hashes, admin flag, disabled, MFA secret and last used TOTP step, recovery codes | API token `last_used_at` / `last_used_ip` |
+| API tokens (hashes, tags, revocation) | The config file: listeners, `[forwarding]` defaults, `[transfer]`, rate limits, logging, backups |
+| Forwarding settings saved from the console (the `settings` override) | The audit log (each server audits its own actions; the standby adds `replication.*` rows) |
+| TSIG keys | The standby's own `[root]` (see below) |
+
+DNS changes arrive through the primary's changelog and are stored in the
+standby's changelog with the **same offsets**, so a promoted standby continues
+the same sequence and changelog clients can switch servers. Account data,
+settings and TSIG keys are not in the changelog: the standby fetches them
+whenever the primary's account-data generation moves (any audited account,
+token, settings or TSIG change) and compares checksums periodically. Every
+`reconcile_interval_secs` the standby compares each zone's serial and a
+checksum of its records and members, and the account data, with the primary;
+a difference is logged with the zones that differ and fixed by loading a
+snapshot.
+
+Record expiry is decided by the primary: `record_expired` / `record_reaped`
+arrive in its changelog (expired records stop being served at their
+`expires_at` on both servers anyway). The standby's expiry sweeper does not
+run. The standby **does** send NOTIFY to its own `[transfer].notify` targets
+when replicated changes arrive; leave that list empty on the standby if your
+secondaries only know the primary.
+
+**Root account.** The standby's `[root]` from its own config always works
+locally, so you can sign in to the standby's console while the primary is
+down. If the primary has a user with the same name (typically `root`), the two
+are merged: the account keeps the primary's id (so its API tokens and zone
+ownership apply) but its password, MFA setting, TOTP enrollment and recovery
+codes are the standby's own. If the primary has no user with that name, the
+standby's root is kept as an extra local account. Other replicated
+administrators are ordinary admins on the standby (only the local root is
+`root`). Use the same root username on both servers.
+
+**TOTP replay protection** survives a failover: the last accepted time step
+is replicated, and a later step used on the standby is kept, so a code used
+on the old primary cannot be replayed on the promoted standby (provided the
+standby had caught up, as it has within about a second while connected).
+
+**On the standby**, every mutating API call returns `409` with
+`code: read_only_standby` and a message naming the primary (documented on
+each operation in the OpenAPI document). Still allowed: signing in and out
+(forced MFA enrollment only for the local root), managing sessions, reloading
+the config, testing upstreams, flushing the forward cache, revealing a TSIG
+key, and promotion.
+
+### Promotion runbook (primary is down)
+
+1. Make sure the primary is really gone (or stop it). The console refuses a
+   promotion while the primary is reachable unless you tick *Promote anyway*
+   (`"force": true`).
+2. Promote the standby, either
+   - console: **Admin -> Replication -> Promote to primary...** (two clicks in
+     the dialog), or
+   - API: `POST /api/replication/promote` with `{"confirm": true}`, or
+   - stopped server: `rust-dns --promote --config /opt/rust-dns/etc/rust-dns.toml`.
+
+   Promotion removes `[follow]` from the config file (a comment records it; the
+   token is not kept), starts a **new history id** whose parent is the old one
+   (recording the offset it forked at), and makes the server writable at once:
+   the expiry sweeper starts, no restart needed. Removing `[follow]` by hand
+   and restarting has the same effect (the next start records the promotion).
+3. Point the registrar's NS/glue and your secondaries' primary address at the
+   new primary if they named the old one.
+
+### Bringing the old primary back
+
+With `[peer]` pointing at the promoted server, the old primary starts
+**fenced** (read-only, role `fenced`) and says why. Make it a standby of the
+new primary: replace `[peer]` with a `[follow]` section pointing at the new
+primary (an administrator token; tokens made on the old primary still work,
+they were replicated) and restart it. It then:
+
+- sees that the new primary was promoted from its own history,
+- writes the changes it made after the fork (offsets after the fork point, and
+  a copy of its DNS data) to `divergent-<time>.json` next to its database for
+  manual review (logged as `DIVERGED` with the path; no account data or
+  secrets in the file),
+- loads a snapshot from the new primary and follows it.
+
+Re-apply anything from the divergence file that you still want on the new
+primary. To fail back later, promote the old primary the same way and make
+the other server its standby.
+
+A standby also refuses (state `refused`) to follow a server it was itself
+promoted away from (the stale old primary), so a leftover `[follow]` cannot
+make a promoted server discard its own writes.
+
+### Replication API
+
+All under `/api/replication/`, admin only (`replicate`) except `identity`:
+`GET status` (both roles), `GET snapshot`, `GET accounts`,
+`GET changes?after=&limit=&wait=` (long-poll), `GET checksum` (served only by
+a writable primary; 409 otherwise), `POST promote`, and the public
+`GET identity` (role and history ids, no data) used by the `[peer]` check.
+Metrics: `rustdns_replication_writable`, `rustdns_replication_standby`, and on
+a standby `rustdns_replication_connected`, `rustdns_replication_lag_changes`,
+`rustdns_replication_last_applied_offset`,
+`rustdns_replication_seconds_since_last_applied`,
+`rustdns_replication_reconnects_total`, `rustdns_replication_rebootstraps_total`.
+
 ## API
 
 Everything the console does goes through `/api`. Authenticate with a session
@@ -305,6 +459,7 @@ curl -H "Authorization: Bearer rdns_…" -H "content-type: application/json" \
 | POST | `/api/me/mfa/recovery` | regenerate recovery codes with TOTP |
 | GET | `/api/status`, `/metrics`, `/api/health` | |
 | GET/PUT/DELETE | `/api/settings/forwarding`, POST `/api/settings/forwarding/cache/flush` | forwarding upstreams, ACL, cache caps; cache stats and flush (admin) |
+| GET/POST | `/api/replication/status`, `snapshot`, `accounts`, `changes`, `checksum`, `identity`, `promote` | standby mode (see [Standby / follow mode](#standby--follow-mode)) |
 
 The zone records endpoint accepts `q`, `offset`, and `limit` for server side
 search and paging. The console displays 500 records per page by default.
@@ -387,7 +542,8 @@ scripts/load-test-local.sh                  # short UDP load probe; intended for
 
 Current status: the Rust suite passes (unit tests, end-to-end tests in
 `tests/e2e.rs`, `tests/tsig.rs`, `tests/forwarding.rs` and
-`tests/hardening.rs` (security regressions: TCP pinning, init-config,
+`tests/follow.rs` (standby mode: two servers, bootstrap, replication,
+failover, promotion, fencing, rejoin with divergence), `tests/hardening.rs` (security regressions: TCP pinning, init-config,
 password logging, TOTP replay across restarts, websocket revocation and
 origin, cookies, slow clients, CSP), API contract and OpenAPI document
 tests). The seeded conformance runner passes 86/86, and ISC genreport reports
@@ -406,7 +562,7 @@ ceiling is the OS loopback path, not the server. Resident memory stays around
 ## Not yet
 
 - DNSSEC signing (NSEC/NSEC3, key management, DS publication).
-- Changelog follower mode and inbound NOTIFY/secondary service.
+- Inbound NOTIFY / acting as a secondary for zones hosted elsewhere; automatic failover.
 - DNS over TLS/HTTPS, response tuple rate limiting (RRL by answer), and per-zone forwarding,
   reverse-zone, transfer ACL, and NOTIFY overrides.
 - Console sorting and bulk record tools, WebAuthn, static musl multi-arch

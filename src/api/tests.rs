@@ -63,6 +63,13 @@ impl Harness {
         });
         let now = Arc::new(AtomicU64::new(T0));
         let clock_now = now.clone();
+        let repl = crate::replication::Replication::new(
+            storage.clone(),
+            mutator.clone(),
+            dns.clone(),
+            reloader.clone(),
+            "unused.toml".into(),
+        );
         let state = Arc::new(AppState {
             cfg: cfg.clone(),
             storage,
@@ -78,6 +85,7 @@ impl Harness {
             clock: Arc::new(move || clock_now.load(Ordering::SeqCst)),
             trusted: vec![],
             started: Instant::now(),
+            repl,
         });
         Harness {
             app: router(state.clone()),
@@ -476,4 +484,112 @@ async fn failed_logins_back_off_per_account() {
     tokio::time::sleep(Duration::from_millis(1100)).await;
     let r = h.login("nora", "nora-password-1").await;
     assert_eq!(r.status, StatusCode::OK, "after the wait: {}", r.json);
+}
+
+/// Every mutating operation in the OpenAPI document (so every route: the
+/// document is generated from the router) is refused on a read-only
+/// standby, except the explicit allowlist, and documents the 409.
+#[tokio::test]
+async fn read_only_standby_refuses_every_mutating_operation() {
+    let h = Harness::new();
+    let doc = serde_json::to_value(openapi_doc()).unwrap();
+    h.state
+        .mutator
+        .gate()
+        .close("this server is a read-only standby of https://dns1.example.net:8053; make changes on the primary");
+    let mut refused = 0;
+    let mut allowed = 0;
+    for (path, item) in doc["paths"].as_object().unwrap() {
+        for method in ["put", "post", "delete", "patch"] {
+            let Some(op) = item.get(method) else { continue };
+            let upper = method.to_uppercase();
+            let concrete = path
+                .replace("{zone}", "a.test")
+                .replace("{username}", "bob")
+                .replace("{name}", "k1.")
+                .replace("{id}", "1");
+            assert!(
+                !concrete.contains('{'),
+                "unhandled path parameter in {path}"
+            );
+            let r = h
+                .call(&upper, &concrete, None, Some(serde_json::json!({})))
+                .await;
+            let read_only =
+                r.status == StatusCode::CONFLICT && r.json["code"] == "read_only_standby";
+            if STANDBY_WRITABLE
+                .iter()
+                .any(|(m, t)| *m == upper && t == path)
+            {
+                assert!(!read_only, "{upper} {path} is allowed on a standby");
+                allowed += 1;
+            } else {
+                assert!(
+                    read_only,
+                    "{upper} {path} must be refused on a standby, got {} {}",
+                    r.status, r.json
+                );
+                assert!(r.json["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("dns1.example.net"));
+                let doc409 = op["responses"]["409"]["$ref"].as_str().unwrap_or("");
+                assert!(
+                    doc409.ends_with("/ReadOnly") || doc409.ends_with("/ConflictOrReadOnly"),
+                    "{upper} {path} documents the read-only 409: {doc409}"
+                );
+                refused += 1;
+            }
+        }
+    }
+    assert_eq!(
+        allowed,
+        STANDBY_WRITABLE.len(),
+        "every allowlist entry is a real route"
+    );
+    assert!(refused >= 25, "refused {refused}");
+    // DNS writes are refused below the API too (background writers).
+    let err = h
+        .state
+        .mutator
+        .create_zone(
+            crate::model::Actor {
+                name: "system".into(),
+                ip: "expiry".into(),
+            },
+            crate::model::ZoneInput {
+                name: Some("x.test".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, crate::mutation::MutationError::ReadOnly(_)));
+    // Reads and sign-in still work.
+    let r = h.call("GET", "/health", None, None).await;
+    assert_eq!(r.status, StatusCode::OK);
+    h.state.mutator.gate().open();
+    let r = h
+        .call("POST", "/zones", None, Some(serde_json::json!({})))
+        .await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "writable again");
+}
+
+#[test]
+fn path_templates_match_single_segments() {
+    assert!(path_matches("/me/sessions/{id}", "/me/sessions/12"));
+    assert!(!path_matches("/me/sessions/{id}", "/me/sessions/12/x"));
+    assert!(!path_matches("/me/sessions/{id}", "/me/sessions/"));
+    assert!(path_matches(
+        "/tsig/keys/{name}/reveal",
+        "/tsig/keys/k1./reveal"
+    ));
+    assert!(!path_matches(
+        "/tsig/keys/{name}/reveal",
+        "/tsig/keys/k1./delete"
+    ));
+    assert!(allowed_when_read_only("GET", "/zones"));
+    assert!(!allowed_when_read_only("POST", "/zones"));
+    assert!(allowed_when_read_only("POST", "/auth/login"));
 }

@@ -128,7 +128,7 @@
           "Auth"
         ],
         "summary": "Complete forced MFA enrollment",
-        "description": "For a session in `enroll_required` state: confirm the secret from the login response with a TOTP code.",
+        "description": "For a session in `enroll_required` state: confirm the secret from the login response with a TOTP code. On a read-only standby only the local root account can enroll here (other accounts are replicated from the primary: enroll there).",
         "operationId": "login_enroll",
         "requestBody": {
           "content": {
@@ -159,6 +159,9 @@
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
+          },
+          "409": {
+            "$ref": "#/components/responses/ReadOnly"
           },
           "429": {
             "$ref": "#/components/responses/TooManyRequests"
@@ -294,6 +297,9 @@
           "403": {
             "$ref": "#/components/responses/Forbidden"
           },
+          "409": {
+            "$ref": "#/components/responses/ReadOnly"
+          },
           "429": {
             "$ref": "#/components/responses/TooManyRequests"
           },
@@ -351,6 +357,9 @@
           "403": {
             "$ref": "#/components/responses/Forbidden"
           },
+          "409": {
+            "$ref": "#/components/responses/ReadOnly"
+          },
           "429": {
             "$ref": "#/components/responses/TooManyRequests"
           },
@@ -401,6 +410,9 @@
           "403": {
             "$ref": "#/components/responses/Forbidden"
           },
+          "409": {
+            "$ref": "#/components/responses/ReadOnly"
+          },
           "429": {
             "$ref": "#/components/responses/TooManyRequests"
           }
@@ -448,6 +460,9 @@
           "403": {
             "$ref": "#/components/responses/Forbidden"
           },
+          "409": {
+            "$ref": "#/components/responses/ReadOnly"
+          },
           "429": {
             "$ref": "#/components/responses/TooManyRequests"
           }
@@ -494,6 +509,9 @@
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/ReadOnly"
           },
           "429": {
             "$ref": "#/components/responses/TooManyRequests"
@@ -669,7 +687,7 @@
             "$ref": "#/components/responses/Forbidden"
           },
           "409": {
-            "$ref": "#/components/responses/Conflict"
+            "$ref": "#/components/responses/ConflictOrReadOnly"
           }
         }
       }
@@ -772,6 +790,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/ReadOnly"
           }
         }
       },
@@ -816,6 +837,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/ReadOnly"
           }
         }
       }
@@ -1009,7 +1033,7 @@
             "$ref": "#/components/responses/NotFound"
           },
           "409": {
-            "$ref": "#/components/responses/Conflict"
+            "$ref": "#/components/responses/ConflictOrReadOnly"
           }
         }
       }
@@ -1083,7 +1107,7 @@
             "$ref": "#/components/responses/NotFound"
           },
           "409": {
-            "$ref": "#/components/responses/Conflict"
+            "$ref": "#/components/responses/ConflictOrReadOnly"
           }
         }
       },
@@ -1139,6 +1163,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/ReadOnly"
           }
         }
       }
@@ -1208,6 +1235,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/ReadOnly"
           }
         }
       },
@@ -1262,6 +1292,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/ReadOnly"
           }
         }
       }
@@ -1496,7 +1529,7 @@
             "$ref": "#/components/responses/Forbidden"
           },
           "409": {
-            "$ref": "#/components/responses/Conflict"
+            "$ref": "#/components/responses/ConflictOrReadOnly"
           }
         }
       }
@@ -1786,7 +1819,7 @@
             "$ref": "#/components/responses/Forbidden"
           },
           "409": {
-            "$ref": "#/components/responses/Conflict"
+            "$ref": "#/components/responses/ConflictOrReadOnly"
           },
           "503": {
             "$ref": "#/components/responses/ServiceUnavailable"
@@ -1852,6 +1885,9 @@
           "404": {
             "$ref": "#/components/responses/NotFound"
           },
+          "409": {
+            "$ref": "#/components/responses/ReadOnly"
+          },
           "503": {
             "$ref": "#/components/responses/ServiceUnavailable"
           }
@@ -1901,6 +1937,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/ReadOnly"
           }
         }
       }
@@ -1947,6 +1986,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/ReadOnly"
           }
         }
       }
@@ -2135,6 +2177,9 @@
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/ReadOnly"
           }
         }
       }
@@ -2198,6 +2243,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/ReadOnly"
           }
         }
       },
@@ -2245,6 +2293,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/ReadOnly"
           }
         }
       }
@@ -2491,6 +2542,9 @@
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/ReadOnly"
           }
         }
       },
@@ -2517,6 +2571,9 @@
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/ReadOnly"
           }
         }
       }
@@ -2682,7 +2739,7 @@
             "$ref": "#/components/responses/Forbidden"
           },
           "409": {
-            "$ref": "#/components/responses/Conflict"
+            "$ref": "#/components/responses/ConflictOrReadOnly"
           }
         }
       }
@@ -2744,6 +2801,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/ReadOnly"
           }
         }
       },
@@ -2790,6 +2850,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/ReadOnly"
           }
         }
       }
@@ -2867,6 +2930,271 @@
         }
       }
     },
+    "/replication/identity": {
+      "get": {
+        "tags": [
+          "Replication"
+        ],
+        "summary": "Role and history of this server (public)",
+        "description": "No authentication. A primary with `[peer]` asks its standby this at startup and periodically: if the peer is writable and its `parent_history_id` is the asking server's history id, the peer was promoted and the asking server stays read-only (fenced). Contains no secrets and no data.",
+        "operationId": "get_replication_identity",
+        "responses": {
+          "200": {
+            "description": "Identity.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Identity"
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
+    "/replication/status": {
+      "get": {
+        "tags": [
+          "Replication"
+        ],
+        "summary": "Replication status (admin)",
+        "description": "Role (primary, promoted, standby, fenced), history, and on a standby the connection to the primary: applied offset, lag, last error, last snapshot and reconcile. On a primary: the standbys that polled it in the last 10 minutes. A standby also calls this on its primary to validate its token. Needs `replicate`.",
+        "operationId": "get_replication_status",
+        "responses": {
+          "200": {
+            "description": "Status.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReplicationStatus"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
+    "/replication/snapshot": {
+      "get": {
+        "tags": [
+          "Replication"
+        ],
+        "summary": "Consistent copy of all replicated data (admin, contains secrets)",
+        "description": "Zones, records (with expiry state), zone members, users (password hashes, MFA secrets and last TOTP step, recovery code hashes), API token hashes and tags, console settings, TSIG keys, the history and the changelog offset it corresponds to, all read in one transaction. A standby loads it to start and whenever it cannot continue from the changelog. Needs `replicate`; refused (409) on a server that is not a writable primary.",
+        "operationId": "get_replication_snapshot",
+        "responses": {
+          "200": {
+            "description": "Snapshot.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Snapshot"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        }
+      }
+    },
+    "/replication/accounts": {
+      "get": {
+        "tags": [
+          "Replication"
+        ],
+        "summary": "Account data, settings and TSIG keys (admin, contains secrets)",
+        "description": "The replicated data that is not in the DNS changelog. A standby fetches it whenever `accounts_generation` in a changes answer moves. Needs `replicate`; refused (409) on a server that is not a writable primary.",
+        "operationId": "get_replication_accounts",
+        "responses": {
+          "200": {
+            "description": "Account data.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountsSnapshot"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        }
+      }
+    },
+    "/replication/changes": {
+      "get": {
+        "tags": [
+          "Replication"
+        ],
+        "summary": "Changes after an offset, long-poll (admin)",
+        "description": "Committed changelog entries after `after`, whole transactions only, with the history id, the latest offset, and the account-data generation. With `wait`, an answer without changes is held until a change commits, account data changes, or the wait ends. `gap: true`: the entries after `after` were pruned; load a snapshot. Needs `replicate`; refused (409) on a server that is not a writable primary.",
+        "operationId": "get_replication_changes",
+        "parameters": [
+          {
+            "name": "after",
+            "in": "query",
+            "description": "Return changes after this offset (0: from the start).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "default": 0,
+              "minimum": 0
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "At most this many changes (extended to the end of the last\ntransaction), 1-5000.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 1000,
+              "maximum": 5000,
+              "minimum": 1
+            }
+          },
+          {
+            "name": "wait",
+            "in": "query",
+            "description": "Seconds to wait for a change (or an account-data change) when there\nis none yet, 0-60.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "default": 0,
+              "maximum": 60,
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Changes.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangesResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        }
+      }
+    },
+    "/replication/checksum": {
+      "get": {
+        "tags": [
+          "Replication"
+        ],
+        "summary": "Per-zone and account-data checksums (admin)",
+        "description": "Serial and SHA-256 of every zone (zone row, records with expiry state, members) and of the account data, at one changelog offset. A standby compares them periodically (`[follow].reconcile_interval_secs`) and re-bootstraps on a mismatch. Needs `replicate`; refused (409) on a server that is not a writable primary.",
+        "operationId": "get_replication_checksum",
+        "responses": {
+          "200": {
+            "description": "Checksums.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Checksums"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        }
+      }
+    },
+    "/replication/promote": {
+      "post": {
+        "tags": [
+          "Replication"
+        ],
+        "summary": "Promote this standby to primary (admin)",
+        "description": "Stops following, removes `[follow]` from the config file, starts a new history (parent: the old one, forked at the current offset), and accepts writes from now on. Refused (409) on a server that is not a standby, and while the primary is reachable unless `force` is true. Needs `replicate`. Audited as `replication.promote`.",
+        "operationId": "promote_standby",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PromoteBody"
+              },
+              "example": {
+                "confirm": true,
+                "force": false
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Promoted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PromoteResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        }
+      }
+    },
     "/metrics": {
       "servers": [
         {
@@ -2902,6 +3230,59 @@
   },
   "components": {
     "schemas": {
+      "AccountsSnapshot": {
+        "type": "object",
+        "description": "Everything replicated that is not in the DNS changelog: accounts,\nconsole settings and TSIG keys.",
+        "required": [
+          "users",
+          "recovery_codes",
+          "tokens",
+          "settings",
+          "tsig_keys",
+          "checksum",
+          "generation"
+        ],
+        "properties": {
+          "users": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReplUser"
+            }
+          },
+          "recovery_codes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReplRecoveryCode"
+            }
+          },
+          "tokens": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReplToken"
+            }
+          },
+          "settings": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReplSetting"
+            }
+          },
+          "tsig_keys": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReplTsigKey"
+            }
+          },
+          "checksum": {
+            "type": "string",
+            "description": "SHA-256 over the content above (see `GET /replication/checksum`)."
+          },
+          "generation": {
+            "type": "string",
+            "description": "Changes whenever any of the above changes on the primary (per\nprocess; a restart starts a new epoch)."
+          }
+        }
+      },
       "AuditPage": {
         "type": "object",
         "required": [
@@ -3180,6 +3561,76 @@
           }
         }
       },
+      "ChangesResponse": {
+        "type": "object",
+        "description": "One long-poll answer: committed changes after the cursor (whole\ntransactions only) and the account-data generation.",
+        "required": [
+          "history_id",
+          "head",
+          "oldest_offset",
+          "gap",
+          "events",
+          "accounts_generation"
+        ],
+        "properties": {
+          "history_id": {
+            "type": "string"
+          },
+          "head": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Latest assigned offset."
+          },
+          "oldest_offset": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "gap": {
+            "type": "boolean",
+            "description": "The cursor fell behind retention: the changes in between are gone,\nfetch a snapshot."
+          },
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChangeEvent"
+            }
+          },
+          "accounts_generation": {
+            "type": "string"
+          }
+        }
+      },
+      "Checksums": {
+        "type": "object",
+        "description": "Per-zone checksums and the account-data checksum at one offset.",
+        "required": [
+          "history_id",
+          "offset",
+          "zones",
+          "accounts_checksum"
+        ],
+        "properties": {
+          "history_id": {
+            "type": "string"
+          },
+          "offset": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "zones": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ZoneChecksum"
+            }
+          },
+          "accounts_checksum": {
+            "type": "string"
+          }
+        }
+      },
       "CodeBody": {
         "type": "object",
         "required": [
@@ -3388,7 +3839,7 @@
               },
               {
                 "$ref": "#/components/schemas/ErrorCode",
-                "description": "Machine-readable reason when one applies: `login_required`,\n`mfa_required`, `enroll_required` (401) or `csrf` (403, cookie write\nwithout `X-Requested-With: rust-dns`). `invalid_request`: the request\ncould not be parsed (malformed JSON, wrong field type or value,\nunparsable path or query parameter, missing JSON content type)."
+                "description": "Machine-readable reason when one applies: `login_required`,\n`mfa_required`, `enroll_required` (401) or `csrf` (403, cookie write\nwithout `X-Requested-With: rust-dns`). `invalid_request`: the request\ncould not be parsed (malformed JSON, wrong field type or value,\nunparsable path or query parameter, missing JSON content type).\n`read_only_standby` (409): this server is a read-only standby; write\nto the primary named in the message."
               }
             ]
           }
@@ -3406,7 +3857,8 @@
           "mfa_required",
           "enroll_required",
           "csrf",
-          "invalid_request"
+          "invalid_request",
+          "read_only_standby"
         ]
       },
       "ExportDoc": {
@@ -3591,6 +4043,142 @@
               "$ref": "#/components/schemas/ExportRecord"
             },
             "default": []
+          }
+        }
+      },
+      "FollowStatus": {
+        "type": "object",
+        "description": "Standby side of `GET /replication/status`.",
+        "required": [
+          "primary",
+          "state",
+          "connected",
+          "last_applied_offset",
+          "primary_head",
+          "lag_changes",
+          "last_applied_at",
+          "seconds_since_last_applied",
+          "last_contact_at",
+          "disconnected_since",
+          "last_error",
+          "last_snapshot_at",
+          "last_snapshot_result",
+          "last_reconcile_at",
+          "last_reconcile_result",
+          "last_accounts_sync_at",
+          "reconnects",
+          "rebootstraps"
+        ],
+        "properties": {
+          "primary": {
+            "type": "string",
+            "description": "The `[follow]` primary URL."
+          },
+          "state": {
+            "type": "string",
+            "description": "connecting | bootstrapping | following | error | refused | stopped"
+          },
+          "connected": {
+            "type": "boolean",
+            "description": "The last request to the primary succeeded."
+          },
+          "last_applied_offset": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "primary_head": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The primary's latest offset at the last contact."
+          },
+          "lag_changes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Changes behind the primary (as of the last contact)."
+          },
+          "last_applied_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "seconds_since_last_applied": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "last_contact_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "disconnected_since": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Unreachable or refused since (null while connected)."
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_snapshot_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "last_snapshot_result": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_reconcile_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "last_reconcile_result": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_accounts_sync_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "reconnects": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "rebootstraps": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
           }
         }
       },
@@ -3886,7 +4474,8 @@
           "manage_own_tokens",
           "change_own_password",
           "manage_own_mfa",
-          "manage_own_sessions"
+          "manage_own_sessions",
+          "replicate"
         ]
       },
       "GlobalRight": {
@@ -3946,6 +4535,89 @@
         "example": {
           "status": "ok",
           "version": "0.1.0"
+        }
+      },
+      "History": {
+        "type": "object",
+        "description": "Where a database's data comes from. A primary gets a random\n`history_id` on first start; a standby adopts its primary's lineage at\nbootstrap; a promotion starts a new history whose parent is the old one.",
+        "required": [
+          "history_id",
+          "parent_history_id",
+          "fork_offset",
+          "promoted_at",
+          "promoted_from"
+        ],
+        "properties": {
+          "history_id": {
+            "type": "string"
+          },
+          "parent_history_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The history this one was promoted from; `null` for an original primary."
+          },
+          "fork_offset": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Changelog offset at which the promotion forked from the parent."
+          },
+          "promoted_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "promoted_from": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The primary the promoted standby had been following."
+          }
+        },
+        "example": {
+          "fork_offset": 1834,
+          "history_id": "q3V9xY2mWk8pTf1a",
+          "parent_history_id": "Hk2mP9sLq0ZwX4bN",
+          "promoted_at": "2026-01-15T09:30:00.000Z",
+          "promoted_from": "https://dns1.example.net:8053"
+        }
+      },
+      "Identity": {
+        "type": "object",
+        "description": "Public identity (no authentication): lets a returning old primary find\nout whether its peer was promoted away from its history.",
+        "required": [
+          "role",
+          "writable",
+          "history"
+        ],
+        "properties": {
+          "role": {
+            "$ref": "#/components/schemas/Role"
+          },
+          "writable": {
+            "type": "boolean"
+          },
+          "history": {
+            "$ref": "#/components/schemas/History"
+          }
+        },
+        "example": {
+          "history": {
+            "fork_offset": 1834,
+            "history_id": "q3V9xY2mWk8pTf1a",
+            "parent_history_id": "Hk2mP9sLq0ZwX4bN",
+            "promoted_at": "2026-01-15T09:30:00.000Z",
+            "promoted_from": "https://dns1.example.net:8053"
+          },
+          "role": "promoted",
+          "writable": true
         }
       },
       "ImportSummary": {
@@ -4281,6 +4953,78 @@
         "example": {
           "current_password": "rootpass123",
           "new_password": "a-new-long-password"
+        }
+      },
+      "PeerStatus": {
+        "type": "object",
+        "required": [
+          "url",
+          "last_check_at",
+          "last_result"
+        ],
+        "properties": {
+          "url": {
+            "type": "string"
+          },
+          "last_check_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "last_result": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "PromoteBody": {
+        "type": "object",
+        "description": "`POST /replication/promote`.",
+        "required": [
+          "confirm"
+        ],
+        "properties": {
+          "confirm": {
+            "type": "boolean",
+            "description": "Must be true."
+          },
+          "force": {
+            "type": "boolean",
+            "description": "Promote even though the primary is currently reachable (two\nwritable servers until the old primary is stopped or fenced)."
+          }
+        },
+        "example": {
+          "confirm": true,
+          "force": false
+        }
+      },
+      "PromoteResult": {
+        "type": "object",
+        "description": "Result of a promotion.",
+        "required": [
+          "history",
+          "config_updated",
+          "notes"
+        ],
+        "properties": {
+          "history": {
+            "$ref": "#/components/schemas/History"
+          },
+          "config_updated": {
+            "type": "boolean",
+            "description": "Whether `[follow]` was removed from the config file."
+          },
+          "notes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "What to do next (config file, old primary)."
+          }
         }
       },
       "QueryEvent": {
@@ -4637,6 +5381,419 @@
           }
         }
       },
+      "ReplMember": {
+        "type": "object",
+        "required": [
+          "zone_id",
+          "user_id",
+          "role",
+          "created_at"
+        ],
+        "properties": {
+          "zone_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "user_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "role": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string"
+          }
+        }
+      },
+      "ReplRecord": {
+        "type": "object",
+        "description": "A record with its expiry bookkeeping (`expired_noted`: the expiry has\nbeen processed and changelogged).",
+        "required": [
+          "id",
+          "zone_id",
+          "name",
+          "type",
+          "value",
+          "ttl",
+          "created_at",
+          "updated_at",
+          "expires_at",
+          "expired_noted"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "zone_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "name": {
+            "type": "string"
+          },
+          "type": {
+            "$ref": "#/components/schemas/RecordType"
+          },
+          "value": {
+            "type": "string"
+          },
+          "ttl": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string"
+          },
+          "expires_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "expired_noted": {
+            "type": "boolean"
+          }
+        }
+      },
+      "ReplRecoveryCode": {
+        "type": "object",
+        "required": [
+          "user_id",
+          "code_hash",
+          "used_at"
+        ],
+        "properties": {
+          "user_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "code_hash": {
+            "type": "string"
+          },
+          "used_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "ReplSetting": {
+        "type": "object",
+        "description": "A console/API setting (e.g. the forwarding override).",
+        "required": [
+          "key",
+          "value",
+          "updated_by",
+          "updated_at"
+        ],
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
+          },
+          "updated_by": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string"
+          }
+        }
+      },
+      "ReplToken": {
+        "type": "object",
+        "description": "An API token as stored (hash only; `last_used_*` is local bookkeeping\nand not replicated).",
+        "required": [
+          "id",
+          "user_id",
+          "name",
+          "token_hash",
+          "created_at",
+          "revoked_at",
+          "tags"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "user_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "name": {
+            "type": "string"
+          },
+          "token_hash": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "revoked_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ReplTsigKey": {
+        "type": "object",
+        "description": "A TSIG key; `secret` is base64.",
+        "required": [
+          "name",
+          "algorithm",
+          "secret",
+          "zones",
+          "created_by",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "algorithm": {
+            "type": "string"
+          },
+          "secret": {
+            "type": "string"
+          },
+          "zones": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "created_by": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string"
+          }
+        }
+      },
+      "ReplUser": {
+        "type": "object",
+        "description": "A user with every stored column, secrets included.",
+        "required": [
+          "id",
+          "username",
+          "password_hash",
+          "display_name",
+          "is_admin",
+          "is_root",
+          "mfa_required",
+          "totp_secret",
+          "totp_enrolled_at",
+          "totp_last_step",
+          "disabled_at",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "username": {
+            "type": "string"
+          },
+          "password_hash": {
+            "type": "string"
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "is_admin": {
+            "type": "boolean"
+          },
+          "is_root": {
+            "type": "boolean"
+          },
+          "mfa_required": {
+            "type": "boolean"
+          },
+          "totp_secret": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "totp_enrolled_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "totp_last_step": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Last accepted TOTP time step (replay protection)."
+          },
+          "disabled_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string"
+          }
+        }
+      },
+      "ReplicationStatus": {
+        "type": "object",
+        "description": "`GET /replication/status`.",
+        "required": [
+          "role",
+          "writable",
+          "history",
+          "head",
+          "read_only_reason",
+          "follow",
+          "peer",
+          "standbys",
+          "warning"
+        ],
+        "properties": {
+          "role": {
+            "$ref": "#/components/schemas/Role"
+          },
+          "writable": {
+            "type": "boolean"
+          },
+          "history": {
+            "$ref": "#/components/schemas/History"
+          },
+          "head": {
+            "type": "integer",
+            "format": "int64",
+            "description": "This node's latest changelog offset."
+          },
+          "read_only_reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why writes are refused (standby / fenced), else null."
+          },
+          "follow": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/FollowStatus",
+                "description": "Present on a standby (`[follow]`)."
+              }
+            ]
+          },
+          "peer": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PeerStatus",
+                "description": "Present when `[peer]` is configured."
+              }
+            ]
+          },
+          "standbys": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StandbySeen"
+            },
+            "description": "Standbys that polled this node in the last 10 minutes."
+          },
+          "warning": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A warning to show prominently (e.g. `[follow]` left in the config after promotion)."
+          }
+        }
+      },
+      "ReplicationSummary": {
+        "type": "object",
+        "description": "Short replication summary in `GET /status` (every signed-in user).",
+        "required": [
+          "role",
+          "writable",
+          "primary",
+          "connected",
+          "lag_changes",
+          "disconnected_since",
+          "read_only_reason"
+        ],
+        "properties": {
+          "role": {
+            "$ref": "#/components/schemas/Role"
+          },
+          "writable": {
+            "type": "boolean"
+          },
+          "primary": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The primary (standby) or the peer that superseded this node (fenced)."
+          },
+          "connected": {
+            "type": "boolean"
+          },
+          "lag_changes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "disconnected_since": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "read_only_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
       "RevokedCount": {
         "type": "object",
         "required": [
@@ -4708,6 +5865,16 @@
           }
         }
       },
+      "Role": {
+        "type": "string",
+        "description": "This node's replication role.",
+        "enum": [
+          "primary",
+          "promoted",
+          "standby",
+          "fenced"
+        ]
+      },
       "RoleSource": {
         "type": "string",
         "description": "Where a zone role comes from.",
@@ -4736,7 +5903,8 @@
           "auto_ptr",
           "cookies",
           "nsid",
-          "catalog_built_at"
+          "catalog_built_at",
+          "replication"
         ],
         "properties": {
           "version": {
@@ -4796,6 +5964,10 @@
             "type": "string",
             "format": "date-time",
             "description": "When the in-memory zone catalog was last rebuilt."
+          },
+          "replication": {
+            "$ref": "#/components/schemas/ReplicationSummary",
+            "description": "Standby / primary role (the console shows a banner on a standby)."
           }
         }
       },
@@ -4925,6 +6097,88 @@
           "config",
           "console"
         ]
+      },
+      "Snapshot": {
+        "type": "object",
+        "description": "A consistent copy of everything replicated, read in one transaction.",
+        "required": [
+          "format",
+          "history",
+          "offset",
+          "taken_at",
+          "zones",
+          "records",
+          "members",
+          "accounts"
+        ],
+        "properties": {
+          "format": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Format version (1).",
+            "minimum": 0
+          },
+          "history": {
+            "$ref": "#/components/schemas/History"
+          },
+          "offset": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The changelog offset this snapshot corresponds to: tail from here."
+          },
+          "taken_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "zones": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Zone"
+            }
+          },
+          "records": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReplRecord"
+            }
+          },
+          "members": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReplMember"
+            }
+          },
+          "accounts": {
+            "$ref": "#/components/schemas/AccountsSnapshot"
+          }
+        }
+      },
+      "StandbySeen": {
+        "type": "object",
+        "description": "A standby polling this primary (in memory, recent contacts only).",
+        "required": [
+          "address",
+          "user",
+          "after",
+          "last_seen_at"
+        ],
+        "properties": {
+          "address": {
+            "type": "string"
+          },
+          "user": {
+            "type": "string"
+          },
+          "after": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The cursor of its last request."
+          },
+          "last_seen_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
       },
       "StatusResponse": {
         "type": "object",
@@ -5864,6 +7118,29 @@
           }
         }
       },
+      "ZoneChecksum": {
+        "type": "object",
+        "required": [
+          "name",
+          "serial",
+          "checksum"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "serial": {
+            "type": "integer",
+            "format": "int64",
+            "maximum": 4294967295,
+            "minimum": 0
+          },
+          "checksum": {
+            "type": "string",
+            "description": "SHA-256 over the zone row, its records (with expiry state) and members."
+          }
+        }
+      },
       "ZoneDeleted": {
         "type": "object",
         "required": [
@@ -6233,6 +7510,16 @@
           }
         }
       },
+      "ConflictOrReadOnly": {
+        "description": "Conflicts with existing data, or this server is a read-only standby (`code: read_only_standby`; the message names the primary to use).",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
       "Forbidden": {
         "description": "Not allowed, or cookie write without `X-Requested-With: rust-dns` (`code`: csrf).",
         "content": {
@@ -6263,6 +7550,20 @@
           "application/json": {
             "schema": {
               "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "ReadOnly": {
+        "description": "This server is a read-only standby (or an old primary fenced after a failover): `code: read_only_standby`; the message names the primary to use.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "example": {
+              "code": "read_only_standby",
+              "error": "this server is a read-only standby of https://dns1.example.net:8053; make changes on the primary"
             }
           }
         }
@@ -6377,6 +7678,10 @@
     {
       "name": "TSIG",
       "description": "TSIG keys (RFC 8945) that authenticate zone transfers and NOTIFY for secondaries, and the transfer policy in effect (administrators)."
+    },
+    {
+      "name": "Replication",
+      "description": "Standby (follow) mode: what a standby pulls from its primary, replication status, and promotion of a standby. A standby refuses every mutating operation with 409 `read_only_standby`."
     }
   ]
 }
