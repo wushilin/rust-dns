@@ -116,6 +116,15 @@ pub enum Change {
         username: String,
         role: String,
     },
+    /// The primary re-signed a DNSSEC zone because its signatures were
+    /// getting close to expiry; the zone's serial bump follows in the same
+    /// transaction (secondaries transfer fresh signatures). Nothing else
+    /// changes: replaying it is a no-op.
+    ZoneResigned {
+        zone: String,
+        zone_id: i64,
+        key_tag: u16,
+    },
     // ---- accounts, settings, TSIG (class "account") ----------------------
     /// A new user (every column).
     UserCreated {
@@ -170,6 +179,14 @@ pub enum Change {
     SettingCleared {
         key: String,
     },
+    /// A zone's DNSSEC signing key (the whole row, private key included).
+    DnssecKeySet {
+        key: crate::replication::types::ReplDnssecKey,
+    },
+    DnssecKeyDeleted {
+        zone_id: i64,
+        zone: String,
+    },
 }
 
 /// Changelog row class: `dns` rows are visible in the changelog API and the
@@ -196,6 +213,7 @@ impl Change {
             Change::MemberRemoved { zone, user_id, .. } => {
                 ("delete", "member", zone, Some(*user_id))
             }
+            Change::ZoneResigned { zone, zone_id, .. } => ("resign", "zone", zone, Some(*zone_id)),
             Change::UserCreated { user } => ("create", "user", "", Some(user.id)),
             Change::UserUpdated { user } => ("update", "user", "", Some(user.id)),
             Change::UserDeleted { user_id, .. } => ("delete", "user", "", Some(*user_id)),
@@ -213,6 +231,11 @@ impl Change {
             Change::TsigKeyDeleted { .. } => ("delete", "tsig_key", "", None),
             Change::SettingSet { .. } => ("update", "setting", "", None),
             Change::SettingCleared { .. } => ("delete", "setting", "", None),
+            // No zone name: account rows never reach zone-scoped views.
+            Change::DnssecKeySet { key } => ("update", "dnssec_key", "", Some(key.zone_id)),
+            Change::DnssecKeyDeleted { zone_id, .. } => {
+                ("delete", "dnssec_key", "", Some(*zone_id))
+            }
         }
     }
 
@@ -229,7 +252,8 @@ impl Change {
             | Change::RecordDeleted { .. }
             | Change::SerialBumped { .. }
             | Change::MemberSet { .. }
-            | Change::MemberRemoved { .. } => CLASS_DNS,
+            | Change::MemberRemoved { .. }
+            | Change::ZoneResigned { .. } => CLASS_DNS,
             Change::UserCreated { .. }
             | Change::UserUpdated { .. }
             | Change::UserDeleted { .. }
@@ -242,7 +266,9 @@ impl Change {
             | Change::TsigKeySet { .. }
             | Change::TsigKeyDeleted { .. }
             | Change::SettingSet { .. }
-            | Change::SettingCleared { .. } => CLASS_ACCOUNT,
+            | Change::SettingCleared { .. }
+            | Change::DnssecKeySet { .. }
+            | Change::DnssecKeyDeleted { .. } => CLASS_ACCOUNT,
         }
     }
 
@@ -341,6 +367,9 @@ impl<'a> Tx<'a> {
         }
         for m in self.members(zone.id)? {
             self.remove_member(zone, m.user_id)?;
+        }
+        if self.dnssec_key(zone.id)?.is_some() {
+            self.delete_dnssec_key(zone)?;
         }
         sql::delete_zone(self.conn, zone.id)?;
         self.touched.remove(&zone.id);
@@ -582,6 +611,44 @@ impl<'a> Tx<'a> {
         Ok(())
     }
 
+    // ---- DNSSEC ---------------------------------------------------------
+
+    /// The zone's signing key (private key included; never returned by the API).
+    pub fn dnssec_key(
+        &self,
+        zone_id: i64,
+    ) -> MResult<Option<crate::replication::types::ReplDnssecKey>> {
+        Ok(db::get_dnssec_key(self.conn, zone_id)?)
+    }
+
+    /// Store a zone's signing key. An account-class change: the private
+    /// key reaches standbys but never the changelog API or websocket.
+    pub fn set_dnssec_key(&mut self, key: crate::replication::types::ReplDnssecKey) -> MResult<()> {
+        acct_sql::put_dnssec_key(self.conn, &key)?;
+        self.changes.push(Change::DnssecKeySet { key });
+        Ok(())
+    }
+
+    pub fn delete_dnssec_key(&mut self, zone: &Zone) -> MResult<()> {
+        acct_sql::delete_dnssec_key(self.conn, zone.id)?;
+        self.changes.push(Change::DnssecKeyDeleted {
+            zone_id: zone.id,
+            zone: zone.name.clone(),
+        });
+        Ok(())
+    }
+
+    /// Re-sign: record why and bump the serial at commit.
+    pub fn resign_zone(&mut self, zone: &Zone, key_tag: u16) -> MResult<()> {
+        self.touched.insert(zone.id, zone.name.clone());
+        self.changes.push(Change::ZoneResigned {
+            zone: zone.name.clone(),
+            zone_id: zone.id,
+            key_tag,
+        });
+        Ok(())
+    }
+
     /// Bump serials of changed zones, then write every change to the changelog.
     fn finish(mut self, actor: &Actor, command: &str) -> MResult<Vec<ChangeEvent>> {
         for (zone_id, name) in std::mem::take(&mut self.touched) {
@@ -601,7 +668,12 @@ impl<'a> Tx<'a> {
         let txn = crate::auth::random_token(9);
         let mut events = Vec::with_capacity(self.changes.len());
         for c in &self.changes {
-            events.push(sql::append_changelog(self.conn, actor, command, &txn, c)?);
+            let ev = sql::append_changelog(self.conn, actor, command, &txn, c)?;
+            // Account-class rows (secrets) are for standbys only: never
+            // published to the websocket / live feed.
+            if c.class() == CLASS_DNS {
+                events.push(ev);
+            }
         }
         Ok(events)
     }
@@ -700,6 +772,30 @@ pub struct Mutator {
     expiry_wake: Arc<tokio::sync::Notify>,
     /// Closed on a standby: DNS operations are refused.
     gate: Arc<WriteGate>,
+    /// DNSSEC signing settings and signed-zone cache (catalog builds).
+    signer: Arc<crate::dnssec::Signer>,
+}
+
+/// Read zones, records and keys and build (and sign) the catalog.
+fn build_catalog(storage: &Storage, signer: &crate::dnssec::Signer) -> Result<Catalog> {
+    let (zones, records, keys) = storage.catalog_inputs()?;
+    Ok(Catalog::build_signed(
+        zones,
+        records,
+        &keys,
+        signer,
+        chrono::Utc::now(),
+    ))
+}
+
+/// What `PUT /zones/{zone}/dnssec` did.
+#[derive(Debug, Clone)]
+pub struct DnssecChange {
+    pub zone: Zone,
+    /// A new key was generated (first enable, or `new_key`).
+    pub key_generated: bool,
+    /// Signing was switched on or off by this call.
+    pub changed: bool,
 }
 
 /// JSON export / import document.
@@ -892,6 +988,7 @@ fn default_zone(name: &str, owner_id: Option<i64>) -> Zone {
         created_at: now.clone(),
         updated_at: now,
         owner_id,
+        dnssec: false,
     }
 }
 
@@ -940,6 +1037,7 @@ impl Mutator {
             zone_defaults: std::sync::RwLock::new((None, None)),
             expiry_wake: Arc::new(tokio::sync::Notify::new()),
             gate: Arc::new(WriteGate::default()),
+            signer: Arc::new(crate::dnssec::Signer::default()),
         };
         m.set_zone_defaults(default_primary_ns, default_hostmaster);
         m
@@ -967,9 +1065,21 @@ impl Mutator {
         self.zone_defaults.read().unwrap().clone()
     }
 
+    /// DNSSEC signing state (settings, signed-zone cache, errors).
+    pub fn signer(&self) -> Arc<crate::dnssec::Signer> {
+        self.signer.clone()
+    }
+
+    /// Apply `[dnssec]` (startup and reload). Takes effect at the next
+    /// catalog build (the re-sign task rebuilds when windows change).
+    pub fn set_dnssec_config(&self, cfg: crate::config::DnssecConfig) {
+        self.signer.set_config(cfg);
+        self.expiry_wake.notify_one();
+    }
+
     /// Rebuild the catalog from storage (used at startup).
     pub fn rebuild(&self) -> Result<()> {
-        let catalog = Catalog::build(self.storage.list_zones()?, self.storage.all_records()?);
+        let catalog = build_catalog(&self.storage, &self.signer)?;
         self.cache.store(catalog);
         Ok(())
     }
@@ -1038,13 +1148,12 @@ impl Mutator {
     /// retried in the background; it never un-commits the change.
     async fn refresh_catalog(&self) {
         let storage = self.storage.clone();
+        let signer = self.signer.clone();
         let build = || {
             let storage = storage.clone();
+            let signer = signer.clone();
             tokio::task::spawn_blocking(move || -> Result<Catalog> {
-                Ok(Catalog::build(
-                    storage.list_zones()?,
-                    storage.all_records()?,
-                ))
+                build_catalog(&storage, &signer)
             })
         };
         match build().await {
@@ -1061,9 +1170,10 @@ impl Mutator {
                     for attempt in 1..=10u64 {
                         tokio::time::sleep(std::time::Duration::from_secs(attempt)).await;
                         let s = storage.clone();
+                        let sg = signer.clone();
                         if let Ok(Ok(c)) =
                             tokio::task::spawn_blocking(move || -> Result<Catalog> {
-                                Ok(Catalog::build(s.list_zones()?, s.all_records()?))
+                                build_catalog(&s, &sg)
                             })
                             .await
                         {
@@ -1240,6 +1350,184 @@ impl Mutator {
             t.remove_member(&z, user_id)
         })
         .await
+    }
+
+    // ---- DNSSEC --------------------------------------------------------
+
+    /// Turn DNSSEC signing on or off for a zone. On: the zone's key is
+    /// generated the first time (or replaced with `new_key`, only while
+    /// signing is off) and the zone's `dnssec` flag set, all in one
+    /// transaction (a serial bump; the key is an account-class change).
+    /// Off: the flag is cleared; the key is kept, so turning signing back
+    /// on reuses it (the DS at the registrar stays valid).
+    pub async fn set_dnssec(
+        &self,
+        actor: Actor,
+        zone_name: &str,
+        enable: bool,
+        new_key: bool,
+    ) -> MResult<DnssecChange> {
+        let zone_name = zone_name.to_string();
+        let (name, key_generated, changed) = self
+            .execute(actor, if enable { "enable_dnssec" } else { "disable_dnssec" }, move |t| {
+                let z = t.require_zone(&normalize_zone_name(&zone_name)?)?;
+                if !enable {
+                    if new_key {
+                        return Err(MutationError::Invalid(
+                            "new_key applies only when turning signing on".into(),
+                        ));
+                    }
+                    if !z.dnssec {
+                        return Ok((z.name, false, false));
+                    }
+                    let mut after = z.clone();
+                    after.dnssec = false;
+                    t.update_zone(z.clone(), after)?;
+                    return Ok((z.name, false, true));
+                }
+                if new_key && z.dnssec {
+                    return Err(MutationError::Conflict(
+                        "the key cannot be replaced while signing is on: remove the DS at the registrar, wait for its TTL, turn signing off, then turn it on with a new key".into(),
+                    ));
+                }
+                let mut generated = false;
+                if new_key || t.dnssec_key(z.id)?.is_none() {
+                    let k = crate::dnssec::generate_key()?;
+                    let rdata = crate::dnssec::wire::dnskey_rdata(
+                        crate::dnssec::CSK_FLAGS,
+                        crate::dnssec::ALGORITHM,
+                        &k.public_key,
+                    );
+                    t.set_dnssec_key(crate::replication::types::ReplDnssecKey {
+                        zone_id: z.id,
+                        zone: z.name.clone(),
+                        algorithm: crate::dnssec::ALGORITHM,
+                        flags: crate::dnssec::CSK_FLAGS,
+                        key_tag: crate::dnssec::wire::key_tag(&rdata),
+                        public_key: data_encoding::BASE64.encode(&k.public_key),
+                        private_key: crate::replication::types::Hidden(
+                            data_encoding::BASE64.encode(&k.pkcs8),
+                        ),
+                        created_at: now_rfc3339(),
+                    })?;
+                    generated = true;
+                }
+                if z.dnssec {
+                    return Ok((z.name, generated, false));
+                }
+                let mut after = z.clone();
+                after.dnssec = true;
+                t.update_zone(z.clone(), after)?;
+                Ok((z.name, generated, true))
+            })
+            .await?;
+        let zone = self
+            .storage
+            .get_zone(&name)?
+            .ok_or_else(|| MutationError::NotFound(format!("zone '{name}' not found")))?;
+        Ok(DnssecChange {
+            zone,
+            key_generated,
+            changed,
+        })
+    }
+
+    /// Signed zones whose signatures are due for re-signing at `now`
+    /// (`[dnssec].resign_before_days` before they expire).
+    pub fn resign_candidates(&self, now: chrono::DateTime<chrono::Utc>) -> Vec<String> {
+        let cfg = self.signer.config();
+        self.cache
+            .load()
+            .zones
+            .values()
+            .filter(|z| z.zone.dnssec)
+            .filter(|z| {
+                crate::dnssec::resign_due_at(&z.zone.updated_at, &cfg)
+                    .is_some_and(|due| now.timestamp() >= due)
+            })
+            .map(|z| z.zone.name.clone())
+            .collect()
+    }
+
+    /// Re-sign every due zone: one transaction with a `zone_resigned` change
+    /// and a serial bump per zone. Returns the zones re-signed. Refused on
+    /// a standby (the primary's bumps replicate).
+    pub async fn resign_due(&self, now: chrono::DateTime<chrono::Utc>) -> MResult<Vec<String>> {
+        let due = self.resign_candidates(now);
+        if due.is_empty() {
+            return Ok(vec![]);
+        }
+        let cfg = self.signer.config();
+        let ts = now.timestamp();
+        self.execute(
+            Actor {
+                name: "system".into(),
+                ip: "dnssec".into(),
+            },
+            "resign_zones",
+            move |t| {
+                let mut done = Vec::new();
+                for name in due {
+                    let Some(z) = t.zone(&name)? else { continue };
+                    if !z.dnssec {
+                        continue;
+                    }
+                    let Some(due) = crate::dnssec::resign_due_at(&z.updated_at, &cfg) else {
+                        continue;
+                    };
+                    if ts < due {
+                        continue; // changed meanwhile: signed afresh already
+                    }
+                    let Some(key) = t.dnssec_key(z.id)? else {
+                        continue;
+                    };
+                    t.resign_zone(&z, key.key_tag)?;
+                    done.push(z.name);
+                }
+                Ok(done)
+            },
+        )
+        .await
+    }
+
+    /// Background task (every node): on a writable primary, re-sign zones
+    /// when due; everywhere, rebuild the catalog in memory when a signature
+    /// window would change without a serial bump (a standby cut off from
+    /// its primary; never a write).
+    pub fn spawn_resigner(self: &Arc<Self>) {
+        let m = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let now = chrono::Utc::now();
+                if !m.gate.read_only() {
+                    match m.resign_due(now).await {
+                        Ok(z) if !z.is_empty() => {
+                            tracing::info!(zones = ?z, "DNSSEC: zones re-signed (serial bumped)")
+                        }
+                        Ok(_) => {}
+                        Err(MutationError::ReadOnly(_)) => {}
+                        Err(e) => tracing::error!(error = %e, "DNSSEC re-sign failed; retrying"),
+                    }
+                }
+                if m.signer.window_stale(&m.cache.load(), now.timestamp()) {
+                    tracing::info!("DNSSEC: signature window moved without a serial change; re-signing in memory");
+                    m.refresh_catalog().await;
+                }
+                // Next check: the earliest due re-sign, within 1 min .. 1 h.
+                let cfg = m.signer.config();
+                let next = m
+                    .cache
+                    .load()
+                    .zones
+                    .values()
+                    .filter(|z| z.zone.dnssec)
+                    .filter_map(|z| crate::dnssec::resign_due_at(&z.zone.updated_at, &cfg))
+                    .min()
+                    .map(|due| (due - chrono::Utc::now().timestamp()).clamp(60, 3600))
+                    .unwrap_or(3600);
+                tokio::time::sleep(std::time::Duration::from_secs(next as u64)).await;
+            }
+        });
     }
 
     // ---- expiry --------------------------------------------------------
@@ -1936,6 +2224,200 @@ mod tests {
     /// Full contents of every replicated table (all columns except the
     /// per-server `last_used_*` of tokens), generic over the registry: a
     /// column missing from a change payload makes the comparison fail.
+
+    #[tokio::test]
+    async fn dnssec_enable_disable_keeps_the_key_and_hides_it() {
+        let (s, m, _) = setup();
+        let rx = m.bus.subscribe_changes().unwrap();
+        m.create_zone(actor(), zone_input("sec.test"), None)
+            .await
+            .unwrap();
+        m.create_record(actor(), "sec.test", rec("www", RecordType::A, "192.0.2.1"))
+            .await
+            .unwrap();
+        let before = s.get_zone("sec.test").unwrap().unwrap();
+        let on = m
+            .set_dnssec(actor(), "sec.test", true, false)
+            .await
+            .unwrap();
+        assert!(on.changed && on.key_generated && on.zone.dnssec);
+        assert_eq!(
+            on.zone.serial,
+            before.serial + 1,
+            "turning signing on bumps the serial"
+        );
+        let key = s.get_dnssec_key(on.zone.id).unwrap().unwrap();
+        assert_eq!((key.algorithm, key.flags), (13, 257));
+        // The catalog serves the signed view.
+        let signed = m.cache.load().zones["sec.test."].signed.clone().unwrap();
+        assert_eq!(signed.key_tag, key.key_tag);
+
+        // The key is an account-class change: in the full changelog (standbys),
+        // never in the user-facing changelog, never on the event bus.
+        let all = s
+            .read_tx(|c| crate::replication::data::changelog_tail(c, 0))
+            .unwrap();
+        let key_rows: Vec<&ChangeEvent> = all
+            .iter()
+            .filter(|e| e.payload["kind"] == "dnssec_key_set")
+            .collect();
+        assert_eq!(key_rows.len(), 1);
+        assert_eq!(key_rows[0].zone, "", "account rows carry no zone name");
+        let secret = &key.private_key.0;
+        let visible = s.changelog_after(0, 10_000).unwrap();
+        assert!(visible
+            .iter()
+            .all(|e| e.payload["kind"] != "dnssec_key_set"));
+        assert!(
+            !serde_json::to_string(&visible)
+                .unwrap()
+                .contains(secret.as_str()),
+            "private key never in the user-facing changelog"
+        );
+        let mut published = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            published.push(ev);
+        }
+        assert!(published
+            .iter()
+            .any(|e| e.payload["kind"] == "zone_updated"));
+        assert!(
+            !serde_json::to_string(&published)
+                .unwrap()
+                .contains(secret.as_str()),
+            "private key never published to the websocket / live feed"
+        );
+        assert!(
+            !format!("{key:?}").contains(secret.as_str()),
+            "Debug hides it"
+        );
+
+        // Idempotent; the key cannot be replaced while signing is on.
+        let again = m
+            .set_dnssec(actor(), "sec.test", true, false)
+            .await
+            .unwrap();
+        assert!(!again.changed && !again.key_generated);
+        assert!(matches!(
+            m.set_dnssec(actor(), "sec.test", true, true).await,
+            Err(MutationError::Conflict(_))
+        ));
+        // Off keeps the key; on again reuses it (the published DS stays valid).
+        let off = m
+            .set_dnssec(actor(), "sec.test", false, false)
+            .await
+            .unwrap();
+        assert!(off.changed && !off.zone.dnssec);
+        assert!(m.cache.load().zones["sec.test."].signed.is_none());
+        let on2 = m
+            .set_dnssec(actor(), "sec.test", true, false)
+            .await
+            .unwrap();
+        assert!(!on2.key_generated);
+        assert_eq!(
+            s.get_dnssec_key(on.zone.id).unwrap().unwrap().key_tag,
+            key.key_tag
+        );
+        // A new key only while off.
+        m.set_dnssec(actor(), "sec.test", false, false)
+            .await
+            .unwrap();
+        let rotated = m.set_dnssec(actor(), "sec.test", true, true).await.unwrap();
+        assert!(rotated.key_generated);
+        assert_ne!(
+            s.get_dnssec_key(on.zone.id).unwrap().unwrap().public_key,
+            key.public_key
+        );
+        // Deleting the zone deletes its key, as a logged change.
+        m.delete_zone(actor(), "sec.test").await.unwrap();
+        assert!(s.get_dnssec_key(on.zone.id).unwrap().is_none());
+        let all = s
+            .read_tx(|c| crate::replication::data::changelog_tail(c, 0))
+            .unwrap();
+        assert!(all
+            .iter()
+            .any(|e| e.payload["kind"] == "dnssec_key_deleted"));
+    }
+
+    #[tokio::test]
+    async fn resign_bumps_the_serial_only_when_due_and_never_on_a_standby() {
+        let (s, m, _) = setup();
+        m.create_zone(actor(), zone_input("rs.test"), None)
+            .await
+            .unwrap();
+        m.set_dnssec(actor(), "rs.test", true, false).await.unwrap();
+        let z0 = s.get_zone("rs.test").unwrap().unwrap();
+        let sig0 = m.cache.load().zones["rs.test."].signed.clone().unwrap();
+        // Not due now, nor 6 days from now (validity 14, re-sign 7 days before expiry).
+        assert!(m.resign_due(chrono::Utc::now()).await.unwrap().is_empty());
+        assert!(m
+            .resign_due(chrono::Utc::now() + chrono::Duration::days(6))
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(s.get_zone("rs.test").unwrap().unwrap().serial, z0.serial);
+        // Due 7 days in: one zone_resigned + serial bump.
+        let done = m
+            .resign_due(chrono::Utc::now() + chrono::Duration::days(7))
+            .await
+            .unwrap();
+        assert_eq!(done, vec!["rs.test".to_string()]);
+        let z1 = s.get_zone("rs.test").unwrap().unwrap();
+        assert_eq!(z1.serial, z0.serial + 1);
+        let log = log(&s);
+        assert!(log
+            .iter()
+            .any(|e| e.payload["kind"] == "zone_resigned" && e.zone == "rs.test"));
+        let sig1 = m.cache.load().zones["rs.test."].signed.clone().unwrap();
+        assert!(
+            sig1.inception >= sig0.inception,
+            "signed afresh for the new serial"
+        );
+        // The window follows the new change time: not due again right away.
+        assert!(m
+            .resign_due(chrono::Utc::now() + chrono::Duration::days(1))
+            .await
+            .unwrap()
+            .is_empty());
+        // A read-only standby never re-signs.
+        m.gate().close("standby");
+        assert!(matches!(
+            m.resign_due(chrono::Utc::now() + chrono::Duration::days(30))
+                .await,
+            Err(MutationError::ReadOnly(_))
+        ));
+        assert_eq!(s.get_zone("rs.test").unwrap().unwrap().serial, z1.serial);
+    }
+
+    #[tokio::test]
+    async fn signing_uses_the_same_window_for_the_same_zone_state() {
+        let (_, m, _) = setup();
+        m.create_zone(actor(), zone_input("w.test"), None)
+            .await
+            .unwrap();
+        m.set_dnssec(actor(), "w.test", true, false).await.unwrap();
+        let a = m.cache.load().zones["w.test."].signed.clone().unwrap();
+        m.rebuild().unwrap();
+        let b = m.cache.load().zones["w.test."].signed.clone().unwrap();
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "unchanged zone: signatures reused from the cache"
+        );
+        // A change elsewhere does not re-sign this zone either.
+        m.create_zone(actor(), zone_input("other.test"), None)
+            .await
+            .unwrap();
+        let c = m.cache.load().zones["w.test."].signed.clone().unwrap();
+        assert!(Arc::ptr_eq(&a, &c));
+        // A change in the zone re-signs it.
+        m.create_record(actor(), "w.test", rec("x", RecordType::A, "192.0.2.9"))
+            .await
+            .unwrap();
+        let d = m.cache.load().zones["w.test."].signed.clone().unwrap();
+        assert!(!Arc::ptr_eq(&a, &d));
+        assert!(d.nsec_at("x.w.test.").is_some());
+    }
+
     fn dump(s: &Storage) -> serde_json::Value {
         s.read_tx(|c| {
             let mut v = serde_json::Map::new();
@@ -1988,7 +2470,7 @@ mod tests {
         let mut extra_users: Vec<i64> = Vec::new();
         for step in 0..600 {
             let z = zones[rng.random_range(0..zones.len())];
-            let res: MResult<()> = match rng.random_range(0..130) {
+            let res: MResult<()> = match rng.random_range(0..140) {
                 0..=4 => m
                     .create_zone(actor(), zone_input(z), Some(users[0].id))
                     .await
@@ -2129,6 +2611,16 @@ mod tests {
                         .await
                         .map(|_| ())
                 }
+                // ---- DNSSEC: key (account class), flag, re-sign ----
+                130..=134 => m
+                    .set_dnssec(actor(), z, true, step % 7 == 0)
+                    .await
+                    .map(|_| ()),
+                135..=137 => m.set_dnssec(actor(), z, false, false).await.map(|_| ()),
+                138..=139 => m
+                    .resign_due(chrono::Utc::now() + chrono::Duration::days(8))
+                    .await
+                    .map(|_| ()),
                 // ---- accounts, settings, TSIG ----
                 k => {
                     let uid = users[rng.random_range(0..users.len())].id;
@@ -2325,6 +2817,9 @@ mod tests {
             "tsig_key_deleted",
             "setting_set",
             "setting_cleared",
+            "dnssec_key_set",
+            "dnssec_key_deleted",
+            "zone_resigned",
         ] {
             assert!(
                 events.iter().any(|e| e.payload["kind"] == kind),

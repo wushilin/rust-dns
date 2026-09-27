@@ -18,6 +18,8 @@ pub struct ZoneData {
     pub existing: HashSet<String>,
     /// Names below the apex that hold NS records: delegation points.
     pub delegations: Vec<String>,
+    /// The signed view when DNSSEC signing is on for this zone.
+    pub signed: Option<Arc<crate::dnssec::SignedZone>>,
 }
 
 impl ZoneData {
@@ -32,6 +34,17 @@ impl ZoneData {
             .iter()
             .filter(|d| owner == d.as_str() || owner.ends_with(&format!(".{d}")))
             .max_by_key(|d| d.len())
+            .map(|s| s.as_str())
+    }
+
+    /// The zone cut `owner` is at or below, taking the highest one when
+    /// delegations are nested (everything below the first cut belongs to
+    /// the child). Used for signed zones.
+    pub fn cut_for(&self, owner: &str) -> Option<&str> {
+        self.delegations
+            .iter()
+            .filter(|d| owner == d.as_str() || crate::dnssec::signed::is_below(owner, d))
+            .min_by_key(|d| d.len())
             .map(|s| s.as_str())
     }
 }
@@ -55,9 +68,42 @@ impl Catalog {
 
     /// Build the catalog as of now: expired records are left out, so they stop
     /// answering, stop appearing in zone transfers and exports, and no longer
-    /// produce automatic PTR answers.
+    /// produce automatic PTR answers. (Unsigned; tests.)
+    #[cfg(test)]
     pub fn build(zones: Vec<Zone>, records: Vec<Record>) -> Self {
         Self::build_at(zones, records, &now_rfc3339())
+    }
+
+    /// Build the catalog and sign the zones that have DNSSEC on (with the
+    /// zone's key from `keys`; a zone without a usable key is served
+    /// unsigned and the error is kept by the signer).
+    pub fn build_signed(
+        zones: Vec<Zone>,
+        records: Vec<Record>,
+        keys: &[crate::replication::types::ReplDnssecKey],
+        signer: &crate::dnssec::Signer,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        let now_s = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let mut c = Self::build_at(zones, records, &now_s);
+        let mut signed_ids = Vec::new();
+        for zd in c.zones.values_mut() {
+            if !zd.zone.dnssec {
+                continue;
+            }
+            signed_ids.push(zd.zone.id);
+            let Some(key) = keys.iter().find(|k| k.zone_id == zd.zone.id) else {
+                tracing::error!(zone = %zd.zone.name, "DNSSEC is on but the zone has no key; serving it unsigned");
+                continue;
+            };
+            if let Some(s) = signer.sign(zd, key, now.timestamp()) {
+                if let Some(z) = Arc::get_mut(zd) {
+                    z.signed = Some(s);
+                }
+            }
+        }
+        signer.retain(&signed_ids);
+        c
     }
 
     pub fn build_at(zones: Vec<Zone>, records: Vec<Record>, now: &str) -> Self {
@@ -111,6 +157,7 @@ impl Catalog {
                     names,
                     existing,
                     delegations,
+                    signed: None,
                 }),
             );
         }
@@ -185,6 +232,7 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
             owner_id: None,
+            dnssec: false,
         }
     }
     fn rec(id: i64, zone_id: i64, name: &str, t: RecordType, v: &str) -> Record {

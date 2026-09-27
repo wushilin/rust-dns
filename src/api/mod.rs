@@ -2,6 +2,7 @@
 //! by hand so PROXY protocol headers can be read before HTTP starts.
 
 pub mod client_ip;
+pub mod dnssec;
 pub mod error;
 pub mod guard;
 pub mod openapi;
@@ -316,6 +317,10 @@ fn api_router() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(routes::update_record, routes::delete_record))
         .routes(routes!(routes::set_member, routes::remove_member))
         .routes(routes!(routes::user_rights))
+        .routes(routes!(dnssec::get_dnssec, dnssec::set_dnssec))
+        .routes(routes!(dnssec::get_ds))
+        .routes(routes!(dnssec::check_dnssec))
+        .routes(routes!(dnssec::get_parent_ds))
         .routes(routes!(routes::export_zone))
         .routes(routes!(routes::export_all))
         .routes(routes!(routes::import))

@@ -658,6 +658,8 @@ mod tests {
         m.expire_due(chrono::Utc::now() + chrono::Duration::seconds(5))
             .await
             .unwrap();
+        // DNSSEC: the key travels as an account-class change, the flag as a zone update.
+        m.set_dnssec(actor(), "a.test", true, false).await.unwrap();
         m.set_member(actor(), "a.test", root.id, ZoneRole::Viewer)
             .await
             .unwrap();
@@ -711,6 +713,12 @@ mod tests {
             .unwrap();
         assert_eq!(sum.local_root, "merged");
         assert_eq!(replicated(&ss), replicated(&ps));
+        // The standby signs with the replicated key (in memory, its own signatures).
+        let pz = ps.get_zone("a.test").unwrap().unwrap();
+        let key = ps.get_dnssec_key(pz.id).unwrap().unwrap();
+        assert_eq!(ss.get_dnssec_key(pz.id).unwrap().unwrap(), key);
+        let signed = sm.cache.load().zones["a.test."].signed.clone().unwrap();
+        assert_eq!(signed.key_tag, key.key_tag);
         let fwd = crate::mutation::settings::load_forwarding(&ss)
             .unwrap()
             .unwrap()
@@ -1234,7 +1242,11 @@ mod tests {
         assert!(!visible.contains("user_created") && !visible.contains("tsig_key_set"));
         let audit = serde_json::to_string(&ss.audit_after(0, 1000).unwrap()).unwrap();
         let tsig_b64 = data_encoding::BASE64.encode(b"tsig-secret-bytes");
+        let pz = ps.get_zone("a.test").unwrap().unwrap();
+        let dnssec_key = ps.get_dnssec_key(pz.id).unwrap().unwrap().private_key.0;
+        assert!(!visible.contains("dnssec_key_set"));
         for secret in [
+            dnssec_key.as_str(),
             "alice-hash",
             PRIMARY_ROOT_HASH,
             STANDBY_ROOT_HASH,

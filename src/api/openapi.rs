@@ -46,6 +46,7 @@ This document is generated from the server's code, so it always matches the runn
         (name = "Account", description = "The caller's own profile, password, MFA and sessions."),
         (name = "Zones", description = "Create, inspect, update and delete zones."),
         (name = "Records", description = "Search and edit resource records inside a zone."),
+        (name = "DNSSEC", description = "Per-zone DNSSEC signing (ECDSA P-256, NSEC): status, turning it on and off, the DS records for the registrar, a check of this server's signed answers and a lookup of the DS at the parent."),
         (name = "Access", description = "Zone membership (editor/viewer) and effective rights."),
         (name = "Import/Export", description = "JSON export documents (export and re-import)."),
         (name = "Change log", description = "DNS change log, account audit log and the realtime WebSocket."),

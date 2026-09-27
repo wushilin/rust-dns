@@ -7,6 +7,10 @@ use hickory_proto::rr::rdata::{A, AAAA, CNAME, MX, NS, NULL, PTR, SOA, SRV, TXT}
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
 
+use crate::dnssec::signed::NsecEntry;
+use crate::dnssec::wire;
+use crate::dnssec::SignedZone;
+
 /// DNAME is not modelled by hickory; it is carried as an unknown type 39
 /// whose RDATA is the uncompressed target name (RFC 6672 §2.1).
 pub const DNAME_TYPE: RecordType = RecordType::Unknown(39);
@@ -32,6 +36,9 @@ pub struct Answer {
     pub answers: Vec<Record>,
     pub authority: Vec<Record>,
     pub additional: Vec<Record>,
+    /// NSEC proofs a positive answer needs (wildcard expansion), collected
+    /// through CNAME/DNAME chains and moved into `authority` by `lookup`.
+    proofs: Vec<Record>,
 }
 
 impl Answer {
@@ -42,7 +49,29 @@ impl Answer {
             answers: vec![],
             authority: vec![],
             additional: vec![],
+            proofs: vec![],
         }
+    }
+
+    /// RFC 8482 for a signed zone: keep only the first RRset of the answer
+    /// and its RRSIG (a real, validatable RRset rather than a synthesized
+    /// HINFO), drop the additional section.
+    pub fn keep_first_rrset(&mut self) {
+        let Some(first) = self.answers.first() else {
+            return;
+        };
+        let owner = key_of(&first.name);
+        let t = u16::from(first.record_type());
+        self.answers.retain(|r| {
+            key_of(&r.name) == owner
+                && match u16::from(r.record_type()) {
+                    wire::T_RRSIG => wire::raw_rdata(r)
+                        .and_then(|b| b.get(..2))
+                        .is_some_and(|c| u16::from_be_bytes([c[0], c[1]]) == t),
+                    x => x == t,
+                }
+        });
+        self.additional.clear();
     }
 }
 
@@ -86,6 +115,15 @@ pub fn to_rr(zone: &Zone, r: &StoredRecord, owner: &Name) -> Option<Record> {
         Rt::DNAME => dname_rdata(&name_of(&r.value)?)?,
         Rt::CAA | Rt::HTTPS | Rt::SVCB | Rt::TLSA | Rt::SSHFP | Rt::NAPTR | Rt::HINFO => {
             RData::try_from_str(r.rtype.to_hickory(), &r.value).ok()?
+        }
+        Rt::DS => {
+            let (tag, alg, dt, digest) = wire::parse_ds_text(&r.value).ok()?;
+            return Some(wire::raw_record(
+                owner.clone(),
+                ttl,
+                wire::T_DS,
+                wire::ds_rdata(tag, alg, dt, &digest),
+            ));
         }
     };
     Some(Record::from_rdata(owner.clone(), ttl, rdata))
@@ -175,13 +213,16 @@ fn wants(qtype: RecordType, rt: Rt) -> bool {
 }
 
 /// Find the record set at `owner` in zone `z`, falling back to wildcard
-/// synthesis. Returns `(records, owner_exists)`.
-fn find_rrset<'a>(z: &'a ZoneData, owner: &str) -> (Option<&'a Vec<StoredRecord>>, bool) {
+/// synthesis. Returns `(records, owner_exists, wildcard owner if synthesized)`.
+fn find_rrset<'a>(
+    z: &'a ZoneData,
+    owner: &str,
+) -> (Option<&'a Vec<StoredRecord>>, bool, Option<String>) {
     if let Some(rs) = z.records_at(owner) {
-        return (Some(rs), true);
+        return (Some(rs), true, None);
     }
     if z.existing.contains(owner) {
-        return (None, true); // empty non-terminal
+        return (None, true, None); // empty non-terminal
     }
     // Wildcard (RFC 4592): walk up to the closest encloser, the first ancestor
     // that exists in the zone, and only a `*` directly beneath it may match.
@@ -197,7 +238,7 @@ fn find_rrset<'a>(z: &'a ZoneData, owner: &str) -> (Option<&'a Vec<StoredRecord>
             format!("*.{cur}")
         };
         if let Some(rs) = z.records_at(&wc) {
-            return (Some(rs), false);
+            return (Some(rs), false, Some(wc));
         }
         if z.existing.contains(cur) {
             break; // closest encloser found and it has no wildcard child
@@ -206,7 +247,7 @@ fn find_rrset<'a>(z: &'a ZoneData, owner: &str) -> (Option<&'a Vec<StoredRecord>
             break;
         }
     }
-    (None, false)
+    (None, false, None)
 }
 
 /// Find a DNAME at a strict ancestor of `key` (below or at the apex). Returns (owner, target).
@@ -229,6 +270,19 @@ fn find_dname(z: &ZoneData, key: &str) -> Option<(String, String)> {
 }
 
 pub fn lookup(catalog: &Catalog, qname: &Name, qtype: RecordType, auto_ptr: bool) -> Lookup {
+    lookup_dnssec(catalog, qname, qtype, auto_ptr, false)
+}
+
+/// [`lookup`] for a query with the DO bit: in a signed zone the answer
+/// carries RRSIGs and NSEC proofs (RFC 4035 §3.1). Without DO the answer is
+/// the same as for an unsigned zone.
+pub fn lookup_dnssec(
+    catalog: &Catalog,
+    qname: &Name,
+    qtype: RecordType,
+    auto_ptr: bool,
+    dnssec_ok: bool,
+) -> Lookup {
     let key = key_of(qname);
     let zone = match catalog.find_zone(&key) {
         Some(z) => z.clone(),
@@ -241,9 +295,43 @@ pub fn lookup(catalog: &Catalog, qname: &Name, qtype: RecordType, auto_ptr: bool
             return Lookup::NotOurs;
         }
     };
+    let zone = ds_parent_side(catalog, &zone, &key, qtype).unwrap_or(zone);
     let mut ans = Answer::new(ResponseCode::NoError);
-    resolve_into(catalog, &zone, qname, &key, qtype, auto_ptr, &mut ans, 0);
+    resolve_into(
+        catalog, &zone, qname, &key, qtype, auto_ptr, &mut ans, 0, dnssec_ok,
+    );
+    for r in std::mem::take(&mut ans.proofs) {
+        if !ans.authority.contains(&r) {
+            ans.authority.push(r);
+        }
+    }
     Lookup::Answer(ans)
+}
+
+/// RFC 4035 §3.1.4.1: a DS query for the apex of a zone whose parent zone
+/// is also here is answered from the parent (DS is parent-side data), when
+/// the parent is signed or holds DS records for it.
+fn ds_parent_side(
+    catalog: &Catalog,
+    z: &Arc<ZoneData>,
+    key: &str,
+    qtype: RecordType,
+) -> Option<Arc<ZoneData>> {
+    if qtype != RecordType::DS || key != z.apex || key == "." {
+        return None;
+    }
+    let parent = match key.split_once('.') {
+        Some((_, rest)) if !rest.is_empty() => rest,
+        _ => ".",
+    };
+    let p = catalog.find_zone(parent)?;
+    if p.cut_for(key) != Some(key) {
+        return None;
+    }
+    let has_ds = p
+        .records_at(key)
+        .is_some_and(|rs| rs.iter().any(|r| r.rtype == Rt::DS));
+    (p.signed.is_some() || has_ds).then(|| p.clone())
 }
 
 fn auto_ptr_answer(catalog: &Catalog, qname: &Name, key: &str) -> Option<Answer> {
@@ -262,6 +350,62 @@ fn auto_ptr_answer(catalog: &Catalog, qname: &Name, key: &str) -> Option<Answer>
     Some(ans)
 }
 
+/// Append the RRSIG of every RRset in `section[from..]` (records owned by
+/// one name, signed under `owner`: the wildcard owner for a synthesized
+/// answer). The RRSIG carries the name and the TTL the RRset is served with.
+fn sign_section(sec: &SignedZone, section: &mut Vec<Record>, from: usize, owner: &str) {
+    let mut types: Vec<RecordType> = Vec::new();
+    let mut sigs = Vec::new();
+    for r in &section[from..] {
+        let t = r.record_type();
+        if types.contains(&t) {
+            continue;
+        }
+        types.push(t);
+        let ttl = section[from..]
+            .iter()
+            .filter(|x| x.record_type() == t)
+            .map(|x| x.ttl)
+            .min()
+            .unwrap_or(r.ttl);
+        if let Some(s) = sec.sig_as(owner, u16::from(t), &r.name, ttl) {
+            sigs.push(s);
+        }
+    }
+    section.extend(sigs);
+}
+
+/// The closest encloser of a name that does not exist: its longest
+/// existing ancestor (RFC 5155 terminology; RFC 4592 §3.3.1).
+fn closest_encloser(z: &ZoneData, key: &str) -> String {
+    let mut cur = key;
+    while cur != z.apex {
+        cur = match cur.split_once('.') {
+            Some((_, rest)) if !rest.is_empty() => rest,
+            _ => return z.apex.clone(),
+        };
+        if z.existing.contains(cur) {
+            return cur.to_string();
+        }
+    }
+    z.apex.clone()
+}
+
+fn push_proofs(sec: &SignedZone, entries: Vec<&NsecEntry>, out: &mut Vec<Record>) {
+    let mut seen: Vec<&str> = Vec::new();
+    for e in entries {
+        if seen.contains(&e.owner.as_str()) {
+            continue;
+        }
+        seen.push(&e.owner);
+        for r in sec.proof(e) {
+            if !out.contains(&r) {
+                out.push(r);
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn resolve_into(
     catalog: &Catalog,
@@ -272,18 +416,60 @@ fn resolve_into(
     auto_ptr: bool,
     ans: &mut Answer,
     depth: usize,
+    dnssec_ok: bool,
 ) {
     let zone = &z.zone;
     let is_apex = key == z.apex;
+    let signed = z.signed.as_deref();
+    // RRSIGs and NSEC proofs only for a DO query to a signed zone.
+    let sec = if dnssec_ok { signed } else { None };
 
     // Referral: name is at or below a delegation point inside this zone.
     if !is_apex {
-        if let Some(deleg) = z.delegation_for(key) {
+        let cut = if signed.is_some() {
+            z.cut_for(key)
+        } else {
+            z.delegation_for(key)
+        };
+        if let Some(deleg) = cut {
             // A query for the NS set exactly at the cut is still a referral (not authoritative).
             let owner = match name_of(deleg) {
                 Some(o) => o,
                 None => return,
             };
+            let ds_at = |n: &Name| -> Vec<Record> {
+                z.records_at(deleg)
+                    .map(|rs| {
+                        rs.iter()
+                            .filter(|r| r.rtype == Rt::DS)
+                            .filter_map(|r| to_rr(zone, r, n))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let ds = ds_at(&owner);
+            // RFC 4035 §3.1.4.1: DS at the cut is parent-side data, answered
+            // authoritatively (only for a signed zone or when DS records
+            // exist; otherwise the referral as before).
+            if qtype == RecordType::DS && key == deleg && (signed.is_some() || !ds.is_empty()) {
+                if ds.is_empty() {
+                    if depth == 0 {
+                        ans.rcode = ResponseCode::NoError;
+                    }
+                    negative_soa(z, sec, ans);
+                    if let Some(sec) = sec {
+                        let proof: Vec<&NsecEntry> = sec.nsec_at(deleg).into_iter().collect();
+                        push_proofs(sec, proof, &mut ans.authority);
+                    }
+                } else {
+                    let from = ans.answers.len();
+                    ans.answers.extend(ds_at(qname));
+                    if let Some(sec) = sec {
+                        sign_section(sec, &mut ans.answers, from, deleg);
+                    }
+                }
+                return;
+            }
             let ns: Vec<Record> = z
                 .records_at(deleg)
                 .map(|rs| {
@@ -296,6 +482,17 @@ fn resolve_into(
             ans.authoritative = false;
             ans.authority.extend(ns.iter().cloned());
             add_glue(catalog, &ns, &mut ans.additional);
+            // RFC 4035 §3.1.4: the DS RRset (signed) or an NSEC proving there is none.
+            if let Some(sec) = sec {
+                if ds.is_empty() {
+                    let proof: Vec<&NsecEntry> = sec.nsec_at(deleg).into_iter().collect();
+                    push_proofs(sec, proof, &mut ans.authority);
+                } else {
+                    let from = ans.authority.len();
+                    ans.authority.extend(ds);
+                    sign_section(sec, &mut ans.authority, from, deleg);
+                }
+            }
             return;
         }
     }
@@ -308,9 +505,14 @@ fn resolve_into(
                 .and_then(|rs| rs.iter().find(|r| r.rtype == Rt::DNAME))
                 .and_then(|r| to_rr(zone, r, &owner_n))
             {
+                let from = ans.answers.len();
                 ans.answers.push(dr);
+                if let Some(sec) = sec {
+                    sign_section(sec, &mut ans.answers, from, &owner);
+                }
             }
             // Substitute the suffix: qname = <prefix>.<owner> -> <prefix>.<target>
+            // The synthesized CNAME is not signed (RFC 6672 §5.3.1).
             let prefix = &key[..key.len() - owner.len()];
             let new_key = format!("{prefix}{target}");
             if let Some(new_name) = name_of(&new_key) {
@@ -333,9 +535,11 @@ fn resolve_into(
                             auto_ptr,
                             &mut sub,
                             depth + 1,
+                            dnssec_ok,
                         );
                         ans.answers.extend(sub.answers);
                         ans.additional.extend(sub.additional);
+                        ans.proofs.extend(sub.proofs);
                     }
                 }
             }
@@ -344,7 +548,10 @@ fn resolve_into(
         }
     }
 
-    let (rrset, exists) = find_rrset(z, key);
+    let (rrset, exists, wildcard) = find_rrset(z, key);
+    // The owner the served RRsets are signed under.
+    let sig_owner: &str = wildcard.as_deref().unwrap_or(key);
+    let start = ans.answers.len();
 
     // Synthesised apex records.
     if is_apex && (qtype == RecordType::SOA || qtype == RecordType::ANY) {
@@ -361,8 +568,30 @@ fn resolve_into(
             }
         }
     }
+    // A signed zone also holds DNSKEY at the apex and NSEC / RRSIG at each
+    // name of its chain.
+    if let Some(s) = signed {
+        if is_apex && (qtype == RecordType::DNSKEY || qtype == RecordType::ANY) {
+            let mut r = s.dnskey.clone();
+            r.name = qname.clone();
+            ans.answers.push(r);
+        }
+        if wildcard.is_none() && qtype == RecordType::NSEC {
+            if let Some(e) = s.nsec_at(key) {
+                let mut r = e.record.clone();
+                r.name = qname.clone();
+                ans.answers.push(r);
+            }
+        }
+        if wildcard.is_none() && qtype == RecordType::RRSIG {
+            for mut r in s.sigs_at(key) {
+                r.name = qname.clone();
+                ans.answers.push(r);
+            }
+        }
+    }
 
-    let mut matched = !ans.answers.is_empty();
+    let mut matched = ans.answers.len() > start;
     let mut cname_target: Option<Name> = None;
 
     if let Some(rs) = rrset {
@@ -394,6 +623,20 @@ fn resolve_into(
         }
     }
 
+    if let Some(sec) = sec {
+        if matched {
+            if qtype != RecordType::RRSIG {
+                sign_section(sec, &mut ans.answers, start, sig_owner);
+            }
+            // RFC 4035 §3.1.3.3: a wildcard answer proves that no closer
+            // name (the next closer name) exists.
+            if wildcard.is_some() {
+                let proof: Vec<&NsecEntry> = sec.nsec_covering(key).into_iter().collect();
+                push_proofs(sec, proof, &mut ans.proofs);
+            }
+        }
+    }
+
     if let Some(target) = cname_target {
         if depth < MAX_CNAME_HOPS {
             let tkey = key_of(&target);
@@ -409,9 +652,11 @@ fn resolve_into(
                     auto_ptr,
                     &mut sub,
                     depth + 1,
+                    dnssec_ok,
                 );
                 ans.answers.extend(sub.answers);
                 ans.additional.extend(sub.additional);
+                ans.proofs.extend(sub.proofs);
                 // rcode from the chase is not propagated (RFC 6604): NOERROR with the CNAME.
             }
         }
@@ -424,8 +669,10 @@ fn resolve_into(
         return;
     }
 
-    // Nothing found: try auto PTR before going negative.
-    if auto_ptr && (qtype == RecordType::PTR || qtype == RecordType::ANY) {
+    // Nothing found: try auto PTR before going negative. Not in a signed
+    // zone: a synthesized PTR could not be signed (and would contradict
+    // the zone's NSEC chain).
+    if auto_ptr && signed.is_none() && (qtype == RecordType::PTR || qtype == RecordType::ANY) {
         if let Some(a) = auto_ptr_answer(catalog, qname, key) {
             ans.answers.extend(a.answers);
             return;
@@ -440,8 +687,50 @@ fn resolve_into(
             ResponseCode::NXDomain
         };
     }
-    if let Some(soa) = soa_record(z, zone.minimum.min(zone.default_ttl)) {
+    negative_soa(z, sec, ans);
+    if let Some(sec) = sec {
+        // RFC 4035 §3.1.3.
+        let proofs: Vec<&NsecEntry> = if exists {
+            // NODATA: the NSEC at the name shows the type is absent; an empty
+            // non-terminal is proven by the NSEC whose next name is below it.
+            match sec.nsec_at(key) {
+                Some(e) => vec![e],
+                None => sec.nsec_covering(key).into_iter().collect(),
+            }
+        } else if let Some(wc) = &wildcard {
+            // Wildcard NODATA: no closer match, and the wildcard lacks the type.
+            sec.nsec_covering(key)
+                .into_iter()
+                .chain(sec.nsec_at(wc))
+                .collect()
+        } else {
+            // NXDOMAIN: the name does not exist, nor the wildcard at its
+            // closest encloser.
+            let ce = closest_encloser(z, key);
+            let wc = if ce == "." {
+                "*.".to_string()
+            } else {
+                format!("*.{ce}")
+            };
+            sec.nsec_covering(key)
+                .into_iter()
+                .chain(sec.nsec_covering(&wc))
+                .collect()
+        };
+        push_proofs(sec, proofs, &mut ans.authority);
+    }
+}
+
+/// The SOA of a negative answer (TTL min(SOA minimum, zone TTL), RFC 2308 /
+/// RFC 9077) and, for a DO query to a signed zone, its RRSIG.
+fn negative_soa(z: &ZoneData, sec: Option<&SignedZone>, ans: &mut Answer) {
+    let ttl = z.zone.minimum.min(z.zone.default_ttl);
+    if let Some(soa) = soa_record(z, ttl) {
+        let name = soa.name.clone();
         ans.authority.push(soa);
+        if let Some(s) = sec.and_then(|sec| sec.sig_as(&z.apex, 6, &name, ttl)) {
+            ans.authority.push(s);
+        }
     }
 }
 
@@ -465,6 +754,7 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
             owner_id: None,
+            dnssec: false,
         }
     }
     fn rec(id: i64, zone_id: i64, name: &str, t: Rt, v: &str) -> StoredRecord {

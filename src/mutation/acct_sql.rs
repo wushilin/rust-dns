@@ -294,6 +294,38 @@ pub(super) fn delete_setting(c: &Connection, key: &str) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn put_dnssec_key(
+    c: &Connection,
+    k: &crate::replication::types::ReplDnssecKey,
+) -> Result<()> {
+    c.execute(
+        "INSERT INTO dnssec_keys (zone_id, zone, algorithm, flags, key_tag, public_key, private_key, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(zone_id) DO UPDATE SET zone = excluded.zone, algorithm = excluded.algorithm,
+            flags = excluded.flags, key_tag = excluded.key_tag, public_key = excluded.public_key,
+            private_key = excluded.private_key, created_at = excluded.created_at",
+        params![
+            k.zone_id,
+            k.zone,
+            k.algorithm as i64,
+            k.flags as i64,
+            k.key_tag as i64,
+            k.public_key,
+            k.private_key.0,
+            k.created_at
+        ],
+    )?;
+    Ok(())
+}
+
+pub(super) fn delete_dnssec_key(c: &Connection, zone_id: i64) -> Result<()> {
+    c.execute(
+        "DELETE FROM dnssec_keys WHERE zone_id = ?1",
+        params![zone_id],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     /// Structural guarantee: no file of the mutation module other than this
@@ -308,6 +340,7 @@ mod tests {
             "api_tokens",
             "settings",
             "tsig_keys",
+            "dnssec_keys",
         ];
         for e in std::fs::read_dir(&dir).unwrap() {
             let path = e.unwrap().path();

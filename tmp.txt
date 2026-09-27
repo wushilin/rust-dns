@@ -1,0 +1,709 @@
+Type
+
+Name
+
+Priority
+
+TTL
+
+Data
+
+A
+
+*.ap-southeast-1
+
+N/A
+
+30 mins
+
+3.1.237.225
+
+A
+
+*.gate
+
+N/A
+
+30 mins
+
+3.1.237.225
+
+A
+
+*.rusts3api
+
+N/A
+
+4 hrs
+
+43.230.99.31
+
+A
+
+@
+
+N/A
+
+4 hrs
+
+116.15.54.86
+
+A
+
+andromeda
+
+N/A
+
+4 hrs
+
+192.9.250.241
+
+A
+
+ap-southeast-1
+
+N/A
+
+30 mins
+
+3.1.237.225
+
+A
+
+archmage
+
+N/A
+
+30 mins
+
+3.1.237.225
+
+A
+
+auth
+
+N/A
+
+1 hr
+
+8.210.185.60
+
+A
+
+awsec2
+
+N/A
+
+4 hrs
+
+18.136.225.229
+
+A
+
+azure
+
+N/A
+
+30 mins
+
+20.198.178.7
+
+A
+
+baba
+
+N/A
+
+30 mins
+
+47.237.120.106
+
+A
+
+baba2
+
+N/A
+
+30 mins
+
+47.237.120.106
+
+A
+
+bazinga
+
+N/A
+
+30 mins
+
+3.1.237.225
+
+A
+
+binstore
+
+N/A
+
+30 mins
+
+3.1.237.225
+
+A
+
+bot
+
+N/A
+
+4 hrs
+
+3.1.237.225
+
+A
+
+bridge
+
+N/A
+
+1 day
+
+8.210.144.65
+
+A
+
+bridge2
+
+N/A
+
+4 hrs
+
+8.210.144.65
+
+A
+
+browser
+
+N/A
+
+30 mins
+
+3.1.237.225
+
+A
+
+ca
+
+N/A
+
+30 mins
+
+3.1.237.225
+
+A
+
+car
+
+N/A
+
+30 mins
+
+3.1.237.225
+
+A
+
+ceo
+
+N/A
+
+4 hrs
+
+119.23.46.250
+
+A
+
+certs
+
+N/A
+
+30 mins
+
+3.1.237.225
+
+A
+
+cp
+
+N/A
+
+30 mins
+
+47.239.240.32
+
+A
+
+dns1
+
+N/A
+
+30 mins
+
+3.1.237.225
+
+A
+
+dns2
+
+N/A
+
+30 mins
+
+47.237.120.106
+
+A
+
+eu1
+
+N/A
+
+4 hrs
+
+72.144.161.200
+
+A
+
+gate
+
+N/A
+
+30 mins
+
+3.1.237.225
+
+A
+
+gateproxy
+
+N/A
+
+30 mins
+
+3.1.237.225
+
+A
+
+help
+
+N/A
+
+30 mins
+
+3.1.237.225
+
+A
+
+home
+
+N/A
+
+30 mins
+
+3.1.237.225
+
+A
+
+jsmhook1
+
+N/A
+
+30 mins
+
+3.1.237.225
+
+A
+
+keycloak
+
+N/A
+
+30 mins
+
+3.1.237.225
+
+A
+
+mail
+
+N/A
+
+30 mins
+
+3.1.237.225
+
+A
+
+mama
+
+N/A
+
+30 mins
+
+39.108.89.219
+
+A
+
+mamah
+
+N/A
+
+4 hrs
+
+8.210.144.65
+
+A
+
+mercury
+
+N/A
+
+4 hrs
+
+43.230.99.31
+
+A
+
+milkyway
+
+N/A
+
+4 hrs
+
+192.9.246.205
+
+A
+
+minio
+
+N/A
+
+30 mins
+
+162.220.12.42
+
+A
+
+minioapi
+
+N/A
+
+30 mins
+
+162.220.12.42
+
+A
+
+msk
+
+N/A
+
+1 hr
+
+48.217.52.147
+
+A
+
+mskold
+
+N/A
+
+4 hrs
+
+18.117.187.106
+
+A
+
+myhome
+
+N/A
+
+30 mins
+
+43.230.99.31
+
+A
+
+nubecn
+
+N/A
+
+4 hrs
+
+205.198.80.60
+
+A
+
+nubehk
+
+N/A
+
+4 hrs
+
+205.198.64.119
+
+A
+
+ossapi
+
+N/A
+
+30 mins
+
+3.1.237.225
+
+A
+
+rusts3
+
+N/A
+
+30 mins
+
+43.230.99.31
+
+A
+
+rusts3api
+
+N/A
+
+30 mins
+
+43.230.99.31
+
+A
+
+s3
+
+N/A
+
+30 mins
+
+43.230.99.31
+
+A
+
+s3api
+
+N/A
+
+30 mins
+
+43.230.99.31
+
+A
+
+share
+
+N/A
+
+30 mins
+
+3.1.237.225
+
+A
+
+shell
+
+N/A
+
+30 mins
+
+3.1.237.225
+
+A
+
+singtel
+
+N/A
+
+4 hrs
+
+43.230.99.31
+
+A
+
+sr
+
+N/A
+
+30 mins
+
+43.230.99.31
+
+A
+
+test
+
+N/A
+
+30 mins
+
+34.142.130.224
+
+A
+
+tests3api
+
+N/A
+
+30 mins
+
+43.230.99.31
+
+A
+
+titan
+
+N/A
+
+4 hrs
+
+43.230.99.31
+
+A
+
+toto
+
+N/A
+
+4 hrs
+
+43.160.200.118
+
+A
+
+us1
+
+N/A
+
+4 hrs
+
+138.91.125.67
+
+A
+
+velodb
+
+N/A
+
+4 hrs
+
+47.129.45.33
+
+A
+
+velodbproxy
+
+N/A
+
+4 hrs
+
+47.129.45.33
+
+A
+
+venus
+
+N/A
+
+4 hrs
+
+14.103.93.54
+
+A
+
+vq
+
+N/A
+
+30 mins
+
+43.230.99.31
+
+A
+
+webhook
+
+N/A
+
+30 mins
+
+3.1.237.225
+
+A
+
+www
+
+N/A
+
+30 mins
+
+3.1.237.225
+
+AAAA
+
+mercury
+
+N/A
+
+4 hrs
+
+2001:d98:b450:9c00::ffff:101a
+
+AAAA
+
+titan
+
+N/A
+
+30 mins
+
+2001:d98:b450:9c00::ffff:2e
+
+CNAME
+
+registry
+
+N/A
+
+5 mins
+
+vq.wushilin.net
+
+CNAME
+
+ymhh3kyr3evt
+
+N/A
+
+4 hrs
+
+gv-q67lhs3ob66b6o.dv.googlehosted.com
+
+MX
+
+@
+
+10
+
+30 mins
+
+mail.wushilin.net
+
+TXT
+
+@
+
+N/A
+
+30 mins
+
+v=spf1 a:mail.wushilin.net ~all

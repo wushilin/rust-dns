@@ -307,6 +307,9 @@ pub fn snapshot(c: &Connection) -> Result<Snapshot> {
     for z in zones {
         e.push(Change::ZoneCreated { zone: z });
     }
+    for k in db::list_dnssec_keys(c)? {
+        e.push(Change::DnssecKeySet { key: k });
+    }
     for r in records(c, None)? {
         let zone = names.get(&r.zone_id).cloned().unwrap_or_default();
         let record = crate::model::Record {

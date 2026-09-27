@@ -11,13 +11,18 @@ Single static binary, one SQLite file, one TOML config. Zero JavaScript build.
 
 **DNS**
 - Authoritative for any number of zones, including `.` as a private root.
-- A, AAAA, CNAME, PTR, NS, MX, TXT, SRV. SOA and apex NS are synthesized from
-  zone settings when not set explicitly.
+- A, AAAA, CNAME, PTR, NS, MX, TXT, SRV, CAA, HTTPS/SVCB, TLSA, SSHFP, NAPTR,
+  HINFO, DNAME and DS. SOA and apex NS are synthesized from zone settings when
+  not set explicitly.
+- DNSSEC online signing per zone (off by default): ECDSA P-256 combined
+  signing key, NSEC denial, signatures renewed automatically, DS records for
+  the registrar and a pre-publication check in the console (see
+  [DNSSEC](#dnssec)).
 - CNAME chasing, RFC 4592 wildcards, delegations with glue, RFC 2308 negative
   answers, empty non-terminals, RFC 8482 minimal ANY, EDNS with BADVERS,
   truncation with TCP fallback, CHAOS `version.bind`.
 - Automatic PTR answers synthesized from A/AAAA records (no separate reverse
-  zone maintenance).
+  zone maintenance; not inside DNSSEC-signed zones).
 - UDP and TCP on any set of bind addresses and any port, IPv4 and IPv6.
 - Optional forwarding of foreign names to upstream resolvers, restricted to an
   allow-list of client networks so you never become an open resolver.
@@ -305,6 +310,111 @@ Consider also a lower `[rate_limit].max_resolutions_per_second_per_address`,
 monitoring the counters above and your provider's abuse mailbox, and, where
 possible, restricting UDP/53 to known networks at the firewall instead.
 
+## DNSSEC
+
+Signing is **off by default** and turned on per zone (console: zone page ->
+**DNSSEC**, or `PUT /api/zones/{zone}/dnssec`). With signing off nothing
+changes; the only protocol difference in this version for every zone is that
+the DO bit of a query is now copied into the response (RFC 3225).
+
+**What is signed.** One combined signing key per zone (flags 257, SEP,
+algorithm 13 = ECDSA P-256 / SHA-256), generated on this server the first time
+signing is turned on. Denial of existence is NSEC (not NSEC3). Every
+authoritative RRset is signed: SOA, apex NS, DNSKEY, every record set and
+every NSEC; a DS RRset at a delegation point is signed (DS records can be
+added in the record editor); the NS RRset at a delegation and glue below it
+are not. Names below a DNAME are occluded (the DNAME answers for them) and
+not signed. The NSEC chain links every authoritative name in canonical order
+(wildcard owners such as `*.gate.example.net.` included; empty non-terminals
+have no NSEC of their own, the previous NSEC's next name proves them).
+Expired records are not served, so they are not in the chain either.
+
+**Answers.** Only a query with the DO bit gets DNSSEC records: RRSIGs for
+answer and authority RRsets; NXDOMAIN with the SOA, an NSEC covering the name
+and one covering the wildcard at the closest encloser; NODATA with the NSEC at
+the name (or the covering NSEC of an empty non-terminal); wildcard answers
+with the wildcard's RRSIG (its labels field marks the expansion) and the NSEC
+proving the next closer name does not exist; wildcard NODATA with both;
+referrals with the signed DS or the NSEC proving there is none; DS queries at
+a cut answered authoritatively from the parent side (RFC 4035 3.1.4.1).
+DNAME is signed, the synthesized CNAME is not (RFC 6672). `ANY` with DO on a
+signed zone returns one real RRset with its RRSIG instead of the synthesized
+HINFO (which could not be validated). Queries without DO get the same answers
+as for an unsigned zone. A UDP answer that does not fit first loses its
+additional section, then is truncated (TC, nothing partial); TCP answers are
+complete. Zone transfers of a signed zone carry the DNSKEY, every RRSIG and
+NSEC (TSIG-signed as usual). **Automatic PTR answers are not synthesized in a
+signed zone** (they could not be signed); auto-PTR for names outside any zone
+is unchanged.
+
+**Signatures and re-signing.** The zone is signed in memory whenever the
+catalog is built after a change, and the signed view is cached until the zone
+changes. Inception = one hour before the zone's last change (`updated_at`),
+expiration = inception + `signature_validity_days` (default 14). The primary
+re-signs a zone when its signatures expire within `resign_before_days`
+(default 7): a `zone_resigned` change and a serial bump (so secondaries
+transfer fresh signatures and NOTIFY goes out). If signatures come within half
+of `resign_before_days` of expiry without a serial bump (a primary that was
+stopped, a standby cut off from it), the server signs in memory from the
+current hour instead.
+
+```toml
+[dnssec]
+signature_validity_days = 14  # 2..365
+resign_before_days = 7        # 1..(validity - 1)
+```
+
+**Standbys** receive the signing flag, the key (an account-class change: never
+in the changelog API, the websocket, the audit log or the logs; scrubbed after
+`account_retention_days`) and the re-sign serial bumps, and sign in memory
+with their own copy of the key. ECDSA signatures are randomised, so a
+standby's RRSIGs differ from the primary's, but both verify with the same
+DNSKEY and every response is self-consistent, which is all resolvers and
+AXFR/IXFR secondaries need. A standby never writes or re-signs by itself; its
+replicated-table checksums do not include signatures. **Upgrade every standby
+before turning signing on** (an older standby cannot apply the new change
+kinds and halts).
+
+**Publishing (registrar).** Turning signing on changes nothing for validating
+resolvers until the parent zone publishes a DS record. The console's DNSSEC
+tab shows the DS (SHA-256, digest type 2; SHA-384 as well) with copy buttons
+and the individual fields registrars ask for, and:
+
+1. **Check before adding DS** (`GET /api/zones/{zone}/dnssec/check`): queries
+   this server's own answers with DO (DNSKEY, SOA, NS, a sample of names,
+   wildcards, a missing name and type) and validates every signature and
+   denial proof with the key.
+2. Make sure every nameserver of the zone serves the signed zone (secondaries
+   by zone transfer; standbys sign themselves).
+3. Publish the DS at the registrar.
+4. **Is the DS published at the parent?** (`GET /api/zones/{zone}/dnssec/parent`):
+   looks the DS up through the first forwarding upstream (RD, CD, DO) and
+   reports `present` (matches the key), `absent`, `mismatch` (validating
+   resolvers fail the zone) or `unknown` (no upstream, no answer).
+
+**Turning signing off** while a DS is published breaks the zone for every
+validating resolver, so it is refused (409 `ds_published`) unless the parent
+check says `absent`. Remove the DS at the registrar, wait until the parent's
+DS TTL has passed, then turn signing off. The API accepts `force: true` to skip
+the check (the console does not offer it). The key is kept when signing is
+turned off; turning it on again reuses it.
+
+**Key rollover (manual; not automated yet).** A "go insecure" rollover with
+one key per zone:
+1. Remove the DS at the registrar; wait for the parent's DS TTL (and the
+   DNSKEY TTL) to pass. `GET .../dnssec/parent` must say `absent`.
+2. Turn signing off (`PUT .../dnssec {"enabled": false}`).
+3. Turn it on with a new key (`PUT .../dnssec {"enabled": true, "new_key": true}`;
+   the console offers "Use a new key" in the dialog).
+4. Run the check, publish the new DS, confirm with the parent lookup.
+The zone is unsigned for resolvers between steps 1 and 4. A double-signature
+rollover without that gap is listed in `pending.md`.
+
+**API** (all with `#[utoipa::path]`, see `/docs`): `GET /api/zones/{zone}/dnssec`
+(status, key, DS, signature window), `PUT /api/zones/{zone}/dnssec`
+(`enabled`, `force`, `new_key`; owner role), `GET /api/zones/{zone}/dnssec/ds`,
+`GET /api/zones/{zone}/dnssec/check`, `GET /api/zones/{zone}/dnssec/parent`.
+
 ## Securing zone transfers with TSIG
 
 For a public zone run rust-dns as a *hidden primary*: it is not listed in the
@@ -415,6 +525,7 @@ timeout_secs = 30
 | API tokens (hashes, tags, revocation) | The config file: listeners, `[forwarding]` defaults, `[transfer]`, rate limits, logging, backups |
 | Forwarding settings saved from the console (the `settings` override) | The audit log (each server audits its own actions; the standby adds `replication.*` rows) |
 | TSIG keys | The standby's own `[root]` (see below) |
+| DNSSEC: the per-zone signing flag, the signing keys (private keys as account-class changes), re-sign serial bumps | The signatures themselves: each server signs in memory |
 
 **Every mutation is a change.** DNS changes *and* account, settings and TSIG
 changes (users, password and MFA changes, accepted TOTP steps, recovery
@@ -754,7 +865,8 @@ cargo test --test openapi_spec     # completeness of the generated document (ids
 cargo test --bin rust-dns openapi  # docs/openapi.json equals the document generated from the code (UPDATE_OPENAPI=1 refreshes it)
 node tests/ui/duration.test.js     # console duration parser (1m, 1h, 6d12h14s)
 cargo test                          # unit tests + end-to-end (spawns the binary, drives API and DNS)
-scripts/conformance.py <zone> <ip> <port>   # 86 RFC conformance checks (incl. TSIG) (needs dnspython and a seeded zone)
+scripts/conformance.py <zone> <ip> <port>   # 123 RFC conformance checks (incl. TSIG and DNSSEC validation) (needs dnspython + cryptography and a seeded zone)
+scripts/dnssec-vectors.py                   # regenerates the DNSSEC known-answer vectors (dnspython + BIND dnssec-dsfromkey)
 scripts/compliance.sh <zone> <ip> <port>    # ISC DNS Compliance Testing (genreport), builds it on first run
 scripts/e2e-dig.sh <zone> <ip> <port>       # human-readable dig walkthrough
 scripts/conformance-local.sh                # starts a temporary server, seeds it, runs all probes
@@ -767,10 +879,24 @@ Current status: the Rust suite passes (unit tests, end-to-end tests in
 failover, promotion, fencing, rejoin with divergence), `tests/hardening.rs` (security regressions: TCP pinning, init-config,
 password logging, TOTP replay across restarts, websocket revocation and
 origin, cookies, slow clients, CSP), API contract and OpenAPI document
-tests). The seeded conformance runner passes 86/86, and ISC genreport reports
+tests, and `tests/dnssec.rs`). The seeded conformance runner passes 123/123, and ISC genreport reports
 all protocol and record-type probes as `ok`.
 CI runs formatting, clippy, the Rust test suite, conformance, and a short Linux
 UDP load probe.
+
+**DNSSEC is validated by independent implementations**, not by the server's
+own code: `src/dnssec/vectors.rs` pins canonical signed data and signatures
+from dnspython and DS digests from BIND `dnssec-dsfromkey`;
+`scripts/conformance.py` validates every signed answer (positive, wildcard,
+NXDOMAIN, NODATA, empty non-terminal, DNAME, referrals, AXFR and the NSEC
+chain) with `dns.dnssec.validate`; `tests/dnssec.rs` runs BIND
+`dnssec-verify -z` on the transferred zone, `delv` ("fully validated") for 40
+query cases including 0x20 names and TCP, a negative control with a wrong
+trust anchor, and, when `named` is installed, a validating BIND resolver that
+must set AD on every answer; `tests/follow.rs` runs `delv` and
+`dnssec-verify` against a standby. The BIND parts are skipped when the tools
+are missing unless `REQUIRE_BIND_TOOLS=1` (CI installs `bind9-utils` and
+`bind9-dnsutils` and sets it).
 
 Example Prometheus alert rules for rate limiting, refused answers, errors, and
 bad DNS cookies are in `deploy/prometheus-alerts.yml`.
@@ -782,7 +908,8 @@ ceiling is the OS loopback path, not the server. Resident memory stays around
 
 ## Not yet
 
-- DNSSEC signing (NSEC/NSEC3, key management, DS publication).
+- DNSSEC: NSEC3, automated key rollover (double signature / CDS/CDNSKEY),
+  algorithms other than 13.
 - Inbound NOTIFY / acting as a secondary for zones hosted elsewhere; automatic failover.
 - DNS over TLS/HTTPS, response tuple rate limiting (RRL by answer), and per-zone forwarding,
   reverse-zone, transfer ACL, and NOTIFY overrides.

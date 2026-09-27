@@ -46,6 +46,8 @@ utoipa-axum = "0.2"
 # provider (no aws-lc-sys / OpenSSL), OS trust store via the platform verifier.
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# DNSSEC signing (ECDSA P-256, key generation): the same ring rustls uses.
+ring = "0.17"
 
 [dev-dependencies]
 ureq = { version = "2", features = ["json", "cookies"] }

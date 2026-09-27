@@ -1294,6 +1294,52 @@ fn live_api_matches_spec() {
         c.expect("duplicate record", &r, 409);
     }
 
+    // ---- DNSSEC: the PUT example turned signing on; the self-check now
+    // succeeds. Turning it off is refused while the parent's DS cannot be
+    // ruled out (no forwarding upstream here) and allowed with force.
+    let r = c.call(
+        Auth::Session(&root),
+        "get",
+        "/zones/{zone}/dnssec/check",
+        &[],
+        "",
+        Body::None,
+    );
+    c.expect("DNSSEC self-check once signing is on", &r, 200);
+    if r.status == 200 && r.json()["ok"] != true {
+        c.failures
+            .push(format!("DNSSEC self-check did not pass: {}", r.text));
+    }
+    let r = c.call(
+        Auth::Session(&root),
+        "put",
+        "/zones/{zone}/dnssec",
+        &[],
+        "",
+        Body::Json(&json!({ "enabled": false })),
+    );
+    c.expect(
+        "turning DNSSEC off without a confirmed-absent parent DS",
+        &r,
+        409,
+    );
+    if r.status == 409 && r.json()["code"] != "ds_published" {
+        c.failures
+            .push(format!("expected code ds_published: {}", r.text));
+    }
+    let r = c.call(
+        Auth::Session(&root),
+        "put",
+        "/zones/{zone}/dnssec",
+        &[],
+        "",
+        Body::Json(&json!({ "enabled": false, "force": true })),
+    );
+    c.expect("turning DNSSEC off with force", &r, 200);
+    if r.status == 200 && (r.json()["enabled"] != false || r.json()["state"] != "off") {
+        c.failures.push(format!("DNSSEC should be off: {}", r.text));
+    }
+
     // ---- API token (bearer) --------------------------------------------------
     let token = c
         .ctx

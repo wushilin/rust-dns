@@ -6,7 +6,7 @@ use super::Runtime;
 use super::{DnsServer, Proto, Reply};
 use crate::model::QueryEvent;
 use crate::ratelimit::Decision;
-use crate::zones::{lookup, Lookup};
+use crate::zones::{lookup, lookup_dnssec, Lookup};
 use hickory_proto::op::{Edns, Message, MessageType, OpCode, ResponseCode};
 use hickory_proto::rr::rdata::opt::{EdnsCode, EdnsOption};
 use hickory_proto::rr::rdata::TXT;
@@ -54,6 +54,8 @@ struct Ctx {
     /// Open resolver mode lowered `udp_limit` from this value: truncation
     /// the client's own limit would not have needed is counted separately.
     open_cap_from: Option<usize>,
+    /// The query had the DO bit (RFC 3225).
+    dnssec_ok: bool,
 }
 
 /// A request whose TSIG signature verified.
@@ -131,6 +133,21 @@ impl DnsServer {
         }
     }
 
+    /// Answer a query from this server itself (the DNSSEC pre-publication
+    /// check): the same code path as a TCP query from 127.0.0.1, without
+    /// the client rate limit. Shows in the live feed like any query.
+    pub async fn answer_internal(&self, req: &[u8]) -> Option<Vec<u8>> {
+        let rt = self.runtime.load_full();
+        let client = SocketAddr::from(([127, 0, 0, 1], 0));
+        match self
+            .answer(req, client, Proto::Tcp, Instant::now(), &rt, None)
+            .await
+        {
+            Reply::One(b) => Some(b),
+            _ => None,
+        }
+    }
+
     /// Verify a signed request, answer it, and sign the answer (every
     /// message of a multi-message transfer, chained per RFC 8945 §5.3.1).
     async fn answer_signed(
@@ -166,6 +183,7 @@ impl DnsServer {
                 udp_limit: 65535,
                 reserve: 0,
                 open_cap_from: None,
+                dnssec_ok: false,
             };
             return Reply::One(self.tsig_error_reply(
                 req,
@@ -288,6 +306,11 @@ impl DnsServer {
         if request.metadata.message_type != MessageType::Query {
             return Reply::None;
         }
+        let dnssec_ok = request
+            .edns
+            .as_ref()
+            .map(|e| e.flags().dnssec_ok)
+            .unwrap_or(false);
         let mut ctx = Ctx {
             client,
             proto,
@@ -297,6 +320,7 @@ impl DnsServer {
                 .map(|b| tsig::record_len(&b.entry.key.name, b.entry.key.algorithm, 0))
                 .unwrap_or(0),
             open_cap_from: None,
+            dnssec_ok,
         };
 
         let mut resp = Message::response(id, request.metadata.op_code);
@@ -312,9 +336,10 @@ impl DnsServer {
         let mut cookie_valid = false;
         if let Some(edns) = &request.edns {
             let mut ours = Edns::new();
+            // RFC 3225 §3: the DO bit of the query is copied into the response.
             ours.set_max_payload(rt.udp_max_payload)
                 .set_version(0)
-                .set_dnssec_ok(false);
+                .set_dnssec_ok(dnssec_ok);
             ctx.udp_limit = (edns.max_payload() as usize).clamp(512, rt.udp_max_payload as usize);
             if edns.version() != 0 {
                 resp.set_edns(ours);
@@ -462,6 +487,25 @@ impl DnsServer {
             let key = crate::zones::key_of(&qname);
             if let Some(z) = catalog.find_zone(&key) {
                 self.stats.authoritative.fetch_add(1, Relaxed);
+                if dnssec_ok && z.signed.is_some() {
+                    // Signed zone, DO query: a synthesized HINFO could not be
+                    // validated, so answer one real RRset with its RRSIG
+                    // (RFC 8482 §4.1), or the signed negative answer.
+                    if let Lookup::Answer(mut a) =
+                        lookup_dnssec(&catalog, &qname, RecordType::ANY, rt.auto_ptr, true)
+                    {
+                        a.keep_first_rrset();
+                        if a.rcode == ResponseCode::NXDomain {
+                            self.stats.nxdomain.fetch_add(1, Relaxed);
+                        }
+                        resp.metadata.authoritative = a.authoritative;
+                        resp.metadata.response_code = a.rcode;
+                        resp.insert_answers(a.answers);
+                        resp.insert_authorities(a.authority);
+                        resp.insert_additionals(a.additional);
+                        return Reply::One(self.finish(resp, &ctx, "auth"));
+                    }
+                }
                 resp.metadata.authoritative = true;
                 if z.existing.contains(&key) || z.records_at(&key).is_some() {
                     let hinfo =
@@ -477,7 +521,7 @@ impl DnsServer {
             }
         }
 
-        match lookup(&catalog, &qname, qtype, rt.auto_ptr) {
+        match lookup_dnssec(&catalog, &qname, qtype, rt.auto_ptr, dnssec_ok) {
             Lookup::Answer(a) => {
                 self.stats.authoritative.fetch_add(1, Relaxed);
                 if a.rcode == ResponseCode::NXDomain {
@@ -501,11 +545,6 @@ impl DnsServer {
                         return reply;
                     }
                 }
-                let dnssec_ok = request
-                    .edns
-                    .as_ref()
-                    .map(|e| e.flags().dnssec_ok)
-                    .unwrap_or(false);
                 let key = super::fwdcache::Key::new(&qname, qtype, q.query_class(), dnssec_ok);
                 if rt.forwarding.cache_entries > 0 {
                     if let Some(mut cached) = self.fwd_cache.get(&key, rt.cache_caps()) {
@@ -591,6 +630,22 @@ impl DnsServer {
         };
         let mut result = summarize(&resp, &qname);
         let limit = ctx.udp_limit.saturating_sub(ctx.reserve);
+        // A DO answer (RRSIGs make it larger) first loses its additional
+        // section, which needs no TC (RFC 2181 §9); only if the answer and
+        // authority sections still do not fit is it truncated.
+        if ctx.proto == Proto::Udp
+            && bytes.len() > limit
+            && ctx.dnssec_ok
+            && !resp.additionals.is_empty()
+        {
+            let mut trimmed = resp.clone();
+            trimmed.additionals.clear();
+            if let Ok(b) = trimmed.to_vec() {
+                if b.len() <= limit {
+                    bytes = b;
+                }
+            }
+        }
         if ctx.proto == Proto::Udp && bytes.len() > limit {
             self.stats.truncated.fetch_add(1, Relaxed);
             let t = resp.truncate();
@@ -718,6 +773,13 @@ fn summarize(m: &Message, qname: &Name) -> Vec<String> {
             r.record_type().to_string()
         };
         let data = match &r.data {
+            RData::Unknown { code, rdata }
+                if crate::dnssec::wire::display_rdata(u16::from(*code), &rdata.anything)
+                    .is_some() =>
+            {
+                crate::dnssec::wire::display_rdata(u16::from(*code), &rdata.anything)
+                    .unwrap_or_default()
+            }
             RData::Unknown { code, rdata } if *code == crate::zones::DNAME_TYPE => {
                 let mut dec = hickory_proto::serialize::binary::BinDecoder::new(&rdata.anything);
                 Name::read(&mut dec)

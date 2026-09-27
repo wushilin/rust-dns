@@ -77,6 +77,10 @@ pub(super) fn apply(c: &Connection, change: &Change, ctx: &Ctx) -> Result<()> {
         Change::TsigKeyDeleted { name } => acct_sql::delete_tsig_key(c, name)?,
         Change::SettingSet { setting } => acct_sql::put_setting(c, setting)?,
         Change::SettingCleared { key } => acct_sql::delete_setting(c, key)?,
+        // The serial bump that goes with it is its own change.
+        Change::ZoneResigned { .. } => {}
+        Change::DnssecKeySet { key } => acct_sql::put_dnssec_key(c, key)?,
+        Change::DnssecKeyDeleted { zone_id, .. } => acct_sql::delete_dnssec_key(c, *zone_id)?,
     }
     Ok(())
 }

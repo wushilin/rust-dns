@@ -1128,6 +1128,8 @@ impl Replication {
                     "table {}: differs ({} rows here, {} on the primary)",
                     t.table, t.rows, r.rows
                 )),
+                // An empty table an older primary does not have yet.
+                None if t.rows == 0 => {}
                 None => diffs.push(format!("table {}: unknown to the primary", t.table)),
             }
         }

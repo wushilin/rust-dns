@@ -20,6 +20,10 @@ pub struct Table {
     /// Replicated table: columns that are per server (local bookkeeping, or
     /// merged with local state on a standby); left out of checksums.
     pub node_columns: &'static [&'static str],
+    /// Replicated columns left out of the table checksum because another
+    /// checksum covers them (the per-zone checksum) and older versions do
+    /// not have them (a mixed-version primary/standby pair keeps matching).
+    pub compat_columns: &'static [&'static str],
     /// Rows a fresh database may still have (`?1` = the config root's name).
     pub fresh_keeps: Option<&'static str>,
     /// Rows of the server's own root account, which is local on a standby
@@ -43,6 +47,7 @@ const fn replicated(
         name,
         class: Class::Replicated,
         node_columns: &[],
+        compat_columns: &[],
         fresh_keeps: None,
         own_root_rows: None,
         order,
@@ -55,6 +60,7 @@ const fn local(name: &'static str) -> Table {
         name,
         class: Class::Local,
         node_columns: &[],
+        compat_columns: &[],
         fresh_keeps: None,
         own_root_rows: None,
         order: "rowid",
@@ -63,7 +69,12 @@ const fn local(name: &'static str) -> Table {
 }
 
 pub const TABLES: &[Table] = &[
-    replicated("zones", "id", ("zone", "zones")),
+    Table {
+        // `dnssec` (added with DNSSEC signing) is covered by the per-zone
+        // checksum (the zone row as JSON, where it appears only when on).
+        compat_columns: &["dnssec"],
+        ..replicated("zones", "id", ("zone", "zones"))
+    },
     replicated("records", "id", ("record", "records")),
     replicated(
         "zone_members",
@@ -109,6 +120,8 @@ pub const TABLES: &[Table] = &[
         ),
     ),
     replicated("tsig_keys", "name", ("TSIG key", "TSIG keys")),
+    // Written by DnssecKeySet / DnssecKeyDeleted (account class: secrets).
+    replicated("dnssec_keys", "zone_id", ("DNSSEC key", "DNSSEC keys")),
     // Sign-in sessions exist on the server where the user signed in.
     local("sessions"),
     // Each server audits its own actions.
@@ -180,7 +193,13 @@ pub fn dump(
 pub fn checksums(c: &Connection, root: &str) -> Result<Vec<super::types::TableChecksum>> {
     replicated_tables()
         .map(|t| {
-            let rows = dump(c, t, t.node_columns, Some(root))?;
+            let exclude: Vec<&str> = t
+                .node_columns
+                .iter()
+                .chain(t.compat_columns)
+                .copied()
+                .collect();
+            let rows = dump(c, t, &exclude, Some(root))?;
             Ok(super::types::TableChecksum {
                 table: t.name.to_string(),
                 rows: rows.len() as i64,
@@ -269,7 +288,7 @@ mod tests {
                     t.name
                 );
                 let cols = columns(c, t.name)?;
-                for col in t.node_columns {
+                for col in t.node_columns.iter().chain(t.compat_columns) {
                     assert!(
                         cols.iter().any(|x| x == col),
                         "{}.{col} does not exist",

@@ -55,6 +55,13 @@ impl Reloader {
             &cfg.server.default_primary_ns,
             &cfg.server.default_hostmaster,
         );
+        if cfg.dnssec != old.dnssec {
+            self.mutator.set_dnssec_config(cfg.dnssec.clone());
+            notes.push(format!(
+                "[dnssec] applied: signatures valid {} days, re-signed {} days before expiry (takes effect at the next re-sign or change)",
+                cfg.dnssec.signature_validity_days, cfg.dnssec.resign_before_days
+            ));
+        }
 
         let fixed = [
             (

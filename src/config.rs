@@ -20,6 +20,7 @@ pub struct Config {
     pub root: RootConfig,
     pub changelog: ChangelogConfig,
     pub expiry: ExpiryConfig,
+    pub dnssec: DnssecConfig,
     pub logging: LoggingConfig,
     /// Standby mode: mirror another rust-dns (the primary) and refuse
     /// mutations. Absent = this server is a primary.
@@ -177,6 +178,28 @@ impl Default for ExpiryConfig {
         ExpiryConfig {
             retention_days: 30,
             sweep_interval_secs: 60,
+        }
+    }
+}
+
+/// `[dnssec]`: online signing of the zones that have DNSSEC turned on
+/// (per zone, in the console or API). Reloadable.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DnssecConfig {
+    /// Validity of every signature (RRSIG), counted from one hour before
+    /// the zone's last change (clock-skew margin).
+    pub signature_validity_days: u32,
+    /// The primary re-signs a zone (a serial bump, so secondaries transfer
+    /// fresh signatures) when its signatures expire within this many days.
+    pub resign_before_days: u32,
+}
+
+impl Default for DnssecConfig {
+    fn default() -> Self {
+        DnssecConfig {
+            signature_validity_days: 14,
+            resign_before_days: 7,
         }
     }
 }
@@ -722,6 +745,11 @@ account_retention_days = 3  # account/settings/TSIG change payloads (secrets) ar
 retention_days = 30      # expired records stop answering at once and are deleted after this many days
 sweep_interval_secs = 60 # upper bound on the sweeper's sleep; it also wakes at the next due expiry
 
+[dnssec]
+# Signing is off by default and turned on per zone (console: zone -> DNSSEC).
+signature_validity_days = 14  # each RRSIG is valid this long (from 1 h before the zone's last change)
+resign_before_days = 7        # the primary re-signs (serial bump) when signatures expire within this
+
 [logging]
 format = "text"          # "text" or "json"
 level = "info"           # e.g. "info", "debug", "rust_dns=debug,info"
@@ -938,6 +966,18 @@ pub fn check(path: &Path) -> Result<Config> {
 
 /// Validate a parsed configuration. Collects every problem and returns a
 /// single error listing each one on its own line, naming the TOML key.
+/// `[dnssec]` problems (empty = valid).
+pub fn dnssec_problems(d: &DnssecConfig) -> Vec<String> {
+    let mut errs = Vec::new();
+    if !(2..=365).contains(&d.signature_validity_days) {
+        errs.push("[dnssec].signature_validity_days must be between 2 and 365".into());
+    }
+    if d.resign_before_days == 0 || d.resign_before_days >= d.signature_validity_days {
+        errs.push("[dnssec].resign_before_days must be at least 1 and less than signature_validity_days (default 7 of 14)".into());
+    }
+    errs
+}
+
 pub fn validate(cfg: &Config) -> Result<()> {
     let mut errs: Vec<String> = Vec::new();
 
@@ -1131,6 +1171,7 @@ pub fn validate(cfg: &Config) -> Result<()> {
     if cfg.expiry.sweep_interval_secs == 0 {
         errs.push("[expiry].sweep_interval_secs must be greater than zero".into());
     }
+    errs.extend(dnssec_problems(&cfg.dnssec));
 
     // [root]
     if cfg.root.username.trim().is_empty() {

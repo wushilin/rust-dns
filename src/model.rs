@@ -38,10 +38,13 @@ pub enum RecordType {
     SSHFP,
     NAPTR,
     HINFO,
+    /// Delegation signer (RFC 4034): at a delegation point, the digest of a
+    /// signed child zone's key.
+    DS,
 }
 
 impl RecordType {
-    pub const ALL: [RecordType; 16] = [
+    pub const ALL: [RecordType; 17] = [
         RecordType::A,
         RecordType::AAAA,
         RecordType::CNAME,
@@ -58,6 +61,7 @@ impl RecordType {
         RecordType::SSHFP,
         RecordType::NAPTR,
         RecordType::HINFO,
+        RecordType::DS,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -78,6 +82,7 @@ impl RecordType {
             RecordType::SSHFP => "SSHFP",
             RecordType::NAPTR => "NAPTR",
             RecordType::HINFO => "HINFO",
+            RecordType::DS => "DS",
         }
     }
 
@@ -107,6 +112,7 @@ impl RecordType {
             RecordType::SSHFP => H::SSHFP,
             RecordType::NAPTR => H::NAPTR,
             RecordType::HINFO => H::HINFO,
+            RecordType::DS => H::DS,
         }
     }
 }
@@ -142,6 +148,13 @@ pub struct Zone {
     pub updated_at: String,
     #[schema(required = true)]
     pub owner_id: Option<i64>,
+    /// DNSSEC signing is on (see `/zones/{zone}/dnssec`); absent when off.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub dnssec: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl Zone {
@@ -761,6 +774,10 @@ pub fn normalize_value(rtype: RecordType, value: &str) -> Result<String, Invalid
             let n = normalize_domain(v, true)?;
             Ok(format!("{n}."))
         }
+        RecordType::DS => {
+            let (tag, alg, dt, digest) = crate::dnssec::wire::parse_ds_text(v).map_err(Invalid)?;
+            Ok(crate::dnssec::wire::ds_text(tag, alg, dt, &digest))
+        }
         RecordType::TXT => {
             if v.len() > 4096 {
                 return invalid("TXT value is longer than 4096 bytes");
@@ -816,6 +833,7 @@ pub fn value_hint(rtype: RecordType) -> &'static str {
         RecordType::SSHFP => "4 2 <sha256-hex>",
         RecordType::NAPTR => "100 10 \"S\" \"SIP+D2U\" \"\" _sip._udp.example.com.",
         RecordType::HINFO => "\"x86_64\" \"Linux\"",
+        RecordType::DS => "12345 13 2 <sha256 digest, 64 hex digits>",
     }
 }
 

@@ -45,7 +45,7 @@ def q(name, rtype, tcp=False, edns=None, payload=1232, flags=None, rdclass="IN",
     if flags is not None:
         m.flags = flags
     if edns is not None:
-        m.use_edns(edns, payload=payload, options=options or [])
+        m.use_edns(edns, payload=payload, options=options or [], ednsflags=dns.flags.DO if want_dnssec else 0)
     else:
         m.use_edns(False)
     fn = dns.query.tcp if tcp else dns.query.udp
@@ -169,6 +169,10 @@ r = q("www", "A", edns=0, options=[dns.edns.GenericOption(65001, b"\x00\x01")])
 check("6891 §6.1.2: unknown EDNS option ignored, answer given", r.rcode() == dns.rcode.NOERROR and r.answer)
 r = q("www", "A", edns=0, want_dnssec=True)
 check("6891/4035: DO bit accepted on unsigned zone", r.rcode() == dns.rcode.NOERROR and r.answer)
+check("3225 §3: DO bit copied into the response OPT", r.ednsflags & dns.flags.DO)
+check("4035 §3.1: unsigned zone: no RRSIG even with DO", not rrsets(r.answer, "RRSIG"))
+r = q("www", "A", edns=0)
+check("3225 §3: DO clear in the response when the query had none", not (r.ednsflags & dns.flags.DO))
 r = q("www", "A", edns=0, options=[dns.edns.NSIDOption(b"")])
 check("5001: NSID request accepted", r.rcode() == dns.rcode.NOERROR)
 r = q("www", "A", edns=0, options=[dns.edns.CookieOption(b"\x01" * 8, b"")])
@@ -406,6 +410,225 @@ m = dns.message.make_query(f"{ZONE}.", "AXFR")
 m.use_tsig(OTHER_KEY)
 plain, err = tsig_raw(m, OTHER_KEY, tcp=True)
 check("8945 + policy: key scoped to other zones -> REFUSED, response signed", plain.rcode() == dns.rcode.REFUSED and err is None and plain.had_tsig, f"{plain.rcode()} {err!r}")
+
+
+# --- DNSSEC (RFC 4033-4035, RFC 6605 ECDSA P-256, NSEC) ---------------------------------------------
+# signed.test is seeded with signing turned on (scripts/seed-conformance.py).
+# Every signature is validated with dnspython (dns.dnssec.validate), an
+# implementation independent of the server's.
+import dns.dnssec
+
+SZ = dns.name.from_text("signed.test.")
+IN = dns.rdataclass.IN
+RRSIG = dns.rdatatype.RRSIG
+NSEC = dns.rdatatype.NSEC
+
+
+def sq(name, rtype, tcp=True, payload=4096, do=True, edns=0):
+    if isinstance(name, str) and not name.endswith("."):
+        name = f"{name}.signed.test."
+    m = dns.message.make_query(name, rtype, want_dnssec=do)
+    if edns is None:
+        m.use_edns(False)
+    else:
+        m.use_edns(edns, payload=payload, ednsflags=dns.flags.DO if do else 0)
+    fn = dns.query.tcp if tcp else dns.query.udp
+    return fn(m, IP, port=PORT, timeout=3)
+
+
+r = sq(SZ, "DNSKEY")
+dnskey = r.get_rrset(r.answer, SZ, IN, dns.rdatatype.DNSKEY)
+dnskey_sig = r.get_rrset(r.answer, SZ, IN, RRSIG, dns.rdatatype.DNSKEY)
+KEYS = {SZ: dnskey} if dnskey is not None else {}
+try:
+    dns.dnssec.validate(dnskey, dnskey_sig, KEYS)
+    err = ""
+except Exception as e:
+    err = repr(e)
+check("4034 §2 / 6605: DNSKEY at the apex (flags 257, algorithm 13), self-signature validates", dnskey is not None and not err and all(k.flags == 257 and k.algorithm == 13 for k in dnskey), err)
+
+
+def validate_sections(r, sections=("answer", "authority"), skip_referral_ns=True):
+    """Validate every RRset (except RRSIGs, and unsigned delegation NS) with
+    its RRSIG. Returns a list of problems."""
+    problems = []
+    for sec in sections:
+        rs = getattr(r, sec)
+        for rrset in rs:
+            if rrset.rdtype == RRSIG:
+                continue
+            if not rrset.name.is_subdomain(SZ):
+                continue
+            if skip_referral_ns and rrset.rdtype == dns.rdatatype.NS and not (r.flags & dns.flags.AA):
+                continue
+            sig = r.get_rrset(rs, rrset.name, IN, RRSIG, rrset.rdtype)
+            if sig is None:
+                problems.append(f"{rrset.name} {dns.rdatatype.to_text(rrset.rdtype)}: no RRSIG in {sec}")
+                continue
+            try:
+                dns.dnssec.validate(rrset, sig, KEYS)
+            except Exception as e:
+                problems.append(f"{rrset.name} {dns.rdatatype.to_text(rrset.rdtype)}: {e!r}")
+    return problems
+
+
+def nsecs(r):
+    return [rr for rr in r.authority if rr.rdtype == NSEC]
+
+
+def covers(nsec_rrset, name):
+    owner, nxt = nsec_rrset.name, nsec_rrset[0].next
+    if owner < nxt:
+        return owner < name < nxt
+    return name > owner or name < nxt  # last NSEC wraps to the apex
+
+
+def has_type(nsec_rrset, rtype):
+    return dns.rdatatype.from_text(rtype) in [t for w in nsec_rrset[0].windows for t in _window_types(w)]
+
+
+def _window_types(w):
+    window, bitmap = w
+    out = []
+    for i, byte in enumerate(bitmap):
+        for bit in range(8):
+            if byte & (0x80 >> bit):
+                out.append(window * 256 + i * 8 + bit)
+    return out
+
+
+r = sq("www", "A")
+p = validate_sections(r)
+check("4035 §3.1.1: positive answer carries RRSIG; validates (dnspython)", rrsets(r.answer, "RRSIG") and not p, str(p))
+r = sq("WwW.SiGnEd.TeSt.", "A")
+check("4034 §6.2 + 0x20: mixed-case query name validates", r.answer and not validate_sections(r), str(validate_sections(r)))
+r = sq("www", "A", do=False)
+check("4035 §3.2.1: no DNSSEC records without DO", r.answer and not rrsets(r.answer, "RRSIG") and not nsecs(r))
+r = sq(SZ, "SOA")
+check("4035 §2.2: SOA signed", not validate_sections(r) and rrsets(r.answer, "RRSIG"))
+r = sq(SZ, "NS")
+check("4035 §2.2: apex NS signed", not validate_sections(r) and rrsets(r.answer, "RRSIG"))
+r = sq(SZ, "MX")
+check("4035: MX signed; additional glue does not break validation", not validate_sections(r))
+
+nx = dns.name.from_text("nope.signed.test.")
+r = sq(nx, "A")
+p = validate_sections(r)
+ce_wild = dns.name.from_text("*.signed.test.")
+check("4035 §3.1.3.2: NXDOMAIN: SOA + NSECs signed and valid", r.rcode() == dns.rcode.NXDOMAIN and not p and nsecs(r), str(p))
+check("4035 §3.1.3.2: NXDOMAIN: an NSEC covers the name", any(covers(n, nx) for n in nsecs(r)))
+check("4035 §3.1.3.2: NXDOMAIN: an NSEC covers the wildcard at the closest encloser", any(covers(n, ce_wild) for n in nsecs(r)))
+
+r = sq("www", "MX")
+p = validate_sections(r)
+own = [n for n in nsecs(r) if n.name == dns.name.from_text("www.signed.test.")]
+check("4035 §3.1.3.1: NODATA: NSEC at the name without the type, signed", r.rcode() == dns.rcode.NOERROR and not r.answer and own and not has_type(own[0], "MX") and has_type(own[0], "A") and not p, str(p))
+
+ent = dns.name.from_text("deep.signed.test.")
+r = sq(ent, "A")
+p = validate_sections(r)
+check("4035 §3.1.3.2 / 8020: empty non-terminal NODATA: covering NSEC whose next name is below it", r.rcode() == dns.rcode.NOERROR and not p and any(covers(n, ent) and n[0].next.is_subdomain(ent) for n in nsecs(r)), str(p))
+
+wq = dns.name.from_text("host.gate.signed.test.")
+r = sq(wq, "A")
+p = validate_sections(r)
+sig = r.get_rrset(r.answer, wq, IN, RRSIG, dns.rdatatype.A)
+check("4035 §3.1.3.3: wildcard answer validates (RRSIG labels = wildcard owner labels)", r.answer and not p and sig is not None and sig[0].labels == 3, str(p))
+check("4035 §3.1.3.3: wildcard answer proves the next closer name does not exist", any(covers(n, wq) for n in nsecs(r)))
+r = sq("a.b.c.gate", "A")
+check("4592 + 4035: multi-label wildcard expansion validates", r.answer and not validate_sections(r))
+r = sq(wq, "AAAA")
+p = validate_sections(r)
+wild_owner = dns.name.from_text("*.gate.signed.test.")
+check("4035 §3.1.3.4: wildcard NODATA: no-closer-match NSEC + wildcard NSEC without the type", r.rcode() == dns.rcode.NOERROR and not r.answer and not p and any(covers(n, wq) for n in nsecs(r)) and any(n.name == wild_owner and not has_type(n, "AAAA") for n in nsecs(r)), str(p))
+
+r = sq("alias", "A")
+p = validate_sections(r)
+check("4035 §3.1: in-zone CNAME chain: CNAME and target both signed", len(rrsets(r.answer, "RRSIG")) == 2 and not p, str(p))
+r = sq("ext", "A")
+check("4035: CNAME to an out-of-zone target: the CNAME is signed", rrsets(r.answer, "CNAME") and not validate_sections(r))
+r = sq("host.old", "A")
+dn = rrsets(r.answer, "DNAME")
+cn = rrsets(r.answer, "CNAME")
+sigs = rrsets(r.answer, "RRSIG")
+cname_signed = any(s.covers == dns.rdatatype.CNAME for s in sigs)
+r.answer = [rr for rr in r.answer if rr.rdtype != dns.rdatatype.CNAME and not (rr.rdtype == RRSIG and rr.covers == dns.rdatatype.CNAME)]
+p = validate_sections(r)
+check("6672 §5.3.1: DNAME signed, synthesized CNAME unsigned, target (wildcard) answer signed", dn and cn and not cname_signed and not p and any(s.covers == dns.rdatatype.DNAME for s in sigs), str(p))
+
+r = sq("host.secure", "A")
+p = validate_sections(r)
+check("4035 §3.1.4: referral to a signed child: NS unsigned, DS + RRSIG in authority", not (r.flags & dns.flags.AA) and rrsets(r.authority, "DS") and not p, str(p))
+r = sq("host.sub", "A")
+p = validate_sections(r)
+cut = [n for n in nsecs(r) if n.name == dns.name.from_text("sub.signed.test.")]
+check("4035 §3.1.4.1: referral to an unsigned child: NSEC at the cut proves no DS", not (r.flags & dns.flags.AA) and cut and has_type(cut[0], "NS") and not has_type(cut[0], "DS") and not p, str(p))
+r = sq("secure", "DS")
+check("4035 §3.1.4.1: DS query at the cut answered authoritatively by the parent", r.flags & dns.flags.AA and rrsets(r.answer, "DS") and not validate_sections(r))
+r = sq("sub", "DS")
+check("4035 §3.1.4.1: DS query at an unsigned cut: authoritative NODATA with NSEC", r.flags & dns.flags.AA and not r.answer and nsecs(r) and not validate_sections(r))
+
+r = sq(SZ, "ANY")
+types = {rr.rdtype for rr in r.answer if rr.rdtype != RRSIG}
+check("8482 §4.1 + 4035: ANY on a signed zone with DO: one real RRset with its RRSIG", len(types) == 1 and rrsets(r.answer, "RRSIG") and not validate_sections(r), str(types))
+r = sq(SZ, "ANY", do=False)
+check("8482: ANY without DO still the synthesized HINFO", len(rrsets(r.answer, "HINFO")) == 1)
+r = sq("www", "TYPE65280")
+check("3597 + 4035: unknown type NODATA proven by the NSEC at the name", r.rcode() == dns.rcode.NOERROR and nsecs(r) and not validate_sections(r))
+r = sq(SZ, "NSEC")
+check("4034 §4: NSEC query at a name answers its NSEC, signed", rrsets(r.answer, "NSEC") and not validate_sections(r))
+
+# Truncation: the signed answer never splits an RRset from its RRSIG.
+r = sq("many", "A", tcp=False, payload=512)
+full = sq("many", "A")
+check("4035 §3.1.1 / 2181 §9: signed answer larger than 512: TC=1 and nothing partial", len(full.to_wire()) > 512 and r.flags & dns.flags.TC and not r.answer and not r.authority, f"full={len(full.to_wire())} tc={bool(r.flags & dns.flags.TC)} answers={len(r.answer)}")
+check("7766: the same signed answer over TCP is complete and validates", not (full.flags & dns.flags.TC) and len(rrsets(full.answer, "A")) == 1 and len(rrsets(full.answer, "A")[0]) == 30 and not validate_sections(full))
+r = sq("big", "TXT", tcp=False, payload=512)
+check("4035 + 1035 §4.2.1: large signed TXT over UDP/512 truncated (TC, empty)", r.flags & dns.flags.TC and not r.answer)
+r = sq("big", "TXT", tcp=False, payload=1232)
+check("6891: large signed TXT fits in 1232 with its RRSIG, validates", not (r.flags & dns.flags.TC) and not validate_sections(r))
+r = sq("big", "TXT", tcp=False, edns=None, do=False)
+check("1035 §4.2.1: without EDNS the answer is limited to 512 (TC)", r.flags & dns.flags.TC and not r.answer)
+
+# AXFR of the signed zone: every RRset validates and the NSEC chain is complete.
+axfr = []
+for msg in dns.query.xfr(IP, "signed.test", port=PORT, timeout=5, relativize=False):
+    axfr.extend(msg.answer)
+zone_rrsets = {}
+for rr in axfr:
+    key = (rr.name, rr.rdtype, rr.covers if rr.rdtype == RRSIG else 0)
+    if key in zone_rrsets:
+        zone_rrsets[key].union_update(rr)
+    else:
+        zone_rrsets[key] = rr
+problems = []
+signed_count = 0
+for (name, rdtype, _), rrset in zone_rrsets.items():
+    if rdtype == RRSIG:
+        continue
+    below_cut = any(name.is_subdomain(c) and name != c for c in (dns.name.from_text("sub.signed.test."), dns.name.from_text("secure.signed.test.")))
+    at_cut_ns = rdtype == dns.rdatatype.NS and name != SZ
+    sig = zone_rrsets.get((name, RRSIG, rdtype))
+    if below_cut or at_cut_ns:
+        if sig is not None:
+            problems.append(f"{name} {dns.rdatatype.to_text(rdtype)} signed but not authoritative")
+        continue
+    if sig is None:
+        problems.append(f"{name} {dns.rdatatype.to_text(rdtype)} unsigned")
+        continue
+    try:
+        dns.dnssec.validate(rrset, sig, KEYS)
+        signed_count += 1
+    except Exception as e:
+        problems.append(f"{name} {dns.rdatatype.to_text(rdtype)}: {e!r}")
+check("5936 + 4035: AXFR of a signed zone: every authoritative RRset validates, glue/delegation NS unsigned", signed_count > 20 and not problems, str(problems[:3]))
+chain = {name: rrset for (name, rdtype, _), rrset in zone_rrsets.items() if rdtype == NSEC}
+walk, cur = [], SZ
+while cur in chain and cur not in walk:
+    walk.append(cur)
+    cur = chain[cur][0].next
+owners = {name for (name, rdtype, _) in zone_rrsets if not any(name.is_subdomain(c) and name != c for c in (dns.name.from_text("sub.signed.test."), dns.name.from_text("secure.signed.test.")))}
+check("4034 §4.1.1: NSEC chain in canonical order covers every authoritative name and wraps to the apex", cur == SZ and set(walk) == owners and walk == sorted(walk), f"{len(walk)} links, {len(owners)} names")
 
 failed = [n for n, ok, _ in results if not ok]
 print(f"\n{len(results) - len(failed)}/{len(results)} checks passed")

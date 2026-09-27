@@ -1597,3 +1597,289 @@ fn a_diverged_standby_halts_until_rebuilt() {
     drop(s);
     let _ = std::fs::remove_dir_all(&root_dir);
 }
+
+/// Tools for the DNSSEC checks (BIND; skipped when absent unless
+/// REQUIRE_BIND_TOOLS is set).
+fn bind_tool(name: &str) -> Option<PathBuf> {
+    let mut dirs: Vec<PathBuf> = [
+        "/opt/homebrew/opt/bind/bin",
+        "/usr/local/opt/bind/bin",
+        "/usr/local/bin",
+        "/usr/bin",
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .collect();
+    if let Some(p) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&p));
+    }
+    let t = dirs.into_iter().map(|d| d.join(name)).find(|p| p.is_file());
+    if t.is_none() {
+        assert!(
+            std::env::var("REQUIRE_BIND_TOOLS").is_err(),
+            "{name} not found"
+        );
+        eprintln!("follow: {name} not found; skipping that check");
+    }
+    t
+}
+
+fn dnssec_query(port: u16, name: &str, rtype: RecordType) -> Message {
+    let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    let mut m = Message::new(4343, MessageType::Query, OpCode::Query);
+    m.add_query(Query::query(Name::from_ascii(name).unwrap(), rtype));
+    let mut e = hickory_proto::op::Edns::new();
+    e.set_max_payload(4096).set_dnssec_ok(true);
+    m.set_edns(e);
+    sock.send_to(&m.to_vec().unwrap(), ("127.0.0.1", port))
+        .unwrap();
+    let mut buf = [0u8; 65535];
+    let n = sock.recv(&mut buf).expect("udp reply");
+    Message::from_bytes(&buf[..n]).unwrap()
+}
+
+#[test]
+fn dnssec_signing_on_the_primary_is_served_by_the_standby() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root_dir = std::env::temp_dir().join(format!(
+        "rust-dns-follow-dnssec-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root_dir).unwrap();
+    let mut p = Node::new(&root_dir, "primary", "rootpass-primary");
+    let mut s = Node::new(&root_dir, "standby", "rootpass-standby");
+    let transfer = "[transfer]\nallow = [\"127.0.0.0/8\"]\n";
+    p.configure(transfer);
+    p.start();
+    let pr = p.root();
+    let token = ok(
+        call(
+            &Auth::Session(&pr),
+            "POST",
+            &p.api("/tokens"),
+            Some(json!({ "name": "repl" })),
+        ),
+        "token",
+    )["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    ok(
+        call(
+            &Auth::Session(&pr),
+            "POST",
+            &p.api("/zones"),
+            Some(json!({ "name": "sec.test" })),
+        ),
+        "zone",
+    );
+    for (n, t, v) in [
+        ("@", "NS", "ns1.sec.test."),
+        ("ns1", "A", "192.0.2.53"),
+        ("www", "A", "192.0.2.1"),
+        ("*.gate", "A", "192.0.2.2"),
+        ("gate", "A", "192.0.2.3"),
+        ("a.b.deep", "TXT", "hello"),
+    ] {
+        ok(
+            call(
+                &Auth::Session(&pr),
+                "POST",
+                &p.api("/zones/sec.test/records"),
+                Some(json!({ "name": n, "type": t, "value": v })),
+            ),
+            "record",
+        );
+    }
+    s.configure(&format!("{transfer}{}", follow_cfg(&p, "dns2", &token)));
+    s.start();
+    let sr = s.root();
+    wait_for("standby has the zone", 15, || {
+        record_names(&s, &sr, "sec.test").len() == 6
+    });
+
+    // Turn signing on at the primary.
+    let on = ok(
+        call(
+            &Auth::Session(&pr),
+            "PUT",
+            &p.api("/zones/sec.test/dnssec"),
+            Some(json!({ "enabled": true })),
+        ),
+        "enable DNSSEC",
+    );
+    let key_tag = on["key"]["key_tag"].clone();
+    let dnskey = on["key"]["dnskey"].as_str().unwrap().to_string();
+    wait_for("the standby signs with the replicated key", 15, || {
+        let st = call(
+            &Auth::Session(&sr),
+            "GET",
+            &s.api("/zones/sec.test/dnssec"),
+            None,
+        )
+        .1;
+        st["state"] == "signing" && st["key"]["key_tag"] == key_tag
+    });
+    let sst = ok(
+        call(
+            &Auth::Session(&sr),
+            "GET",
+            &s.api("/zones/sec.test/dnssec"),
+            None,
+        ),
+        "standby status",
+    );
+    assert_eq!(sst["standby"], true);
+    assert!(
+        sst["signatures"]["next_resign"].is_null(),
+        "a standby never re-signs"
+    );
+    assert_eq!(sst["key"]["dnskey"], on["key"]["dnskey"]);
+    assert_eq!(sst["ds"], on["ds"], "same DS from both servers");
+    // Same data and serial; the same signature window (from the replicated
+    // change time), but their own (randomised) ECDSA signatures.
+    assert_eq!(
+        soa_serial(p.dns, "sec.test."),
+        soa_serial(s.dns, "sec.test.")
+    );
+    assert_eq!(
+        sst["signatures"]["inception"],
+        on["signatures"]["inception"]
+    );
+    let pk = dnssec_query(p.dns, "sec.test.", RecordType::DNSKEY);
+    let sk = dnssec_query(s.dns, "sec.test.", RecordType::DNSKEY);
+    let dnskey_rdata = |m: &Message| {
+        m.answers
+            .iter()
+            .filter(|r| r.record_type() == RecordType::DNSKEY)
+            .map(|r| r.data.to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(dnskey_rdata(&pk), dnskey_rdata(&sk));
+    let pw = dnssec_query(p.dns, "x.gate.sec.test.", RecordType::A);
+    let sw = dnssec_query(s.dns, "x.gate.sec.test.", RecordType::A);
+    assert_eq!(pw.answers.len(), 2, "A + RRSIG");
+    assert_eq!(sw.answers.len(), 2, "A + RRSIG");
+    assert!(sw
+        .authorities
+        .iter()
+        .any(|r| r.record_type() == RecordType::NSEC));
+    // A write on the standby is refused.
+    let (code, v) = call(
+        &Auth::Session(&sr),
+        "PUT",
+        &s.api("/zones/sec.test/dnssec"),
+        Some(json!({ "enabled": false, "force": true })),
+    );
+    assert_eq!(code, 409, "{v}");
+    assert_eq!(v["code"], "read_only_standby");
+
+    // Independent validation of the standby's answers.
+    if let Some(delv) = bind_tool("delv") {
+        let f: Vec<&str> = dnskey.split_whitespace().collect();
+        let anchor = root_dir.join("anchor.conf");
+        std::fs::write(
+            &anchor,
+            format!(
+                "trust-anchors {{ \"{}\" static-key {} {} {} \"{}\"; }};\n",
+                f[0], f[4], f[5], f[6], f[7]
+            ),
+        )
+        .unwrap();
+        for port in [p.dns, s.dns] {
+            for (name, t, want) in [
+                ("sec.test", "SOA", "; fully validated"),
+                ("sec.test", "DNSKEY", "; fully validated"),
+                ("www.sec.test", "A", "; fully validated"),
+                ("x.gate.sec.test", "A", "; fully validated"),
+                ("nope.sec.test", "A", "; negative response, fully validated"),
+                ("deep.sec.test", "A", "; negative response, fully validated"),
+                (
+                    "x.gate.sec.test",
+                    "AAAA",
+                    "; negative response, fully validated",
+                ),
+            ] {
+                let out = Command::new(&delv)
+                    .args([
+                        "@127.0.0.1",
+                        "-p",
+                        &port.to_string(),
+                        "-a",
+                        anchor.to_str().unwrap(),
+                        "+root=sec.test",
+                        name,
+                        t,
+                    ])
+                    .output()
+                    .unwrap();
+                let text = String::from_utf8_lossy(&out.stdout).to_string()
+                    + &String::from_utf8_lossy(&out.stderr);
+                assert!(
+                    text.lines().any(|l| l.starts_with(want)),
+                    "delv @{port} {name} {t}: {text}"
+                );
+            }
+        }
+    }
+    if let (Some(dig), Some(verify)) = (bind_tool("dig"), bind_tool("dnssec-verify")) {
+        let out = Command::new(&dig)
+            .args([
+                "@127.0.0.1",
+                "-p",
+                &s.dns.to_string(),
+                "sec.test",
+                "AXFR",
+                "+nocmd",
+                "+nocomments",
+                "+nostats",
+            ])
+            .output()
+            .unwrap();
+        let zf = root_dir.join("standby-axfr.zone");
+        std::fs::write(&zf, &out.stdout).unwrap();
+        let v = Command::new(&verify)
+            .args(["-z", "-o", "sec.test", zf.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let text =
+            String::from_utf8_lossy(&v.stdout).to_string() + &String::from_utf8_lossy(&v.stderr);
+        assert!(
+            v.status.success() && text.contains("Zone fully signed"),
+            "{text}"
+        );
+    }
+
+    // Reconcile: every replicated table (the key included) and the zone
+    // match; nothing halted; the standby wrote no serial bump of its own.
+    let head = ok(
+        call(
+            &Auth::Session(&pr),
+            "GET",
+            &p.api("/replication/status"),
+            None,
+        ),
+        "primary status",
+    )["head"]
+        .clone();
+    wait_for("a reconcile at the primary's head reports ok", 20, || {
+        let st = status(&s, &sr);
+        st["head"] == head
+            && st["follow"]["last_reconcile_result"]
+                .as_str()
+                .is_some_and(|r| r.starts_with("ok"))
+    });
+    let st = status(&s, &sr);
+    assert!(st["follow"]["halted"].is_null(), "{st}");
+    assert_eq!(st["follow"]["state"], "following");
+    assert_eq!(
+        soa_serial(p.dns, "sec.test."),
+        soa_serial(s.dns, "sec.test.")
+    );
+    assert!(!s.log().contains("re-signed"), "the standby never re-signs");
+    let _ = std::fs::remove_dir_all(&root_dir);
+}

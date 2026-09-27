@@ -9,7 +9,8 @@ use hickory_proto::rr::{Name, Record, RecordType};
 const CHUNK_BYTES: usize = 48 * 1024;
 
 /// Build the full transfer as a sequence of response messages:
-/// SOA, apex NS, all other records, SOA.
+/// SOA, apex NS, all other records, then (signed zone) the DNSKEY, every
+/// NSEC and RRSIG of the signed view queries are answered from, and SOA.
 pub fn build(z: &ZoneData, id: u16, query: &Query) -> Vec<Vec<u8>> {
     let zone = &z.zone;
     let apex = match Name::from_ascii(&z.apex) {
@@ -35,6 +36,9 @@ pub fn build(z: &ZoneData, id: u16, query: &Query) -> Vec<Vec<u8>> {
                 records.push(rr);
             }
         }
+    }
+    if let Some(signed) = &z.signed {
+        records.extend(signed.transfer_records());
     }
     records.push(soa);
     let _ = apex;

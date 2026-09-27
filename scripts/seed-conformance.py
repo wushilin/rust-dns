@@ -11,12 +11,12 @@ base = sys.argv[1].rstrip("/")
 opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
 
 
-def request(path, payload=None, headers=None):
+def request(path, payload=None, headers=None, method=None):
     body = None if payload is None else json.dumps(payload).encode()
     h = {} if headers is None else dict(headers)
     if body is not None:
         h["Content-Type"] = "application/json"
-    req = urllib.request.Request(base + path, data=body, headers=h)
+    req = urllib.request.Request(base + path, data=body, headers=h, method=method)
     try:
         with opener.open(req, timeout=2) as response:
             data = response.read()
@@ -86,7 +86,38 @@ reverse = {
     "soa_rname": "hostmaster.0.0.10.in-addr.arpa.",
     "records": [{"name": "25", "type": "PTR", "value": "mail.example.test."}],
 }
-doc = {"version": 1, "exported_at": "2026-01-01T00:00:00Z", "zones": [zone, reverse]}
+# A DNSSEC-signed zone (signing is turned on below through the API).
+signed = {
+    "name": "signed.test",
+    "soa_mname": "ns1.signed.test.",
+    "soa_rname": "hostmaster.signed.test.",
+    "minimum": 300,
+    "default_ttl": 3600,
+    "records": [{"name": n, "type": t, "value": v} for (n, t, v) in [
+        ("@", "NS", "ns1.signed.test."),
+        ("@", "A", "10.1.0.1"),
+        ("@", "MX", "10 mail.signed.test."),
+        ("@", "TXT", "v=spf1 -all"),
+        ("ns1", "A", "10.1.0.53"),
+        ("mail", "A", "10.1.0.25"),
+        ("www", "A", "10.1.0.80"),
+        ("www", "AAAA", "2001:db8:1::80"),
+        ("alias", "CNAME", "www.signed.test."),
+        ("ext", "CNAME", "example.org."),
+        ("gate", "A", "10.1.0.2"),
+        ("*.gate", "A", "10.1.0.3"),
+        ("a.b.deep", "TXT", "below two empty non-terminals"),
+        ("_dmarc", "TXT", "v=DMARC1; p=none"),
+        ("old", "DNAME", "gate.signed.test."),
+        ("sub", "NS", "ns.sub.signed.test."),
+        ("ns.sub", "A", "10.1.0.61"),
+        ("secure", "NS", "ns.secure.signed.test."),
+        ("ns.secure", "A", "10.1.0.62"),
+        ("secure", "DS", "12345 13 2 " + "ab" * 32),
+        ("big", "TXT", "y" * 700),
+    ] + [("many", "A", f"10.1.1.{i}") for i in range(1, 31)]],
+}
+doc = {"version": 1, "exported_at": "2026-01-01T00:00:00Z", "zones": [zone, reverse, signed]}
 status, result = request(
     "/api/import?mode=replace",
     doc,
@@ -95,6 +126,11 @@ status, result = request(
 if status != 200 or result.get("records_added", 0) < 20:
     raise SystemExit(f"fixture import was incomplete: {result}")
 print(f"seeded {result['records_added']} records in {result['zones_created']} zones")
+
+status, st = request("/api/zones/signed.test/dnssec", {"enabled": True}, {"X-Requested-With": "rust-dns"}, "PUT")
+if status != 200 or st.get("state") != "signing":
+    raise SystemExit(f"DNSSEC was not turned on for signed.test: {status} {st}")
+print(f"signed.test: DNSSEC on, key tag {st['key']['key_tag']}")
 
 # TSIG keys (RFC 8945) with fixed secrets known to conformance.py.
 TSIG_KEYS = [

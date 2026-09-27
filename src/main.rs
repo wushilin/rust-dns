@@ -4,6 +4,7 @@ mod backup;
 mod cache;
 mod config;
 mod dns;
+mod dnssec;
 mod events;
 mod logging;
 mod model;
@@ -191,6 +192,7 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!(username = %root.username, config = %cli.config.display(), "generated a new configuration with a random root password (printed once on stderr, not logged)");
         eprintln!("\n  Root login: {}  /  {}\n  (the plaintext is only shown once; the config now holds a hash)\n", root.username, pw);
     }
+    mutator.set_dnssec_config(cfg.dnssec.clone());
     mutator.rebuild()?;
     let (zc, rc) = storage.counts()?;
     tracing::info!(zones = zc, records = rc, "catalog loaded");
@@ -259,6 +261,8 @@ async fn main() -> anyhow::Result<()> {
         let r = reloader.clone();
         mutator.spawn_expiry_sweeper(move || r.current.load().expiry.clone());
     }
+    // DNSSEC: re-sign due zones (primary), refresh signature windows (all).
+    mutator.spawn_resigner();
     #[cfg(unix)]
     {
         let r = reloader.clone();

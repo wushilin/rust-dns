@@ -177,6 +177,21 @@ impl std::fmt::Debug for ReplTsigKey {
     }
 }
 
+/// A zone's DNSSEC signing key; `private_key` is base64 PKCS#8 (a secret:
+/// hidden from `Debug`, travels only in account-class changes and snapshots).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReplDnssecKey {
+    pub zone_id: i64,
+    pub zone: String,
+    pub algorithm: u8,
+    pub flags: u16,
+    pub key_tag: u16,
+    /// base64, 64 bytes (x || y).
+    pub public_key: String,
+    pub private_key: Hidden<String>,
+    pub created_at: String,
+}
+
 /// A consistent copy of everything replicated, read in one transaction,
 /// as logical entities: the same facts as changelog changes (`user_created`,
 /// `token_created`, `recovery_codes_replaced`, `tsig_key_set`,

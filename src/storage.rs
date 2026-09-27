@@ -56,7 +56,10 @@ CREATE TABLE IF NOT EXISTS zones (
     minimum     INTEGER NOT NULL DEFAULT 300,
     default_ttl INTEGER NOT NULL DEFAULT 300,
     created_at  TEXT NOT NULL,
-    updated_at  TEXT NOT NULL
+    updated_at  TEXT NOT NULL,
+    -- DNSSEC signing on (1) or off (0); last so that migrated and new
+    -- databases have the same column order (replication checksums).
+    dnssec      INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS records (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -130,6 +133,20 @@ CREATE TABLE IF NOT EXISTS tsig_keys (
     created_by  TEXT NOT NULL,
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL
+);
+-- DNSSEC signing keys (one combined signing key per zone). Written only
+-- through typed changes (src/mutation/acct_sql.rs); the private key (base64
+-- PKCS#8) is a secret like a TSIG secret: replicated as an account-class
+-- change, never shown by the API, the changelog API or the logs.
+CREATE TABLE IF NOT EXISTS dnssec_keys (
+    zone_id     INTEGER PRIMARY KEY REFERENCES zones(id) ON DELETE CASCADE,
+    zone        TEXT NOT NULL,
+    algorithm   INTEGER NOT NULL,
+    flags       INTEGER NOT NULL,
+    key_tag     INTEGER NOT NULL,
+    public_key  TEXT NOT NULL,
+    private_key TEXT NOT NULL,
+    created_at  TEXT NOT NULL
 );
 -- Replication (standby / follow mode) state: this database's history id and
 -- lineage, and standby bookkeeping. Written only by src/mutation/replica.rs
@@ -259,6 +276,13 @@ fn migrate(conn: &Connection) -> Result<()> {
         }
     }
     migrate_api_tokens(conn)?;
+    let zcols: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('zones')")?
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    if !zcols.is_empty() && !zcols.iter().any(|c| c == "dnssec") {
+        conn.execute_batch("ALTER TABLE zones ADD COLUMN dnssec INTEGER NOT NULL DEFAULT 0")?;
+    }
     let rcols: Vec<String> = conn
         .prepare("SELECT name FROM pragma_table_info('records')")?
         .query_map([], |r| r.get(0))?
@@ -436,6 +460,7 @@ impl Storage {
         self.with_conn(|c| list_records(c, zone_id))
     }
 
+    #[cfg(test)]
     pub fn all_records(&self) -> Result<Vec<Record>> {
         self.with_conn(all_records)
     }
@@ -611,6 +636,25 @@ impl Storage {
 
     pub fn get_tsig_key(&self, name: &str) -> Result<Option<StoredTsigKey>> {
         self.with_conn(|c| get_tsig_key(c, name))
+    }
+
+    /// A zone's DNSSEC key (private key included: callers must not expose it).
+    pub fn get_dnssec_key(
+        &self,
+        zone_id: i64,
+    ) -> Result<Option<crate::replication::types::ReplDnssecKey>> {
+        self.with_conn(|c| get_dnssec_key(c, zone_id))
+    }
+
+    /// Zones, records and DNSSEC keys read in one transaction (catalog build).
+    pub fn catalog_inputs(
+        &self,
+    ) -> Result<(
+        Vec<Zone>,
+        Vec<Record>,
+        Vec<crate::replication::types::ReplDnssecKey>,
+    )> {
+        self.read_tx(|c| Ok((list_zones(c)?, all_records(c)?, list_dnssec_keys(c)?)))
     }
 
     pub fn get_setting(&self, key: &str) -> Result<Option<(String, String, String)>> {
@@ -820,11 +864,12 @@ fn row_to_zone(r: &Row<'_>) -> rusqlite::Result<Zone> {
         created_at: r.get(10)?,
         updated_at: r.get(11)?,
         owner_id: r.get(12)?,
+        dnssec: r.get::<_, i64>(13)? != 0,
     })
 }
 
 const ZONE_COLS: &str =
-    "id, name, serial, soa_mname, soa_rname, refresh, retry, expire, minimum, default_ttl, created_at, updated_at, owner_id";
+    "id, name, serial, soa_mname, soa_rname, refresh, retry, expire, minimum, default_ttl, created_at, updated_at, owner_id, dnssec";
 
 pub(crate) const USER_COLS: &str =
     "id, username, password_hash, display_name, is_admin, is_root, mfa_required, totp_secret, totp_enrolled_at, disabled_at, created_at, updated_at";
@@ -1241,6 +1286,44 @@ fn row_to_tsig_key(r: &Row) -> rusqlite::Result<StoredTsigKey> {
         created_at: r.get(5)?,
         updated_at: r.get(6)?,
     })
+}
+
+const DNSSEC_KEY_COLS: &str =
+    "zone_id, zone, algorithm, flags, key_tag, public_key, private_key, created_at";
+
+fn row_to_dnssec_key(r: &Row<'_>) -> rusqlite::Result<crate::replication::types::ReplDnssecKey> {
+    Ok(crate::replication::types::ReplDnssecKey {
+        zone_id: r.get(0)?,
+        zone: r.get(1)?,
+        algorithm: r.get::<_, i64>(2)? as u8,
+        flags: r.get::<_, i64>(3)? as u16,
+        key_tag: r.get::<_, i64>(4)? as u16,
+        public_key: r.get(5)?,
+        private_key: crate::replication::types::Hidden(r.get(6)?),
+        created_at: r.get(7)?,
+    })
+}
+
+pub(crate) fn list_dnssec_keys(
+    c: &Connection,
+) -> Result<Vec<crate::replication::types::ReplDnssecKey>> {
+    let mut stmt = c.prepare(&format!(
+        "SELECT {DNSSEC_KEY_COLS} FROM dnssec_keys ORDER BY zone_id"
+    ))?;
+    let rows = stmt.query_map([], row_to_dnssec_key)?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+pub(crate) fn get_dnssec_key(
+    c: &Connection,
+    zone_id: i64,
+) -> Result<Option<crate::replication::types::ReplDnssecKey>> {
+    Ok(c.query_row(
+        &format!("SELECT {DNSSEC_KEY_COLS} FROM dnssec_keys WHERE zone_id = ?1"),
+        params![zone_id],
+        row_to_dnssec_key,
+    )
+    .optional()?)
 }
 
 pub(crate) fn list_tsig_keys(c: &Connection) -> Result<Vec<StoredTsigKey>> {

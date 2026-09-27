@@ -2,6 +2,20 @@
 
 Status as of 2026-09-27. Deployed to dns-test (musl build, /opt/rust-dns) with everything below. Stages 1 to 3 (log rotation, DNS protocol completeness, console fixes) are implemented. The current workspace has additional Stage 4 changes in progress below.
 
+## DNSSEC online signing (2026-09-27, implemented, not committed)
+
+- [x] RFC 3225 fix (ships with signing off): the query's DO bit is copied into the response OPT (was always clear). Unit/e2e/conformance checks.
+- [x] Per-zone signing, off by default: `zones.dnssec` (Zone JSON field only when on; changed through `update_zone` -> `zone_updated` + serial bump), one CSK per zone (257, alg 13 ECDSA P-256, ring), NSEC. Key in `dnssec_keys` (registry: replicated), written only through `DnssecKeySet` / `DnssecKeyDeleted` account-class changes (acct_sql; source-scan test covers the table); never in the changelog API, websocket (Tx::finish now publishes only dns-class events), audit, logs; scrubbed after `account_retention_days`; in snapshots.
+- [x] Signing in memory at catalog build (`dnssec::signed`), cached by a fingerprint of zone row + served records + key + window; queries (DO) and AXFR share it. Inception = `updated_at` - 1 h, validity `[dnssec].signature_validity_days` (14); primary re-signs (`zone_resigned` + serial bump) `resign_before_days` (7) before expiry via `Mutator::spawn_resigner`; any node re-signs in memory from the current hour if a window gets within half of that of expiry without a bump (standby cut off). Standby never writes.
+- [x] Responses: RRSIGs, NXDOMAIN/NODATA/ENT/wildcard/wildcard-NODATA proofs, referrals with DS or no-DS NSEC, DS at a cut answered by the parent side (only when signed or DS records exist: unsigned zones unchanged), DNAME signed / synthesized CNAME unsigned, signed minimal ANY = one RRset + RRSIG, DNSKEY/NSEC/RRSIG qtypes, DO answers drop the additional section before truncating. Auto-PTR disabled inside signed zones.
+- [x] DS record type in the editor (`<tag> <alg> <digest type> <hex>`, types 1/2/4 with exact lengths).
+- [x] API: `GET/PUT /zones/{zone}/dnssec`, `GET .../dnssec/ds`, `GET .../dnssec/check` (self-validation of this server's answers), `GET .../dnssec/parent` (DS via the first forwarding upstream: present/absent/mismatch/unknown). Disabling refused with 409 `ds_published` unless the parent check says absent; `force` in the API only. Contract tests cover all (74/74 operations).
+- [x] Console: DNSSEC chip + tab (status, key, DNSKEY, DS with copy buttons and registrar fields, window and next re-sign, check, parent lookup, two-step enable dialog with optional new key, disable dialog showing the refusal). Delegation tab no longer says DNSSEC is unsupported. Checked in Chrome.
+- [x] Mixed-version safety while signing is off: `zones.dnssec` is left out of the table checksum (covered by the per-zone checksum, where it appears only when on); an empty table unknown to an older primary is not a reconcile difference. Upgrade standbys before turning signing on.
+- [x] Tests: dnspython known-answer vectors + BIND DS (`src/dnssec/vectors.rs`, `scripts/dnssec-vectors.py`), unit tests (canonical order, bitmaps, key tag/DS RFC 4034 examples, chain/positions, window), mutation tests (enable/disable/key lifecycle, secrecy, re-sign, cache), randomized replay covers the new change kinds, replica snapshot/secrets tests, `tests/dnssec.rs` (dnssec-verify, dnssec-dsfromkey, delv x40 + negative control, validating named with AD, no-DO answers unchanged, truncation, re-sign, parent DS refusal with a second rust-dns as parent), `tests/follow.rs` (standby signs with the replicated key, delv + dnssec-verify against it, reconcile ok, no halt), conformance 86 -> 123.
+- [ ] Not done: automated key rollover (double-signature or CDS/CDNSKEY, RFC 7344/8078), NSEC3, other algorithms, signing auto-PTR answers, DS query at an apex whose parent zone is here but unsigned and has no DS keeps the child NODATA (pre-existing behaviour), wildcards whose `*` label is itself an empty non-terminal (records under `*.x`) are answered NXDOMAIN as before and their NSEC proof would not validate (unusual; not blocked in the editor).
+- [ ] Owner notes for deployment: build, deploy with signing off (no answer changes except the DO echo), upgrade baba2 before gate if possible (either order is safe while signing is off), then enable on wushilin.net, run the check, confirm baba2's DNSSEC tab shows the same key, publish the DS at the registrar, confirm with the parent lookup (needs a forwarding upstream on gate, else `dig +short DS wushilin.net`).
+
 ## Open resolver mode (2026-09-27, implemented, not committed)
 
 - [x] `[forwarding] open_resolver = false` (default), `open_resolver_max_udp_payload = 512` (512..4096), `open_resolver_rate_per_second = 20` (0 = no extra limit). The L10 guard stays the default; the flag skips it in `config::validate` and `mutation::settings::validate`. Empty `allowed_clients` still means nobody (the /0 entries must be listed). `--check` prints `WARNING:` lines; WARN at startup, on reload (notes too) and on every off->on transition. Reloadable.
@@ -159,7 +173,7 @@ Status as of 2026-09-27. Deployed to dns-test (musl build, /opt/rust-dns) with e
 
 ## DNS features not started
 
-- [ ] DNSSEC signing (NSEC/NSEC3, key management, DS publication). Largest remaining item.
+- [x] DNSSEC signing (NSEC, CSK, DS publication): see above. NSEC3 and automated rollover remain.
 - [ ] TSIG for AXFR and NOTIFY. Transfers are currently restricted by client network only.
 - [x] Changelog-based follower mode (standby mode, 2026-09-27).
 - [ ] Inbound NOTIFY / acting as a secondary for zones hosted elsewhere.

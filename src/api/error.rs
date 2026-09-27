@@ -23,6 +23,9 @@ pub enum ErrorCode {
     /// 409: this server is a read-only standby (or an old primary fenced
     /// after a failover); the message names the primary to use.
     ReadOnlyStandby,
+    /// 409: DNSSEC signing cannot be turned off while the parent publishes a
+    /// DS record for the zone (or that cannot be ruled out).
+    DsPublished,
 }
 
 /// Every non-2xx JSON error has this shape.
@@ -37,7 +40,8 @@ pub struct ErrorBody {
     /// could not be parsed (malformed JSON, wrong field type or value,
     /// unparsable path or query parameter, missing JSON content type).
     /// `read_only_standby` (409): this server is a read-only standby; write
-    /// to the primary named in the message.
+    /// to the primary named in the message. `ds_published` (409): DNSSEC
+    /// signing cannot be turned off while the parent publishes a DS.
     #[schema(required = true)]
     pub code: Option<ErrorCode>,
 }

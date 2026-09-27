@@ -174,6 +174,11 @@ pre.json { word-break: break-word; overflow-wrap: anywhere; line-height: 1.5; fo
 .note.warn { background: color-mix(in srgb, var(--warn) 13%, transparent); }
 .note.warn .ico { color: var(--warn); }
 .note.info .ico { color: var(--accent); }
+.note.ok { background: color-mix(in srgb, var(--ok) 13%, transparent); }
+.note.ok .ico { color: var(--ok); }
+.note.bad { background: color-mix(in srgb, var(--danger) 12%, transparent); }
+.note.bad .ico { color: var(--danger); }
+a.tablink { color: var(--accent); cursor: pointer; }
 
 /* ---- zone page ---- */
 .back { display: inline-flex; align-items: center; gap: 4px; font-size: 13px; color: var(--muted); }
@@ -561,8 +566,8 @@ $('#nav').addEventListener('click', e => { if (e.target.closest('a')) $('#app').
 // state
 // ---------------------------------------------------------------------------
 const S = { user: null, zones: [], zone: null, panel: null, status: null, queries: [], changes: [], lastOffset: null, ws: null, wsTimer: null, paused: false, filter: '', repl: null, readOnly: false };
-const RTYPES = ['A', 'AAAA', 'CNAME', 'DNAME', 'PTR', 'NS', 'MX', 'TXT', 'SRV', 'CAA', 'HTTPS', 'SVCB', 'TLSA', 'SSHFP', 'NAPTR', 'HINFO'];
-const VALUE_HINT = { A: '10.0.0.1', AAAA: '2001:db8::1', CNAME: 'target.example.com', DNAME: 'other.example.com', PTR: 'host.example.com', NS: 'ns1.example.com', MX: '10 mail.example.com', TXT: 'v=spf1 -all', SRV: '10 20 5060 sip.example.com', CAA: '0 issue "letsencrypt.org"', HTTPS: '1 . alpn=h2,h3', SVCB: '1 svc.example.com. port=8443', TLSA: '3 1 1 <sha256 hex>', SSHFP: '4 2 <sha256 hex>', NAPTR: '100 10 "S" "SIP+D2U" "" _sip._udp.example.com.', HINFO: '"x86_64" "Linux"' };
+const RTYPES = ['A', 'AAAA', 'CNAME', 'DNAME', 'PTR', 'NS', 'MX', 'TXT', 'SRV', 'CAA', 'HTTPS', 'SVCB', 'TLSA', 'SSHFP', 'NAPTR', 'HINFO', 'DS'];
+const VALUE_HINT = { A: '10.0.0.1', AAAA: '2001:db8::1', CNAME: 'target.example.com', DNAME: 'other.example.com', PTR: 'host.example.com', NS: 'ns1.example.com', MX: '10 mail.example.com', TXT: 'v=spf1 -all', SRV: '10 20 5060 sip.example.com', CAA: '0 issue "letsencrypt.org"', HTTPS: '1 . alpn=h2,h3', SVCB: '1 svc.example.com. port=8443', TLSA: '3 1 1 <sha256 hex>', SSHFP: '4 2 <sha256 hex>', NAPTR: '100 10 "S" "SIP+D2U" "" _sip._udp.example.com.', HINFO: '"x86_64" "Linux"', DS: '12345 13 2 <sha256 digest, 64 hex digits>' };
 
 // ---------------------------------------------------------------------------
 // login flow
@@ -630,7 +635,7 @@ async function enterApp() {
 // ---------------------------------------------------------------------------
 // standby (read-only) mode: banner on every page, write controls disabled
 // ---------------------------------------------------------------------------
-const WRITE_SEL = '#z-new,#z-edit,#z-del,#u-new,#tk-new,#tk-save,#tk-del,#t-new,#soa-edit,#rf-save,#r-add,#m-add,#im-go,#fw-save,#fw-reset,#pw-btn,#mfa-on,#mfa-off,#mfa-regen,[data-edit],[data-del],[data-rm],[data-rev],[data-tab="import"]';
+const WRITE_SEL = '#sec-on,#sec-off,#z-new,#z-edit,#z-del,#u-new,#tk-new,#tk-save,#tk-del,#t-new,#soa-edit,#rf-save,#r-add,#m-add,#im-go,#fw-save,#fw-reset,#pw-btn,#mfa-on,#mfa-off,#mfa-regen,[data-edit],[data-del],[data-rm],[data-rev],[data-tab="import"]';
 function applyReadOnly() {
   if (!S.readOnly) return;
   $$(WRITE_SEL).forEach(b => { if (!b.disabled) { b.disabled = true; b.dataset.ro = '1'; b.title = 'Read-only: make changes on the primary'; } });
@@ -898,6 +903,7 @@ function renderZone(keepFilter) {
         <button class="chip-btn" data-panel="soa" title="Start of authority: serial, timers, contacts">${ico('info', 's')} SOA <span class="sub mono">serial ${z.serial}</span></button>
         <button class="chip-btn${delegWarn ? ' warn' : ''}" data-panel="deleg" title="${dl.reverse ? 'How reverse delegation works' : 'Nameservers and glue for your registrar'}">${ico(delegWarn ? 'warn' : 'deleg', 's')} ${dl.reverse ? 'Reverse delegation' : 'Delegation'} <span class="sub">${dl.ns.length} NS</span></button>
         <button class="chip-btn" data-panel="dig" title="Commands to query this zone">${ico('term', 's')} Test with dig</button>
+        <button class="chip-btn" data-panel="dnssec" title="DNSSEC signing: status, DS record for the registrar, checks">${ico('shield', 's')} DNSSEC <span class="sub">${z.dnssec ? 'signing' : 'off'}</span></button>
         ${isOwner ? `<button class="chip-btn" data-panel="access" title="Who can see and edit this zone">${ico('lock', 's')} Access <span class="sub">${z.members.length}</span></button>` : ''}
         <span class="meta">owner <b>${esc(z.owner || '–')}</b> · you are <span class="badge">${esc(z.role)}</span> · default TTL ${z.default_ttl}s</span>
       </div>
@@ -1036,7 +1042,7 @@ function expiryPreview(text) {
   } catch (e) { return { ok: false, msg: e.message }; }
 }
 // ---- add / edit record dialog ---------------------------------------------
-const TYPE_INFO = { A: 'IPv4 address', AAAA: 'IPv6 address', CNAME: 'alias: this name is another name (nothing else may share the name)', DNAME: 'redirects every name below this one to another domain', PTR: 'reverse lookup: the host name for an address', NS: 'nameserver for this name (at @: this zone; below @: delegates a subdomain)', MX: 'mail server: priority, then host name', TXT: 'free text, e.g. SPF, DKIM or a site-verification token', SRV: 'service location: priority weight port target', CAA: 'which certificate authorities may issue certificates: flags tag "value"', HTTPS: 'HTTPS service binding: priority target parameters', SVCB: 'service binding: priority target parameters', TLSA: 'DANE certificate association: usage selector matching-type hash', SSHFP: 'SSH host key fingerprint: algorithm type hash', NAPTR: 'naming authority pointer: order preference "flags" "service" "regexp" replacement', HINFO: 'host information: "cpu" "os"' };
+const TYPE_INFO = { A: 'IPv4 address', AAAA: 'IPv6 address', CNAME: 'alias: this name is another name (nothing else may share the name)', DNAME: 'redirects every name below this one to another domain', PTR: 'reverse lookup: the host name for an address', NS: 'nameserver for this name (at @: this zone; below @: delegates a subdomain)', MX: 'mail server: priority, then host name', TXT: 'free text, e.g. SPF, DKIM or a site-verification token', SRV: 'service location: priority weight port target', CAA: 'which certificate authorities may issue certificates: flags tag "value"', HTTPS: 'HTTPS service binding: priority target parameters', SVCB: 'service binding: priority target parameters', TLSA: 'DANE certificate association: usage selector matching-type hash', SSHFP: 'SSH host key fingerprint: algorithm type hash', NAPTR: 'naming authority pointer: order preference "flags" "service" "regexp" replacement', HINFO: 'host information: "cpu" "os"', DS: 'delegation signer: at a delegated name (with NS), the DS record the signed child zone gives you: key tag, algorithm, digest type, digest' };
 // Full owner name for what is typed in the Name field (mirrors the server's rules).
 function ownerName(name, zone) {
   const raw = String(name).trim().toLowerCase();
@@ -1198,8 +1204,8 @@ async function openZonePanel(tab) {
   const keep = same ? ($('#drawer .d-body') || {}).scrollTop || 0 : 0;
   S.panel = { zone: z.name, tab };
   const dl = delegationInfo(z);
-  const tabs = [['soa', 'SOA'], ['deleg', dl.reverse ? 'Reverse delegation' : 'Delegation'], ['dig', 'Test with dig']].concat(isOwner ? [['access', 'Access']] : []);
-  const body = tab === 'soa' ? soaHtml(z) : tab === 'deleg' ? delegHtml(z, dl) : tab === 'dig' ? digHtml(z) : accessHtml(z);
+  const tabs = [['soa', 'SOA'], ['deleg', dl.reverse ? 'Reverse delegation' : 'Delegation'], ['dig', 'Test with dig'], ['dnssec', 'DNSSEC']].concat(isOwner ? [['access', 'Access']] : []);
+  const body = tab === 'soa' ? soaHtml(z) : tab === 'deleg' ? delegHtml(z, dl) : tab === 'dig' ? digHtml(z) : tab === 'dnssec' ? dnssecHtml(z) : accessHtml(z);
   openDrawer(`<div class="d-head"><div class="d-title"><h2 class="mono">${esc(z.fqdn)}</h2><button type="button" class="icon-btn" data-dclose title="Close (Esc)" aria-label="Close">${ico('close')}</button></div>
     <div class="tabs" role="tablist">${tabs.map(([k, l]) => `<button type="button" role="tab" data-dtab="${k}" class="${k === tab ? 'on' : ''}">${l}</button>`).join('')}</div></div>
     <div class="d-body">${body}</div>`);
@@ -1214,7 +1220,15 @@ async function openZonePanel(tab) {
     $('#m-user').addEventListener('keydown', e => { if (e.key === 'Enter') grant(); });
     if (!same) setTimeout(() => $('#m-user') && $('#m-user').focus(), 40);
   }
+  if (tab === 'dnssec') wireDnssec(z, d);
   markPanelChip();
+  if (tab === 'dnssec' && (!S.dnssec || S.dnssec.zone !== z.name || S.dnssec.serial !== z.serial)) {
+    const prev = S.dnssec && S.dnssec.zone === z.name ? S.dnssec : {};
+    try { const st = await GET(`/zones/${encodeURIComponent(z.name)}/dnssec`); S.dnssec = { zone: z.name, serial: z.serial, st, check: prev.check || null, parent: prev.parent || null }; }
+    catch (e) { S.dnssec = { zone: z.name, serial: z.serial, err: e.message }; }
+    if (S.panel && S.panel.zone === z.name && S.panel.tab === 'dnssec') openZonePanel('dnssec');
+    return;
+  }
   if ((tab === 'dig' || tab === 'deleg') && !S.status) {
     try { S.status = await GET('/status'); } catch { return; }
     if (S.panel && S.panel.zone === z.name && S.panel.tab === tab) openZonePanel(tab);
@@ -1273,7 +1287,7 @@ function delegHtml(z, dl) {
       ${inZone.length ? `<li>Because ${inZone.map(n => `<span class="mono">${esc(noDot(n.name))}</span>`).join(', ')} ${inZone.length === 1 ? 'is' : 'are'} inside <span class="mono">${esc(zn)}</span>, also register <b>glue records</b> (the registrar may call them "host records", "child nameservers" or "register a nameserver") with these addresses:
         <div class="tw" style="margin-top:6px"><table><tbody>${inZone.map(n => `<tr><td>${copyVal(noDot(n.name))}</td><td>${n.glue.length ? n.glue.map(g => `<div>${copyVal(g.value)}</div>`).join('') : '<span class="badge warn">no A/AAAA record</span>'}</td></tr>`).join('')}</tbody></table></div></li>` : ''}
       <li>Most registrars require <b>at least two nameservers</b>${dl.ns.length < 2 ? ` and you have ${dl.ns.length}` : ''}. Run a secondary DNS server that copies this zone by zone transfer (AXFR, which this server supports: allow the secondary's address in the transfer settings of the server configuration and give it a key under TSIG keys${S.status && S.status.transfer && (S.status.transfer.allow || []).length ? `; currently allowed: ${esc(S.status.transfer.allow.join(', '))}` : ''}), add an NS record for it here, and list it at the registrar too.</li>
-      <li><b>DNSSEC is not supported</b> by this server: remove any DS record for the domain at the registrar, otherwise validating resolvers treat the domain as broken.</li>
+      ${z.dnssec ? `<li><b>DNSSEC</b> is on for this zone: publish its DS record at the registrar (see the <a class="tablink" role="button" tabindex="0" data-dtab="dnssec">DNSSEC</a> tab) once the check there passes.</li>` : `<li><b>DNSSEC</b> is off for this zone: the registrar must have <b>no DS record</b> for the domain, otherwise validating resolvers treat it as broken. To sign the zone, see the <a class="tablink" role="button" tabindex="0" data-dtab="dnssec">DNSSEC</a> tab.</li>`}
       <li>After the change (the parent's cache time can make it take up to a day or two), check the delegation from the root down:${cmdBlock(`dig NS ${zn} +trace`)}<span class="hint">The last step should list your nameservers.</span> And check that this server answers for the zone:${cmdBlock(`${digAt(t)} ${zn} SOA`)}<span class="hint">Look for status NOERROR and the <b>aa</b> (authoritative) flag.</span></li>
     </ol>${portNote}`;
 }
@@ -1294,6 +1308,142 @@ function digHtml(z) {
     ${t.note ? `<div class="note info">${ico('info', 's')}<span>${esc(t.note)}</span></div>` : ''}
     ${cmds.map(([c, why]) => `<div style="margin-top:12px"><div class="hint">${esc(why)}</div>${cmdBlock(c)}</div>`).join('')}
     <p class="hint" style="margin-top:14px">In the reply, <b>status: NOERROR</b> means the name exists, <b>NXDOMAIN</b> that it does not; the <b>aa</b> flag marks an authoritative answer.</p>`;
+}
+
+// ---------------------------------------------------------------------------
+// DNSSEC (zone panel tab)
+// ---------------------------------------------------------------------------
+const secWhen = t => t ? `${esc(fmtTime(t))} <span class="hint">(${new Date(t) > new Date() ? 'in ' + formatDuration((new Date(t) - Date.now()) / 1000, 2) : ago(t)})</span>` : '<span class="hint">–</span>';
+function dsFields(d) {
+  return `<div class="tw"><table><tbody>
+    <tr><td class="hint">Key tag</td><td>${copyVal(String(d.key_tag))}</td></tr>
+    <tr><td class="hint">Algorithm</td><td>${copyVal(String(d.algorithm))} <span class="hint">ECDSA P-256 / SHA-256 (ECDSAP256SHA256)</span></td></tr>
+    <tr><td class="hint">Digest type</td><td>${copyVal(String(d.digest_type))} <span class="hint">${esc(d.digest_name)}</span></td></tr>
+    <tr><td class="hint">Digest</td><td>${copyVal(d.digest)}</td></tr></tbody></table></div>`;
+}
+function parentHtml(p, st) {
+  if (!p) return '';
+  if (p.loading) return '<p class="hint">Asking the forwarding upstream…</p>';
+  if (p.err) return `<div class="note bad">${ico('warn', 's')}<span>${esc(p.err)}</span></div>`;
+  const ds = (p.parent_ds || []).length ? `<div class="hint" style="margin-top:6px">Published at the parent:</div>${p.parent_ds.map(x => `<div class="mono" style="word-break:break-all;font-size:12px">${esc(x)}</div>`).join('')}` : '';
+  const via = p.upstream ? `<div class="hint" style="margin-top:6px">Looked up through ${esc(p.upstream)} (the first forwarding upstream).</div>` : '';
+  if (p.state === 'present') return `<div class="note ok">${ico('check', 's')}<span><b>DS published and matching.</b> Validating resolvers now check this zone's signatures${st.enabled ? '' : ' — <b>but signing is off: the zone fails for them. Turn signing on again or remove the DS at the registrar.</b>'}.</span></div>${ds}${via}`;
+  if (p.state === 'absent') return `<div class="note info">${ico('info', 's')}<span><b>No DS at the parent.</b> Resolvers treat the zone as unsigned; nothing depends on the signatures yet.${st.enabled ? ' Publish the DS above at the registrar once the check passes.' : ''}</span></div>${via}`;
+  if (p.state === 'mismatch') return `<div class="note bad">${ico('warn', 's')}<span><b>The parent publishes a DS that does not match this zone's key.</b> Validating resolvers fail the zone (SERVFAIL). Replace it at the registrar with the DS above.</span></div>${ds}${via}`;
+  return `<div class="note warn">${ico('warn', 's')}<span><b>Could not check:</b> ${esc(p.detail)}</span></div>`;
+}
+function checkHtml(c) {
+  if (!c) return '';
+  if (c.loading) return '<p class="hint">Querying this server…</p>';
+  if (c.err) return `<div class="note bad">${ico('warn', 's')}<span>${esc(c.err)}</span></div>`;
+  return `<div class="note ${c.ok ? 'ok' : 'bad'}">${ico(c.ok ? 'check' : 'warn', 's')}<span>${c.ok ? `<b>All ${c.checks.length} checks passed:</b> this server's signed answers validate with key ${c.key_tag}.` : '<b>Some checks failed:</b> do not publish the DS until they pass.'}</span></div>
+    <div class="tw"><table><tbody>${c.checks.map(x => `<tr><td style="width:1%">${x.ok ? '<span class="badge ok">ok</span>' : '<span class="badge bad">fail</span>'}</td><td><div class="mono">${esc(x.query)}</div><div class="hint" style="word-break:break-word">${esc(x.detail)}</div></td></tr>`).join('')}</tbody></table></div>
+    <p class="hint">${esc(c.note)}</p>`;
+}
+function dnssecHtml(z) {
+  const d = S.dnssec && S.dnssec.zone === z.name ? S.dnssec : null;
+  if (!d || (!d.st && !d.err)) return '<p class="hint">Loading…</p>';
+  if (d.err) return `<div class="note bad">${ico('warn', 's')}<span>${esc(d.err)}</span></div>`;
+  const st = d.st, zn = noDot(z.fqdn), owner = z.role === 'owner';
+  const badge = st.state === 'signing' ? '<span class="badge ok">signing</span>' : st.state === 'error' ? '<span class="badge bad">error: served unsigned</span>' : '<span class="badge muted">off</span>';
+  const k = st.key, sig = st.signatures;
+  const rec = (st.ds || []).find(x => x.recommended);
+  return `<p class="hint">DNSSEC lets resolvers verify that answers for <span class="mono">${esc(zn)}</span> come from you unchanged. This server signs the zone itself (ECDSA P-256, NSEC). It protects anyone only once the parent zone publishes a <b>DS record</b> for it, which you add at your registrar.</p>
+    <div class="facts">
+      ${fact('Status', '', badge + (st.error ? `<div class="hint" style="margin-top:4px">${esc(st.error)}</div>` : ''), st.enabled ? 'Answers carry signatures for resolvers that ask for them (DO bit); zone transfers include DNSKEY, RRSIG and NSEC records.' : 'Answers are unsigned.')}
+      ${k ? fact('Key', '', `tag <b class="mono">${k.key_tag}</b> · algorithm ${k.algorithm} (${esc(k.algorithm_name)}) · flags ${k.flags}`, `One combined signing key, created ${esc(fmtTime(k.created_at))}. The private key stays on this server (and its standbys).`) : ''}
+      ${k ? fact('DNSKEY', '', copyVal(k.dnskey), 'The public key, published in the zone.') : ''}
+      ${sig ? fact('Signatures', '', `valid ${secWhen(sig.inception)} to ${secWhen(sig.expiration)}`, `${num(sig.signed_rrsets)} RRsets and ${num(sig.nsec_names)} names signed at serial ${sig.serial}. Valid ${st.signature_validity_days} days; ${st.standby ? 'the primary re-signs them' : 're-signed automatically ' + st.resign_before_days + ' days before they expire (a new serial, so secondaries transfer them)'}.`) : ''}
+      ${sig && sig.next_resign ? fact('Next re-sign', '', secWhen(sig.next_resign), '') : ''}
+    </div>
+    ${st.standby ? `<div class="note info">${ico('servers', 's')}<span>This server is a read-only standby: it signs with the key replicated from the primary (its own signatures, equally valid). Turn signing on or off on the primary.</span></div>` : ''}
+    ${rec ? `<h3>DS record for the registrar</h3>
+      <p class="hint">Most registrars ask for these fields separately; some take the whole record. Use the SHA-256 digest (type 2) unless the registrar asks for SHA-384.</p>
+      ${dsFields(rec)}
+      ${(st.ds || []).map(x => `<div style="margin-top:8px"><div class="hint">${esc(x.digest_name)}${x.recommended ? ' (recommended)' : ''}</div>${snip(x.record, 'Copy DS record')}</div>`).join('')}` : ''}
+    ${st.enabled ? `<h3>Before you publish the DS</h3>
+      <ol class="steps">
+        <li><b>Check this server's answers</b>: queries this server with the DO bit and validates every signature and denial-of-existence proof with the key.
+          <div class="row" style="margin-top:6px"><button class="btn" id="sec-check">Check before adding DS</button></div><div id="sec-check-out">${checkHtml(d.check)}</div></li>
+        <li><b>Every nameserver of the zone must serve it signed.</b> Standbys sign by themselves; secondaries get DNSKEY, RRSIG and NSEC with the zone transfer. A nameserver that still serves the zone unsigned makes it fail for validating resolvers.</li>
+        <li><b>Publish the DS</b> (above) at your registrar.</li>
+        <li><b>Is the DS published at the parent?</b>
+          <div class="row" style="margin-top:6px"><button class="btn" id="sec-parent">Look up the DS at the parent</button></div><div id="sec-parent-out">${parentHtml(d.parent, st)}</div></li>
+      </ol>` : `<h3>Is a DS published at the parent?</h3><p class="hint">With signing off the parent must not publish a DS for this zone.</p>
+      <div class="row"><button class="btn" id="sec-parent">Look up the DS at the parent</button></div><div id="sec-parent-out">${parentHtml(d.parent, st)}</div>`}
+    ${owner && !st.standby ? `<h3>${st.enabled ? 'Turn signing off' : 'Turn signing on'}</h3>
+      <div class="row">${st.enabled ? '<button class="btn danger" id="sec-off">Turn off signing…</button>' : '<button class="btn primary" id="sec-on">Turn on signing…</button>'}</div>` : ''}
+    <p class="hint" style="margin-top:14px">Signed zones do not synthesize automatic PTR answers. To replace the key: remove the DS at the registrar, wait for its TTL, turn signing off, then on again with a new key (see the README).</p>`;
+}
+function wireDnssec(z, d) {
+  const st = S.dnssec && S.dnssec.zone === z.name ? S.dnssec.st : null; if (!st) return;
+  const ck = $('#sec-check', d);
+  if (ck) ck.onclick = async () => {
+    S.dnssec.check = { loading: true }; $('#sec-check-out').innerHTML = checkHtml(S.dnssec.check); ck.disabled = true;
+    try { S.dnssec.check = await GET(`/zones/${encodeURIComponent(z.name)}/dnssec/check`); } catch (e) { S.dnssec.check = { err: e.message }; }
+    if ($('#sec-check-out')) { $('#sec-check-out').innerHTML = checkHtml(S.dnssec.check); ck.disabled = false; }
+  };
+  const pb = $('#sec-parent', d);
+  if (pb) pb.onclick = async () => {
+    S.dnssec.parent = { loading: true }; $('#sec-parent-out').innerHTML = parentHtml(S.dnssec.parent, st); pb.disabled = true;
+    try { S.dnssec.parent = await GET(`/zones/${encodeURIComponent(z.name)}/dnssec/parent`); } catch (e) { S.dnssec.parent = { err: e.message }; }
+    if ($('#sec-parent-out')) { $('#sec-parent-out').innerHTML = parentHtml(S.dnssec.parent, st); pb.disabled = false; }
+  };
+  if ($('#sec-on', d)) $('#sec-on', d).onclick = () => dnssecOnModal(z, st);
+  if ($('#sec-off', d)) $('#sec-off', d).onclick = () => dnssecOffModal(z);
+}
+async function afterDnssecChange(z, st) {
+  S.dnssec = { zone: z.name, st, check: null, parent: null };
+  await reloadZone(); await refreshZones();
+  openZonePanel('dnssec');
+}
+function dnssecOnModal(z, st) {
+  const zn = noDot(z.fqdn);
+  openModal(`<h2>Turn on DNSSEC signing</h2>
+    <div id="so-step1">
+      <p>This server signs <b class="mono">${esc(zn)}</b> from now on:</p>
+      <ul class="hint" style="line-height:1.6;padding-left:18px;margin:6px 0">
+        <li>${st.key ? `The existing key (tag ${st.key.key_tag}) is used again.` : 'A signing key (ECDSA P-256) is generated and kept in this server\'s database; standbys receive it.'}</li>
+        <li>Resolvers that ask for DNSSEC data get signatures and proofs; answers for everyone else stay the same. The serial changes once.</li>
+        <li><b>Nothing changes for validating resolvers until you publish the DS record at your registrar.</b> Before that, check the signatures here; turning signing off again is safe.</li>
+        <li>After the DS is published, the zone depends on the signatures: every nameserver of the zone must serve it signed, and signing may only be turned off after the DS is removed again.</li>
+      </ul>
+      <label style="display:flex;gap:8px;align-items:center;margin-top:10px"><input type="checkbox" id="so-ack"> I understand that publishing the DS at the registrar is a separate, later step</label>
+    </div>
+    <div id="so-step2" class="hidden">
+      <p><b>Confirm:</b> sign <span class="mono">${esc(zn)}</span> now. The change is recorded in the zone's change log.</p>
+      ${st.key ? `<label style="display:flex;gap:8px;align-items:center;margin-top:10px"><input type="checkbox" id="so-new"> Use a new key instead of key ${st.key.key_tag} (its DS changes; only when no DS of the old key is published)</label>` : ''}
+    </div>
+    <div class="error" id="so-err"></div>
+    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn" id="so-next" disabled>Continue</button><button class="btn primary hidden" id="so-ok">Turn on signing</button></div>`, m => {
+    const ack = m.querySelector('#so-ack'), next = m.querySelector('#so-next'), ok = m.querySelector('#so-ok');
+    ack.onchange = () => { next.disabled = !ack.checked; };
+    next.onclick = () => { m.querySelector('#so-step1').classList.add('hidden'); m.querySelector('#so-step2').classList.remove('hidden'); next.classList.add('hidden'); ok.classList.remove('hidden'); };
+    ok.onclick = async () => {
+      ok.disabled = true; m.querySelector('#so-err').textContent = '';
+      const nk = m.querySelector('#so-new');
+      try { const r = await PUT(`/zones/${encodeURIComponent(z.name)}/dnssec`, { enabled: true, new_key: !!(nk && nk.checked) }); closeModal(); toast(`${zn} is signed (key ${r.key.key_tag})`, 'ok'); afterDnssecChange(z, r); }
+      catch (e) { m.querySelector('#so-err').textContent = e.message; ok.disabled = false; }
+    };
+  });
+}
+function dnssecOffModal(z) {
+  const zn = noDot(z.fqdn);
+  openModal(`<h2>Turn off DNSSEC signing</h2>
+    <div class="note warn">${ico('warn', 's')}<span>If the parent zone still publishes a DS record for <b class="mono">${esc(zn)}</b>, turning signing off makes the zone <b>fail for every validating resolver</b> (SERVFAIL) until the DS is gone from their caches.</span></div>
+    <p>First remove the DS record at your registrar, then wait until the parent's DS TTL has passed (often one to two days). This server checks the parent before turning signing off and refuses while a DS is found or cannot be ruled out.</p>
+    <p class="hint">The key is kept: turning signing on again reuses it.</p>
+    <label style="display:flex;gap:8px;align-items:center;margin-top:10px"><input type="checkbox" id="sf-ack"> The DS is removed at the registrar and its TTL has passed</label>
+    <div class="error" id="sf-err" style="word-break:break-word"></div>
+    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn danger" id="sf-ok" disabled>Turn off signing</button></div>`, m => {
+    const ack = m.querySelector('#sf-ack'), ok = m.querySelector('#sf-ok');
+    ack.onchange = () => { ok.disabled = !ack.checked; };
+    ok.onclick = async () => {
+      ok.disabled = true; m.querySelector('#sf-err').textContent = '';
+      try { const r = await PUT(`/zones/${encodeURIComponent(z.name)}/dnssec`, { enabled: false }); closeModal(); toast(`Signing is off for ${zn}`, 'ok'); afterDnssecChange(z, r); }
+      catch (e) { m.querySelector('#sf-err').textContent = e.code === 'ds_published' ? `Not turned off: ${e.message}.` : e.message; ok.disabled = false; }
+    };
+  });
 }
 function accessHtml(z) {
   return `<p class="hint">Editors can change records. Viewers can only read. Ownership is set in Settings by an administrator.</p>

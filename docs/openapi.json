@@ -1360,6 +1360,241 @@
         }
       }
     },
+    "/zones/{zone}/dnssec": {
+      "get": {
+        "tags": [
+          "DNSSEC"
+        ],
+        "summary": "DNSSEC status of a zone",
+        "description": "Signing state, the key (public part), the DS records for the registrar and the signature window. Needs the viewer role.",
+        "operationId": "get_dnssec",
+        "parameters": [
+          {
+            "name": "zone",
+            "in": "path",
+            "description": "Zone name, e.g. `example.com`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "example.com"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Status.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DnssecStatus"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "DNSSEC"
+        ],
+        "summary": "Turn DNSSEC signing on or off",
+        "description": "Needs the owner role. **On**: the zone is signed from now on (a key is generated the first time). Nothing changes for resolvers until the DS record is published at the registrar. **Off**: refused with 409 `ds_published` while the parent publishes a DS for the zone (or when that cannot be checked): remove the DS at the registrar first and wait for its TTL. `force: true` skips that check.",
+        "operationId": "set_dnssec",
+        "parameters": [
+          {
+            "name": "zone",
+            "in": "path",
+            "description": "Zone name, e.g. `example.com`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "example.com"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DnssecInput"
+              },
+              "example": {
+                "enabled": true
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "New status.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DnssecStatus"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/ConflictOrReadOnly"
+          }
+        }
+      }
+    },
+    "/zones/{zone}/dnssec/ds": {
+      "get": {
+        "tags": [
+          "DNSSEC"
+        ],
+        "summary": "DS records to publish at the registrar",
+        "description": "SHA-256 (digest type 2, publish this one) and SHA-384 (4) DS records of the zone's key. Empty before signing was ever turned on. Needs the viewer role.",
+        "operationId": "get_ds",
+        "parameters": [
+          {
+            "name": "zone",
+            "in": "path",
+            "description": "Zone name, e.g. `example.com`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "example.com"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "DS records.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DsList"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/zones/{zone}/dnssec/check": {
+      "get": {
+        "tags": [
+          "DNSSEC"
+        ],
+        "summary": "Check this server's signed answers (before adding the DS)",
+        "description": "Queries this server's own answers with the DO bit (DNSKEY, SOA, NS, a sample of names, a name that does not exist, a missing type) and validates every signature and denial-of-existence proof with the zone's key. Only this server is checked: other name servers of the zone are not. Needs the viewer role; 409 while signing is off.",
+        "operationId": "check_dnssec",
+        "parameters": [
+          {
+            "name": "zone",
+            "in": "path",
+            "description": "Zone name, e.g. `example.com`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "example.com"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Results.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DnssecCheck"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        }
+      }
+    },
+    "/zones/{zone}/dnssec/parent": {
+      "get": {
+        "tags": [
+          "DNSSEC"
+        ],
+        "summary": "Is the DS published at the parent?",
+        "description": "Looks up the zone's DS record through the first forwarding upstream (a recursive resolver) and compares it with the zone's key: `present` (matches), `absent`, `mismatch` (a DS for another key: validating resolvers fail the zone) or `unknown` (no upstream configured, or the lookup failed). Needs the viewer role.",
+        "operationId": "get_parent_ds",
+        "parameters": [
+          {
+            "name": "zone",
+            "in": "path",
+            "description": "Zone name, e.g. `example.com`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "example.com"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "What the parent publishes.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ParentDsCheck"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
     "/zones/{zone}/export": {
       "get": {
         "tags": [
@@ -4041,6 +4276,366 @@
           }
         }
       },
+      "DnssecCheck": {
+        "type": "object",
+        "description": "This server's own signed answers, validated with the zone's key.",
+        "required": [
+          "zone",
+          "ok",
+          "key_tag",
+          "checked_at",
+          "checks",
+          "note"
+        ],
+        "properties": {
+          "zone": {
+            "type": "string"
+          },
+          "ok": {
+            "type": "boolean",
+            "description": "Every check passed."
+          },
+          "key_tag": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "checked_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "checks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DnssecCheckItem"
+            }
+          },
+          "note": {
+            "type": "string"
+          }
+        },
+        "example": {
+          "checked_at": "2026-01-15T09:30:00.000Z",
+          "checks": [
+            {
+              "detail": "NOERROR, 1 answer and 0 authority RRsets verified",
+              "ok": true,
+              "query": "example.com. DNSKEY"
+            }
+          ],
+          "key_tag": 12345,
+          "note": "These are this server's answers only; validating resolvers start checking once the DS is published at the parent.",
+          "ok": true,
+          "zone": "example.com"
+        }
+      },
+      "DnssecCheckItem": {
+        "type": "object",
+        "description": "One query of the self-check.",
+        "required": [
+          "query",
+          "ok",
+          "detail"
+        ],
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "e.g. `example.com. DNSKEY`."
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "detail": {
+            "type": "string"
+          }
+        }
+      },
+      "DnssecInput": {
+        "type": "object",
+        "description": "Turn signing on or off.",
+        "required": [
+          "enabled"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "true: sign the zone (a key is generated the first time); false: stop\nsigning (the key is kept, turning signing on again reuses it)."
+          },
+          "force": {
+            "type": "boolean",
+            "description": "Turning off: skip the check that the parent publishes no DS. Only\nwhen the DS is already gone from the registrar and its TTL passed but\nthe check cannot confirm it. With a DS still published, the zone\nfails to resolve for every validating resolver."
+          },
+          "new_key": {
+            "type": "boolean",
+            "description": "Turning on while off: replace the kept key with a new one (a new DS\nmust then be published at the registrar)."
+          }
+        }
+      },
+      "DnssecKeyView": {
+        "type": "object",
+        "description": "The zone's signing key (public part only).",
+        "required": [
+          "key_tag",
+          "algorithm",
+          "algorithm_name",
+          "flags",
+          "public_key",
+          "dnskey",
+          "created_at"
+        ],
+        "properties": {
+          "key_tag": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "algorithm": {
+            "type": "integer",
+            "format": "int32",
+            "description": "13 = ECDSA Curve P-256 with SHA-256.",
+            "minimum": 0
+          },
+          "algorithm_name": {
+            "type": "string",
+            "example": "ECDSAP256SHA256"
+          },
+          "flags": {
+            "type": "integer",
+            "format": "int32",
+            "description": "257 = zone key and secure entry point (one combined signing key).",
+            "minimum": 0
+          },
+          "public_key": {
+            "type": "string",
+            "description": "Base64 public key (64 bytes)."
+          },
+          "dnskey": {
+            "type": "string",
+            "description": "The DNSKEY record in zone-file form."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "DnssecState": {
+        "type": "string",
+        "description": "off | signing | error.",
+        "enum": [
+          "off",
+          "signing",
+          "error"
+        ]
+      },
+      "DnssecStatus": {
+        "type": "object",
+        "description": "DNSSEC status of a zone.",
+        "required": [
+          "zone",
+          "enabled",
+          "state",
+          "key",
+          "ds",
+          "signatures",
+          "error",
+          "signature_validity_days",
+          "resign_before_days",
+          "standby"
+        ],
+        "properties": {
+          "zone": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "Signing is on for this zone."
+          },
+          "state": {
+            "$ref": "#/components/schemas/DnssecState"
+          },
+          "key": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DnssecKeyView",
+                "description": "Present once a key exists (signing was turned on at least once)."
+              }
+            ]
+          },
+          "ds": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DsRecordView"
+            },
+            "description": "DS records for the registrar (empty without a key)."
+          },
+          "signatures": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SignatureInfo",
+                "description": "The signatures currently served (null when not signing)."
+              }
+            ]
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why signing failed (state `error`)."
+          },
+          "signature_validity_days": {
+            "type": "integer",
+            "format": "int32",
+            "description": "`[dnssec].signature_validity_days`.",
+            "minimum": 0
+          },
+          "resign_before_days": {
+            "type": "integer",
+            "format": "int32",
+            "description": "`[dnssec].resign_before_days`.",
+            "minimum": 0
+          },
+          "standby": {
+            "type": "boolean",
+            "description": "This server is a read-only standby: it signs in memory with the\nreplicated key and never re-signs by itself."
+          }
+        },
+        "example": {
+          "ds": [
+            {
+              "algorithm": 13,
+              "digest": "3490A6806D47F17A34C29E2CE80E8A999FFBE4BE3A1C5B8BCCDE3CFB5A0BA3B5",
+              "digest_name": "SHA-256",
+              "digest_type": 2,
+              "key_tag": 12345,
+              "recommended": true,
+              "record": "example.com. IN DS 12345 13 2 3490A6806D47F17A34C29E2CE80E8A999FFBE4BE3A1C5B8BCCDE3CFB5A0BA3B5"
+            }
+          ],
+          "enabled": true,
+          "error": null,
+          "key": {
+            "algorithm": 13,
+            "algorithm_name": "ECDSAP256SHA256",
+            "created_at": "2026-01-15T09:30:00.000Z",
+            "dnskey": "example.com. 3600 IN DNSKEY 257 3 13 mdsswUyr3DPW132mOi8V9xESWE8jTo0dxCjjnopKl+GqJxpVXckHAeF+KkxLbxILfDLUT0rAK9iUzy1L53eKGQ==",
+            "flags": 257,
+            "key_tag": 12345,
+            "public_key": "mdsswUyr3DPW132mOi8V9xESWE8jTo0dxCjjnopKl+GqJxpVXckHAeF+KkxLbxILfDLUT0rAK9iUzy1L53eKGQ=="
+          },
+          "resign_before_days": 7,
+          "signature_validity_days": 14,
+          "signatures": {
+            "expiration": "2026-01-29T08:30:00Z",
+            "inception": "2026-01-15T08:30:00Z",
+            "next_resign": "2026-01-22T08:30:00Z",
+            "nsec_names": 17,
+            "serial": 2026011502,
+            "signed_rrsets": 42
+          },
+          "standby": false,
+          "state": "signing",
+          "zone": "example.com"
+        }
+      },
+      "DsList": {
+        "type": "object",
+        "description": "The DS records of the zone's key.",
+        "required": [
+          "zone",
+          "key_tag",
+          "ds"
+        ],
+        "properties": {
+          "zone": {
+            "type": "string"
+          },
+          "key_tag": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Null when the zone has no key yet.",
+            "minimum": 0
+          },
+          "ds": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DsRecordView"
+            }
+          }
+        },
+        "example": {
+          "ds": [
+            {
+              "algorithm": 13,
+              "digest": "3490A6806D47F17A34C29E2CE80E8A999FFBE4BE3A1C5B8BCCDE3CFB5A0BA3B5",
+              "digest_name": "SHA-256",
+              "digest_type": 2,
+              "key_tag": 12345,
+              "recommended": true,
+              "record": "example.com. IN DS 12345 13 2 3490A6806D47F17A34C29E2CE80E8A999FFBE4BE3A1C5B8BCCDE3CFB5A0BA3B5"
+            }
+          ],
+          "key_tag": 12345,
+          "zone": "example.com"
+        }
+      },
+      "DsRecordView": {
+        "type": "object",
+        "description": "A DS record for the parent zone (the registrar).",
+        "required": [
+          "key_tag",
+          "algorithm",
+          "digest_type",
+          "digest_name",
+          "digest",
+          "record",
+          "recommended"
+        ],
+        "properties": {
+          "key_tag": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "algorithm": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "digest_type": {
+            "type": "integer",
+            "format": "int32",
+            "description": "2 = SHA-256 (publish this one), 4 = SHA-384.",
+            "minimum": 0
+          },
+          "digest_name": {
+            "type": "string",
+            "example": "SHA-256"
+          },
+          "digest": {
+            "type": "string",
+            "description": "Hex, upper case."
+          },
+          "record": {
+            "type": "string",
+            "description": "`example.com. IN DS <key tag> 13 2 <digest>`."
+          },
+          "recommended": {
+            "type": "boolean",
+            "description": "The one to publish unless the registrar asks for another digest."
+          }
+        }
+      },
       "EnrollPayload": {
         "type": "object",
         "description": "TOTP enrollment data.",
@@ -4113,7 +4708,7 @@
               },
               {
                 "$ref": "#/components/schemas/ErrorCode",
-                "description": "Machine-readable reason when one applies: `login_required`,\n`mfa_required`, `enroll_required` (401) or `csrf` (403, cookie write\nwithout `X-Requested-With: rust-dns`). `invalid_request`: the request\ncould not be parsed (malformed JSON, wrong field type or value,\nunparsable path or query parameter, missing JSON content type).\n`read_only_standby` (409): this server is a read-only standby; write\nto the primary named in the message."
+                "description": "Machine-readable reason when one applies: `login_required`,\n`mfa_required`, `enroll_required` (401) or `csrf` (403, cookie write\nwithout `X-Requested-With: rust-dns`). `invalid_request`: the request\ncould not be parsed (malformed JSON, wrong field type or value,\nunparsable path or query parameter, missing JSON content type).\n`read_only_standby` (409): this server is a read-only standby; write\nto the primary named in the message. `ds_published` (409): DNSSEC\nsigning cannot be turned off while the parent publishes a DS."
               }
             ]
           }
@@ -4132,7 +4727,8 @@
           "enroll_required",
           "csrf",
           "invalid_request",
-          "read_only_standby"
+          "read_only_standby",
+          "ds_published"
         ]
       },
       "ExportDoc": {
@@ -5294,6 +5890,70 @@
           "ok"
         ]
       },
+      "ParentDsCheck": {
+        "type": "object",
+        "description": "What the parent zone publishes, looked up through the forwarding upstream.",
+        "required": [
+          "zone",
+          "state",
+          "detail",
+          "upstream",
+          "parent_ds",
+          "expected"
+        ],
+        "properties": {
+          "zone": {
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/ParentDsState"
+          },
+          "detail": {
+            "type": "string"
+          },
+          "upstream": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The resolver asked (the first forwarding upstream)."
+          },
+          "parent_ds": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "DS records the parent publishes (presentation form)."
+          },
+          "expected": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "DS records of this zone's key."
+          }
+        },
+        "example": {
+          "detail": "no DS record for example.com. at the parent",
+          "expected": [
+            "example.com. IN DS 12345 13 2 3490A6806D47F17A34C29E2CE80E8A999FFBE4BE3A1C5B8BCCDE3CFB5A0BA3B5"
+          ],
+          "parent_ds": [],
+          "state": "absent",
+          "upstream": "1.1.1.1:53",
+          "zone": "example.com"
+        }
+      },
+      "ParentDsState": {
+        "type": "string",
+        "description": "present | absent | mismatch | unknown.",
+        "enum": [
+          "present",
+          "absent",
+          "mismatch",
+          "unknown"
+        ]
+      },
       "PasswordBody": {
         "type": "object",
         "required": [
@@ -5700,7 +6360,8 @@
           "TLSA",
           "SSHFP",
           "NAPTR",
-          "HINFO"
+          "HINFO",
+          "DS"
         ],
         "example": "A"
       },
@@ -6345,6 +7006,53 @@
           "config",
           "console"
         ]
+      },
+      "SignatureInfo": {
+        "type": "object",
+        "description": "The signatures served now.",
+        "required": [
+          "serial",
+          "inception",
+          "expiration",
+          "next_resign",
+          "signed_rrsets",
+          "nsec_names"
+        ],
+        "properties": {
+          "serial": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Zone serial they were computed for.",
+            "maximum": 4294967295,
+            "minimum": 0
+          },
+          "inception": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "expiration": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "next_resign": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When the primary re-signs (bumps the serial); null on a standby,\nwhich follows the primary's re-signs."
+          },
+          "signed_rrsets": {
+            "type": "integer",
+            "description": "RRsets signed (NSEC RRsets included).",
+            "minimum": 0
+          },
+          "nsec_names": {
+            "type": "integer",
+            "description": "Names in the NSEC chain.",
+            "minimum": 0
+          }
+        }
       },
       "Snapshot": {
         "type": "object",
@@ -7340,6 +8048,10 @@
               "null"
             ],
             "format": "int64"
+          },
+          "dnssec": {
+            "type": "boolean",
+            "description": "DNSSEC signing is on (see `/zones/{zone}/dnssec`); absent when off."
           }
         }
       },
@@ -7875,6 +8587,10 @@
     {
       "name": "Records",
       "description": "Search and edit resource records inside a zone."
+    },
+    {
+      "name": "DNSSEC",
+      "description": "Per-zone DNSSEC signing (ECDSA P-256, NSEC): status, turning it on and off, the DS records for the registrar, a check of this server's signed answers and a lookup of the DS at the parent."
     },
     {
       "name": "Access",
