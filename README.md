@@ -24,7 +24,7 @@ Single static binary, one SQLite file, one TOML config. Zero JavaScript build.
 - Per-client rate limiting (N queries per second per address) with an LRU cap
   on tracked addresses so a flood cannot exhaust memory.
 - PROXY protocol v1/v2 for DNS-over-TCP behind HAProxy or a cloud NLB.
-- DNS Cookies (RFC 7873), EDNS NSID, outbound AXFR and NOTIFY for secondaries,
+- DNS Cookies (RFC 7873), EDNS NSID, outbound AXFR and NOTIFY for secondaries (TSIG-authenticated, RFC 8945),
   plus IDN zone and record names.
 - Config reload on SIGHUP or `POST /api/admin/reload`; listener, database, log
   target, and PROXY listener settings require a restart.
@@ -144,6 +144,61 @@ starting listeners or changing the file.
 Scheduled backups use SQLite's online backup API; the configured number of
 timestamped database snapshots is retained.
 
+## Securing zone transfers with TSIG
+
+For a public zone run rust-dns as a *hidden primary*: it is not listed in the
+zone's NS records, and one or more secondaries (Hurricane Electric's free
+secondary service, a BIND/NSD box, ...) pull the zone by AXFR and answer the
+internet. Transfers and NOTIFY are then authenticated with TSIG (RFC 8945)
+shared keys in addition to the address allow-list.
+
+1. In the console open **Admin → TSIG keys → New key**. Name the key (a DNS
+   name, e.g. `hn-secondary.`), pick the algorithm (hmac-sha256 unless the
+   secondary needs another; hmac-sha1 is offered only as legacy), and either
+   **Generate** a secret or **Import** the base64 secret the provider
+   generated. Optionally limit the key to the zones that secondary serves.
+   The secret is shown once, with a ready-to-paste BIND `key`/`zone`
+   configuration and a `dig -y ... AXFR` test command. Showing it again later
+   (`POST /api/tsig/keys/{name}/reveal`) is recorded in the audit log; the
+   secret itself never appears in the audit log, changelog or server logs.
+2. Configure the policy in the config file and reload (SIGHUP or
+   `POST /api/admin/reload`):
+
+```toml
+[transfer]
+allow = ["216.218.133.2/32", "2001:470:600::2/128"]  # the secondary's transfer addresses
+require_tsig = true           # unsigned transfer requests are refused
+notify_key = "hn-secondary."  # signs NOTIFY; empty = unsigned
+notify = ["216.218.130.2:53"] # or [{ address = "203.0.113.5:53", key = "other-secondary." }]
+```
+
+A transfer (AXFR, or IXFR which is answered with the full zone) is served only
+when the client address is in `allow` **and**, if the request is signed or
+`require_tsig` is on, the signature verifies with a key that covers the zone.
+A signed request with an unknown key gets NOTAUTH/BADKEY, a bad MAC
+NOTAUTH/BADSIG (both unsigned), a clock more than 300 s off NOTAUTH/BADTIME
+(signed, with the server's time); it is never treated as unsigned. Signed
+requests get signed answers, and every message of a multi-message AXFR is
+signed with MAC chaining (RFC 8945 §5.3.1). Signed NOTIFY responses are
+verified and failures are logged. `require_tsig` defaults to `false` for
+existing setups; it is recommended to turn it on. The console shows the policy
+in effect on the TSIG keys page. Keys are stored in the database (as backups
+are), so protect database files and backups accordingly.
+
+On a BIND secondary:
+
+```
+key "hn-secondary." { algorithm hmac-sha256; secret "<base64 secret>"; };
+zone "example.com" {
+    type secondary;
+    file "example.com.db";
+    primaries { 192.0.2.1 key "hn-secondary."; };
+};
+```
+
+Test from an allowed address with
+`dig -y hmac-sha256:hn-secondary.:<secret> @192.0.2.1 example.com AXFR`.
+
 ## API
 
 Everything the console does goes through `/api`. Authenticate with a session
@@ -250,17 +305,18 @@ cargo test --test openapi_spec     # completeness of the generated document (ids
 cargo test --bin rust-dns openapi  # docs/openapi.json equals the document generated from the code (UPDATE_OPENAPI=1 refreshes it)
 node tests/ui/duration.test.js     # console duration parser (1m, 1h, 6d12h14s)
 cargo test                          # unit tests + end-to-end (spawns the binary, drives API and DNS)
-scripts/conformance.py <zone> <ip> <port>   # 76 RFC conformance checks (needs dnspython and a seeded zone)
+scripts/conformance.py <zone> <ip> <port>   # 85 RFC conformance checks (incl. TSIG) (needs dnspython and a seeded zone)
 scripts/compliance.sh <zone> <ip> <port>    # ISC DNS Compliance Testing (genreport), builds it on first run
 scripts/e2e-dig.sh <zone> <ip> <port>       # human-readable dig walkthrough
 scripts/conformance-local.sh                # starts a temporary server, seeds it, runs all probes
 scripts/load-test-local.sh                  # short UDP load probe; intended for Linux
 ```
 
-Current status: the Rust suite passes (60 unit, 3 end-to-end, 5 API contract
-and 7 OpenAPI document tests), and the end-to-end tests include BIND import and
-paged record listing. The seeded
-conformance runner passes 76/76, and ISC genreport reports all protocol and
+Current status: the Rust suite passes (80 unit, 6 end-to-end including
+`tests/tsig.rs`, 5 API contract and 8 OpenAPI document tests), and the
+end-to-end tests include BIND import, paged record listing and TSIG-signed
+transfers and NOTIFY. The seeded
+conformance runner passes 85/85, and ISC genreport reports all protocol and
 record-type probes as `ok`. BIND's `named-checkzone` loads exported zone files.
 CI runs formatting, clippy, the Rust test suite, conformance, and a short Linux
 UDP load probe.
@@ -276,7 +332,6 @@ ceiling is the OS loopback path, not the server. Resident memory stays around
 ## Not yet
 
 - DNSSEC signing (NSEC/NSEC3, key management, DS publication).
-- TSIG for AXFR and NOTIFY; transfers are restricted by client network.
 - Changelog follower mode and inbound NOTIFY/secondary service.
 - DNS over TLS/HTTPS, response tuple rate limiting, and per-zone forwarding,
   reverse-zone, transfer ACL, and NOTIFY overrides.

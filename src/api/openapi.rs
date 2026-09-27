@@ -52,6 +52,7 @@ This document is generated from the server's code, so it always matches the runn
         (name = "Users", description = "User administration (administrators)."),
         (name = "Tokens", description = "API tokens for scripts and automation."),
         (name = "Server", description = "Health, status, metrics and server administration."),
+        (name = "TSIG", description = "TSIG keys (RFC 8945) that authenticate zone transfers and NOTIFY for secondaries, and the transfer policy in effect (administrators)."),
     ),
     security(("bearer" = []), ("cookie" = [])),
     components(

@@ -112,6 +112,11 @@ async fn main() -> anyhow::Result<()> {
             tracing::error!(error = %e, "stored forwarding settings are unreadable; using the config file")
         }
     }
+    // TSIG keys for zone transfers and NOTIFY.
+    dns.reload_tsig_keys(&storage)?;
+    for w in dns.transfer_warnings() {
+        tracing::warn!("{w}");
+    }
     let dns_task = tokio::spawn(dns::serve(dns.clone()));
     tokio::spawn(dns::notify::run(dns.clone()));
 

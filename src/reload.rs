@@ -32,6 +32,10 @@ impl Reloader {
         notes.push(
             "forwarding, transfer, rate limit, cookies, nsid, auto_ptr, minimal_any applied".into(),
         );
+        for w in self.dns.transfer_warnings() {
+            tracing::warn!("{w}");
+            notes.push(format!("warning: {w}"));
+        }
         if self.dns.forwarding_override().is_some() {
             notes.push(
                 "forwarding upstreams/allowed clients/timeout: the console settings still override [forwarding] in the file (reset them in Server settings to use the file)".into(),

@@ -20,6 +20,7 @@ pub mod accounts;
 pub mod replay;
 pub mod settings;
 mod sql;
+pub mod tsig;
 
 use crate::cache::{Cache, Catalog};
 use crate::events::Bus;

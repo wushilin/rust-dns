@@ -2589,6 +2589,276 @@
         }
       }
     },
+    "/tsig/keys": {
+      "get": {
+        "tags": [
+          "TSIG"
+        ],
+        "summary": "List TSIG keys (admin)",
+        "description": "Names, algorithms and zone scopes. Secrets are never listed. Needs `server_admin`.",
+        "operationId": "list_tsig_keys",
+        "responses": {
+          "200": {
+            "description": "Keys, sorted by name.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TsigKeyList"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "TSIG"
+        ],
+        "summary": "Create a TSIG key (admin)",
+        "description": "Generates a random secret, or imports `secret` (base64) when the secondary provider generated the key. The secret is returned only in this response (later: `POST /tsig/keys/{name}/reveal`, audited). Recorded in the audit log as `tsig.create` without the secret. Takes effect at once. Needs `server_admin`.",
+        "operationId": "create_tsig_key",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TsigKeyInput"
+              },
+              "examples": {
+                "generate": {
+                  "summary": "Generate a secret, key limited to one zone",
+                  "value": {
+                    "algorithm": "hmac-sha256",
+                    "name": "hn-secondary.",
+                    "zones": [
+                      "example.com"
+                    ]
+                  }
+                },
+                "import": {
+                  "summary": "Import a secret from the secondary provider, all zones",
+                  "value": {
+                    "algorithm": "hmac-sha512",
+                    "name": "he-import.",
+                    "secret": "3q2+796tvu/erb7v3q2+796tvu/erb7v3q2+796tvu/erb7v3q2+796tvu/erb7v3q2+796tvu/erb7v3q2+7w=="
+                  }
+                }
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Created. The secret is shown only here.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TsigKeyCreated"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        }
+      }
+    },
+    "/tsig/keys/{name}": {
+      "put": {
+        "tags": [
+          "TSIG"
+        ],
+        "summary": "Change the zones a TSIG key may transfer (admin)",
+        "description": "Replaces the zone scope; an empty list allows every zone. The secret and algorithm cannot be changed (create a new key and delete the old one). Recorded as `tsig.update`. Needs `server_admin`.",
+        "operationId": "update_tsig_key",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Key name, with or without the trailing dot (`hn-secondary.`).",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TsigKeyZones"
+              },
+              "example": {
+                "zones": [
+                  "example.com",
+                  "example.org"
+                ]
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Updated key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TsigKeyInfo"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "TSIG"
+        ],
+        "summary": "Delete a TSIG key (admin)",
+        "description": "Secondaries using it can no longer transfer; NOTIFY configured with it is no longer sent. Recorded as `tsig.delete`. Needs `server_admin`.",
+        "operationId": "delete_tsig_key",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Key name, with or without the trailing dot (`hn-secondary.`).",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Deleted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                },
+                "example": {
+                  "status": "deleted"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/tsig/keys/{name}/reveal": {
+      "post": {
+        "tags": [
+          "TSIG"
+        ],
+        "summary": "Show a TSIG key's secret (admin, audited)",
+        "description": "Returns the base64 secret, e.g. to configure another secondary. Every call is recorded in the audit log as `tsig.reveal` (without the secret). Needs `server_admin`.",
+        "operationId": "reveal_tsig_key",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Key name, with or without the trailing dot (`hn-secondary.`).",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The secret.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TsigKeySecret"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/settings/transfer": {
+      "get": {
+        "tags": [
+          "TSIG"
+        ],
+        "summary": "Zone transfer policy in effect (admin)",
+        "description": "Allowed networks, whether TSIG is required, and NOTIFY targets with their keys, from `[transfer]` in the config file (edit the file and reload to change them). Needs `server_admin`.",
+        "operationId": "get_transfer_settings",
+        "responses": {
+          "200": {
+            "description": "Policy in effect.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TransferSettingsView"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
     "/metrics": {
       "servers": [
         {
@@ -2951,7 +3221,8 @@
           "truncated",
           "bad_cookie",
           "transfers",
-          "notifies"
+          "notifies",
+          "tsig_errors"
         ],
         "properties": {
           "queries": {
@@ -3036,6 +3307,12 @@
             "type": "integer",
             "format": "int64",
             "description": "NOTIFY messages sent.",
+            "minimum": 0
+          },
+          "tsig_errors": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Signed requests rejected (unknown key, bad signature, clock skew, truncated MAC).",
             "minimum": 0
           }
         }
@@ -3841,6 +4118,34 @@
           "used_recovery_code": {
             "type": "boolean",
             "description": "True when a one-time recovery code (not a TOTP code) was used."
+          }
+        }
+      },
+      "NotifyTargetView": {
+        "type": "object",
+        "description": "One NOTIFY target from the config file.",
+        "required": [
+          "address",
+          "key",
+          "key_exists"
+        ],
+        "properties": {
+          "address": {
+            "type": "string",
+            "description": "`ip:port`.",
+            "example": "203.0.113.5:53"
+          },
+          "key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Key that signs NOTIFY to this target; `null`: unsigned.",
+            "example": "hn-secondary."
+          },
+          "key_exists": {
+            "type": "boolean",
+            "description": "False when `key` names a key that does not exist (then no NOTIFY is sent)."
           }
         }
       },
@@ -4751,10 +5056,77 @@
           ]
         }
       },
+      "TransferSettingsView": {
+        "type": "object",
+        "description": "The zone transfer policy in effect (`[transfer]` in the config file;\nchange it there and reload).",
+        "required": [
+          "allow",
+          "require_tsig",
+          "notify_key",
+          "notify",
+          "port",
+          "bind",
+          "warnings"
+        ],
+        "properties": {
+          "allow": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Client networks allowed to request transfers. Empty: transfers disabled.",
+            "example": [
+              "203.0.113.5/32"
+            ]
+          },
+          "require_tsig": {
+            "type": "boolean",
+            "description": "Transfers also need a valid TSIG signature."
+          },
+          "notify_key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Default key for NOTIFY (`[transfer].notify_key`); `null`: unsigned.",
+            "example": "hn-secondary."
+          },
+          "notify": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NotifyTargetView"
+            }
+          },
+          "port": {
+            "type": "integer",
+            "format": "int32",
+            "description": "DNS port this server listens on (for secondary configuration snippets).",
+            "minimum": 0
+          },
+          "bind": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "DNS listen addresses.",
+            "example": [
+              "::"
+            ]
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Problems with the settings in effect, e.g. a NOTIFY key that does not exist."
+          }
+        }
+      },
       "TransferStatus": {
         "type": "object",
         "required": [
           "allow",
+          "require_tsig",
           "notify"
         ],
         "properties": {
@@ -4764,11 +5136,211 @@
               "type": "string"
             }
           },
+          "require_tsig": {
+            "type": "boolean",
+            "description": "Transfers also need a valid TSIG signature (`[transfer].require_tsig`)."
+          },
           "notify": {
             "type": "array",
             "items": {
               "type": "string"
             }
+          }
+        }
+      },
+      "TsigAlgorithm": {
+        "type": "string",
+        "description": "HMAC algorithm of a TSIG key. `hmac-sha1` is legacy: only for secondaries\nthat support nothing better.",
+        "enum": [
+          "hmac-sha256",
+          "hmac-sha384",
+          "hmac-sha512",
+          "hmac-sha1"
+        ]
+      },
+      "TsigKeyCreated": {
+        "type": "object",
+        "description": "The created key and its secret. The secret is shown only here; later use\n`POST /tsig/keys/{name}/reveal` (audited).",
+        "required": [
+          "name",
+          "algorithm",
+          "zones",
+          "created_by",
+          "created_at",
+          "updated_at",
+          "secret"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "algorithm": {
+            "$ref": "#/components/schemas/TsigAlgorithm"
+          },
+          "zones": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "created_by": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "secret": {
+            "type": "string",
+            "description": "Base64 secret, for the secondary's configuration."
+          }
+        },
+        "example": {
+          "algorithm": "hmac-sha256",
+          "created_at": "2026-01-15T09:30:00.000Z",
+          "created_by": "root",
+          "name": "hn-secondary.",
+          "secret": "dGhpcyBpcyBub3QgYSByZWFsIHNlY3JldCBhdCBhbGw=",
+          "updated_at": "2026-01-15T09:30:00.000Z",
+          "zones": [
+            "example.com"
+          ]
+        }
+      },
+      "TsigKeyInfo": {
+        "type": "object",
+        "description": "A TSIG key (without its secret).",
+        "required": [
+          "name",
+          "algorithm",
+          "zones",
+          "created_by",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Key name: a DNS name, lowercase with a trailing dot. Secondaries must\nuse exactly this name."
+          },
+          "algorithm": {
+            "$ref": "#/components/schemas/TsigAlgorithm"
+          },
+          "zones": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Zones this key may transfer. Empty: every zone."
+          },
+          "created_by": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "example": {
+          "algorithm": "hmac-sha256",
+          "created_at": "2026-01-15T09:30:00.000Z",
+          "created_by": "root",
+          "name": "hn-secondary.",
+          "updated_at": "2026-01-15T09:30:00.000Z",
+          "zones": [
+            "example.com"
+          ]
+        }
+      },
+      "TsigKeyInput": {
+        "type": "object",
+        "description": "A new TSIG key. Without `secret` a random one is generated (as long as\nthe hash: 32 bytes for hmac-sha256); with `secret` the base64 value your\nsecondary provider gave you is imported.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "A DNS name such as `hn-secondary.` (a trailing dot is added; stored lowercase)."
+          },
+          "algorithm": {
+            "$ref": "#/components/schemas/TsigAlgorithm",
+            "description": "Default `hmac-sha256`."
+          },
+          "secret": {
+            "type": "string",
+            "description": "Base64 secret to import (16 to 512 bytes). Omit to generate one."
+          },
+          "zones": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Zones this key may transfer. Omitted or empty: every zone."
+          }
+        }
+      },
+      "TsigKeyList": {
+        "type": "object",
+        "required": [
+          "keys"
+        ],
+        "properties": {
+          "keys": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TsigKeyInfo"
+            }
+          }
+        }
+      },
+      "TsigKeySecret": {
+        "type": "object",
+        "description": "A key's secret.",
+        "required": [
+          "name",
+          "algorithm",
+          "secret"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "algorithm": {
+            "$ref": "#/components/schemas/TsigAlgorithm"
+          },
+          "secret": {
+            "type": "string",
+            "description": "Base64."
+          }
+        },
+        "example": {
+          "algorithm": "hmac-sha256",
+          "name": "hn-secondary.",
+          "secret": "dGhpcyBpcyBub3QgYSByZWFsIHNlY3JldCBhdCBhbGw="
+        }
+      },
+      "TsigKeyZones": {
+        "type": "object",
+        "description": "New zone scope of a key.",
+        "required": [
+          "zones"
+        ],
+        "properties": {
+          "zones": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Zones this key may transfer. Empty: every zone."
           }
         }
       },
@@ -5663,6 +6235,10 @@
     {
       "name": "Server",
       "description": "Health, status, metrics and server administration."
+    },
+    {
+      "name": "TSIG",
+      "description": "TSIG keys (RFC 8945) that authenticate zone transfers and NOTIFY for secondaries, and the transfer policy in effect (administrators)."
     }
   ]
 }

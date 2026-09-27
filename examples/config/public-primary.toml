@@ -1,7 +1,8 @@
 # Internet-facing primary nameserver for your own domains.
 # - No forwarding: foreign names get REFUSED (never an open resolver).
-# - Zone transfers and NOTIFY to a secondary (e.g. a BIND/NSD box or a
-#   provider's secondary DNS service).
+# - Hidden primary: zone transfers and NOTIFY to secondaries (e.g. a BIND/NSD
+#   box or a provider's secondary DNS service), authenticated with TSIG keys
+#   created in the console (Admin -> TSIG keys).
 # - Console bound to localhost and published through a TLS reverse proxy
 #   (see examples/proxy/nginx.conf).
 
@@ -23,7 +24,9 @@ upstreams = []                           # authoritative only
 
 [transfer]
 allow = ["198.51.100.53/32", "2001:db8:53::53/128"]    # your secondary nameserver(s)
-notify = ["198.51.100.53:53"]
+require_tsig = true                      # transfers also need a valid TSIG key
+notify_key = "ns2-secondary."            # key (created in the console) that signs NOTIFY
+notify = ["198.51.100.53:53"]            # or [{ address = "198.51.100.53:53", key = "ns2-secondary." }]
 
 [rate_limit]
 max_resolutions_per_second_per_address = 200

@@ -114,6 +114,19 @@ CREATE TABLE IF NOT EXISTS settings (
     updated_by  TEXT NOT NULL,
     updated_at  TEXT NOT NULL
 );
+-- TSIG keys (RFC 8945) for zone transfers and NOTIFY. Written only through
+-- audited transactions (src/mutation/tsig.rs). The secret is kept as raw bytes
+-- because HMAC needs it; it never leaves through the API except on create and
+-- the audited reveal. `zones` is a JSON array of zone names; empty = all zones.
+CREATE TABLE IF NOT EXISTS tsig_keys (
+    name        TEXT PRIMARY KEY,
+    algorithm   TEXT NOT NULL,
+    secret      BLOB NOT NULL,
+    zones       TEXT NOT NULL DEFAULT '[]',
+    created_by  TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS api_tokens (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -479,6 +492,15 @@ impl Storage {
     }
 
     /// A console/API setting: (JSON value, updated_by, updated_at).
+    /// Every TSIG key, secrets included (for the DNS keyring and reveal).
+    pub fn list_tsig_keys(&self) -> Result<Vec<StoredTsigKey>> {
+        self.with_conn(list_tsig_keys)
+    }
+
+    pub fn get_tsig_key(&self, name: &str) -> Result<Option<StoredTsigKey>> {
+        self.with_conn(|c| get_tsig_key(c, name))
+    }
+
     pub fn get_setting(&self, key: &str) -> Result<Option<(String, String, String)>> {
         self.with_conn(|c| {
             Ok(c.query_row(
@@ -1057,4 +1079,59 @@ mod tests {
         drop(backup);
         std::fs::remove_dir_all(dir).unwrap();
     }
+}
+
+/// A TSIG key as stored. `Debug` never prints the secret.
+#[derive(Clone)]
+pub struct StoredTsigKey {
+    /// Lowercase, absolute: `hn-secondary.`.
+    pub name: String,
+    /// `hmac-sha256`, `hmac-sha384`, `hmac-sha512` or `hmac-sha1`.
+    pub algorithm: String,
+    pub secret: Vec<u8>,
+    /// Zones the key may transfer; empty = all zones.
+    pub zones: Vec<String>,
+    pub created_by: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl std::fmt::Debug for StoredTsigKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredTsigKey")
+            .field("name", &self.name)
+            .field("algorithm", &self.algorithm)
+            .field("zones", &self.zones)
+            .finish_non_exhaustive()
+    }
+}
+
+const TSIG_COLS: &str = "name, algorithm, secret, zones, created_by, created_at, updated_at";
+
+fn row_to_tsig_key(r: &Row) -> rusqlite::Result<StoredTsigKey> {
+    let zones: String = r.get(3)?;
+    Ok(StoredTsigKey {
+        name: r.get(0)?,
+        algorithm: r.get(1)?,
+        secret: r.get(2)?,
+        zones: serde_json::from_str(&zones).unwrap_or_default(),
+        created_by: r.get(4)?,
+        created_at: r.get(5)?,
+        updated_at: r.get(6)?,
+    })
+}
+
+pub(crate) fn list_tsig_keys(c: &Connection) -> Result<Vec<StoredTsigKey>> {
+    let mut stmt = c.prepare(&format!("SELECT {TSIG_COLS} FROM tsig_keys ORDER BY name"))?;
+    let rows = stmt.query_map([], row_to_tsig_key)?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+pub(crate) fn get_tsig_key(c: &Connection, name: &str) -> Result<Option<StoredTsigKey>> {
+    Ok(c.query_row(
+        &format!("SELECT {TSIG_COLS} FROM tsig_keys WHERE name = ?1"),
+        params![name],
+        row_to_tsig_key,
+    )
+    .optional()?)
 }

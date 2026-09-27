@@ -1,5 +1,8 @@
 //! Turns a raw DNS request into a reply.
 
+use super::keyring::KeyEntry;
+use super::tsig::{self, Chain, SignParams, Signed, VerifyError};
+use super::Runtime;
 use super::{DnsServer, Proto, Reply};
 use crate::model::QueryEvent;
 use crate::ratelimit::Decision;
@@ -11,6 +14,7 @@ use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::BinDecodable;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering::Relaxed;
+use std::sync::Arc;
 use std::time::Instant;
 
 pub const VERSION_STRING: &str = concat!("rust-dns ", env!("CARGO_PKG_VERSION"));
@@ -32,6 +36,13 @@ struct Ctx {
     proto: Proto,
     started: Instant,
     udp_limit: usize,
+    /// Bytes kept free in UDP responses for the TSIG record added afterwards.
+    reserve: usize,
+}
+
+/// A request whose TSIG signature verified.
+struct SignedBy {
+    entry: Arc<KeyEntry>,
 }
 
 impl DnsServer {
@@ -77,6 +88,171 @@ impl DnsServer {
             return Reply::None;
         }
         let id = u16::from_be_bytes([req[0], req[1]]);
+        // TSIG (RFC 8945): a signed request is verified before anything else
+        // and never falls back to being treated as unsigned.
+        match tsig::find(req) {
+            Ok(None) => self.answer(req, client, proto, started, &rt, None).await,
+            Ok(Some(_)) if req[2] & 0x80 != 0 => Reply::None, // a response
+            Ok(Some(signed)) => {
+                self.answer_signed(req, signed, client, proto, started, &rt)
+                    .await
+            }
+            Err(e) => {
+                if req[2] & 0x80 != 0 {
+                    return Reply::None;
+                }
+                self.stats.errors.fetch_add(1, Relaxed);
+                self.stats.tsig_errors.fetch_add(1, Relaxed);
+                tracing::debug!(client = %client, error = e.0, "malformed TSIG record");
+                Reply::One(header_only(id, ResponseCode::FormErr))
+            }
+        }
+    }
+
+    /// Verify a signed request, answer it, and sign the answer (every
+    /// message of a multi-message transfer, chained per RFC 8945 §5.3.1).
+    async fn answer_signed(
+        &self,
+        req: &[u8],
+        signed: Signed,
+        client: SocketAddr,
+        proto: Proto,
+        started: Instant,
+        rt: &Runtime,
+    ) -> Reply {
+        let id = u16::from_be_bytes([req[0], req[1]]);
+        let ring = self.tsig_keys.load_full();
+        let entry = ring.get(&signed.tsig.key_name).cloned();
+        let now = tsig::now();
+        if let Err(e) = tsig::verify(
+            req,
+            &signed,
+            entry.as_ref().map(|e| &e.key),
+            Chain::Request,
+            now,
+        ) {
+            self.stats.tsig_errors.fetch_add(1, Relaxed);
+            tracing::warn!(client = %client.ip(), key = %signed.tsig.key_name, algorithm = %signed.tsig.algorithm_name, error = e.as_str(), "rejected TSIG-signed request");
+            if let VerifyError::FormErr(_) = e {
+                self.stats.errors.fetch_add(1, Relaxed);
+                return Reply::One(header_only(id, ResponseCode::FormErr));
+            }
+            let ctx = Ctx {
+                client,
+                proto,
+                started,
+                udp_limit: 65535,
+                reserve: 0,
+            };
+            return Reply::One(self.tsig_error_reply(
+                req,
+                &signed,
+                &e,
+                entry.as_deref(),
+                now,
+                &ctx,
+            ));
+        }
+        let Some(entry) = entry else {
+            return Reply::None; // verify() returns BADKEY without a key
+        };
+        let stripped = tsig::strip(req, &signed);
+        let by = SignedBy {
+            entry: entry.clone(),
+        };
+        let reply = self
+            .answer(&stripped, client, proto, started, rt, Some(&by))
+            .await;
+        let p = SignParams {
+            time: now,
+            fudge: tsig::MAX_FUDGE,
+            original_id: signed.tsig.original_id,
+            error: 0,
+            other: Vec::new(),
+        };
+        let sign_one = |m: &[u8], chain: Chain| -> (Vec<u8>, Vec<u8>) {
+            if m.len() < 12 {
+                return (m.to_vec(), Vec::new());
+            }
+            tsig::sign(m, &entry.key, chain, &p)
+        };
+        match reply {
+            Reply::None => Reply::None,
+            Reply::One(m) => Reply::One(sign_one(&m, Chain::Response(&signed.tsig.mac)).0),
+            Reply::Many(ms) => {
+                let mut prior = signed.tsig.mac.clone();
+                let mut out = Vec::with_capacity(ms.len());
+                for (i, m) in ms.iter().enumerate() {
+                    let chain = if i == 0 {
+                        Chain::Response(&prior)
+                    } else {
+                        Chain::Continuation(&prior)
+                    };
+                    let (signed_msg, mac) = sign_one(m, chain);
+                    prior = mac;
+                    out.push(signed_msg);
+                }
+                Reply::Many(out)
+            }
+        }
+    }
+
+    /// NOTAUTH with the TSIG error (RFC 8945 §5.2, §5.3.2): unsigned for an
+    /// unknown key or a bad MAC, signed for BADTIME (with our clock in Other
+    /// Data) and BADTRUNC.
+    fn tsig_error_reply(
+        &self,
+        req: &[u8],
+        signed: &Signed,
+        err: &VerifyError,
+        entry: Option<&KeyEntry>,
+        now: u64,
+        ctx: &Ctx,
+    ) -> Vec<u8> {
+        let t = &signed.tsig;
+        let stripped = tsig::strip(req, signed);
+        let mut resp = Message::new();
+        resp.set_id(u16::from_be_bytes([req[0], req[1]]))
+            .set_message_type(MessageType::Response)
+            .set_response_code(ResponseCode::NotAuth);
+        if let Ok(m) = Message::from_bytes(&stripped) {
+            resp.set_op_code(m.op_code());
+            for q in m.queries() {
+                resp.add_query(q.clone());
+            }
+        }
+        let bytes = self.finish(resp, ctx, "refused");
+        let p = SignParams {
+            time: t.time_signed,
+            fudge: t.fudge,
+            original_id: t.original_id,
+            error: err.code(),
+            other: if *err == VerifyError::BadTime {
+                tsig::time48(now).to_vec()
+            } else {
+                Vec::new()
+            },
+        };
+        match entry {
+            Some(e) if err.signed_reply() && bytes.len() >= 12 => {
+                tsig::sign(&bytes, &e.key, Chain::Response(&t.mac), &p).0
+            }
+            _ if bytes.len() >= 12 => tsig::unsigned(&bytes, &t.key_name, &t.algorithm_name, &p),
+            _ => bytes,
+        }
+    }
+
+    /// Answer a request (unsigned, or with its verified TSIG record removed).
+    async fn answer(
+        &self,
+        req: &[u8],
+        client: SocketAddr,
+        proto: Proto,
+        started: Instant,
+        rt: &Runtime,
+        signed_by: Option<&SignedBy>,
+    ) -> Reply {
+        let id = u16::from_be_bytes([req[0], req[1]]);
         let request = match Message::from_bytes(req) {
             Ok(m) => m,
             Err(e) => {
@@ -93,6 +269,9 @@ impl DnsServer {
             proto,
             started,
             udp_limit: 512,
+            reserve: signed_by
+                .map(|b| tsig::record_len(&b.entry.key.name, b.entry.key.algorithm, 0))
+                .unwrap_or(0),
         };
 
         let mut resp = Message::new();
@@ -193,24 +372,51 @@ impl DnsServer {
         let catalog = self.cache.load();
 
         // Zone transfers (RFC 5936 / 1995) for allowed secondaries.
+        // Policy: the client address must be in [transfer].allow AND, when
+        // signed, the key must cover the zone; unsigned requests are refused
+        // when [transfer].require_tsig is on.
         if super::axfr::is_transfer(qtype) {
             let key = crate::zones::key_of(&qname);
             let zone = catalog.zones.get(&key);
-            if zone.is_none() || !rt.may_transfer(client.ip()) {
+            let key_name = signed_by.map(|b| b.entry.key.name.as_str());
+            let refusal = match zone {
+                None => Some((false, "not a zone on this server")),
+                Some(_) if !rt.may_transfer(client.ip()) => {
+                    Some((false, "client address is not in [transfer].allow"))
+                }
+                Some(z) => match signed_by {
+                    Some(b) if !b.entry.allows_zone(&z.zone.name) => {
+                        Some((true, "the TSIG key is not allowed to transfer this zone"))
+                    }
+                    None if rt.require_tsig => {
+                        Some((true, "unsigned request and [transfer].require_tsig is on"))
+                    }
+                    _ => None,
+                },
+            };
+            if let Some((notable, why)) = refusal {
+                if notable {
+                    tracing::info!(client = %client.ip(), zone = %qname, key = ?key_name, why, "zone transfer refused");
+                } else {
+                    tracing::debug!(client = %client.ip(), zone = %qname, key = ?key_name, why, "zone transfer refused");
+                }
                 self.stats.refused.fetch_add(1, Relaxed);
                 resp.set_response_code(ResponseCode::Refused);
                 return Reply::One(self.finish(resp, &ctx, "refused"));
             }
-            let z = zone.unwrap();
+            let z = zone.expect("refused above when missing");
             self.stats.transfers.fetch_add(1, Relaxed);
-            tracing::info!(client = %client.ip(), zone = %z.zone.name, qtype = %qtype, proto = proto.as_str(), "zone transfer");
+            tracing::info!(client = %client.ip(), zone = %z.zone.name, qtype = %qtype, proto = proto.as_str(), key = ?key_name, "zone transfer");
             self.emit(
                 &ctx,
                 &qname,
                 qtype,
                 ResponseCode::NoError,
                 0,
-                vec![format!("zone transfer of {}", z.zone.name)],
+                vec![match key_name {
+                    Some(k) => format!("zone transfer of {} (TSIG {k})", z.zone.name),
+                    None => format!("zone transfer of {}", z.zone.name),
+                }],
                 "transfer",
             );
             return match proto {
@@ -343,7 +549,8 @@ impl DnsServer {
             }
         };
         let mut result = summarize(&resp, &qname);
-        if ctx.proto == Proto::Udp && bytes.len() > ctx.udp_limit {
+        let limit = ctx.udp_limit.saturating_sub(ctx.reserve);
+        if ctx.proto == Proto::Udp && bytes.len() > limit {
             self.stats.truncated.fetch_add(1, Relaxed);
             let t = resp.truncate();
             bytes = t
@@ -352,7 +559,7 @@ impl DnsServer {
             result.push(format!(
                 "truncated for UDP ({} bytes > {}); client retries over TCP",
                 resp.to_vec().map(|v| v.len()).unwrap_or(0),
-                ctx.udp_limit
+                limit
             ));
         }
         self.emit(

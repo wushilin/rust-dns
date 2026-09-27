@@ -403,7 +403,7 @@ impl GlobalPerm {
             }
             GlobalPerm::ViewAudit => "Read the audit log",
             GlobalPerm::ServerAdmin => {
-                "Reload the configuration and run the database integrity check"
+                "Reload the configuration, run the database integrity check, change forwarding and manage TSIG keys"
             }
             GlobalPerm::ManageOwnTokens => "Create, list and revoke own API tokens",
             GlobalPerm::ChangeOwnPassword => "Change own password",

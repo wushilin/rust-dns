@@ -125,8 +125,61 @@ impl Default for BackupConfig {
 pub struct TransferConfig {
     /// Client networks allowed to AXFR any zone. Empty = transfers disabled.
     pub allow: Vec<String>,
-    /// Secondaries to NOTIFY when a zone changes, e.g. ["203.0.113.5:53"].
-    pub notify: Vec<SocketAddr>,
+    /// Also require a valid TSIG signature (RFC 8945) from a key managed in
+    /// the console. Unsigned transfer requests are refused. Recommended.
+    pub require_tsig: bool,
+    /// TSIG key that signs NOTIFY messages to targets without their own
+    /// `key`. Empty = NOTIFY is sent unsigned.
+    pub notify_key: String,
+    /// Secondaries to NOTIFY when a zone changes: `"203.0.113.5:53"`, or
+    /// `{ address = "203.0.113.5:53", key = "hn-secondary." }` to sign with a
+    /// specific key (`key = ""` sends that target unsigned).
+    pub notify: Vec<NotifyTarget>,
+}
+
+/// One NOTIFY target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum NotifyTarget {
+    Address(SocketAddr),
+    Detailed {
+        address: SocketAddr,
+        #[serde(default)]
+        key: Option<String>,
+    },
+}
+
+impl NotifyTarget {
+    pub fn address(&self) -> SocketAddr {
+        match self {
+            NotifyTarget::Address(a) | NotifyTarget::Detailed { address: a, .. } => *a,
+        }
+    }
+}
+
+impl TransferConfig {
+    /// NOTIFY targets with the (normalised) name of the key that signs them.
+    /// Names that fail validation are dropped here; `validate` reports them.
+    pub fn notify_targets(&self) -> Vec<(SocketAddr, Option<String>)> {
+        let norm = |k: &str| {
+            let k = k.trim();
+            if k.is_empty() {
+                None
+            } else {
+                crate::mutation::tsig::normalize_key_name(k).ok()
+            }
+        };
+        self.notify
+            .iter()
+            .map(|t| {
+                let key = match t {
+                    NotifyTarget::Detailed { key: Some(k), .. } => norm(k),
+                    _ => norm(&self.notify_key),
+                };
+                (t.address(), key)
+            })
+            .collect()
+    }
 }
 
 /// PROXY protocol settings shared by the TCP DNS and web console listeners.
@@ -373,7 +426,10 @@ cache_entries = 10000    # TTL-aware cache for forwarded answers; 0 = off
 
 [transfer]
 allow = []               # networks allowed to AXFR zones (for BIND/NSD secondaries), e.g. ["203.0.113.5/32"]
-notify = []              # secondaries to NOTIFY on change, e.g. ["203.0.113.5:53"]
+require_tsig = false     # also require a TSIG key (create keys under "TSIG keys" in the console); recommended: true
+notify_key = ""          # TSIG key that signs NOTIFY messages, e.g. "hn-secondary."; empty = unsigned
+notify = []              # secondaries to NOTIFY on change, e.g. ["203.0.113.5:53"] or
+                         # [{ address = "203.0.113.5:53", key = "hn-secondary." }]
 
 [rate_limit]
 max_resolutions_per_second_per_address = 500
@@ -535,7 +591,27 @@ pub fn validate(cfg: &Config) -> Result<()> {
 
     // [transfer]
     check_cidrs("[transfer].allow", &cfg.transfer.allow, &mut errs);
-    for n in &cfg.transfer.notify {
+    let key_ok =
+        |k: &str| k.trim().is_empty() || crate::mutation::tsig::normalize_key_name(k).is_ok();
+    if !key_ok(&cfg.transfer.notify_key) {
+        errs.push(format!(
+            "[transfer].notify_key '{}' is not a valid key name (a DNS name such as \"hn-secondary.\")",
+            cfg.transfer.notify_key
+        ));
+    }
+    for t in &cfg.transfer.notify {
+        if let NotifyTarget::Detailed {
+            key: Some(k),
+            address,
+        } = t
+        {
+            if !key_ok(k) {
+                errs.push(format!(
+                    "[transfer].notify entry '{address}': key '{k}' is not a valid key name"
+                ));
+            }
+        }
+        let n = t.address();
         if n.ip().is_unspecified() {
             errs.push(format!(
                 "[transfer].notify entry '{n}' is an unspecified address"
@@ -765,7 +841,8 @@ timeout_ms = 0
 allowed_clients = ["10.0.0.0/33"]
 [transfer]
 allow = ["nope"]
-notify = ["0.0.0.0:53"]
+notify_key = "bad key"
+notify = ["0.0.0.0:53", { address = "192.0.2.1:53", key = "a..b" }]
 [tcp_dns]
 proxy_version = 3
 proxy_trust = "1.2.3.4/8;garbage"
@@ -794,7 +871,9 @@ max_files = 0
             "[forwarding].timeout_ms",
             "[forwarding].allowed_clients: '10.0.0.0/33'",
             "[transfer].allow: 'nope'",
-            "[transfer].notify",
+            "[transfer].notify entry '0.0.0.0:53'",
+            "[transfer].notify_key",
+            "[transfer].notify entry '192.0.2.1:53': key 'a..b'",
             "[tcp_dns].proxy_version",
             "[tcp_dns].proxy_trust: 'garbage'",
             "[web_console].proxy_version",
@@ -809,7 +888,45 @@ max_files = 0
         ] {
             assert!(msg.contains(needle), "missing {needle:?} in:\n{msg}");
         }
-        assert!(msg.starts_with("20 configuration error(s):"), "{msg}");
+        assert!(msg.starts_with("22 configuration error(s):"), "{msg}");
+    }
+
+    #[test]
+    fn notify_targets_and_keys() {
+        // The old form still parses.
+        let cfg: Config = toml::from_str("[transfer]\nnotify = [\"192.0.2.1:53\"]").unwrap();
+        assert!(!cfg.transfer.require_tsig);
+        assert_eq!(
+            cfg.transfer.notify_targets(),
+            vec![("192.0.2.1:53".parse().unwrap(), None)]
+        );
+        let cfg: Config = toml::from_str(
+            r#"[transfer]
+require_tsig = true
+notify_key = "HN-Secondary"
+notify = ["192.0.2.1:53", { address = "192.0.2.2:5300", key = "other." }, { address = "[2001:db8::1]:53", key = "" }, { address = "192.0.2.3:53" }]"#,
+        )
+        .unwrap();
+        validate(&cfg).unwrap();
+        assert!(cfg.transfer.require_tsig);
+        assert_eq!(
+            cfg.transfer.notify_targets(),
+            vec![
+                (
+                    "192.0.2.1:53".parse().unwrap(),
+                    Some("hn-secondary.".to_string())
+                ),
+                (
+                    "192.0.2.2:5300".parse().unwrap(),
+                    Some("other.".to_string())
+                ),
+                ("[2001:db8::1]:53".parse().unwrap(), None),
+                (
+                    "192.0.2.3:53".parse().unwrap(),
+                    Some("hn-secondary.".to_string())
+                ),
+            ]
+        );
     }
 
     #[test]

@@ -95,3 +95,17 @@ status, result = request(
 if status != 200 or result.get("records_added", 0) < 20:
     raise SystemExit(f"fixture import was incomplete: {result}")
 print(f"seeded {result['records_added']} records in {result['zones_created']} zones")
+
+# TSIG keys (RFC 8945) with fixed secrets known to conformance.py.
+TSIG_KEYS = [
+    {"name": "conformance-key.", "algorithm": "hmac-sha256",
+     "secret": "Y29uZm9ybWFuY2UtdHNpZy1rZXktMzItYnl0ZXMhISE="},
+    {"name": "conformance-other.", "algorithm": "hmac-sha512",
+     "secret": "b3RoZXItem9uZS1rZXktdGhhdC1pcy1hbGxvd2VkLWZvci1vdGhlci10ZXN0LW9ubHktLTY0LWJ5dGVzLWxvbmc=",
+     "zones": ["other.test"]},
+]
+for key in TSIG_KEYS:
+    status, created = request("/api/tsig/keys", key, {"X-Requested-With": "rust-dns"})
+    if status != 201 or created.get("secret") != key["secret"]:
+        raise SystemExit(f"TSIG key {key['name']} was not created: {status}")
+print(f"created {len(TSIG_KEYS)} TSIG keys")

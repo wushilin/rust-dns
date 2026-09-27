@@ -8,6 +8,7 @@ pub mod proxy;
 pub mod routes;
 pub mod session;
 pub mod settings;
+pub mod tsig;
 pub mod types;
 pub mod ws;
 
@@ -240,6 +241,10 @@ fn api_router() -> OpenApiRouter<Arc<AppState>> {
             settings::reset_forwarding
         ))
         .routes(routes!(settings::test_upstreams))
+        .routes(routes!(tsig::list_tsig_keys, tsig::create_tsig_key))
+        .routes(routes!(tsig::update_tsig_key, tsig::delete_tsig_key))
+        .routes(routes!(tsig::reveal_tsig_key))
+        .routes(routes!(tsig::get_transfer_settings))
 }
 
 /// Documented routes mounted at the server root rather than under `/api`.

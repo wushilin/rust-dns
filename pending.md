@@ -2,6 +2,16 @@
 
 Status as of 2026-09-27. Deployed to dns-test (musl build, /opt/rust-dns) with everything below. Stages 1 to 3 (log rotation, DNS protocol completeness, console fixes) are implemented. The current workspace has additional Stage 4 changes in progress below.
 
+## TSIG for zone transfers and NOTIFY (2026-09-27, verified)
+
+- [x] RFC 8945 hand-implemented in `src/dns/tsig.rs` (pure Rust: `hmac` + `sha1`/`sha2`, no new dependencies): hmac-sha256 (default), -sha384, -sha512, -sha1 (legacy). Constant-time MAC compare; truncated MACs follow §5.2.2.1 (too short/long = FORMERR, valid but shorter than full = signed BADTRUNC); fudge capped at 300 s.
+- [x] Keys in the `tsig_keys` table, written only through `AuditTx` (`tsig.create`, `tsig.update`, `tsig.delete`, `tsig.reveal`; no secret in detail or logs). API (admin, `server_admin`): `GET/POST /api/tsig/keys`, `PUT/DELETE /api/tsig/keys/{name}`, `POST /api/tsig/keys/{name}/reveal`, `GET /api/settings/transfer`.
+- [x] Policy: `[transfer].allow` AND (when signed or `require_tsig = true`) a valid key covering the zone. BADKEY/BADSIG unsigned, BADTIME signed with server time; never treated as unsigned. Every AXFR message signed with MAC chaining. `notify_key` / per-target `{ address, key }` sign NOTIFY; responses verified.
+- [x] Tests: known-answer vectors from dnspython 2.8 (all four algorithms, request + 2-message chained response), unit error cases, `tests/tsig.rs` end to end, 9 new conformance checks (85/85).
+- [x] Interop with BIND 9.20 (`named` as secondary, `dig -y`): multi-message signed AXFR, signed NOTIFY triggers refresh and BIND's signed ack verifies, wrong key refused on both sides.
+- [x] Console: Admin → TSIG keys (create generate/import, zone scope, secret once with BIND/dig snippets, two-step reveal, two-click delete, transfer policy read-only) checked in Chrome.
+- [ ] Not done: replay protection by caching the last Time Signed per key (RFC 8945 §5.2.3 SHOULD); inbound signed NOTIFY/UPDATE (not applicable: primary only).
+
 ## Forwarding settings from the console/API (2026-09-27, verified)
 
 - [x] `GET/PUT/DELETE /api/settings/forwarding`, `POST /api/settings/forwarding/test` (admin): upstreams, allowed clients, timeout; stored in the `settings` table as an override of `[forwarding]`, written with its audit entry in one transaction, applied immediately, kept across restarts and config reloads; reset returns to the config file.
@@ -28,7 +38,7 @@ Status as of 2026-09-27. Deployed to dns-test (musl build, /opt/rust-dns) with e
 - [x] `src/ui/index.html`: zone page paging fix is built; the end-to-end `bind_import_and_record_paging` test covers the server-side paging API.
 - [x] Zone page and record filter verified in the browser (2026-09-27).
 - [ ] Browser check still owed for: BIND import modal, recovery-code modal after MFA enrollment, "New recovery codes" flow, users → "Sign this user out everywhere". In-app Browser is unavailable in this session.
-- [x] `scripts/conformance-local.sh` passes 76/76; `RUN_COMPLIANCE=1 scripts/conformance-local.sh` builds and runs ISC genreport with every probe `ok`.
+- [x] `scripts/conformance-local.sh` passes 85/85 (76 before TSIG); `RUN_COMPLIANCE=1 scripts/conformance-local.sh` builds and runs ISC genreport with every probe `ok`.
 - [x] `cargo fmt --all` and `cargo clippy --all-targets -- -D warnings` pass.
 - [x] `cargo test -- --test-threads=1` passes (34 unit + 3 end-to-end); serial run avoids an occasional collision in the tests' free-port helper.
 

@@ -551,6 +551,8 @@ pub struct ForwardingStatus {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct TransferStatus {
     pub allow: Vec<String>,
+    /// Transfers also need a valid TSIG signature (`[transfer].require_tsig`).
+    pub require_tsig: bool,
     #[schema(value_type = Vec<String>)]
     pub notify: Vec<std::net::SocketAddr>,
 }

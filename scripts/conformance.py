@@ -300,6 +300,107 @@ check("1995 §4: IXFR over UDP answers with the SOA only", len(r.answer) == 1 an
 r = q("nozone.test.", "AXFR", tcp=True)
 check("5936: AXFR for an unknown zone refused", r.rcode() == dns.rcode.REFUSED)
 
+# --- TSIG (RFC 8945) -------------------------------------------------------------------------------
+# Keys seeded by scripts/seed-conformance.py; the fixture runs with require_tsig = false.
+import dns.tsig
+import dns.tsigkeyring
+
+TSIG_KEY = dns.tsig.Key("conformance-key.", "Y29uZm9ybWFuY2UtdHNpZy1rZXktMzItYnl0ZXMhISE=", "hmac-sha256")
+OTHER_KEY = dns.tsig.Key("conformance-other.", "b3RoZXItem9uZS1rZXktdGhhdC1pcy1hbGxvd2VkLWZvci1vdGhlci10ZXN0LW9ubHktLTY0LWJ5dGVzLWxvbmc=", "hmac-sha512")
+
+
+def tsig_raw(m, key, tcp=False):
+    """Send a signed message; return (response parsed WITHOUT validation, error or None
+    from parsing it WITH validation)."""
+    wire = m.to_wire()
+    if tcp:
+        s = socket.create_connection((IP, PORT), timeout=3)
+        s.sendall(struct.pack("!H", len(wire)) + wire)
+        n = struct.unpack("!H", s.recv(2))[0]
+        data = b""
+        while len(data) < n:
+            data += s.recv(n - len(data))
+        s.close()
+    else:
+        data = raw_udp(wire, timeout=3)
+    plain = dns.message.from_wire(data, keyring=False)
+    try:
+        dns.message.from_wire(data, keyring=key, request_mac=m.mac)
+        err = None
+    except Exception as e:  # dns.tsig.PeerBadKey, PeerBadSignature, ...
+        err = e
+    return plain, err
+
+
+kr = dns.tsigkeyring.from_text({"conformance-key.": ("hmac-sha256", "Y29uZm9ybWFuY2UtdHNpZy1rZXktMzItYnl0ZXMhISE=")})
+soa_count = 0; msgs = 0
+try:
+    for msg in dns.query.xfr(IP, ZONE, port=PORT, timeout=5, keyring=kr, keyname="conformance-key.", keyalgorithm="hmac-sha256"):
+        msgs += 1
+        soa_count += sum(1 for rr in msg.answer if rr.rdtype == dns.rdatatype.SOA)
+    xfr_err = ""
+except Exception as e:
+    xfr_err = repr(e)
+check("8945 §5.3.1: TSIG-signed AXFR succeeds; every response message verifies (dnspython)", soa_count == 2 and not xfr_err, xfr_err or f"soa={soa_count}")
+
+m = dns.message.make_query(f"{ZONE}.", "SOA")
+m.use_tsig(TSIG_KEY)
+r = dns.query.udp(m, IP, port=PORT, timeout=3)
+check("8945 §5.3: signed query gets a signed response that verifies", r.rcode() == dns.rcode.NOERROR and r.had_tsig and len(r.answer) == 1)
+
+m = dns.message.make_query(f"{ZONE}.", "SOA")
+m.use_tsig(dns.tsig.Key("no-such-key.", TSIG_KEY.secret, "hmac-sha256"))
+plain, err = tsig_raw(m, None)
+check("8945 §5.2.1: unknown key -> NOTAUTH/BADKEY, unsigned", plain.rcode() == dns.rcode.NOTAUTH and plain.tsig[0].error == dns.rcode.BADKEY and plain.tsig[0].mac == b"", f"rcode={plain.rcode()} tsig={plain.tsig}")
+
+m = dns.message.make_query(f"{ZONE}.", "SOA")
+m.use_tsig(dns.tsig.Key("conformance-key.", b"x" * 32, "hmac-sha256"))
+plain, err = tsig_raw(m, m.keyring)
+check("8945 §5.2.2: wrong secret -> NOTAUTH/BADSIG, unsigned; dnspython raises PeerBadSignature", plain.rcode() == dns.rcode.NOTAUTH and plain.tsig[0].error == dns.rcode.BADSIG and plain.tsig[0].mac == b"" and isinstance(err, dns.tsig.PeerBadSignature), f"{plain.rcode()} {err!r}")
+
+m = dns.message.make_query(f"{ZONE}.", "SOA")
+m.use_tsig(dns.tsig.Key("conformance-key.", TSIG_KEY.secret, "hmac-sha512"))
+plain, err = tsig_raw(m, None)
+check("8945 §5.2.1: known key name with another algorithm -> BADKEY", plain.tsig[0].error == dns.rcode.BADKEY, str(plain.tsig))
+
+# BADTIME: sign with a clock 1000 s behind (dnspython reads time.time() when rendering).
+_real_time = time.time
+time.time = lambda: _real_time() - 1000
+try:
+    m = dns.message.make_query(f"{ZONE}.", "SOA")
+    m.use_tsig(TSIG_KEY)
+    wire_skewed = m.to_wire()
+finally:
+    time.time = _real_time
+m_mac = m.mac
+data = raw_udp(wire_skewed, timeout=3)
+plain = dns.message.from_wire(data, keyring=False)
+t = plain.tsig[0] if plain.tsig else None
+server_time = int.from_bytes(t.other, "big") if t is not None and len(t.other) == 6 else 0
+check("8945 §5.2.3: time outside the fudge -> NOTAUTH/BADTIME, signed, server time in Other Data",
+      plain.rcode() == dns.rcode.NOTAUTH and t is not None and t.error == dns.rcode.BADTIME and len(t.mac) == 32 and abs(server_time - _real_time()) < 5,
+      str(plain.tsig))
+try:
+    # dnspython reports the peer's BADTIME after checking the TSIG structure.
+    dns.message.from_wire(data, keyring=TSIG_KEY, request_mac=m_mac)
+    badtime_err = None
+except Exception as e:
+    badtime_err = e
+check("8945 §5.2.3: dnspython sees PeerBadTime", isinstance(badtime_err, dns.tsig.PeerBadTime), repr(badtime_err))
+
+m = dns.message.make_query(f"{ZONE}.", "SOA")
+m.use_tsig(TSIG_KEY)
+w = bytearray(m.to_wire())
+w[2] ^= 0x01  # flip RD: covered by the MAC
+data = raw_udp(bytes(w), timeout=3)
+plain = dns.message.from_wire(data, keyring=False)
+check("8945 §5.2.2: tampered signed request -> BADSIG, never answered as unsigned", plain.rcode() == dns.rcode.NOTAUTH and plain.tsig and plain.tsig[0].error == dns.rcode.BADSIG and not plain.answer)
+
+m = dns.message.make_query(f"{ZONE}.", "AXFR")
+m.use_tsig(OTHER_KEY)
+plain, err = tsig_raw(m, OTHER_KEY, tcp=True)
+check("8945 + policy: key scoped to other zones -> REFUSED, response signed", plain.rcode() == dns.rcode.REFUSED and err is None and plain.had_tsig, f"{plain.rcode()} {err!r}")
+
 failed = [n for n, ok, _ in results if not ok]
 print(f"\n{len(results) - len(failed)}/{len(results)} checks passed")
 sys.exit(1 if failed else 0)

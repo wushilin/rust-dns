@@ -241,7 +241,8 @@ pub async fn status(State(s): St, caller: Caller) -> ApiResult<Json<ServerStatus
         },
         transfer: TransferStatus {
             allow: cfg.transfer.allow.clone(),
-            notify: rt.notify.clone(),
+            require_tsig: rt.require_tsig,
+            notify: rt.notify.iter().map(|(a, _)| *a).collect(),
         },
         auto_ptr: rt.auto_ptr,
         cookies: rt.cookies,
@@ -350,6 +351,11 @@ pub async fn metrics(State(s): St, _caller: Caller) -> ApiResult<Response> {
         "rustdns_bad_cookie_total",
         "DNS requests with invalid or malformed cookies",
         d.bad_cookie.load(Relaxed),
+    );
+    m(
+        "rustdns_tsig_errors_total",
+        "Signed DNS requests rejected (unknown key, bad signature, clock skew, truncated MAC)",
+        d.tsig_errors.load(Relaxed),
     );
     m(
         "rustdns_truncated_total",

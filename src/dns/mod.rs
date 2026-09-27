@@ -5,8 +5,10 @@ pub mod cookies;
 pub mod forward;
 pub mod fwdcache;
 pub mod handler;
+pub mod keyring;
 pub mod notify;
 pub mod tcp;
+pub mod tsig;
 pub mod udp;
 
 use crate::cache::Cache;
@@ -35,6 +37,7 @@ pub struct Stats {
     pub bad_cookie: AtomicU64,
     pub transfers: AtomicU64,
     pub notifies: AtomicU64,
+    pub tsig_errors: AtomicU64,
     /// Latency histogram buckets in microseconds: <=100, <=500, <=1000, <=5000, <=20000, >20000
     pub latency: [AtomicU64; 6],
     pub latency_sum_us: AtomicU64,
@@ -67,6 +70,7 @@ impl Stats {
             bad_cookie: self.bad_cookie.load(Relaxed),
             transfers: self.transfers.load(Relaxed),
             notifies: self.notifies.load(Relaxed),
+            tsig_errors: self.tsig_errors.load(Relaxed),
         }
     }
 }
@@ -102,6 +106,8 @@ pub struct DnsCounters {
     pub transfers: u64,
     /// NOTIFY messages sent.
     pub notifies: u64,
+    /// Signed requests rejected (unknown key, bad signature, clock skew, truncated MAC).
+    pub tsig_errors: u64,
 }
 
 /// Settings that can change at runtime via config reload.
@@ -109,7 +115,10 @@ pub struct Runtime {
     pub forwarding: ForwardingConfig,
     pub forward_acl: Vec<Cidr>,
     pub transfer_allow: Vec<Cidr>,
-    pub notify: Vec<SocketAddr>,
+    /// Transfers need a valid TSIG signature as well as an allowed address.
+    pub require_tsig: bool,
+    /// NOTIFY targets and the key that signs each (None = unsigned).
+    pub notify: Vec<(SocketAddr, Option<String>)>,
     pub auto_ptr: bool,
     pub minimal_any: bool,
     pub udp_max_payload: u16,
@@ -132,7 +141,8 @@ impl Runtime {
             forward_acl: crate::config::parse_cidrs(&forwarding.allowed_clients),
             forwarding,
             transfer_allow: crate::config::parse_cidrs(&cfg.transfer.allow),
-            notify: cfg.transfer.notify.clone(),
+            require_tsig: cfg.transfer.require_tsig,
+            notify: cfg.transfer.notify_targets(),
             auto_ptr: cfg.server.auto_ptr,
             minimal_any: cfg.server.minimal_any,
             udp_max_payload: cfg.server.udp_max_payload.max(512),
@@ -164,6 +174,8 @@ pub struct DnsServer {
     pub tcp_slots: Arc<tokio::sync::Semaphore>,
     pub cookies: cookies::CookieJar,
     pub fwd_cache: fwdcache::ForwardCache,
+    /// TSIG keys (from the database), swapped whole after every change.
+    pub tsig_keys: ArcSwap<keyring::Keyring>,
     /// Forwarding settings set from the console/API; override the config file.
     forwarding_override: std::sync::RwLock<Option<ForwardingSettings>>,
 }
@@ -194,6 +206,7 @@ impl DnsServer {
             tcp_slots,
             cookies: cookies::CookieJar::new(),
             fwd_cache: fwdcache::ForwardCache::new(cfg.forwarding.cache_entries),
+            tsig_keys: ArcSwap::from_pointee(keyring::Keyring::default()),
             forwarding_override: std::sync::RwLock::new(None),
         }
     }
@@ -205,6 +218,39 @@ impl DnsServer {
             .write()
             .unwrap_or_else(|p| p.into_inner()) = o;
         self.reload(cfg);
+    }
+
+    /// Reload the TSIG keyring from the database (startup and after each change).
+    pub fn reload_tsig_keys(&self, storage: &crate::storage::Storage) -> anyhow::Result<()> {
+        let ring = keyring::Keyring::load(storage)?;
+        tracing::debug!(keys = ring.len(), "TSIG keyring loaded");
+        self.tsig_keys.store(Arc::new(ring));
+        Ok(())
+    }
+
+    /// Human-readable problems with the transfer settings in effect (keys
+    /// named in the config that do not exist, TSIG required without keys).
+    pub fn transfer_warnings(&self) -> Vec<String> {
+        let rt = self.runtime.load();
+        let ring = self.tsig_keys.load();
+        let mut out = Vec::new();
+        let mut missing: Vec<&str> = rt
+            .notify
+            .iter()
+            .filter_map(|(_, k)| k.as_deref())
+            .filter(|k| ring.get(k).is_none())
+            .collect();
+        missing.sort();
+        missing.dedup();
+        for k in missing {
+            out.push(format!(
+                "[transfer] names TSIG key '{k}' for NOTIFY but no such key exists; NOTIFY to those targets is not sent until it is created"
+            ));
+        }
+        if rt.require_tsig && ring.is_empty() && !rt.transfer_allow.is_empty() {
+            out.push("[transfer].require_tsig is on but no TSIG keys exist; every zone transfer is refused".into());
+        }
+        out
     }
 
     pub fn forwarding_override(&self) -> Option<ForwardingSettings> {
