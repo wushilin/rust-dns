@@ -241,6 +241,7 @@ pub async fn status(State(s): St, caller: Caller) -> ApiResult<Json<ServerStatus
         forwarding: ForwardingStatus {
             upstreams: rt.forwarding.upstreams.clone(),
             allowed_clients: rt.forwarding.allowed_clients.clone(),
+            open_resolver: rt.open_resolver(),
         },
         transfer: TransferStatus {
             allow: cfg.transfer.allow.clone(),
@@ -366,6 +367,25 @@ pub async fn metrics(State(s): St, _caller: Caller) -> ApiResult<Response> {
         "UDP responses truncated",
         d.truncated.load(Relaxed),
     );
+    m(
+        "rustdns_open_resolver_truncated_total",
+        "Forwarded UDP answers truncated by the open resolver payload cap",
+        d.open_resolver_truncated.load(Relaxed),
+    );
+    m(
+        "rustdns_open_resolver_any_total",
+        "ANY queries not forwarded in open resolver mode (minimal RFC 8482 answer)",
+        d.open_resolver_any.load(Relaxed),
+    );
+    m(
+        "rustdns_open_resolver_rate_limited_total",
+        "Forwarded queries over the open resolver per-client limit",
+        d.open_resolver_rate_limited.load(Relaxed),
+    );
+    out.push_str(&format!(
+        "# HELP rustdns_open_resolver 1 while open resolver mode is in effect\n# TYPE rustdns_open_resolver gauge\nrustdns_open_resolver {}\n",
+        u8::from(s.dns.runtime.load().open_resolver())
+    ));
     out.push_str(&format!("# TYPE rustdns_zones gauge\nrustdns_zones {zones}\n# TYPE rustdns_records gauge\nrustdns_records {records}\n"));
     out.push_str(&format!("# TYPE rustdns_rate_limit_tracked_addresses gauge\nrustdns_rate_limit_tracked_addresses {}\n", s.limiter.tracked()));
     out.push_str(&format!(

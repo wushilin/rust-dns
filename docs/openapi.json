@@ -2498,7 +2498,7 @@
           "Server"
         ],
         "summary": "Change upstream resolvers (admin)",
-        "description": "Saves forwarding settings that override `[forwarding]` in the config file and applies them at once (no restart). The change and its audit entry are one transaction. Needs `server_admin`.",
+        "description": "Saves forwarding settings that override `[forwarding]` in the config file and applies them at once (no restart). The change and its audit entry are one transaction. `open_resolver: true` deliberately allows any client network (e.g. `0.0.0.0/0`, `::/0`) and turns on the open-resolver safeguards; see the README before using it. Needs `server_admin`.",
         "operationId": "update_forwarding_settings",
         "requestBody": {
           "content": {
@@ -2513,6 +2513,7 @@
                 ],
                 "cache_max_ttl": 86400,
                 "cache_negative_max_ttl": 3600,
+                "open_resolver": false,
                 "timeout_ms": 2000,
                 "upstreams": [
                   "1.1.1.1",
@@ -3924,7 +3925,10 @@
           "bad_cookie",
           "transfers",
           "notifies",
-          "tsig_errors"
+          "tsig_errors",
+          "open_resolver_truncated",
+          "open_resolver_any",
+          "open_resolver_rate_limited"
         ],
         "properties": {
           "queries": {
@@ -4015,6 +4019,24 @@
             "type": "integer",
             "format": "int64",
             "description": "Signed requests rejected (unknown key, bad signature, clock skew, truncated MAC).",
+            "minimum": 0
+          },
+          "open_resolver_truncated": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Open resolver mode: forwarded UDP answers sent truncated because they\nexceeded `[forwarding].open_resolver_max_udp_payload`.",
+            "minimum": 0
+          },
+          "open_resolver_any": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Open resolver mode: ANY queries for foreign names answered with the\nminimal RFC 8482 HINFO instead of being forwarded.",
+            "minimum": 0
+          },
+          "open_resolver_rate_limited": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Open resolver mode: forwarded queries over\n`[forwarding].open_resolver_rate_per_second` for their client.",
             "minimum": 0
           }
         }
@@ -4530,7 +4552,8 @@
           "allowed_clients",
           "timeout_ms",
           "cache_max_ttl",
-          "cache_negative_max_ttl"
+          "cache_negative_max_ttl",
+          "open_resolver"
         ],
         "properties": {
           "upstreams": {
@@ -4559,6 +4582,10 @@
             "type": "integer",
             "format": "int32",
             "minimum": 0
+          },
+          "open_resolver": {
+            "type": "boolean",
+            "description": "`[forwarding].open_resolver`."
           }
         }
       },
@@ -4583,7 +4610,7 @@
             "items": {
               "type": "string"
             },
-            "description": "CIDR networks or single addresses. Anything that would make this an\nopen resolver is refused: an entry shorter than /8 (IPv4) or /16\n(global IPv6), or entries covering over 1/16 of IPv4 together."
+            "description": "CIDR networks or single addresses. Unless `open_resolver` is true,\nanything that would make this an open resolver is refused: an entry\nshorter than /8 (IPv4) or /16 (global IPv6), or entries covering over\n1/16 of IPv4 together. An empty list means no client may use\nforwarding, also in open resolver mode (list `0.0.0.0/0` and `::/0`)."
           },
           "timeout_ms": {
             "type": "integer",
@@ -4604,6 +4631,11 @@
             "description": "Cap on how long negative answers are cached, 1 to 604800 seconds and\nnot above the positive cap. Omitted: the config file's value.",
             "example": 3600,
             "minimum": 0
+          },
+          "open_resolver": {
+            "type": "boolean",
+            "description": "Deliberately run an open resolver: lifts the `allowed_clients` guard\nand turns on the open-resolver safeguards. Omitted: the config file's\n`open_resolver` (the saved override always records the value used).",
+            "example": false
           }
         },
         "example": {
@@ -4622,7 +4654,8 @@
         "type": "object",
         "required": [
           "upstreams",
-          "allowed_clients"
+          "allowed_clients",
+          "open_resolver"
         ],
         "properties": {
           "upstreams": {
@@ -4636,6 +4669,10 @@
             "items": {
               "type": "string"
             }
+          },
+          "open_resolver": {
+            "type": "boolean",
+            "description": "Open resolver mode is in effect (`[forwarding].open_resolver` or the\nconsole setting, with upstreams set): any client in `allowed_clients`,\npossibly everyone, may resolve through this server."
           }
         }
       },
@@ -4651,6 +4688,9 @@
           "updated_at",
           "cache_max_ttl",
           "cache_negative_max_ttl",
+          "open_resolver",
+          "open_resolver_max_udp_payload",
+          "open_resolver_rate_per_second",
           "config",
           "cache"
         ],
@@ -4712,6 +4752,24 @@
             "format": "int32",
             "description": "Longest a negative answer is cached, seconds (in effect).",
             "example": 3600,
+            "minimum": 0
+          },
+          "open_resolver": {
+            "type": "boolean",
+            "description": "Open resolver mode in effect: `allowed_clients` may cover any\nnetwork (e.g. `0.0.0.0/0`) and, whenever queries are forwarded, the\nsafeguards apply (UDP answers\nover `open_resolver_max_udp_payload` truncated, ANY not forwarded,\nper-client forwarding rate limit)."
+          },
+          "open_resolver_max_udp_payload": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Largest forwarded UDP answer in open resolver mode, bytes\n(`[forwarding].open_resolver_max_udp_payload`, config file only).",
+            "example": 512,
+            "minimum": 0
+          },
+          "open_resolver_rate_per_second": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Forwarded queries per second per client in open resolver mode; 0 = no\nextra limit (`[forwarding].open_resolver_rate_per_second`, config file only).",
+            "example": 20,
             "minimum": 0
           },
           "config": {

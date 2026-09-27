@@ -90,6 +90,9 @@ async fn main() -> anyhow::Result<()> {
     if cli.check {
         let cfg = config::check(&cli.config)?;
         println!("configuration {} is valid", cli.config.display());
+        for w in config::open_resolver_warnings(&cfg.forwarding) {
+            println!("WARNING: {w}");
+        }
         if let Some(f) = &cfg.follow {
             println!(
                 "role: standby of {} (read-only; promote with --promote or from the console)",
@@ -215,6 +218,9 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => {
             tracing::error!(error = %e, "stored forwarding settings are unreadable; using the config file")
         }
+    }
+    for w in dns.open_resolver_warnings() {
+        tracing::warn!("{w}");
     }
     // TSIG keys for zone transfers and NOTIFY.
     dns.reload_tsig_keys(&storage)?;

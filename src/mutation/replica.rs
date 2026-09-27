@@ -612,10 +612,12 @@ mod tests {
                 None,
                 &crate::mutation::settings::ForwardingSettings {
                     upstreams: vec!["192.0.2.53:53".parse().unwrap()],
-                    allowed_clients: vec!["10.0.0.0/8".into()],
+                    // Open resolver mode travels in the snapshot too.
+                    allowed_clients: vec!["0.0.0.0/0".into(), "::/0".into()],
                     timeout_ms: 1500,
                     cache_max_ttl: None,
                     cache_negative_max_ttl: None,
+                    open_resolver: Some(true),
                 },
             )?;
             t.create_tsig_key(
@@ -709,6 +711,15 @@ mod tests {
             .unwrap();
         assert_eq!(sum.local_root, "merged");
         assert_eq!(replicated(&ss), replicated(&ps));
+        let fwd = crate::mutation::settings::load_forwarding(&ss)
+            .unwrap()
+            .unwrap()
+            .0;
+        assert_eq!(
+            fwd.open_resolver,
+            Some(true),
+            "open resolver mode in the snapshot"
+        );
         // The standby's root keeps its own password; the primary's root token works for it.
         let root = ss.get_user_by_name("root").unwrap().unwrap();
         assert_eq!(root.password_hash, STANDBY_ROOT_HASH);

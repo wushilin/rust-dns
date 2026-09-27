@@ -746,12 +746,13 @@ async function viewDashboard() {
   const st = S.status = await GET('/status');
   const d = st.dns;
   $('#main').innerHTML = `
-    <div class="topbar"><h1>Dashboard</h1><span class="hint">v${esc(st.version)} · up ${uptime(st.uptime_secs)}</span></div>
+    <div class="topbar"><h1>Dashboard</h1><span class="hint">v${esc(st.version)} · up ${uptime(st.uptime_secs)}</span>${st.forwarding.open_resolver ? ' <span class="badge bad" title="Anyone in the allowed networks may resolve through this server">Open resolver</span>' : ''}</div>
     <div class="grid tiles" id="tiles"></div>
     <div class="card panel" style="margin-top:14px" id="listeners">${listenersHtml(st)}</div>
     <div class="grid two" style="margin-top:14px">
       <div class="card panel"><h2>Server</h2><div class="kv">
         <span class="k">Forwarding</span><span class="mono">${st.forwarding.upstreams.length ? esc(st.forwarding.upstreams.join(', ')) : '<i>off (foreign names are REFUSED)</i>'}</span>
+        ${st.forwarding.open_resolver ? `<span class="k">Open resolver</span><span><span class="badge bad">ON</span> clients: <span class="mono">${esc(st.forwarding.allowed_clients.join(', ') || 'none')}</span> · UDP answers capped, ANY not forwarded, per-client limit · <span class="hint">truncated ${num(d.open_resolver_truncated)} · ANY ${num(d.open_resolver_any)} · limited ${num(d.open_resolver_rate_limited)}</span></span>` : ''}
         <span class="k">Auto PTR</span><span>${st.auto_ptr ? 'on' : 'off'}</span>
         <span class="k">Rate limit</span><span>${num(st.rate_limit.max_resolutions_per_second_per_address)} q/s per address · tracking ${num(st.rate_limit.tracked_addresses)} / ${num(st.rate_limit.max_tracked_addresses)}</span>
         <span class="k">Changelog</span><span>offsets ${st.changelog.oldest_offset ?? '–'} … ${st.changelog.latest_offset ?? '–'} · ${st.changelog.retention_days} day retention</span>
@@ -1578,7 +1579,7 @@ async function viewServer() {
     ? `<span class="badge">set in the console</span> <span class="hint">by ${esc(f.updated_by || '?')} ${f.updated_at ? ago(f.updated_at) : ''}; overrides the config file</span>`
     : '<span class="badge muted">from the config file</span>';
   $('#main').innerHTML = `<div class="topbar"><h1>Server settings</h1></div>
-    <div class="card panel" style="max-width:820px"><div class="row between"><h2>Forwarding</h2><div>${src}</div></div>
+    <div class="card panel" style="max-width:820px"><div class="row between"><h2>Forwarding${f.open_resolver ? ' <span class="badge bad" style="vertical-align:middle">Open resolver</span>' : ''}</h2><div>${src}</div></div>
       <p class="hint">Names this server is not authoritative for are sent to these upstream resolvers, for clients in the allowed networks only.
         With no upstreams, such queries are refused. Changes apply immediately, with no restart, and are recorded in the audit log.</p>
       <div class="grid two" style="gap:0 16px">
@@ -1587,7 +1588,7 @@ async function viewServer() {
           <span class="hint">IP address, optionally with a port; port 53 when omitted. Tried in order.</span></div>
         <div class="field"><label>Clients allowed to use forwarding (one network per line)</label>
           <textarea id="fw-acl" rows="6" spellcheck="false" placeholder="192.168.0.0/16\nfd00::/8">${esc(lines(f.allowed_clients))}</textarea>
-          <span class="hint">CIDR or single address. Never 0.0.0.0/0: that makes an open resolver.</span></div>
+          <span class="hint">${f.open_resolver ? 'CIDR or single address. Open resolver mode: any network is accepted, including 0.0.0.0/0 and ::/0. Empty means nobody.' : 'CIDR or single address. Never 0.0.0.0/0: that makes an open resolver (only possible in open resolver mode, below).'}</span></div>
       </div>
       <div class="grid two" style="gap:0 16px">
         <div class="field"><label>Timeout per upstream (milliseconds)</label><input type="text" inputmode="numeric" id="fw-timeout" value="${f.timeout_ms}"></div>
@@ -1596,6 +1597,16 @@ async function viewServer() {
           <span class="hint">An answer's own TTL is used when shorter; TTLs are never raised. Config file: ${f.config.cache_max_ttl}.</span></div>
         <div class="field"><label>Cache NXDOMAIN / no-data at most (seconds)</label><input type="text" inputmode="numeric" id="fw-negttl" value="${f.cache_negative_max_ttl}">
           <span class="hint">Otherwise the SOA minimum (RFC 2308). Config file: ${f.config.cache_negative_max_ttl}.</span></div>
+      </div>
+      <div class="field"><label>Open resolver mode</label>
+        ${f.open_resolver
+          ? `<div class="note" style="border:1px solid var(--danger)">${ico('warn', 's')}<span><b>On.</b> Every client in the allowed networks may use this server as a recursive resolver${f.upstreams.length ? '' : ' (inactive while there are no upstreams)'}.
+              Safeguards: forwarded UDP answers over ${f.open_resolver_max_udp_payload} bytes are sent truncated (the client retries over TCP), ANY queries for foreign names get a minimal RFC 8482 answer instead of being forwarded,
+              and each client (IPv4 address / IPv6 /64) may forward ${f.open_resolver_rate_per_second ? f.open_resolver_rate_per_second + ' queries per second' : 'without an extra limit'}.
+              ${f.config.open_resolver ? 'Set in the config file (<code>[forwarding].open_resolver</code>).' : ''}</span></div>
+             <div class="row" style="margin-top:8px"><button class="btn danger" id="fw-open-off">Turn off open resolver mode…</button></div>`
+          : `<span class="hint">Off: allowed clients are limited to your own networks. Turning it on lets anyone in the allowed networks, possibly the whole internet, resolve through this server.</span>
+             <div class="row" style="margin-top:8px"><button class="btn" id="fw-open-on">Turn on open resolver mode…</button></div>`}
       </div>
       <div class="error" id="fw-err"></div>
       <div id="fw-test" class="io-summary hidden"></div>
@@ -1619,7 +1630,10 @@ async function viewServer() {
     timeout_ms: Number($('#fw-timeout').value.trim()),
     cache_max_ttl: Number($('#fw-maxttl').value.trim()),
     cache_negative_max_ttl: Number($('#fw-negttl').value.trim()),
+    open_resolver: !!f.open_resolver,
   });
+  if ($('#fw-open-on')) $('#fw-open-on').onclick = () => openResolverOn(f, body);
+  if ($('#fw-open-off')) $('#fw-open-off').onclick = () => openResolverOff(f, body);
   // Two-click confirm: the first click arms the button.
   $('#fc-flush').onclick = async () => {
     const b = $('#fc-flush');
@@ -1646,6 +1660,64 @@ async function viewServer() {
     try { await DEL('/settings/forwarding'); toast('Using the config file again', 'ok'); viewServer(); }
     catch (e) { $('#fw-err').textContent = e.message; }
   };
+}
+
+// Open resolver mode: turning it on takes two steps inside the dialog
+// (read the risks and acknowledge, then confirm); nothing is saved before the
+// second click.
+function openResolverOn(f, body) {
+  const hasUp = $('#fw-up').value.trim() !== '';
+  openModal(`<h2>Turn on open resolver mode</h2>
+    <div id="or-step1">
+      <p>An open resolver answers recursive queries for anyone in the allowed networks. On the public internet that means:</p>
+      <ul class="hint" style="line-height:1.6;padding-left:18px;margin:6px 0">
+        <li><b>Reflection / amplification:</b> attackers spoof a victim's address and use this server to flood it.</li>
+        <li><b>Abuse reports and blocklists:</b> scanners (e.g. Shadowserver) find open resolvers within hours and report them to your provider.</li>
+        <li><b>Provider notices:</b> many cloud providers forbid or throttle open resolvers and may suspend the server.</li>
+        <li><b>Upstream limits:</b> your upstream resolvers may rate-limit or block this server because of other people's traffic.</li>
+      </ul>
+      <p class="hint">Safeguards while on: forwarded UDP answers over ${f.open_resolver_max_udp_payload} bytes are truncated (TCP retry), ANY is not forwarded, ${f.open_resolver_rate_per_second || 'no extra'} forwarded queries/s per client, plus the global rate limit and DNS cookies.</p>
+      ${hasUp ? '' : '<div class="note warn">' + ico('warn', 's') + '<span>No upstreams are set: the mode has no effect until you add some.</span></div>'}
+      <label style="display:flex;gap:8px;align-items:center;margin-top:10px"><input type="checkbox" id="or-ack"> I understand the risks and want to run an open resolver</label>
+    </div>
+    <div id="or-step2" class="hidden">
+      <p><b>Confirm:</b> this is applied immediately and recorded in the audit log.</p>
+      <label style="display:flex;gap:8px;align-items:center;margin-top:10px"><input type="checkbox" id="or-all" checked> Allow every client: set allowed clients to <span class="mono">0.0.0.0/0</span> and <span class="mono">::/0</span></label>
+      <p class="hint">Unticked, the allowed clients in the form are kept (an empty list means nobody).</p>
+    </div>
+    <div class="error" id="or-err"></div>
+    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn" id="or-next" disabled>Continue</button><button class="btn danger hidden" id="or-ok">Turn on open resolver</button></div>`, m => {
+    const ack = m.querySelector('#or-ack'), next = m.querySelector('#or-next'), ok = m.querySelector('#or-ok');
+    ack.onchange = () => { next.disabled = !ack.checked; };
+    next.onclick = () => { m.querySelector('#or-step1').classList.add('hidden'); m.querySelector('#or-step2').classList.remove('hidden'); next.classList.add('hidden'); ok.classList.remove('hidden'); };
+    ok.onclick = async () => {
+      const b = body(); b.open_resolver = true;
+      if (m.querySelector('#or-all').checked) b.allowed_clients = ['0.0.0.0/0', '::/0'];
+      ok.disabled = true; m.querySelector('#or-err').textContent = '';
+      try { await PUT('/settings/forwarding', b); closeModal(); toast('Open resolver mode is ON', 'ok'); viewServer(); }
+      catch (e) { m.querySelector('#or-err').textContent = e.message; ok.disabled = false; }
+    };
+  });
+}
+function openResolverOff(f, body) {
+  const wide = ['0.0.0.0/0', '::/0'];
+  let acl = $('#fw-acl').value.split('\n').map(x => x.trim()).filter(x => x && !wide.includes(x));
+  if (!acl.length) acl = (f.config.allowed_clients || []).filter(x => !wide.includes(x));
+  openModal(`<h2>Turn off open resolver mode</h2>
+    <p>Only your own networks may use forwarding again; the usual limits on allowed clients apply (no entry shorter than /8 for IPv4 or /16 for global IPv6).</p>
+    <div class="field"><label>Clients allowed to use forwarding (one network per line)</label>
+      <textarea id="or-acl" rows="6" spellcheck="false">${esc(acl.join('\n'))}</textarea></div>
+    ${f.config.open_resolver ? '<p class="hint">The config file also turns it on (<code>[forwarding].open_resolver = true</code>); this saves a console override that turns it off.</p>' : ''}
+    <div class="error" id="or-err"></div>
+    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="or-ok">Turn off</button></div>`, m => {
+    m.querySelector('#or-ok').onclick = async () => {
+      const b = body(); b.open_resolver = false;
+      b.allowed_clients = m.querySelector('#or-acl').value.split('\n').map(x => x.trim()).filter(Boolean);
+      m.querySelector('#or-err').textContent = '';
+      try { await PUT('/settings/forwarding', b); closeModal(); toast('Open resolver mode is off', 'ok'); viewServer(); }
+      catch (e) { m.querySelector('#or-err').textContent = e.message; }
+    };
+  });
 }
 
 // ---------------------------------------------------------------------------

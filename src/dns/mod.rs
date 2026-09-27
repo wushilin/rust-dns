@@ -38,6 +38,12 @@ pub struct Stats {
     pub transfers: AtomicU64,
     pub notifies: AtomicU64,
     pub tsig_errors: AtomicU64,
+    /// Open resolver: forwarded UDP answers truncated by the payload cap.
+    pub open_resolver_truncated: AtomicU64,
+    /// Open resolver: ANY queries not forwarded (answered minimally).
+    pub open_resolver_any: AtomicU64,
+    /// Open resolver: forwarded queries over the per-client limit.
+    pub open_resolver_rate_limited: AtomicU64,
     /// Latency histogram buckets in microseconds: <=100, <=500, <=1000, <=5000, <=20000, >20000
     pub latency: [AtomicU64; 6],
     pub latency_sum_us: AtomicU64,
@@ -71,6 +77,9 @@ impl Stats {
             transfers: self.transfers.load(Relaxed),
             notifies: self.notifies.load(Relaxed),
             tsig_errors: self.tsig_errors.load(Relaxed),
+            open_resolver_truncated: self.open_resolver_truncated.load(Relaxed),
+            open_resolver_any: self.open_resolver_any.load(Relaxed),
+            open_resolver_rate_limited: self.open_resolver_rate_limited.load(Relaxed),
         }
     }
 }
@@ -108,10 +117,21 @@ pub struct DnsCounters {
     pub notifies: u64,
     /// Signed requests rejected (unknown key, bad signature, clock skew, truncated MAC).
     pub tsig_errors: u64,
+    /// Open resolver mode: forwarded UDP answers sent truncated because they
+    /// exceeded `[forwarding].open_resolver_max_udp_payload`.
+    pub open_resolver_truncated: u64,
+    /// Open resolver mode: ANY queries for foreign names answered with the
+    /// minimal RFC 8482 HINFO instead of being forwarded.
+    pub open_resolver_any: u64,
+    /// Open resolver mode: forwarded queries over
+    /// `[forwarding].open_resolver_rate_per_second` for their client.
+    pub open_resolver_rate_limited: u64,
 }
 
 /// Settings that can change at runtime via config reload.
 pub struct Runtime {
+    /// Forwarding settings in effect; `forwarding.open_resolver` is the
+    /// effective open resolver mode (see [`Runtime::from_config`]).
     pub forwarding: ForwardingConfig,
     pub forward_acl: Vec<Cidr>,
     pub transfer_allow: Vec<Cidr>,
@@ -142,6 +162,16 @@ impl Runtime {
             if let Some(t) = o.cache_negative_max_ttl {
                 forwarding.cache_negative_max_ttl = t;
             }
+            if let Some(b) = o.open_resolver {
+                forwarding.open_resolver = b;
+            }
+        }
+        // Defence in depth: an ACL the guard would refuse always gets the
+        // open-resolver safeguards, however it came to be in effect.
+        if !forwarding.open_resolver
+            && !crate::config::open_resolver_problems(&forwarding.allowed_clients).is_empty()
+        {
+            forwarding.open_resolver = true;
         }
         Runtime {
             forward_acl: crate::config::parse_cidrs(&forwarding.allowed_clients),
@@ -162,6 +192,11 @@ impl Runtime {
         !self.forwarding.upstreams.is_empty() && self.forward_acl.iter().any(|c| c.contains(client))
     }
 
+    /// Open resolver mode is in effect (with forwarding on at all).
+    pub fn open_resolver(&self) -> bool {
+        self.forwarding.open_resolver && !self.forwarding.upstreams.is_empty()
+    }
+
     pub fn cache_caps(&self) -> fwdcache::Caps {
         fwdcache::Caps {
             max_ttl: self.forwarding.cache_max_ttl,
@@ -178,6 +213,8 @@ pub struct DnsServer {
     pub cache: Arc<Cache>,
     pub bus: Arc<Bus>,
     pub limiter: Arc<RateLimiter>,
+    /// Open resolver mode: per-client limit on forwarded queries.
+    pub fwd_limiter: RateLimiter,
     /// Listener settings (fixed for the process lifetime).
     pub listen: ServerConfig,
     pub tcp_proxy: ProxyConfig,
@@ -213,6 +250,15 @@ impl DnsServer {
             cache,
             bus,
             limiter,
+            fwd_limiter: {
+                let l = RateLimiter::new(
+                    cfg.forwarding.open_resolver_rate_per_second,
+                    std::time::Duration::from_secs(1),
+                    fwd_limiter_size(&Runtime::from_config(cfg, None), cfg),
+                );
+                l.set_slip(cfg.rate_limit.slip);
+                l
+            },
             listen: cfg.server.clone(),
             tcp_proxy: cfg.tcp_dns.clone(),
             tcp_proxy_trust: cfg.tcp_dns.trusted_cidrs(),
@@ -285,12 +331,45 @@ impl DnsServer {
         if old.forwarding.upstreams != next.forwarding.upstreams {
             self.fwd_cache.clear();
         }
+        match (old.open_resolver(), next.open_resolver()) {
+            (false, true) => tracing::warn!(
+                allowed_clients = ?next.forwarding.allowed_clients,
+                "open resolver mode is now ON"
+            ),
+            (true, false) => tracing::info!("open resolver mode is now off"),
+            _ => {}
+        }
+        self.fwd_limiter.reconfigure(
+            cfg.forwarding.open_resolver_rate_per_second,
+            fwd_limiter_size(&next, cfg),
+        );
+        self.fwd_limiter.set_slip(cfg.rate_limit.slip);
         self.runtime.store(Arc::new(next));
         self.limiter.reconfigure(
             cfg.rate_limit.max_resolutions_per_second_per_address,
             cfg.rate_limit.max_tracked_addresses,
         );
         self.limiter.set_slip(cfg.rate_limit.slip);
+    }
+
+    /// Loud warnings while open resolver mode is in effect (startup, reload).
+    pub fn open_resolver_warnings(&self) -> Vec<String> {
+        let rt = self.runtime.load();
+        if !rt.forwarding.open_resolver {
+            return Vec::new();
+        }
+        crate::config::open_resolver_warnings(&rt.forwarding)
+    }
+}
+
+/// Counter table size of the open-resolver forwarding limiter: the
+/// `[rate_limit]` size while the mode is in effect, a token table otherwise
+/// (it is not consulted then; resizing starts it empty).
+fn fwd_limiter_size(rt: &Runtime, cfg: &Config) -> usize {
+    if rt.open_resolver() {
+        cfg.rate_limit.max_tracked_addresses
+    } else {
+        1
     }
 }
 
@@ -343,4 +422,46 @@ pub async fn serve(server: Arc<DnsServer>) -> anyhow::Result<()> {
         let _ = t.await;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fwd(acl: &[&str], open: Option<bool>) -> ForwardingSettings {
+        ForwardingSettings {
+            upstreams: vec!["192.0.2.1:53".parse().unwrap()],
+            allowed_clients: acl.iter().map(|s| s.to_string()).collect(),
+            timeout_ms: 1000,
+            cache_max_ttl: None,
+            cache_negative_max_ttl: None,
+            open_resolver: open,
+        }
+    }
+
+    /// Effective open resolver mode: the override's explicit value, else the
+    /// file's; a wide ACL always gets the safeguards.
+    #[test]
+    fn open_resolver_mode_in_effect() {
+        let mut cfg: Config = toml::from_str("").unwrap();
+        let rt = Runtime::from_config(&cfg, None);
+        assert!(!rt.forwarding.open_resolver && !rt.open_resolver());
+        let rt = Runtime::from_config(&cfg, Some(&fwd(&["10.0.0.0/8"], None)));
+        assert!(!rt.open_resolver());
+        let rt = Runtime::from_config(&cfg, Some(&fwd(&["0.0.0.0/0"], Some(true))));
+        assert!(rt.open_resolver());
+        // Old override (no field): the file decides.
+        cfg.forwarding.open_resolver = true;
+        let rt = Runtime::from_config(&cfg, Some(&fwd(&["10.0.0.0/8"], None)));
+        assert!(rt.open_resolver());
+        let rt = Runtime::from_config(&cfg, Some(&fwd(&["10.0.0.0/8"], Some(false))));
+        assert!(!rt.open_resolver());
+        // Without upstreams nothing is forwarded, so nothing is open.
+        let rt = Runtime::from_config(&cfg, None);
+        assert!(rt.forwarding.open_resolver && !rt.open_resolver());
+        // Defence in depth: a wide ACL never runs without the safeguards.
+        cfg.forwarding.open_resolver = false;
+        let rt = Runtime::from_config(&cfg, Some(&fwd(&["0.0.0.0/1", "128.0.0.0/1"], Some(false))));
+        assert!(rt.open_resolver());
+    }
 }

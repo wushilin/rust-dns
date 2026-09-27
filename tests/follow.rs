@@ -559,7 +559,7 @@ fn primary_standby_failover_and_rejoin() {
             "PUT",
             &p.api("/settings/forwarding"),
             Some(
-                json!({ "upstreams": ["192.0.2.53"], "allowed_clients": ["127.0.0.0/8"], "timeout_ms": 1500 }),
+                json!({ "upstreams": ["192.0.2.53"], "allowed_clients": ["0.0.0.0/0", "::/0"], "timeout_ms": 1500, "open_resolver": true }),
             ),
         ),
         "forwarding",
@@ -672,6 +672,10 @@ fn primary_standby_failover_and_rejoin() {
         }
         if !fwd["upstreams"].to_string().contains("192.0.2.53") {
             m.push("forwarding");
+        }
+        // Open resolver mode is part of the replicated setting and applied.
+        if fwd["open_resolver"] != true || fwd["allowed_clients"] != json!(["0.0.0.0/0", "::/0"]) {
+            m.push("open resolver mode");
         }
         if !zone.to_string().contains("\"bob\"") {
             m.push("member");

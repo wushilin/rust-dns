@@ -23,6 +23,7 @@ max_tcp_connections = 2000
 
 [forwarding]
 upstreams = []                           # authoritative only
+open_resolver = false                    # never on an authoritative server (see README)
 
 [transfer]
 allow = ["198.51.100.53/32", "2001:db8:53::53/128"]    # your secondary nameserver(s)

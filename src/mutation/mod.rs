@@ -2218,12 +2218,19 @@ mod tests {
                                 }
                             }
                             117..=119 => {
+                                // Open resolver mode (and its wide ACL) must replay too.
+                                let open = step % 3 == 0;
                                 let f = settings::ForwardingSettings {
                                     upstreams: vec![format!("192.0.2.{}:53", step % 200 + 1).parse().unwrap()],
-                                    allowed_clients: vec!["10.0.0.0/8".into()],
+                                    allowed_clients: if open {
+                                        vec!["0.0.0.0/0".into(), "::/0".into()]
+                                    } else {
+                                        vec!["10.0.0.0/8".into()]
+                                    },
                                     timeout_ms: 1000 + step as u64,
                                     cache_max_ttl: None,
                                     cache_negative_max_ttl: None,
+                                    open_resolver: Some(open),
                                 };
                                 if step % 4 == 0 {
                                     t.clear_forwarding(&f)?;

@@ -37,6 +37,13 @@ pub struct ForwardingSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false, example = 3600)]
     pub cache_negative_max_ttl: Option<u32>,
+    /// Deliberate open resolver: `allowed_clients` may cover any network
+    /// and the open-resolver safeguards apply. Always stored explicitly;
+    /// absent (overrides saved by older versions): the config file's
+    /// `open_resolver`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false, example = false)]
+    pub open_resolver: Option<bool>,
 }
 
 /// Parse one upstream: `1.1.1.1`, `1.1.1.1:5353`, `2606:4700:4700::1111`,
@@ -76,13 +83,18 @@ fn check_ip(ip: IpAddr, t: &str) -> Result<(), String> {
 }
 
 /// Validate and normalise user input. Collects every problem.
+/// `open_resolver`: `None` means the config file's value; the result always
+/// stores it explicitly, so a later change of the file cannot turn a wide
+/// ACL saved here into an open resolver without the safeguards.
 pub fn validate(
     upstreams: &[String],
     allowed_clients: &[String],
     timeout_ms: u64,
     caps: (Option<u32>, Option<u32>),
+    open_resolver: Option<bool>,
     file: &crate::config::ForwardingConfig,
 ) -> Result<ForwardingSettings, Vec<String>> {
+    let open_resolver = open_resolver.unwrap_or(file.open_resolver);
     let mut errs = Vec::new();
     let mut ups: Vec<SocketAddr> = Vec::new();
     for u in upstreams.iter().map(|u| u.trim()).filter(|u| !u.is_empty()) {
@@ -113,8 +125,15 @@ pub fn validate(
         }
     }
     // Refuses 0.0.0.0/0 and anything close to it (e.g. 0.0.0.0/1 +
-    // 128.0.0.0/1): see config::open_resolver_problems.
-    errs.extend(crate::config::open_resolver_problems(&acl));
+    // 128.0.0.0/1): see config::open_resolver_problems. Skipped only for a
+    // deliberate open resolver.
+    if !open_resolver {
+        errs.extend(
+            crate::config::open_resolver_problems(&acl)
+                .into_iter()
+                .map(|e| format!("{e} (or turn on open resolver mode if that is really intended)")),
+        );
+    }
     if !(100..=30_000).contains(&timeout_ms) {
         errs.push("timeout_ms must be between 100 and 30000".into());
     }
@@ -130,6 +149,7 @@ pub fn validate(
             timeout_ms,
             cache_max_ttl: caps.0,
             cache_negative_max_ttl: caps.1,
+            open_resolver: Some(open_resolver),
         })
     } else {
         Err(errs)
@@ -251,6 +271,7 @@ mod tests {
             ],
             50,
             (None, None),
+            None,
             &crate::config::ForwardingConfig::default(),
         )
         .unwrap_err();
@@ -265,23 +286,24 @@ mod tests {
             &["0.0.0.0/1".into(), "128.0.0.0/1".into()],
             1000,
             (None, None),
+            None,
             &crate::config::ForwardingConfig::default(),
         )
         .unwrap_err();
         assert!(errs.iter().any(|e| e.contains("open resolver")), "{errs:?}");
         // Cache caps: validated as they would be in effect.
         let file = crate::config::ForwardingConfig::default();
-        let errs = validate(&[], &[], 1000, (Some(60), Some(120)), &file).unwrap_err();
+        let errs = validate(&[], &[], 1000, (Some(60), Some(120)), None, &file).unwrap_err();
         assert!(
             errs.iter().any(|e| e.contains("must not exceed")),
             "{errs:?}"
         );
-        let errs = validate(&[], &[], 1000, (None, Some(90_000)), &file).unwrap_err();
+        let errs = validate(&[], &[], 1000, (None, Some(90_000)), None, &file).unwrap_err();
         assert!(
             errs.iter().any(|e| e.contains("must not exceed")),
             "{errs:?}"
         );
-        let ok = validate(&[], &[], 1000, (Some(7200), None), &file).unwrap();
+        let ok = validate(&[], &[], 1000, (Some(7200), None), None, &file).unwrap();
         assert_eq!(
             (ok.cache_max_ttl, ok.cache_negative_max_ttl),
             (Some(7200), None)
@@ -297,6 +319,7 @@ mod tests {
             &["192.168.0.0/16".into(), "192.168.0.0/16".into()],
             1500,
             (None, None),
+            None,
             &crate::config::ForwardingConfig::default(),
         )
         .unwrap();
@@ -309,6 +332,120 @@ mod tests {
             vec!["192.168.0.0/16".to_string()],
             "blank lines and duplicates dropped"
         );
+    }
+
+    /// The open-resolver guard stays on by default; open resolver mode is
+    /// the explicit override. The flag is always stored explicitly.
+    #[test]
+    fn open_resolver_mode_lifts_the_guard() {
+        let file = crate::config::ForwardingConfig::default();
+        let wide = ["0.0.0.0/0".to_string(), "::/0".to_string()];
+        for flag in [None, Some(false)] {
+            let errs =
+                validate(&["1.1.1.1".into()], &wide, 1000, (None, None), flag, &file).unwrap_err();
+            assert!(errs.iter().any(|e| e.contains("open resolver")), "{errs:?}");
+        }
+        let ok = validate(
+            &["1.1.1.1".into()],
+            &wide,
+            1000,
+            (None, None),
+            Some(true),
+            &file,
+        )
+        .unwrap();
+        assert_eq!(ok.open_resolver, Some(true));
+        assert_eq!(ok.allowed_clients, wide.to_vec());
+        // Omitted: the config file's value, stored explicitly.
+        let open_file = crate::config::ForwardingConfig {
+            open_resolver: true,
+            ..file.clone()
+        };
+        let ok = validate(
+            &["1.1.1.1".into()],
+            &wide,
+            1000,
+            (None, None),
+            None,
+            &open_file,
+        )
+        .unwrap();
+        assert_eq!(ok.open_resolver, Some(true));
+        let ok = validate(&[], &["10.0.0.0/8".into()], 1000, (None, None), None, &file).unwrap();
+        assert_eq!(ok.open_resolver, Some(false));
+        // Explicitly off overrides a file that turns it on.
+        assert!(validate(&[], &wide, 1000, (None, None), Some(false), &open_file).is_err());
+        // Overrides saved before the flag existed still load (None: the
+        // file's value applies) and are written back without the field.
+        let old: ForwardingSettings = serde_json::from_str(
+            r#"{"upstreams":["1.1.1.1:53"],"allowed_clients":["10.0.0.0/8"],"timeout_ms":2000,"cache_max_ttl":600}"#,
+        )
+        .unwrap();
+        assert_eq!(old.open_resolver, None);
+        assert!(!serde_json::to_string(&old)
+            .unwrap()
+            .contains("open_resolver"));
+        let on: ForwardingSettings = serde_json::from_str(
+            r#"{"upstreams":[],"allowed_clients":["0.0.0.0/0"],"timeout_ms":2000,"open_resolver":true}"#,
+        )
+        .unwrap();
+        assert_eq!(on.open_resolver, Some(true));
+    }
+
+    /// Turning open resolver mode on is a typed `setting_set` change: it is
+    /// audited (before/after) and a standby replaying the changelog gets it.
+    #[test]
+    fn open_resolver_is_audited_and_replicated() {
+        let s = Arc::new(Storage::open_memory().unwrap());
+        let a = Accounts::new(s.clone());
+        let actor = Actor {
+            name: "root".into(),
+            ip: "127.0.0.1".into(),
+        };
+        let file = crate::config::ForwardingConfig::default();
+        let off = validate(
+            &["9.9.9.9".into()],
+            &["10.0.0.0/8".into()],
+            1000,
+            (None, None),
+            None,
+            &file,
+        )
+        .unwrap();
+        let on = validate(
+            &["9.9.9.9".into()],
+            &["0.0.0.0/0".into(), "::/0".into()],
+            1000,
+            (None, None),
+            Some(true),
+            &file,
+        )
+        .unwrap();
+        a.run(&actor, "update_forwarding", |t| {
+            t.set_forwarding("root", None, &off)
+        })
+        .unwrap();
+        a.run(&actor, "update_forwarding", |t| {
+            t.set_forwarding("root", Some(&off), &on)
+        })
+        .unwrap();
+        let audit = s.audit_after(0, 10).unwrap();
+        let last = audit.last().unwrap();
+        assert_eq!(last.action, "settings.forwarding.update");
+        let detail = serde_json::to_string(&last.detail).unwrap();
+        assert!(detail.contains(r#""open_resolver":false"#), "{detail}");
+        assert!(detail.contains(r#""open_resolver":true"#), "{detail}");
+
+        let events = s
+            .read_tx(|c| crate::replication::data::changelog_tail(c, 0))
+            .unwrap();
+        assert!(events.iter().any(|e| e.payload["kind"] == "setting_set"));
+        let standby = Storage::open_memory().unwrap();
+        crate::mutation::replay::replay(&standby, &events).unwrap();
+        let (got, by, _) = load_forwarding(&standby).unwrap().unwrap();
+        assert_eq!(got, on);
+        assert_eq!(got.open_resolver, Some(true));
+        assert_eq!(by, "root");
     }
 
     #[test]
@@ -324,6 +461,7 @@ mod tests {
             &["10.0.0.0/8".into()],
             1000,
             (None, None),
+            None,
             &crate::config::ForwardingConfig::default(),
         )
         .unwrap();
@@ -344,6 +482,7 @@ mod tests {
             &[],
             1000,
             (None, None),
+            None,
             &crate::config::ForwardingConfig::default(),
         )
         .unwrap();

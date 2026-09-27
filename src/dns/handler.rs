@@ -51,6 +51,9 @@ struct Ctx {
     udp_limit: usize,
     /// Bytes kept free in UDP responses for the TSIG record added afterwards.
     reserve: usize,
+    /// Open resolver mode lowered `udp_limit` from this value: truncation
+    /// the client's own limit would not have needed is counted separately.
+    open_cap_from: Option<usize>,
 }
 
 /// A request whose TSIG signature verified.
@@ -162,6 +165,7 @@ impl DnsServer {
                 started,
                 udp_limit: 65535,
                 reserve: 0,
+                open_cap_from: None,
             };
             return Reply::One(self.tsig_error_reply(
                 req,
@@ -292,6 +296,7 @@ impl DnsServer {
             reserve: signed_by
                 .map(|b| tsig::record_len(&b.entry.key.name, b.entry.key.algorithm, 0))
                 .unwrap_or(0),
+            open_cap_from: None,
         };
 
         let mut resp = Message::response(id, request.metadata.op_code);
@@ -491,6 +496,11 @@ impl DnsServer {
                     resp.metadata.response_code = ResponseCode::Refused;
                     return Reply::One(self.finish(resp, &ctx, "refused"));
                 }
+                if rt.open_resolver() {
+                    if let Some(reply) = self.open_resolver_guard(req, &resp, &mut ctx, rt, qtype) {
+                        return reply;
+                    }
+                }
                 let dnssec_ok = request
                     .edns
                     .as_ref()
@@ -541,10 +551,7 @@ impl DnsServer {
                         let bytes = match (&parsed, proto) {
                             (Ok(m), Proto::Udp) if bytes.len() > limit => {
                                 self.stats.truncated.fetch_add(1, Relaxed);
-                                result.push(format!(
-                                    "truncated for UDP ({} bytes > {limit}); client retries over TCP",
-                                    bytes.len()
-                                ));
+                                result.push(self.truncation_note(&ctx, bytes.len(), limit));
                                 m.truncate()
                                     .to_vec()
                                     .unwrap_or_else(|_| header_only(id, ResponseCode::ServFail))
@@ -590,11 +597,8 @@ impl DnsServer {
             bytes = t
                 .to_vec()
                 .unwrap_or_else(|_| header_only(resp.metadata.id, ResponseCode::ServFail));
-            result.push(format!(
-                "truncated for UDP ({} bytes > {}); client retries over TCP",
-                resp.to_vec().map(|v| v.len()).unwrap_or(0),
-                limit
-            ));
+            let full = resp.to_vec().map(|v| v.len()).unwrap_or(0);
+            result.push(self.truncation_note(ctx, full, limit));
         }
         self.emit(
             ctx,
@@ -606,6 +610,70 @@ impl DnsServer {
             source,
         );
         bytes
+    }
+
+    /// Query-log note for a truncated UDP answer; counts the truncations
+    /// only the open-resolver payload cap caused.
+    fn truncation_note(&self, ctx: &Ctx, full: usize, limit: usize) -> String {
+        match ctx.open_cap_from {
+            Some(orig) if full <= orig.saturating_sub(ctx.reserve) => {
+                self.stats.open_resolver_truncated.fetch_add(1, Relaxed);
+                format!("truncated for UDP ({full} bytes > {limit}, open resolver cap); client retries over TCP")
+            }
+            _ => format!("truncated for UDP ({full} bytes > {limit}); client retries over TCP"),
+        }
+    }
+
+    /// Open resolver safeguards for a query about to be forwarded: the
+    /// per-client forwarding limit, no forwarded ANY (RFC 8482 minimal
+    /// answer instead), and the UDP payload cap (lowers `ctx.udp_limit`).
+    /// Returns the reply when the query must not be forwarded.
+    fn open_resolver_guard(
+        &self,
+        req: &[u8],
+        resp: &Message,
+        ctx: &mut Ctx,
+        rt: &Runtime,
+        qtype: RecordType,
+    ) -> Option<Reply> {
+        match self.fwd_limiter.check(ctx.client.ip()) {
+            Decision::Allow => {}
+            d => {
+                self.stats.open_resolver_rate_limited.fetch_add(1, Relaxed);
+                if matches!(d, Decision::RejectFirst) {
+                    tracing::warn!(client = %ctx.client.ip(), limit = rt.forwarding.open_resolver_rate_per_second, "open resolver: per-client forwarding limit exceeded; dropping forwarded queries for this window");
+                }
+                // As the global limiter: UDP drop (or slip), TCP REFUSED.
+                return Some(match ctx.proto {
+                    Proto::Udp if d == Decision::Slip => {
+                        slip_reply(req).map(Reply::One).unwrap_or(Reply::None)
+                    }
+                    Proto::Udp => Reply::None,
+                    Proto::Tcp => {
+                        self.stats.refused.fetch_add(1, Relaxed);
+                        let mut r = resp.clone();
+                        r.metadata.response_code = ResponseCode::Refused;
+                        Reply::One(self.finish(r, ctx, "refused"))
+                    }
+                });
+            }
+        }
+        if qtype == RecordType::ANY {
+            // RFC 8482 §4.2: a synthesized HINFO, as the authoritative
+            // minimal-ANY path does; small, and never forwarded.
+            self.stats.open_resolver_any.fetch_add(1, Relaxed);
+            let q = resp.queries[0].name().clone();
+            let mut r = resp.clone();
+            let hinfo = hickory_proto::rr::rdata::HINFO::new("RFC8482".to_string(), String::new());
+            r.add_answer(Record::from_rdata(q, 3789, RData::HINFO(hinfo)));
+            return Some(Reply::One(self.finish(r, ctx, "forward")));
+        }
+        let cap = rt.forwarding.open_resolver_max_udp_payload as usize;
+        if ctx.proto == Proto::Udp && cap < ctx.udp_limit {
+            ctx.open_cap_from = Some(ctx.udp_limit);
+            ctx.udp_limit = cap.max(512);
+        }
+        None
     }
 
     #[allow(clippy::too_many_arguments)]

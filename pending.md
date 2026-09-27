@@ -2,6 +2,14 @@
 
 Status as of 2026-09-27. Deployed to dns-test (musl build, /opt/rust-dns) with everything below. Stages 1 to 3 (log rotation, DNS protocol completeness, console fixes) are implemented. The current workspace has additional Stage 4 changes in progress below.
 
+## Open resolver mode (2026-09-27, implemented, not committed)
+
+- [x] `[forwarding] open_resolver = false` (default), `open_resolver_max_udp_payload = 512` (512..4096), `open_resolver_rate_per_second = 20` (0 = no extra limit). The L10 guard stays the default; the flag skips it in `config::validate` and `mutation::settings::validate`. Empty `allowed_clients` still means nobody (the /0 entries must be listed). `--check` prints `WARNING:` lines; WARN at startup, on reload (notes too) and on every off->on transition. Reloadable.
+- [x] Console/API override: `ForwardingSettings.open_resolver: Option<bool>` (absent in old overrides = the file's value; new saves always store it explicitly). `ForwardingInput.open_resolver` (omitted = file value), `ForwardingView.open_resolver/_max_udp_payload/_rate_per_second`, `config.open_resolver`. Audited in `settings.forwarding.update` before/after; replicated as part of the `setting_set` JSON (replay test data, snapshot test, `tests/follow.rs`).
+- [x] Runtime: effective mode = override ?? file; an ACL the guard would refuse always gets the safeguards (defence in depth). Safeguards only while on and upstreams exist: UDP cap on forwarded answers (upstream and cache; TC=1), ANY for foreign names -> RFC 8482 HINFO (not forwarded), per-client forwarding limiter (`DnsServer::fwd_limiter`, same count-min + slip; UDP drop/slip, TCP REFUSED).
+- [x] Visibility: gauge `rustdns_open_resolver`, counters `rustdns_open_resolver_{truncated,any,rate_limited}_total`, `/api/status` `forwarding.open_resolver` + `dns.open_resolver_*`; console badge on dashboard and Server settings, two-step in-dialog enable, turn-off dialog with a narrowed ACL.
+- [ ] Not done: exempting clients with a valid server cookie from the UDP cap (cookie proves the source address); per-mode limits configurable from the console (file only).
+
 ## Replica tracking and halting (2026-09-27, implemented, not committed)
 
 - [x] `[follow].instance_id` required (host label); standby sends `X-Rust-DNS-Instance/Version/Session` on every replication request; data endpoints 400 without it.

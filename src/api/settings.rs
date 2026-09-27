@@ -40,6 +40,8 @@ pub struct ForwardingFileValues {
     pub timeout_ms: u64,
     pub cache_max_ttl: u32,
     pub cache_negative_max_ttl: u32,
+    /// `[forwarding].open_resolver`.
+    pub open_resolver: bool,
 }
 
 /// Forwarding cache size and counters since start.
@@ -90,6 +92,20 @@ pub struct ForwardingView {
     /// Longest a negative answer is cached, seconds (in effect).
     #[schema(example = 3600)]
     pub cache_negative_max_ttl: u32,
+    /// Open resolver mode in effect: `allowed_clients` may cover any
+    /// network (e.g. `0.0.0.0/0`) and, whenever queries are forwarded, the
+    /// safeguards apply (UDP answers
+    /// over `open_resolver_max_udp_payload` truncated, ANY not forwarded,
+    /// per-client forwarding rate limit).
+    pub open_resolver: bool,
+    /// Largest forwarded UDP answer in open resolver mode, bytes
+    /// (`[forwarding].open_resolver_max_udp_payload`, config file only).
+    #[schema(example = 512)]
+    pub open_resolver_max_udp_payload: u16,
+    /// Forwarded queries per second per client in open resolver mode; 0 = no
+    /// extra limit (`[forwarding].open_resolver_rate_per_second`, config file only).
+    #[schema(example = 20)]
+    pub open_resolver_rate_per_second: u32,
     /// The config file's values, for comparison and reset.
     pub config: ForwardingFileValues,
     pub cache: ForwardCacheInfo,
@@ -103,9 +119,11 @@ pub struct ForwardingView {
 pub struct ForwardingInput {
     /// At most 8, tried in order. An empty list turns forwarding off.
     pub upstreams: Vec<String>,
-    /// CIDR networks or single addresses. Anything that would make this an
-    /// open resolver is refused: an entry shorter than /8 (IPv4) or /16
-    /// (global IPv6), or entries covering over 1/16 of IPv4 together.
+    /// CIDR networks or single addresses. Unless `open_resolver` is true,
+    /// anything that would make this an open resolver is refused: an entry
+    /// shorter than /8 (IPv4) or /16 (global IPv6), or entries covering over
+    /// 1/16 of IPv4 together. An empty list means no client may use
+    /// forwarding, also in open resolver mode (list `0.0.0.0/0` and `::/0`).
     pub allowed_clients: Vec<String>,
     /// 100 to 30000.
     pub timeout_ms: u64,
@@ -119,6 +137,12 @@ pub struct ForwardingInput {
     #[serde(default)]
     #[schema(nullable = false, example = 3600)]
     pub cache_negative_max_ttl: Option<u32>,
+    /// Deliberately run an open resolver: lifts the `allowed_clients` guard
+    /// and turns on the open-resolver safeguards. Omitted: the config file's
+    /// `open_resolver` (the saved override always records the value used).
+    #[serde(default)]
+    #[schema(nullable = false, example = false)]
+    pub open_resolver: Option<bool>,
 }
 
 /// Upstreams to probe before saving.
@@ -172,6 +196,9 @@ fn view(s: &AppState) -> ApiResult<ForwardingView> {
         timeout_ms: rt.forwarding.timeout_ms,
         cache_max_ttl: rt.forwarding.cache_max_ttl,
         cache_negative_max_ttl: rt.forwarding.cache_negative_max_ttl,
+        open_resolver: rt.forwarding.open_resolver,
+        open_resolver_max_udp_payload: rt.forwarding.open_resolver_max_udp_payload,
+        open_resolver_rate_per_second: rt.forwarding.open_resolver_rate_per_second,
         cache: cache_info(s),
         source,
         updated_by,
@@ -187,6 +214,7 @@ fn view(s: &AppState) -> ApiResult<ForwardingView> {
             timeout_ms: cfg.forwarding.timeout_ms,
             cache_max_ttl: cfg.forwarding.cache_max_ttl,
             cache_negative_max_ttl: cfg.forwarding.cache_negative_max_ttl,
+            open_resolver: cfg.forwarding.open_resolver,
         },
     })
 }
@@ -263,8 +291,8 @@ pub async fn get_forwarding(State(s): St, caller: Caller) -> ApiResult<Json<Forw
     tag = "Server",
     operation_id = "update_forwarding_settings",
     summary = "Change upstream resolvers (admin)",
-    description = "Saves forwarding settings that override `[forwarding]` in the config file and applies them at once (no restart). The change and its audit entry are one transaction. Needs `server_admin`.",
-    request_body(content = ForwardingInput, example = json!({ "upstreams": ["1.1.1.1", "[2606:4700:4700::1111]:53"], "allowed_clients": ["192.168.0.0/16", "fd00::/8"], "timeout_ms": 2000, "cache_max_ttl": 86400, "cache_negative_max_ttl": 3600 })),
+    description = "Saves forwarding settings that override `[forwarding]` in the config file and applies them at once (no restart). The change and its audit entry are one transaction. `open_resolver: true` deliberately allows any client network (e.g. `0.0.0.0/0`, `::/0`) and turns on the open-resolver safeguards; see the README before using it. Needs `server_admin`.",
+    request_body(content = ForwardingInput, example = json!({ "upstreams": ["1.1.1.1", "[2606:4700:4700::1111]:53"], "allowed_clients": ["192.168.0.0/16", "fd00::/8"], "timeout_ms": 2000, "cache_max_ttl": 86400, "cache_negative_max_ttl": 3600, "open_resolver": false })),
     responses(
         (status = 200, description = "Saved and applied.", body = ForwardingView),
         (status = 400, response = BadRequest),
@@ -284,6 +312,7 @@ pub async fn update_forwarding(
         &input.allowed_clients,
         input.timeout_ms,
         (input.cache_max_ttl, input.cache_negative_max_ttl),
+        input.open_resolver,
         &file,
     )
     .map_err(|errs| ApiError::bad_request(errs.join("; ")))?;
@@ -295,6 +324,9 @@ pub async fn update_forwarding(
     s.dns
         .set_forwarding_override(Some(next.clone()), &s.reloader.current.load());
     tracing::info!(actor = %actor.name, upstreams = ?next.upstreams, "forwarding settings updated from the console");
+    for w in s.dns.open_resolver_warnings() {
+        tracing::warn!("{w}");
+    }
     Ok(Json(view(&s)?))
 }
 

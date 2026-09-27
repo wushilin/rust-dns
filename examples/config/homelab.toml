@@ -13,11 +13,16 @@ default_hostmaster = "admin@home.arpa"
 [forwarding]
 upstreams = ["1.1.1.1:53", "9.9.9.9:53", "[2606:4700:4700::1111]:53"]
 timeout_ms = 1500
-# Only LAN clients may use forwarding. Never add 0.0.0.0/0 here.
+# Only LAN clients may use forwarding. Never add 0.0.0.0/0 here: it is refused
+# unless open_resolver = true (see "Running an open resolver" in the README).
 allowed_clients = ["127.0.0.0/8", "::1/128", "192.168.0.0/16", "10.0.0.0/8", "fd00::/8", "fe80::/10"]
 cache_entries = 20000
 cache_max_ttl = 86400          # never cache longer than this (TTLs are never raised)
 cache_negative_max_ttl = 3600  # NXDOMAIN / no-data
+open_resolver = false          # true only for a deliberate public resolver; then also set
+                               # allowed_clients = ["0.0.0.0/0", "::/0"]. Safeguards while on:
+# open_resolver_max_udp_payload = 512   # bigger forwarded UDP answers are sent TC=1 (retry over TCP)
+# open_resolver_rate_per_second = 20    # forwarded queries/s per client (IPv4 / IPv6 /64); 0 = off
 
 [rate_limit]
 max_resolutions_per_second_per_address = 500

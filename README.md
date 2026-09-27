@@ -115,6 +115,9 @@ allowed_clients = ["10.0.0.0/8", "192.168.0.0/16", "fc00::/7"]
 cache_entries = 10000
 cache_max_ttl = 86400         # cap on how long an answer is cached (never raises TTLs)
 cache_negative_max_ttl = 3600 # cap for NXDOMAIN / no-data answers
+open_resolver = false         # true = deliberate open resolver; see "Running an open resolver"
+open_resolver_max_udp_payload = 512  # open resolver: bigger forwarded UDP answers are sent TC=1
+open_resolver_rate_per_second = 20   # open resolver: forwarded queries/s per client; 0 = no extra limit
 
 [rate_limit]
 max_resolutions_per_second_per_address = 500   # per IPv4 address / IPv6 /64
@@ -213,7 +216,8 @@ Before exposing rust-dns to the internet, note:
   Forwarded answers are truncated to the client's UDP size. ACLs that would
   make an open resolver (a /0, or anything shorter than /8 IPv4 or /16 global
   IPv6, or entries covering more than 1/16 of IPv4 together) are refused in
-  the config file and the console.
+  the config file and the console, unless open resolver mode is turned on on
+  purpose (see [Running an open resolver](#running-an-open-resolver)).
 - **Web listener.** Request headers must arrive within
   `request_header_timeout_secs`, at most `max_connections` connections are
   served, and pages are served with a strict Content-Security-Policy (scripts
@@ -221,6 +225,85 @@ Before exposing rust-dns to the internet, note:
 - **TSIG is unaffected** by these changes.
 - **BIND zone-file import and export were removed** (the parser followed
   `$INCLUDE` to files on the server). JSON import/export remains.
+
+## Running an open resolver
+
+By default rust-dns refuses to become an open resolver: forwarding is limited
+to `allowed_clients`, and a list that covers the internet (see *Forwarding*
+above) is rejected. If you really want a public recursive resolver, turn on
+**open resolver mode** explicitly, either in the config file:
+
+```toml
+[forwarding]
+upstreams = ["1.1.1.1:53", "[2606:4700:4700::1111]:53"]
+open_resolver = true
+allowed_clients = ["0.0.0.0/0", "::/0"]   # list them: an empty list still means nobody
+open_resolver_max_udp_payload = 512      # optional (512 to 4096)
+open_resolver_rate_per_second = 20       # optional; 0 = only [rate_limit] applies
+```
+
+or in the console (*Server settings -> Forwarding -> Turn on open resolver
+mode*, a two-step confirmation that can also set the allowed clients to
+`0.0.0.0/0` and `::/0`), or with the API (`PUT /api/settings/forwarding` with
+`"open_resolver": true`). The mode only lifts the guard on `allowed_clients`;
+it does not add anything to the list. A console/API setting overrides the
+file like the other forwarding settings (and always records the mode it was
+saved with, so editing the file later cannot silently drop the safeguards).
+Turning it on or off is recorded in the audit log
+(`settings.forwarding.update`, before/after) and is replicated to standbys.
+
+**Risks.** An open resolver answers anyone. Expect:
+
+- **Reflection and amplification:** attackers send small queries with a
+  victim's spoofed source address; the (larger) answers flood the victim.
+  Your server becomes part of the attack and your bandwidth pays for it.
+- **Abuse reports and blocklists:** internet-wide scanners (Shadowserver,
+  the Open Resolver Project and others) find open resolvers within hours and
+  report them to your network's abuse contact.
+- **Cloud provider notices:** many providers forbid open resolvers in their
+  acceptable-use policy, send abuse tickets, throttle UDP/53 or suspend the
+  instance.
+- **Upstream limits:** the upstream resolvers see all of your users' traffic
+  as yours; public resolvers rate-limit or block heavy sources, which then
+  hurts your own lookups too.
+- Cache poisoning attempts and resource exhaustion from anyone on the
+  internet (the forwarding cache and upstream sockets are shared).
+
+**Safeguards** (only while open resolver mode is in effect; otherwise
+nothing changes):
+
+- **UDP size cap.** Forwarded answers larger than
+  `open_resolver_max_udp_payload` (default 512 bytes) are sent over UDP
+  truncated (TC=1, answer sections emptied), whatever EDNS size the client
+  offers. Real clients retry over TCP, which cannot be spoofed; a reflected
+  answer is never much larger than the query. This removes most of the
+  amplification.
+- **No forwarded ANY.** `ANY` queries for names this server is not
+  authoritative for are not forwarded. They get the RFC 8482 minimal answer
+  (a synthesized `HINFO "RFC8482" ""`, TTL 3789), as authoritative names
+  already do with `minimal_any`. Chosen over REFUSED/NOTIMP because it is
+  what RFC 8482 §4.2 prescribes (and what large public resolvers answer), it
+  is just as small, and RFC 8482-aware clients treat it as a normal answer
+  rather than a server failure. ANY is the classic amplification query.
+- **Per-client forwarding limit.** `open_resolver_rate_per_second` (default
+  20) forwarded queries (upstream or cache) per second per client (IPv4
+  address / IPv6 /64), on top of the global `[rate_limit]`. It uses the same
+  flood-proof count-min limiter and `slip`: over the limit, UDP queries are
+  dropped (every `slip`-th gets an empty TC=1 answer), TCP gets REFUSED.
+  Authoritative answers are not affected.
+- **DNS cookies** (RFC 7873, `[server].cookies`, on by default) stay on.
+- **Loud.** A WARN log line at startup, on every reload (SIGHUP or
+  `POST /api/admin/reload`) and when the mode changes; `--check` prints a
+  `WARNING:` line; the gauge `rustdns_open_resolver` is 1;
+  `/api/status` has `forwarding.open_resolver: true` and the counters
+  `dns.open_resolver_truncated`, `dns.open_resolver_any` and
+  `dns.open_resolver_rate_limited` (also in `/metrics` as
+  `rustdns_open_resolver_*_total`); the console shows an *Open resolver*
+  badge on the dashboard and on Server settings.
+
+Consider also a lower `[rate_limit].max_resolutions_per_second_per_address`,
+monitoring the counters above and your provider's abuse mailbox, and, where
+possible, restricting UDP/53 to known networks at the firewall instead.
 
 ## Securing zone transfers with TSIG
 

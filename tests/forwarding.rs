@@ -31,6 +31,9 @@ enum Mode {
     Lowercase,
     /// UDP: empty TC=1 reply; TCP: 80 A records (too big for 512 bytes).
     Big,
+    /// Names starting with "big.": 40 A records over UDP and TCP (over 512
+    /// bytes, under 1232); others as Normal.
+    BigName,
 }
 
 /// A fake resolver on UDP and TCP (same port) that counts the queries it
@@ -63,6 +66,9 @@ fn fake_upstream_with(
                     0
                 }
                 (Mode::Big, true) => 80,
+                (Mode::BigName, _) if name.to_ascii().to_ascii_lowercase().starts_with("big.") => {
+                    40
+                }
                 _ => 1,
             };
             for i in 0..n {
@@ -148,6 +154,8 @@ fn fake_upstream() -> u16 {
     port
 }
 
+const DEFAULT_FORWARDING: &str = "upstreams = []\nallowed_clients = [\"127.0.0.0/8\"]";
+
 struct Server {
     child: Child,
     dns: u16,
@@ -156,14 +164,18 @@ struct Server {
 
 impl Server {
     fn start(dir: PathBuf, dns: u16, web_port: u16) -> Server {
+        Server::start_with(dir, dns, web_port, DEFAULT_FORWARDING)
+    }
+
+    /// `forwarding`: the body of `[forwarding]`.
+    fn start_with(dir: PathBuf, dns: u16, web_port: u16, forwarding: &str) -> Server {
         let cfg = format!(
             r#"
 [server]
 bind = ["127.0.0.1"]
 port = {dns}
 [forwarding]
-upstreams = []
-allowed_clients = ["127.0.0.0/8"]
+{forwarding}
 [rate_limit]
 max_resolutions_per_second_per_address = 0
 [database]
@@ -606,6 +618,300 @@ fn tcp_fallback_answers_are_truncated_for_udp_clients() {
         "TC=1 tells the client to retry over TCP"
     );
     assert_eq!(r.metadata.id, m.metadata.id);
+    drop(srv);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A UDP query with EDNS (payload 4096); None when no reply came in time.
+fn query_udp_edns(
+    port: u16,
+    name: &str,
+    qtype: RecordType,
+    wait: Duration,
+) -> Option<(usize, Message)> {
+    let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    sock.set_read_timeout(Some(wait)).unwrap();
+    let mut m = Message::new(rand_id(), MessageType::Query, OpCode::Query);
+    m.metadata.recursion_desired = true;
+    m.add_query(Query::query(Name::from_ascii(name).unwrap(), qtype));
+    let mut e = hickory_proto::op::Edns::new();
+    e.set_max_payload(4096);
+    m.set_edns(e);
+    sock.send_to(&m.to_vec().unwrap(), ("127.0.0.1", port))
+        .unwrap();
+    let mut buf = [0u8; 65535];
+    let n = sock.recv(&mut buf).ok()?;
+    Some((n, Message::from_bytes(&buf[..n]).unwrap()))
+}
+
+fn query_tcp(port: u16, name: &str, qtype: RecordType) -> Message {
+    use std::io::{Read, Write};
+    let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut m = Message::new(rand_id(), MessageType::Query, OpCode::Query);
+    m.metadata.recursion_desired = true;
+    m.add_query(Query::query(Name::from_ascii(name).unwrap(), qtype));
+    let q = m.to_vec().unwrap();
+    c.write_all(&(q.len() as u16).to_be_bytes()).unwrap();
+    c.write_all(&q).unwrap();
+    let mut len = [0u8; 2];
+    c.read_exact(&mut len).unwrap();
+    let mut buf = vec![0u8; u16::from_be_bytes(len) as usize];
+    c.read_exact(&mut buf).unwrap();
+    Message::from_bytes(&buf).unwrap()
+}
+
+fn metric(web: &str, a: &ureq::Agent, name: &str) -> String {
+    let text = a
+        .get(&format!("{web}/metrics"))
+        .call()
+        .unwrap()
+        .into_string()
+        .unwrap();
+    text.lines()
+        .find(|l| l.starts_with(&format!("{name} ")))
+        .unwrap_or_else(|| panic!("{name} missing from /metrics"))
+        .split(' ')
+        .nth(1)
+        .unwrap()
+        .to_string()
+}
+
+/// Open resolver mode: explicit opt-in through the API (audited), then the
+/// safeguards: UDP answers over the cap come back TC (complete over TCP),
+/// ANY is not forwarded, and the per-client forwarding limit engages.
+/// Turning it off restores the usual behaviour.
+#[test]
+fn open_resolver_mode_and_safeguards() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let dir = std::env::temp_dir().join(format!(
+        "rust-dns-open-{}-{}",
+        std::process::id(),
+        rand_id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (up, count) = fake_upstream_with(Mode::BigName, 300);
+    let srv = Server::start_with(
+        dir.clone(),
+        free_port(),
+        free_port(),
+        &format!("{DEFAULT_FORWARDING}\nopen_resolver_rate_per_second = 10"),
+    );
+    let (web, dns) = (srv.web.clone(), srv.dns);
+    let root = login(&web, "root", "rootpass123");
+    let url = format!("{web}/api/settings/forwarding");
+    let upstream = format!("127.0.0.1:{up}");
+    let wide = serde_json::json!(["0.0.0.0/0", "::/0"]);
+    let pause = || std::thread::sleep(Duration::from_millis(1100)); // new limiter window
+
+    // The guard is the default: a wide ACL without the flag is refused.
+    let (s, v) = call(
+        &root,
+        "PUT",
+        &url,
+        Some(
+            serde_json::json!({ "upstreams": [upstream], "allowed_clients": wide, "timeout_ms": 1000 }),
+        ),
+    );
+    assert_eq!(s, 400, "{v}");
+    assert!(
+        v["error"].as_str().unwrap().contains("open resolver"),
+        "{v}"
+    );
+    let (s, v) = call(
+        &root,
+        "PUT",
+        &url,
+        Some(
+            serde_json::json!({ "upstreams": [upstream], "allowed_clients": wide, "timeout_ms": 1000, "open_resolver": false }),
+        ),
+    );
+    assert_eq!(s, 400, "{v}");
+
+    // Off (ordinary ACL): a 40-record answer fits the client's EDNS size.
+    let (s, v) = call(
+        &root,
+        "PUT",
+        &url,
+        Some(
+            serde_json::json!({ "upstreams": [upstream], "allowed_clients": ["127.0.0.0/8"], "timeout_ms": 1000 }),
+        ),
+    );
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["open_resolver"], false);
+    let (n, r) = query_udp_edns(
+        dns,
+        "big.off.example.",
+        RecordType::A,
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    assert!(
+        n > 512 && !r.metadata.truncation && r.answers.len() == 40,
+        "{n} {r:?}"
+    );
+    let (_, st) = call(&root, "GET", &format!("{web}/api/status"), None);
+    assert_eq!(st["forwarding"]["open_resolver"], false);
+    assert_eq!(metric(&web, &root, "rustdns_open_resolver"), "0");
+
+    // Turn it on, explicitly.
+    let (s, v) = call(
+        &root,
+        "PUT",
+        &url,
+        Some(
+            serde_json::json!({ "upstreams": [upstream], "allowed_clients": wide, "timeout_ms": 1000, "open_resolver": true }),
+        ),
+    );
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["open_resolver"], true);
+    assert_eq!(v["allowed_clients"], wide);
+    assert_eq!(v["open_resolver_max_udp_payload"], 512);
+    assert_eq!(v["open_resolver_rate_per_second"], 10);
+    let (_, st) = call(&root, "GET", &format!("{web}/api/status"), None);
+    assert_eq!(st["forwarding"]["open_resolver"], true, "{st}");
+    assert_eq!(metric(&web, &root, "rustdns_open_resolver"), "1");
+    let (_, audit) = call(&root, "GET", &format!("{web}/api/audit?limit=50"), None);
+    let e = audit["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| {
+            e["action"] == "settings.forwarding.update"
+                && e["detail"]["after"]["open_resolver"] == true
+        })
+        .unwrap_or_else(|| panic!("audited: {audit}"));
+    assert_eq!(e["detail"]["before"]["open_resolver"], false, "{e}");
+
+    // A client (inside 0.0.0.0/0) is answered via the upstream.
+    pause();
+    assert!(answered_by_fake(&query(dns, "hello.example.")));
+
+    // Over the UDP cap: TC=1 with the answer removed, from the upstream and
+    // from the cache alike; TCP gets the whole answer.
+    for i in 0..2 {
+        let (n, r) = query_udp_edns(
+            dns,
+            "big.on.example.",
+            RecordType::A,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(n <= 512, "#{i}: {n} bytes");
+        assert!(r.metadata.truncation && r.answers.is_empty(), "#{i}: {r:?}");
+    }
+    let r = query_tcp(dns, "big.on.example.", RecordType::A);
+    assert!(!r.metadata.truncation && r.answers.len() == 40, "{r:?}");
+
+    // ANY is not forwarded: a minimal RFC 8482 answer instead.
+    let before = count.load(SeqCst);
+    let (_, r) =
+        query_udp_edns(dns, "any.example.", RecordType::ANY, Duration::from_secs(5)).unwrap();
+    assert_eq!(r.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(r.answers.len(), 1, "{r:?}");
+    assert!(
+        matches!(&r.answers[0].data, RData::HINFO(h) if &*h.cpu == b"RFC8482"),
+        "{r:?}"
+    );
+    assert_eq!(count.load(SeqCst), before, "ANY reached the upstream");
+
+    // The per-client forwarding limit (10/s here): a burst of 30 gets
+    // at most two windows' worth of answers.
+    pause();
+    let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    sock.set_read_timeout(Some(Duration::from_millis(1500)))
+        .unwrap();
+    for i in 0..30u16 {
+        let mut m = Message::new(i, MessageType::Query, OpCode::Query);
+        m.metadata.recursion_desired = true;
+        m.add_query(Query::query(
+            Name::from_ascii("hello.example.").unwrap(),
+            RecordType::A,
+        ));
+        sock.send_to(&m.to_vec().unwrap(), ("127.0.0.1", dns))
+            .unwrap();
+    }
+    let (mut full, mut buf) = (0, [0u8; 4096]);
+    while let Ok(n) = sock.recv(&mut buf) {
+        let r = Message::from_bytes(&buf[..n]).unwrap();
+        if answered_by_fake(&r) {
+            full += 1;
+        }
+    }
+    assert!((1..=20).contains(&full), "answered {full} of 30");
+    let (_, st) = call(&root, "GET", &format!("{web}/api/status"), None);
+    let d = &st["dns"];
+    assert!(
+        d["open_resolver_rate_limited"].as_u64().unwrap() >= 10,
+        "{d}"
+    );
+    assert!(d["open_resolver_truncated"].as_u64().unwrap() >= 2, "{d}");
+    assert_eq!(d["open_resolver_any"], 1, "{d}");
+    assert_ne!(
+        metric(&web, &root, "rustdns_open_resolver_rate_limited_total"),
+        "0"
+    );
+
+    // Off again: the guard applies, and the cap no longer does.
+    let (s, v) = call(
+        &root,
+        "PUT",
+        &url,
+        Some(
+            serde_json::json!({ "upstreams": [upstream], "allowed_clients": ["127.0.0.0/8"], "timeout_ms": 1000, "open_resolver": false }),
+        ),
+    );
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["open_resolver"], false);
+    assert_eq!(metric(&web, &root, "rustdns_open_resolver"), "0");
+    let (n, r) = query_udp_edns(
+        dns,
+        "big.on.example.",
+        RecordType::A,
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    assert!(n > 512 && !r.metadata.truncation, "{n} {r:?}");
+    drop(srv);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `[forwarding].open_resolver = true` in the config file: a wide ACL is
+/// accepted at startup, and `--check` says so loudly.
+#[test]
+fn open_resolver_from_the_config_file() {
+    let dir = std::env::temp_dir().join(format!(
+        "rust-dns-openfile-{}-{}",
+        std::process::id(),
+        rand_id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let up = fake_upstream();
+    let fwd = format!("open_resolver = true\nupstreams = [\"127.0.0.1:{up}\"]\nallowed_clients = [\"0.0.0.0/0\", \"::/0\"]");
+    let srv = Server::start_with(dir.clone(), free_port(), free_port(), &fwd);
+    let out = Command::new(env!("CARGO_BIN_EXE_rust-dns"))
+        .arg("--config")
+        .arg(dir.join("t.toml"))
+        .arg("--check")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("WARNING: [forwarding].open_resolver is ON"),
+        "{stdout}"
+    );
+    let root = login(&srv.web, "root", "rootpass123");
+    let (_, v) = call(
+        &root,
+        "GET",
+        &format!("{}/api/settings/forwarding", srv.web),
+        None,
+    );
+    assert_eq!(v["source"], "config");
+    assert_eq!(v["open_resolver"], true);
+    assert_eq!(v["config"]["open_resolver"], true);
+    assert!(answered_by_fake(&query(srv.dns, "hello.example.")));
     drop(srv);
     let _ = std::fs::remove_dir_all(&dir);
 }

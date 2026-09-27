@@ -239,6 +239,18 @@ pub struct ForwardingConfig {
     /// Longest a negative answer (NXDOMAIN / no data) is cached, seconds;
     /// otherwise min(SOA MINIMUM, SOA TTL) as in RFC 2308.
     pub cache_negative_max_ttl: u32,
+    /// Deliberately run an open resolver: `allowed_clients` may then cover
+    /// any network, including `0.0.0.0/0` and `::/0` (the open-resolver
+    /// guard is skipped). An empty `allowed_clients` still means nobody;
+    /// list the /0 entries explicitly. While on, forwarded answers get the
+    /// safeguards below (UDP size cap, no forwarded ANY, per-client rate).
+    pub open_resolver: bool,
+    /// Open resolver only: forwarded answers over UDP larger than this are
+    /// sent truncated (TC=1) so the client retries over TCP.
+    pub open_resolver_max_udp_payload: u16,
+    /// Open resolver only: forwarded queries per second per client (IPv4
+    /// address / IPv6 /64), on top of `[rate_limit]`. 0 = no extra limit.
+    pub open_resolver_rate_per_second: u32,
 }
 
 /// Largest accepted forwarding cache TTL cap (one week).
@@ -553,6 +565,9 @@ impl Default for ForwardingConfig {
             cache_entries: 10_000,
             cache_max_ttl: 86_400,
             cache_negative_max_ttl: 3_600,
+            open_resolver: false,
+            open_resolver_max_udp_payload: 512,
+            open_resolver_rate_per_second: 20,
         }
     }
 }
@@ -649,6 +664,11 @@ allowed_clients = ["127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192
 cache_entries = 10000    # TTL-aware cache for forwarded answers; 0 = off
 cache_max_ttl = 86400    # cap on how long a forwarded answer is cached (its own TTL if lower; never raised)
 cache_negative_max_ttl = 3600  # cap for NXDOMAIN/no-data answers (otherwise min(SOA MINIMUM, SOA TTL))
+# open_resolver = true lifts the allowed_clients guard so it may list "0.0.0.0/0" and "::/0"
+# (an empty list still means nobody). Only for a deliberate public resolver: see the README.
+open_resolver = false
+open_resolver_max_udp_payload = 512 # open resolver: larger forwarded UDP answers are sent truncated (TC=1)
+open_resolver_rate_per_second = 20  # open resolver: forwarded queries/s per client (IPv4 / IPv6 /64); 0 = off
 
 [transfer]
 allow = []               # networks allowed to AXFR zones (for BIND/NSD secondaries), e.g. ["203.0.113.5/32"]
@@ -990,8 +1010,19 @@ pub fn validate(cfg: &Config) -> Result<()> {
         &cfg.forwarding.allowed_clients,
         &mut errs,
     );
-    for e in open_resolver_problems(&cfg.forwarding.allowed_clients) {
-        errs.push(format!("[forwarding].allowed_clients: {e}"));
+    // The open-resolver guard, unless an open resolver is deliberate.
+    if !cfg.forwarding.open_resolver {
+        for e in open_resolver_problems(&cfg.forwarding.allowed_clients) {
+            errs.push(format!(
+                "[forwarding].allowed_clients: {e} (or set [forwarding].open_resolver = true if that is really intended; see the README)"
+            ));
+        }
+    }
+    if !(512..=4096).contains(&cfg.forwarding.open_resolver_max_udp_payload) {
+        errs.push(format!(
+            "[forwarding].open_resolver_max_udp_payload must be between 512 and 4096 (got {})",
+            cfg.forwarding.open_resolver_max_udp_payload
+        ));
     }
     for e in cache_cap_problems(
         cfg.forwarding.cache_max_ttl,
@@ -1320,6 +1351,35 @@ pub fn open_resolver_problems(list: &[String]) -> Vec<String> {
     errs
 }
 
+/// What `--check`, startup and reload say while `[forwarding].open_resolver`
+/// is on (empty when it is off).
+pub fn open_resolver_warnings(f: &ForwardingConfig) -> Vec<String> {
+    if !f.open_resolver {
+        return Vec::new();
+    }
+    let mut out = vec![format!(
+        "[forwarding].open_resolver is ON: clients in allowed_clients ({}) may use this server as a recursive resolver; safeguards: forwarded UDP answers over {} bytes are truncated, ANY is not forwarded, {} forwarded queries/s per client",
+        if f.allowed_clients.is_empty() {
+            "none listed".to_string()
+        } else {
+            f.allowed_clients.join(", ")
+        },
+        f.open_resolver_max_udp_payload,
+        if f.open_resolver_rate_per_second == 0 {
+            "no limit on".to_string()
+        } else {
+            f.open_resolver_rate_per_second.to_string()
+        }
+    )];
+    if f.open_resolver_rate_per_second == 0 {
+        out.push("[forwarding].open_resolver_rate_per_second = 0: open-resolver clients are limited only by [rate_limit]".into());
+    }
+    if f.upstreams.is_empty() {
+        out.push("[forwarding].open_resolver is on but no upstreams are set: foreign names are refused anyway".into());
+    }
+    out
+}
+
 fn share(part: u128, whole: u128) -> String {
     format!("{:.1}%", part as f64 * 100.0 / whole as f64)
 }
@@ -1552,6 +1612,46 @@ notify = ["192.0.2.1:53", { address = "192.0.2.2:5300", key = "other." }, { addr
         .map(|s| s.to_string())
         .collect();
         assert!(open_resolver_problems(&ok).is_empty());
+    }
+
+    /// The guard stays the default; `open_resolver = true` is the explicit
+    /// override that lets `allowed_clients` cover everything.
+    #[test]
+    fn open_resolver_flag_lifts_the_guard() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(!cfg.forwarding.open_resolver);
+        assert_eq!(cfg.forwarding.open_resolver_max_udp_payload, 512);
+        assert_eq!(cfg.forwarding.open_resolver_rate_per_second, 20);
+        assert!(open_resolver_warnings(&cfg.forwarding).is_empty());
+        // Without the flag: refused, and the message names the override.
+        let msg = err_of("[forwarding]\nallowed_clients = [\"0.0.0.0/0\", \"::/0\"]");
+        assert!(msg.contains("open resolver"), "{msg}");
+        assert!(msg.contains("open_resolver = true"), "{msg}");
+        // With it: accepted, and loudly reported.
+        let cfg: Config = toml::from_str(
+            "[forwarding]\nopen_resolver = true\nupstreams = [\"1.1.1.1:53\"]\nallowed_clients = [\"0.0.0.0/0\", \"::/0\"]",
+        )
+        .unwrap();
+        validate(&cfg).unwrap();
+        let w = open_resolver_warnings(&cfg.forwarding);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("open_resolver is ON"), "{w:?}");
+        assert!(w[0].contains("0.0.0.0/0"), "{w:?}");
+        // The payload cap is validated either way.
+        let msg = err_of("[forwarding]\nopen_resolver_max_udp_payload = 100");
+        assert!(msg.contains("open_resolver_max_udp_payload"), "{msg}");
+        let msg =
+            err_of("[forwarding]\nopen_resolver = true\nopen_resolver_max_udp_payload = 9000");
+        assert!(msg.contains("open_resolver_max_udp_payload"), "{msg}");
+        // No extra rate limit and no upstreams are pointed out.
+        let cfg: Config = toml::from_str(
+            "[forwarding]\nopen_resolver = true\nopen_resolver_rate_per_second = 0\nallowed_clients = []",
+        )
+        .unwrap();
+        validate(&cfg).unwrap();
+        let w = open_resolver_warnings(&cfg.forwarding);
+        assert_eq!(w.len(), 3, "{w:?}");
+        assert!(w[0].contains("none listed"), "{w:?}");
     }
 
     #[test]

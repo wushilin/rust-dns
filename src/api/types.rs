@@ -538,6 +538,10 @@ pub struct ForwardingStatus {
     #[schema(value_type = Vec<String>)]
     pub upstreams: Vec<std::net::SocketAddr>,
     pub allowed_clients: Vec<String>,
+    /// Open resolver mode is in effect (`[forwarding].open_resolver` or the
+    /// console setting, with upstreams set): any client in `allowed_clients`,
+    /// possibly everyone, may resolve through this server.
+    pub open_resolver: bool,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
