@@ -5,8 +5,11 @@
 //! operation are declared in one place. Request and response bodies are the
 //! typed structs whose `ToSchema` derives produce the documented schemas.
 
-use super::error::{ApiError, ApiResult};
-use super::openapi::{BadRequest, Conflict, Forbidden, InvalidRequest, NotFound, Unauthorized};
+use super::error::{ApiError, ApiResult, ErrorCode};
+use super::openapi::{
+    BadRequest, Conflict, Forbidden, InvalidRequest, NotFound, ServiceUnavailable, TooManyRequests,
+    Unauthorized,
+};
 use super::session::{public_user, Caller};
 use super::types::*;
 use super::AppState;
@@ -860,20 +863,18 @@ pub async fn remove_member(
 
 // ---- export / import ---------------------------------------------------------
 
-/// Export formats. `bind` and `zone` both return a zone file.
+/// Export formats. Only `json` (BIND zone-file export was removed).
 #[derive(Deserialize, ToSchema)]
 #[allow(dead_code)] // documents the accepted values of `ExportQuery::format`
 #[serde(rename_all = "lowercase")]
 pub enum ExportFormat {
     Json,
-    Bind,
-    Zone,
 }
 
 #[derive(Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct ExportQuery {
-    /// `bind` (alias `zone`) returns a zone file.
+    /// Only `json` is supported.
     #[param(inline, value_type = ExportFormat, required = false, default = "json")]
     pub format: Option<String>,
 }
@@ -917,10 +918,7 @@ pub async fn export_all(State(s): St, caller: Caller) -> ApiResult<Response> {
     summary = "Export one zone",
     params(ZonePath, ExportQuery),
     responses(
-        (status = 200, description = "Download (`Content-Disposition: attachment`). JSON export document, or a BIND zone file with `format=bind`.", content(
-            (ExportDoc = "application/json"),
-            (String = "text/plain", example = "$ORIGIN example.com.\n@ 3600 IN SOA ns1.example.com. hostmaster.example.com. ( 2026011501 3600 600 1209600 300 )\nwww 300 IN A 192.0.2.10\n"),
-        )),
+        (status = 200, description = "Download (`Content-Disposition: attachment`): JSON export document.", body = ExportDoc),
         (status = 400, response = BadRequest),
         (status = 401, response = Unauthorized),
         (status = 404, response = NotFound),
@@ -944,21 +942,6 @@ pub async fn export_zone(
         z.name.clone()
     };
     match q.format.as_deref().unwrap_or("json") {
-        "bind" | "zone" => {
-            let text = crate::zones::to_zone_file(zd);
-            let disp = format!("attachment; filename=\"{base}.zone\"");
-            Ok((
-                [
-                    (
-                        header::CONTENT_TYPE,
-                        "text/plain; charset=utf-8".to_string(),
-                    ),
-                    (header::CONTENT_DISPOSITION, disp),
-                ],
-                text,
-            )
-                .into_response())
-        }
         "json" => {
             let doc = ExportDoc {
                 version: 1,
@@ -976,7 +959,7 @@ pub async fn export_zone(
                 .into_response())
         }
         other => Err(ApiError::bad_request(format!(
-            "unknown format '{other}'; use json or bind"
+            "unknown format '{other}'; only json is supported"
         ))),
     }
 }
@@ -1046,112 +1029,6 @@ pub async fn import(
         )
         .await?;
     Ok(Json(summary))
-}
-
-/// Import a BIND-format zone file into one zone (records only; SOA values are ignored).
-#[utoipa::path(
-    post,
-    path = "/zones/{zone}/import-bind",
-    tag = "Import/Export",
-    operation_id = "import_bind",
-    summary = "Import a BIND zone file into this zone",
-    description = "Needs the owner role. Records only; SOA values in the file are ignored. Names are relative to the zone origin.",
-    params(ZonePath, ImportQuery),
-    request_body(content = String, content_type = "text/plain",
-        example = "$ORIGIN example.com.\n$TTL 3600\nwww   300 IN A    192.0.2.10\nwww       IN AAAA 2001:db8::10\n@         IN MX   10 mail.example.com.\nmail      IN A    192.0.2.25\n"),
-    responses(
-        (status = 200, description = "Import summary; unsupported or invalid entries are listed in `skipped`.", body = BindImportSummary),
-        (status = 400, response = BadRequest),
-        (status = 401, response = Unauthorized),
-        (status = 403, response = Forbidden),
-        (status = 404, response = NotFound),
-    ),
-)]
-pub async fn import_bind(
-    State(s): St,
-    caller: Caller,
-    Path(ZonePath { zone }): Path<ZonePath>,
-    Query(q): Query<ImportQuery>,
-    body: String,
-) -> ApiResult<Json<BindImportSummary>> {
-    let (z, _) = s.require_zone(&caller, &zone, ZonePerm::Import)?;
-    let origin = hickory_proto::rr::Name::from_ascii(z.fqdn()).map_err(ApiError::internal)?;
-    let body = crate::zonefile::make_ttls_explicit(&body, z.default_ttl);
-    let parsed = hickory_proto::serialize::txt::Parser::new(body, None, Some(origin))
-        .parse()
-        .map_err(|e| ApiError::bad_request(format!("zone file: {e}")))?;
-    let mut records = Vec::new();
-    let mut skipped = Vec::new();
-    for (key, set) in parsed.1 {
-        let Some(rtype) = RecordType::parse(&key.record_type.to_string()) else {
-            if key.record_type != hickory_proto::rr::RecordType::SOA {
-                skipped.push(format!(
-                    "{} {}: unsupported type",
-                    key.name, key.record_type
-                ));
-            }
-            continue;
-        };
-        for r in set.records_without_rrsigs() {
-            let value = match r.data() {
-                hickory_proto::rr::RData::TXT(t) => t
-                    .iter()
-                    .map(|b| String::from_utf8_lossy(b).into_owned())
-                    .collect::<Vec<_>>()
-                    .join(""),
-                d => d.to_string(),
-            };
-            let value = match normalize_value(rtype, &value) {
-                Ok(v) => v,
-                Err(e) => {
-                    skipped.push(format!("{} {rtype} {value}: {}", key.name, e.0));
-                    continue;
-                }
-            };
-            let name = match normalize_record_name(&key.name.to_string(), &z.name) {
-                Ok(n) => n,
-                Err(e) => {
-                    skipped.push(format!("{}: {}", key.name, e.0));
-                    continue;
-                }
-            };
-            records.push(crate::mutation::ExportRecord {
-                name,
-                rtype,
-                value,
-                ttl: Some(set.ttl()).filter(|t| *t > 0 && *t != z.default_ttl),
-                expires_at: None,
-            });
-        }
-    }
-    let doc = ExportDoc {
-        version: 1,
-        exported_at: now_rfc3339(),
-        zones: vec![crate::mutation::ExportZone {
-            name: z.name.clone(),
-            serial: None,
-            soa_mname: None,
-            soa_rname: None,
-            refresh: None,
-            retry: None,
-            expire: None,
-            minimum: None,
-            default_ttl: None,
-            owner: None,
-            records,
-        }],
-    };
-    let summary = s
-        .mutator
-        .import(
-            caller.actor(),
-            doc,
-            q.mode.unwrap_or(ImportMode::Merge),
-            Some(caller.user.id),
-            Some(vec![z.name.clone()]),
-        )
-        .await?;
-    Ok(Json(BindImportSummary { summary, skipped }))
 }
 
 // ---- sessions ------------------------------------------------------------------
@@ -1330,6 +1207,7 @@ pub async fn revoke_user_sessions(
         (status = 400, response = BadRequest),
         (status = 401, response = Unauthorized),
         (status = 403, response = Forbidden),
+        (status = 429, response = TooManyRequests),
     ),
 )]
 pub async fn mfa_recovery_regen(
@@ -1338,14 +1216,7 @@ pub async fn mfa_recovery_regen(
     Json(b): Json<super::session::CodeBody>,
 ) -> ApiResult<Json<RecoveryCodes>> {
     s.require(&caller, GlobalPerm::ManageOwnMfa)?;
-    let secret = caller
-        .user
-        .totp_secret
-        .clone()
-        .ok_or_else(|| ApiError::bad_request("MFA is not enrolled"))?;
-    if !auth::totp_verify(&secret, &b.code) {
-        return Err(ApiError::unauthorized("invalid code"));
-    }
+    verify_current_totp(&s, &caller, &b.code)?;
     let (codes, hashes) = super::session::new_recovery_codes();
     s.accounts
         .run(&caller.actor(), "regenerate_recovery_codes", |t| {
@@ -1531,7 +1402,7 @@ pub async fn audit(
     tag = "Change log",
     operation_id = "get_changelog",
     summary = "DNS change log (WAL-style offsets)",
-    description = "One row per committed fact (zone, record, serial, member); rows from one transaction share `txn` and `command`. Rolled-back operations never appear. Non-admins see only their zones.",
+    description = "One row per committed fact (zone, record, serial, member); rows from one transaction share `txn` and `command`. Rolled-back operations never appear. Non-admins see only their zones; membership rows and other users' `actor_ip` (empty string) only on zones they own.",
     params(LogQuery),
     responses(
         (status = 200, description = "Entries plus retention bounds.", body = ChangelogPage, example = json!({
@@ -1559,12 +1430,10 @@ pub async fn changelog(
         None => s.storage.changelog_recent(limit)?,
     };
     if !caller.user.is_admin {
-        let visible: Vec<String> = s
-            .visible_zones(&caller.user)?
-            .into_iter()
-            .map(|(z, _)| z.name)
-            .collect();
-        entries.retain(|e| visible.contains(&e.zone));
+        // Same rules as the websocket feed: own zones only; membership
+        // changes and other users' IPs only for zone owners.
+        let view = super::ws::View::build(&s, &caller.user)?;
+        entries = entries.iter().filter_map(|e| view.change(e)).collect();
     }
     let stale = matches!((q.after, oldest), (Some(a), Some(o)) if a + 1 < o);
     Ok(Json(ChangelogPage {
@@ -1631,6 +1500,7 @@ pub async fn list_users(State(s): St, caller: Caller) -> ApiResult<Json<UserList
         (status = 401, response = Unauthorized),
         (status = 403, response = Forbidden),
         (status = 409, response = Conflict),
+        (status = 503, response = ServiceUnavailable),
     ),
 )]
 pub async fn create_user(
@@ -1655,7 +1525,7 @@ pub async fn create_user(
         &caller.actor(),
         &NewUser {
             username: username.clone(),
-            password_hash: auth::hash_password(password)?,
+            password_hash: auth::hash_password_async(password).await??,
             display_name: b
                 .display_name
                 .unwrap_or_default()
@@ -1684,6 +1554,7 @@ pub async fn create_user(
         (status = 401, response = Unauthorized),
         (status = 403, response = Forbidden),
         (status = 404, response = NotFound),
+        (status = 503, response = ServiceUnavailable),
     ),
 )]
 pub async fn update_user(
@@ -1700,10 +1571,10 @@ pub async fn update_user(
     if before.is_root && !caller.user.is_root {
         return Err(ApiError::forbidden("only root may modify the root account"));
     }
-    let mut u = before.clone();
+    let mut ch = crate::mutation::accounts::UserChanges::default();
     let mut revoke_sessions = false;
     if let Some(p) = &b.password {
-        if u.is_root {
+        if before.is_root {
             return Err(ApiError::bad_request(
                 "the root password is managed in the configuration file",
             ));
@@ -1713,34 +1584,31 @@ pub async fn update_user(
                 "password must be at least 8 characters",
             ));
         }
-        u.password_hash = auth::hash_password(p)?;
+        ch.password_hash = Some(auth::hash_password_async(p).await??);
         revoke_sessions = true;
     }
     if let Some(d) = b.display_name {
-        u.display_name = d.chars().take(100).collect();
+        ch.display_name = Some(d.chars().take(100).collect());
     }
     if let Some(a) = b.is_admin {
-        if u.is_root && !a {
+        if before.is_root && !a {
             return Err(ApiError::bad_request("root is always an administrator"));
         }
-        u.is_admin = a;
+        ch.is_admin = Some(a);
     }
     if let Some(m) = b.mfa_required {
-        u.mfa_required = m;
+        ch.mfa_required = Some(m);
     }
     if let Some(d) = b.disabled {
-        if u.is_root {
+        if before.is_root {
             return Err(ApiError::bad_request("root cannot be disabled"));
         }
-        u.disabled_at = if d {
-            before.disabled_at.clone().or_else(|| Some(now_rfc3339()))
-        } else {
-            None
-        };
+        ch.disabled = Some(d);
         revoke_sessions |= d;
     }
+    // Only the fields in the request are written (see AuditTx::change_user).
     let u = s.accounts.run(&caller.actor(), "update_user", |t| {
-        let u = t.update_user(&before, &u)?;
+        let u = t.change_user(before.id, &ch)?;
         if revoke_sessions {
             t.delete_user_sessions(&u, "password changed or account disabled")?;
         }
@@ -1777,11 +1645,8 @@ pub async fn reset_user_mfa(
     if before.is_root && !caller.user.is_root {
         return Err(ApiError::forbidden("only root may modify the root account"));
     }
-    let mut u = before.clone();
-    u.totp_secret = None;
-    u.totp_enrolled_at = None;
     let u = s.accounts.run(&caller.actor(), "reset_mfa", |t| {
-        let u = t.update_user(&before, &u)?;
+        let u = t.set_mfa(before.id, None)?;
         t.set_recovery_codes(&u, &[])?;
         t.delete_user_sessions(&u, "MFA reset")?;
         Ok(u)
@@ -1842,13 +1707,15 @@ pub struct PasswordBody {
     tag = "Account",
     operation_id = "change_password",
     summary = "Change own password",
-    description = "Needs an interactive (cookie) session. Not available to root, whose password is set in the configuration file.",
+    description = "Needs an interactive (cookie) session. Not available to root, whose password is set in the configuration file. Every other session of the user is signed out; API tokens keep working (revoke them separately).",
     request_body(content = PasswordBody, example = json!({ "current_password": "rootpass123", "new_password": "a-new-long-password" })),
     responses(
         (status = 200, description = "Changed.", body = StatusResponse, example = json!({ "status": "ok" })),
         (status = 400, response = BadRequest),
         (status = 401, response = Unauthorized),
         (status = 403, response = Forbidden),
+        (status = 429, response = TooManyRequests),
+        (status = 503, response = ServiceUnavailable),
     ),
 )]
 pub async fn change_password(
@@ -1857,17 +1724,27 @@ pub async fn change_password(
     Json(b): Json<PasswordBody>,
 ) -> ApiResult<Json<StatusResponse>> {
     s.require(&caller, GlobalPerm::ChangeOwnPassword)?;
-    if !auth::verify_password(&b.current_password, &caller.user.password_hash) {
-        return Err(ApiError::unauthorized("current password is incorrect"));
+    super::session::account_wait(&s, &caller.user.username, caller.ip)?;
+    if !auth::verify_password_async(&b.current_password, &caller.user.password_hash).await? {
+        return Err(wrong_secret(&s, &caller, "current password is incorrect"));
     }
     if b.new_password.len() < 8 {
         return Err(ApiError::bad_request(
             "password must be at least 8 characters",
         ));
     }
-    let mut u = caller.user.clone();
-    u.password_hash = auth::hash_password(&b.new_password)?;
-    s.accounts.update_user(&caller.actor(), &caller.user, &u)?;
+    let hash = auth::hash_password_async(&b.new_password).await??;
+    // Only the password column is written, and every other session of the
+    // user is signed out in the same transaction (this one stays). API
+    // tokens are not affected.
+    let keep = caller.session_id;
+    s.accounts.run(&caller.actor(), "change_password", |t| {
+        let u = t.set_password(caller.user.id, &hash)?;
+        if let Some(keep) = keep {
+            t.delete_other_sessions(&u, keep)?;
+        }
+        Ok(())
+    })?;
     Ok(Json(StatusResponse::ok()))
 }
 
@@ -1878,18 +1755,52 @@ pub async fn change_password(
     tag = "Account",
     operation_id = "mfa_start",
     summary = "Start voluntary MFA enrollment",
-    description = "Needs an interactive (cookie) session.",
+    description = "Needs an interactive (cookie) session. Replacing an already enrolled authenticator also needs the current TOTP code or the password.",
+    request_body(content = Option<ReauthBody>, description = "Only when MFA is already enrolled (replacing the authenticator): the current TOTP `code` or the account `password`. Otherwise send no body or `{}`.", example = json!({ "code": "123456" })),
     responses(
         (status = 200, description = "Secret, otpauth URI and QR SVG; confirm with /me/mfa/confirm.", body = EnrollPayload),
+        (status = 400, response = BadRequest),
         (status = 401, response = Unauthorized),
         (status = 403, response = Forbidden),
+        (status = 429, response = TooManyRequests),
+        (status = 503, response = ServiceUnavailable),
     ),
 )]
-pub async fn mfa_start(State(s): St, caller: Caller) -> ApiResult<Json<EnrollPayload>> {
+pub async fn mfa_start(
+    State(s): St,
+    caller: Caller,
+    body: axum::body::Bytes,
+) -> ApiResult<Json<EnrollPayload>> {
     s.require(&caller, GlobalPerm::ManageOwnMfa)?;
     let sid = caller
         .session_id
         .ok_or_else(|| ApiError::forbidden("MFA enrollment requires an interactive session"))?;
+    if caller.user.mfa_enrolled() {
+        // Replacing an enrolled authenticator needs the current factor, so a
+        // stolen session cookie cannot swap it for the attacker's.
+        let b: ReauthBody = if body.iter().all(|c| c.is_ascii_whitespace()) {
+            ReauthBody::default()
+        } else {
+            serde_json::from_slice(&body).map_err(|e| {
+                ApiError::bad_request(format!("invalid body: {e}"))
+                    .with_code(ErrorCode::InvalidRequest)
+            })?
+        };
+        match (b.code.as_deref(), b.password.as_deref()) {
+            (Some(code), _) => verify_current_totp(&s, &caller, code)?,
+            (None, Some(pw)) => {
+                super::session::account_wait(&s, &caller.user.username, caller.ip)?;
+                if !auth::verify_password_async(pw, &caller.user.password_hash).await? {
+                    return Err(wrong_secret(&s, &caller, "password is incorrect"));
+                }
+            }
+            (None, None) => {
+                return Err(ApiError::unauthorized(
+                    "MFA is already enrolled: send the current TOTP `code` or your `password` to replace it",
+                ))
+            }
+        }
+    }
     let secret = auth::totp_new_secret();
     let sess = s
         .storage
@@ -1915,6 +1826,7 @@ pub async fn mfa_start(State(s): St, caller: Caller) -> ApiResult<Json<EnrollPay
         (status = 400, response = BadRequest),
         (status = 401, response = Unauthorized),
         (status = 403, response = Forbidden),
+        (status = 429, response = TooManyRequests),
     ),
 )]
 pub async fn mfa_confirm(
@@ -1934,17 +1846,20 @@ pub async fn mfa_confirm(
         .pending_secret
         .clone()
         .ok_or_else(|| ApiError::bad_request("start enrollment first"))?;
-    if !auth::totp_verify(&secret, &b.code) {
-        return Err(ApiError::unauthorized(
-            "invalid code; check the time on your device",
+    super::session::account_wait(&s, &caller.user.username, caller.ip)?;
+    let Some(step) = auth::totp_match(&secret, &b.code, &s.clock) else {
+        return Err(super::session::code_failed(
+            &s,
+            &caller.user,
+            &sess,
+            caller.ip,
         ));
-    }
-    let mut u = caller.user.clone();
-    u.totp_secret = Some(secret);
-    u.totp_enrolled_at = Some(now_rfc3339());
+    };
+    s.guard.code_success(sess.id);
     let (codes, hashes) = super::session::new_recovery_codes();
     let u = s.accounts.run(&caller.actor(), "mfa_enroll", |t| {
-        let u = t.update_user(&caller.user, &u)?;
+        let u = t.set_mfa(caller.user.id, Some(&secret))?;
+        t.accept_totp_step(&u, step)?;
         t.set_recovery_codes(&u, &hashes)?;
         t.set_session_state(&u, &sess, "active", None)?;
         Ok(u)
@@ -1968,6 +1883,7 @@ pub async fn mfa_confirm(
         (status = 400, response = BadRequest),
         (status = 401, response = Unauthorized),
         (status = 403, response = Forbidden),
+        (status = 429, response = TooManyRequests),
     ),
 )]
 pub async fn mfa_disable(
@@ -1979,23 +1895,72 @@ pub async fn mfa_disable(
     if caller.user.mfa_required {
         return Err(ApiError::forbidden("MFA is required for this account"));
     }
+    verify_current_totp(&s, &caller, &b.code)?;
+    let u = s.accounts.run(&caller.actor(), "mfa_disable", |t| {
+        let u = t.set_mfa(caller.user.id, None)?;
+        t.set_recovery_codes(&u, &[])?;
+        Ok(u)
+    })?;
+    Ok(Json(public_user(&u)))
+}
+
+/// Body of `POST /me/mfa/start` when replacing an enrolled authenticator.
+#[derive(Deserialize, ToSchema, Default)]
+#[schema(example = json!({ "code": "123456" }))]
+pub struct ReauthBody {
+    /// A current TOTP code of the enrolled authenticator.
+    #[schema(example = "123456")]
+    pub code: Option<String>,
+    /// Or the account password.
+    #[schema(format = Password)]
+    pub password: Option<String>,
+}
+
+/// The caller's session, needed to count wrong codes against it.
+fn caller_session(s: &AppState, caller: &Caller) -> ApiResult<Session> {
+    let sid = caller
+        .session_id
+        .ok_or_else(|| ApiError::forbidden("needs an interactive session"))?;
+    s.storage
+        .get_session_by_id(sid)?
+        .ok_or_else(|| ApiError::unauthorized("session gone").with_code(ErrorCode::LoginRequired))
+}
+
+/// A wrong password or code from a signed-in session: account back-off
+/// plus the session's attempt limit (the session is deleted after 5).
+fn wrong_secret(s: &AppState, caller: &Caller, msg: &str) -> ApiError {
+    match caller_session(s, caller) {
+        Ok(sess) => match super::session::code_failed(s, &caller.user, &sess, caller.ip) {
+            e if e.code == Some(ErrorCode::LoginRequired) => e,
+            _ => ApiError::unauthorized(msg),
+        },
+        Err(e) => e,
+    }
+}
+
+/// Check a current TOTP code of the caller's enrolled authenticator:
+/// back-off first, replay-protected (the step is recorded), and wrong codes
+/// count toward the session's attempt limit.
+fn verify_current_totp(s: &AppState, caller: &Caller, code: &str) -> ApiResult<()> {
     let secret = caller
         .user
         .totp_secret
         .clone()
         .ok_or_else(|| ApiError::bad_request("MFA is not enrolled"))?;
-    if !auth::totp_verify(&secret, &b.code) {
-        return Err(ApiError::unauthorized("invalid code"));
+    super::session::account_wait(s, &caller.user.username, caller.ip)?;
+    let accepted = match auth::totp_match(&secret, code, &s.clock) {
+        Some(step) => s.accounts.run(&caller.actor(), "totp_check", |t| {
+            t.accept_totp_step(&caller.user, step)
+        })?,
+        None => false,
+    };
+    if !accepted {
+        return Err(wrong_secret(s, caller, "invalid code"));
     }
-    let mut u = caller.user.clone();
-    u.totp_secret = None;
-    u.totp_enrolled_at = None;
-    let u = s.accounts.run(&caller.actor(), "mfa_disable", |t| {
-        let u = t.update_user(&caller.user, &u)?;
-        t.set_recovery_codes(&u, &[])?;
-        Ok(u)
-    })?;
-    Ok(Json(public_user(&u)))
+    if let Some(sid) = caller.session_id {
+        s.guard.code_success(sid);
+    }
+    Ok(())
 }
 
 // ---- API tokens ------------------------------------------------------------------

@@ -7,7 +7,7 @@ license = "Apache-2.0"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-hickory-proto = { version = "0.25", features = ["text-parsing"] }
+hickory-proto = "0.26.1"
 rusqlite = { version = "0.37", features = ["bundled", "backup"] }
 axum = { version = "0.8", features = ["ws", "macros"] }
 hyper = { version = "1", features = ["server", "http1"] }
@@ -36,8 +36,9 @@ sha1 = "0.10"
 data-encoding = "2"
 qrcode = { version = "0.14", default-features = false }
 flate2 = "1"
-lru = "0.16"
+lru = "0.18.2"
 idna = "1"
+libc = "0.2"
 # OpenAPI generated from the handlers and types (served at /api/openapi.json).
 utoipa = { version = "5.5", features = ["preserve_order", "preserve_path_order"] }
 utoipa-axum = "0.2"

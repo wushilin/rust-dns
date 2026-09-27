@@ -1,7 +1,7 @@
 //! End-to-end: forwarding (upstream resolvers) managed through the API.
 //! Starts the real binary and a fake upstream resolver on 127.0.0.1.
 
-use hickory_proto::op::{Message, MessageType, Query, ResponseCode};
+use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::rdata::A;
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::BinDecodable;
@@ -20,6 +20,104 @@ fn free_port() -> u16 {
         .port()
 }
 
+/// How a [`fake_upstream_with`] resolver behaves.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Echo the question, answer A 203.0.113.77.
+    Normal,
+    /// Answer for a different name (a spoofed / mismatched reply).
+    WrongQuestion,
+    /// Echo the question in lower case (does not preserve 0x20).
+    Lowercase,
+    /// UDP: empty TC=1 reply; TCP: 80 A records (too big for 512 bytes).
+    Big,
+}
+
+/// A fake resolver on UDP and TCP (same port) that counts the queries it
+/// receives and answers with the given TTL.
+fn fake_upstream_with(
+    mode: Mode,
+    ttl: u32,
+) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = sock.local_addr().unwrap().port();
+    let tcp = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let count = std::sync::Arc::new(AtomicUsize::new(0));
+    let answer = move |q: &Message, over_tcp: bool| -> Vec<u8> {
+        let mut r = Message::new(q.metadata.id, MessageType::Response, q.metadata.op_code);
+        r.metadata.recursion_desired = true;
+        r.metadata.recursion_available = true;
+        for query in &q.queries {
+            let name = match mode {
+                Mode::WrongQuestion => Name::from_ascii("evil.example.").unwrap(),
+                Mode::Lowercase => {
+                    Name::from_ascii(query.name().to_ascii().to_ascii_lowercase()).unwrap()
+                }
+                _ => query.name().clone(),
+            };
+            r.add_query(Query::query(name.clone(), query.query_type()));
+            let n = match (mode, over_tcp) {
+                (Mode::Big, false) => {
+                    r.metadata.truncation = true;
+                    0
+                }
+                (Mode::Big, true) => 80,
+                _ => 1,
+            };
+            for i in 0..n {
+                let ip = if n == 1 {
+                    ANSWER
+                } else {
+                    Ipv4Addr::new(198, 51, 100, i as u8)
+                };
+                r.add_answer(Record::from_rdata(name.clone(), ttl, RData::A(A(ip))));
+            }
+        }
+        r.to_vec().unwrap()
+    };
+    {
+        let count = count.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                let Ok((n, peer)) = sock.recv_from(&mut buf) else {
+                    return;
+                };
+                let Ok(q) = Message::from_bytes(&buf[..n]) else {
+                    continue;
+                };
+                count.fetch_add(1, Ordering::SeqCst);
+                let _ = sock.send_to(&answer(&q, false), peer);
+            }
+        });
+    }
+    {
+        let count = count.clone();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for mut c in tcp.incoming().flatten() {
+                let mut len = [0u8; 2];
+                if c.read_exact(&mut len).is_err() {
+                    continue;
+                }
+                let mut buf = vec![0u8; u16::from_be_bytes(len) as usize];
+                if c.read_exact(&mut buf).is_err() {
+                    continue;
+                }
+                let Ok(q) = Message::from_bytes(&buf) else {
+                    continue;
+                };
+                count.fetch_add(1, Ordering::SeqCst);
+                let out = answer(&q, true);
+                let _ = c.write_all(&(out.len() as u16).to_be_bytes());
+                let _ = c.write_all(&out);
+            }
+        });
+    }
+    (port, count)
+}
+
 /// A resolver that answers every query with A 203.0.113.77.
 fn fake_upstream() -> u16 {
     let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -33,12 +131,10 @@ fn fake_upstream() -> u16 {
             let Ok(q) = Message::from_bytes(&buf[..n]) else {
                 continue;
             };
-            let mut r = Message::new();
-            r.set_id(q.id())
-                .set_message_type(MessageType::Response)
-                .set_recursion_desired(true)
-                .set_recursion_available(true);
-            for query in q.queries() {
+            let mut r = Message::new(q.metadata.id, MessageType::Response, q.metadata.op_code);
+            r.metadata.recursion_desired = true;
+            r.metadata.recursion_available = true;
+            for query in &q.queries {
                 r.add_query(query.clone());
                 r.add_answer(Record::from_rdata(
                     query.name().clone(),
@@ -145,10 +241,8 @@ fn call(
 fn query(port: u16, name: &str) -> Message {
     let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
     sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    let mut m = Message::new();
-    m.set_id(rand_id())
-        .set_message_type(MessageType::Query)
-        .set_recursion_desired(true);
+    let mut m = Message::new(rand_id(), MessageType::Query, OpCode::Query);
+    m.metadata.recursion_desired = true;
     m.add_query(Query::query(Name::from_ascii(name).unwrap(), RecordType::A));
     sock.send_to(&m.to_vec().unwrap(), ("127.0.0.1", port))
         .unwrap();
@@ -166,10 +260,10 @@ fn rand_id() -> u16 {
 }
 
 fn answered_by_fake(m: &Message) -> bool {
-    m.response_code() == ResponseCode::NoError
-        && m.answers()
+    m.metadata.response_code == ResponseCode::NoError
+        && m.answers
             .iter()
-            .any(|r| matches!(r.data(), RData::A(a) if a.0 == ANSWER))
+            .any(|r| matches!(&r.data, RData::A(a) if a.0 == ANSWER))
 }
 
 #[test]
@@ -191,7 +285,7 @@ fn forwarding_is_managed_through_the_api() {
     assert_eq!(v["source"], "config");
     assert_eq!(v["upstreams"], serde_json::json!([]));
     assert_eq!(
-        query(srv.dns, "anything.example.").response_code(),
+        query(srv.dns, "anything.example.").metadata.response_code,
         ResponseCode::Refused
     );
 
@@ -303,7 +397,9 @@ fn forwarding_is_managed_through_the_api() {
     assert_eq!(s, 200, "{v}");
     assert_eq!(v["source"], "config");
     assert_eq!(
-        query(srv.dns, "after-reset.example.").response_code(),
+        query(srv.dns, "after-reset.example.")
+            .metadata
+            .response_code,
         ResponseCode::Refused
     );
     let audit = call(&root, "GET", &format!("{web}/api/audit?limit=20"), None).1;
@@ -313,6 +409,203 @@ fn forwarding_is_managed_through_the_api() {
         .iter()
         .any(|e| e["action"] == "settings.forwarding.reset"));
 
+    drop(srv);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn query_ttl(m: &Message) -> u32 {
+    m.answers.iter().map(|r| r.ttl).max().unwrap_or(0)
+}
+
+/// Owner request (forward cache TTL caps): caps set through the API bound
+/// the TTL of cached answers; flushing empties the cache (the next query
+/// reaches the upstream again); both are audited.
+#[test]
+fn forward_cache_caps_and_flush() {
+    use std::sync::atomic::Ordering;
+    let dir = std::env::temp_dir().join(format!(
+        "rust-dns-fwdcache-{}-{}",
+        std::process::id(),
+        rand_id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (dns, web_port) = (free_port(), free_port());
+    let (up_port, upstream_queries) = fake_upstream_with(Mode::Normal, 3600);
+    let upstream = format!("127.0.0.1:{up_port}");
+    let srv = Server::start(dir.clone(), dns, web_port);
+    let web = srv.web.clone();
+    let root = login(&web, "root", "rootpass123");
+    let url = format!("{web}/api/settings/forwarding");
+
+    let (s, v) = call(&root, "GET", &url, None);
+    assert_eq!(s, 200);
+    assert_eq!(v["cache_max_ttl"], 86400);
+    assert_eq!(v["cache_negative_max_ttl"], 3600);
+    // Invalid caps are refused.
+    let (s, v) = call(
+        &root,
+        "PUT",
+        &url,
+        Some(
+            serde_json::json!({ "upstreams": [upstream], "allowed_clients": ["127.0.0.0/8"], "timeout_ms": 1000, "cache_max_ttl": 60, "cache_negative_max_ttl": 120 }),
+        ),
+    );
+    assert_eq!(s, 400, "{v}");
+    let (s, v) = call(
+        &root,
+        "PUT",
+        &url,
+        Some(
+            serde_json::json!({ "upstreams": [upstream], "allowed_clients": ["127.0.0.0/8"], "timeout_ms": 1000, "cache_max_ttl": 300, "cache_negative_max_ttl": 60 }),
+        ),
+    );
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["cache_max_ttl"], 300);
+
+    let first = query(srv.dns, "cached.example.");
+    assert!(answered_by_fake(&first));
+    assert_eq!(
+        query_ttl(&first),
+        3600,
+        "the first answer is the upstream's own"
+    );
+    let n0 = upstream_queries.load(Ordering::SeqCst);
+    let cached = query(srv.dns, "cached.example.");
+    assert!(answered_by_fake(&cached));
+    assert!(
+        query_ttl(&cached) <= 300,
+        "cached TTL within the cap: {}",
+        query_ttl(&cached)
+    );
+    assert_eq!(
+        upstream_queries.load(Ordering::SeqCst),
+        n0,
+        "served from the cache"
+    );
+
+    let (s, v) = call(&root, "GET", &url, None);
+    assert_eq!(s, 200);
+    assert_eq!(v["cache"]["entries"], 1, "{v}");
+    assert!(v["cache"]["hits"].as_u64().unwrap() >= 1);
+
+    // Flush: dropped count, empty cache, next query goes upstream, audited.
+    let (s, v) = call(&root, "POST", &format!("{url}/cache/flush"), None);
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["dropped"], 1);
+    assert_eq!(call(&root, "GET", &url, None).1["cache"]["entries"], 0);
+    assert!(answered_by_fake(&query(srv.dns, "cached.example.")));
+    assert_eq!(
+        upstream_queries.load(Ordering::SeqCst),
+        n0 + 1,
+        "after a flush the upstream is asked again"
+    );
+    let audit = call(&root, "GET", &format!("{web}/api/audit?limit=50"), None).1;
+    let entries = audit["entries"].as_array().unwrap();
+    assert!(entries
+        .iter()
+        .any(|e| e["action"] == "settings.forwarding.cache_flush" && e["detail"]["dropped"] == 1));
+    assert!(entries
+        .iter()
+        .any(|e| e["action"] == "settings.forwarding.update"
+            && e["detail"]["after"]["cache_max_ttl"] == 300));
+
+    // Non-admins may not flush.
+    call(
+        &root,
+        "POST",
+        &format!("{web}/api/users"),
+        Some(serde_json::json!({ "username": "bob", "password": "bobpass123" })),
+    );
+    let bob = login(&web, "bob", "bobpass123");
+    assert_eq!(
+        call(&bob, "POST", &format!("{url}/cache/flush"), None).0,
+        403
+    );
+
+    drop(srv);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn start_forwarding_to(upstream: u16) -> (Server, PathBuf) {
+    let dir = std::env::temp_dir().join(format!(
+        "rust-dns-fwdm5-{}-{}",
+        std::process::id(),
+        rand_id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let srv = Server::start(dir.clone(), free_port(), free_port());
+    let root = login(&srv.web, "root", "rootpass123");
+    let (s, v) = call(
+        &root,
+        "PUT",
+        &format!("{}/api/settings/forwarding", srv.web),
+        Some(
+            serde_json::json!({ "upstreams": [format!("127.0.0.1:{upstream}")], "allowed_clients": ["127.0.0.0/8"], "timeout_ms": 800 }),
+        ),
+    );
+    assert_eq!(s, 200, "{v}");
+    (srv, dir)
+}
+
+/// M5 regression: a reply for another question (same ID) used to be
+/// accepted, relayed and cached for every client.
+#[test]
+fn mismatched_upstream_replies_are_not_accepted() {
+    let (up, _) = fake_upstream_with(Mode::WrongQuestion, 3600);
+    let (srv, dir) = start_forwarding_to(up);
+    let r = query(srv.dns, "victim.example.");
+    assert_eq!(r.metadata.response_code, ResponseCode::ServFail, "{r:?}");
+    assert!(r.answers.is_empty());
+    drop(srv);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// M5: 0x20 is optional for upstreams; one that lower-cases the question is
+/// retried without it and still works.
+#[test]
+fn upstreams_without_0x20_still_work() {
+    let (up, count) = fake_upstream_with(Mode::Lowercase, 60);
+    let (srv, dir) = start_forwarding_to(up);
+    let r = query(srv.dns, "MixedCase.Example.");
+    assert!(answered_by_fake(&r), "{r:?}");
+    assert_eq!(
+        r.queries[0].name().to_ascii(),
+        "MixedCase.Example.",
+        "client case restored"
+    );
+    assert!(count.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+    drop(srv);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// M5 regression: an answer fetched over TCP after an upstream TC used to
+/// be returned over UDP whole, beyond the client's 512-byte limit.
+#[test]
+fn tcp_fallback_answers_are_truncated_for_udp_clients() {
+    let (up, _) = fake_upstream_with(Mode::Big, 60);
+    let (srv, dir) = start_forwarding_to(up);
+    let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut m = Message::new(rand_id(), MessageType::Query, OpCode::Query);
+    m.metadata.recursion_desired = true;
+    m.add_query(Query::query(
+        Name::from_ascii("big.example.").unwrap(),
+        RecordType::A,
+    ));
+    sock.send_to(&m.to_vec().unwrap(), ("127.0.0.1", srv.dns))
+        .unwrap();
+    let mut buf = [0u8; 65535];
+    let n = sock.recv(&mut buf).unwrap();
+    assert!(
+        n <= 512,
+        "UDP reply of {n} bytes exceeds the client's 512-byte limit"
+    );
+    let r = Message::from_bytes(&buf[..n]).unwrap();
+    assert!(
+        r.metadata.truncation,
+        "TC=1 tells the client to retry over TCP"
+    );
+    assert_eq!(r.metadata.id, m.metadata.id);
     drop(srv);
     let _ = std::fs::remove_dir_all(&dir);
 }

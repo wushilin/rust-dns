@@ -3,11 +3,14 @@
 
 pub mod client_ip;
 pub mod error;
+pub mod guard;
 pub mod openapi;
 pub mod proxy;
 pub mod routes;
 pub mod session;
 pub mod settings;
+#[cfg(test)]
+mod tests;
 pub mod tsig;
 pub mod types;
 pub mod ws;
@@ -45,30 +48,71 @@ pub struct AppState {
     pub reloader: Arc<crate::reload::Reloader>,
     pub limiter: Arc<RateLimiter>,
     pub login_limiter: RateLimiter,
+    /// Failed sign-in / code bookkeeping (per account, network, session).
+    pub guard: guard::AttemptGuard,
+    /// Time source for TOTP checks (the system clock; pinned in tests).
+    pub clock: crate::auth::Clock,
     pub trusted: Vec<Cidr>,
     pub started: Instant,
 }
+
+/// Whether the client reached us over HTTPS, as reported by a trusted
+/// proxy (`X-Forwarded-Proto: https`). rust-dns itself serves plain HTTP.
+#[derive(Clone, Copy, Debug)]
+pub struct Https(pub bool);
 
 async fn client_ip_layer(
     axum::extract::State(s): axum::extract::State<Arc<AppState>>,
     mut req: Request,
     next: Next,
 ) -> Response {
-    let ip = match req.extensions().get::<ConnInfo>() {
-        Some(ci) => client_ip::resolve(ci, req.headers(), &s.trusted),
-        None => std::net::IpAddr::from([0, 0, 0, 0]),
+    let (ip, https) = match req.extensions().get::<ConnInfo>() {
+        Some(ci) => (
+            client_ip::resolve(ci, req.headers(), &s.trusted),
+            client_ip::forwarded_https(ci, req.headers(), &s.trusted),
+        ),
+        None => (std::net::IpAddr::from([0, 0, 0, 0]), false),
     };
     req.extensions_mut().insert(ClientIp(ip));
+    req.extensions_mut().insert(Https(https));
+    let page = match req.uri().path() {
+        "/" | "/index.html" => Some(crate::ui::Page::Console),
+        "/docs" => Some(crate::ui::Page::Docs),
+        _ => None,
+    };
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
     let mut resp = next.run(req).await;
     let h = resp.headers_mut();
     h.insert("x-content-type-options", "nosniff".parse().unwrap());
     // The console embeds its own API explorer (/docs) in a frame; other sites may not.
     h.insert("x-frame-options", "SAMEORIGIN".parse().unwrap());
-    h.insert(
-        "content-security-policy",
-        "frame-ancestors 'self'".parse().unwrap(),
-    );
+    let csp = match page {
+        Some(p) => crate::ui::content_security_policy(p, host.as_deref()),
+        // API responses and static assets are never rendered as documents.
+        None => "default-src 'none'; frame-ancestors 'self'".to_string(),
+    };
+    if let Ok(v) = csp.parse() {
+        h.insert("content-security-policy", v);
+    }
     h.insert("referrer-policy", "same-origin".parse().unwrap());
+    h.insert(
+        "permissions-policy",
+        "camera=(), microphone=(), geolocation=(), payment=(), usb=(), interest-cohort=()"
+            .parse()
+            .unwrap(),
+    );
+    h.insert("cross-origin-opener-policy", "same-origin".parse().unwrap());
+    if https {
+        // Only meaningful over HTTPS; browsers ignore it on plain HTTP.
+        h.insert(
+            "strict-transport-security",
+            "max-age=15552000".parse().unwrap(),
+        );
+    }
     resp
 }
 
@@ -217,7 +261,6 @@ fn api_router() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(routes::set_member, routes::remove_member))
         .routes(routes!(routes::user_rights))
         .routes(routes!(routes::export_zone))
-        .routes(routes!(routes::import_bind))
         .routes(routes!(routes::export_all))
         .routes(routes!(routes::import))
         .routes(routes!(routes::changelog))
@@ -241,6 +284,7 @@ fn api_router() -> OpenApiRouter<Arc<AppState>> {
             settings::reset_forwarding
         ))
         .routes(routes!(settings::test_upstreams))
+        .routes(routes!(settings::flush_forward_cache))
         .routes(routes!(tsig::list_tsig_keys, tsig::create_tsig_key))
         .routes(routes!(tsig::update_tsig_key, tsig::delete_tsig_key))
         .routes(routes!(tsig::reveal_tsig_key))
@@ -291,6 +335,11 @@ pub async fn serve(state: Arc<AppState>) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("cannot bind web listener {addr}: {e}"))?;
     tracing::info!(%addr, proxy_on = state.cfg.web_console.proxy.proxy_on, "web console and API listening");
     let app = router(state.clone());
+    let slots = Arc::new(tokio::sync::Semaphore::new(
+        state.cfg.web_console.max_connections.max(1),
+    ));
+    let header_timeout =
+        Duration::from_secs(state.cfg.web_console.request_header_timeout_secs.max(1));
     loop {
         let (mut stream, remote) = match listener.accept().await {
             Ok(v) => v,
@@ -300,10 +349,16 @@ pub async fn serve(state: Arc<AppState>) -> anyhow::Result<()> {
                 continue;
             }
         };
+        let Ok(permit) = slots.clone().try_acquire_owned() else {
+            tracing::debug!(%remote, "web connection limit reached; closing");
+            drop(stream);
+            continue;
+        };
         let app = app.clone();
         let proxy_cfg = state.cfg.web_console.proxy.clone();
         let trusted = state.trusted.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             let proxy_src = if proxy_cfg.proxy_on && trusted.iter().any(|c| c.contains(remote.ip()))
             {
                 match proxy::read_proxy_header(&mut stream, proxy_cfg.proxy_version).await {
@@ -324,7 +379,15 @@ pub async fn serve(state: Arc<AppState>) -> anyhow::Result<()> {
                 async move { app.call(req).await }
             });
             let io = TokioIo::new(stream);
-            let builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+            let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+            // Slow or idle clients are cut off: headers (including the wait
+            // for the next request on a keep-alive connection) must arrive
+            // within `request_header_timeout_secs`.
+            builder
+                .http1()
+                .timer(hyper_util::rt::TokioTimer::new())
+                .header_read_timeout(header_timeout)
+                .keep_alive(true);
             if let Err(e) = builder.serve_connection_with_upgrades(io, svc).await {
                 tracing::debug!(%remote, error = %e, "connection ended with error");
             }

@@ -139,8 +139,7 @@ fn b64(s: &str) -> Vec<u8> {
 }
 
 fn query_bytes(id: u16, zone: &str, qtype: RecordType) -> Vec<u8> {
-    let mut m = Message::new();
-    m.set_id(id).set_message_type(MessageType::Query);
+    let mut m = Message::new(id, MessageType::Query, OpCode::Query);
     m.add_query(Query::query(
         Name::from_ascii(format!("{zone}.")).unwrap(),
         qtype,
@@ -184,11 +183,11 @@ fn tcp_exchange(port: u16, req: &[u8]) -> Vec<Vec<u8>> {
         s.read_exact(&mut buf).unwrap();
         let m = Message::from_bytes(&buf).unwrap();
         soas += m
-            .answers()
+            .answers
             .iter()
             .filter(|r| r.record_type() == RecordType::SOA)
             .count();
-        let done = m.response_code() != ResponseCode::NoError || soas >= 2;
+        let done = m.metadata.response_code != ResponseCode::NoError || soas >= 2;
         msgs.push(buf);
         if done {
             break;
@@ -207,7 +206,7 @@ fn udp_exchange(port: u16, req: &[u8]) -> Vec<u8> {
 }
 
 fn rcode(m: &[u8]) -> ResponseCode {
-    Message::from_bytes(m).unwrap().response_code()
+    Message::from_bytes(m).unwrap().metadata.response_code
 }
 
 fn tsig_of(m: &[u8]) -> tsig::TsigRecord {
@@ -216,7 +215,7 @@ fn tsig_of(m: &[u8]) -> tsig::TsigRecord {
 
 fn answer_count(msgs: &[Vec<u8>]) -> usize {
     msgs.iter()
-        .map(|m| Message::from_bytes(m).unwrap().answers().len())
+        .map(|m| Message::from_bytes(m).unwrap().answers.len())
         .sum()
 }
 
@@ -368,17 +367,23 @@ fn tsig_keys_transfers_and_notify() {
         Some(serde_json::json!({ "name": ZONE })),
     );
     assert_eq!(s, 201, "{v}");
-    let mut text = format!("$ORIGIN {ZONE}.\n$TTL 300\n@ IN NS ns1\nns1 IN A 192.0.2.53\n");
+    let mut records = vec![
+        serde_json::json!({ "name": "@", "type": "NS", "value": format!("ns1.{ZONE}.") }),
+        serde_json::json!({ "name": "ns1", "type": "A", "value": "192.0.2.53" }),
+    ];
     for i in 0..1500 {
-        text.push_str(&format!(
-            "h{i} IN TXT \"padding record {i} so the transfer needs several messages\"\n"
-        ));
+        records.push(serde_json::json!({
+            "name": format!("h{i}"), "type": "TXT",
+            "value": format!("padding record {i} so the transfer needs several messages")
+        }));
     }
     let r = root
-        .post(&format!("{web}/api/zones/{ZONE}/import-bind"))
+        .post(&format!("{web}/api/import"))
         .set("X-Requested-With", "rust-dns")
-        .set("content-type", "text/plain")
-        .send_string(&text)
+        .send_json(serde_json::json!({
+            "version": 1, "exported_at": "2026-01-01T00:00:00Z",
+            "zones": [{ "name": ZONE, "records": records }]
+        }))
         .unwrap();
     assert_eq!(r.status(), 200);
     // The zone change also triggered a NOTIFY; drain it (checked below).
@@ -515,14 +520,14 @@ fn tsig_keys_transfers_and_notify() {
         let s = tsig::find(m).unwrap().expect("NOTIFY is signed");
         tsig::verify(m, &s, Some(&key), Chain::Request, tsig::now()).unwrap();
         let parsed = Message::from_bytes(&tsig::strip(m, &s)).unwrap();
-        assert_eq!(parsed.op_code(), OpCode::Notify);
-        assert_eq!(parsed.queries()[0].name().to_ascii(), format!("{ZONE}."));
+        assert_eq!(parsed.metadata.op_code, OpCode::Notify);
+        assert_eq!(parsed.queries[0].name().to_ascii(), format!("{ZONE}."));
     };
     // Acknowledge with a signed response (as BIND does), so no retries follow.
     let ack = |m: &[u8], from: std::net::SocketAddr| {
         let s = tsig::find(m).unwrap().unwrap();
         let mut a = Message::from_bytes(&tsig::strip(m, &s)).unwrap();
-        a.set_message_type(MessageType::Response);
+        a.metadata.message_type = MessageType::Response;
         let (a, _) = tsig::sign(
             &a.to_vec().unwrap(),
             &key,

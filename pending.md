@@ -2,6 +2,19 @@
 
 Status as of 2026-09-27. Deployed to dns-test (musl build, /opt/rust-dns) with everything below. Stages 1 to 3 (log rotation, DNS protocol completeness, console fixes) are implemented. The current workspace has additional Stage 4 changes in progress below.
 
+## Security review fixes (2026-09-27)
+
+- [x] H3 TCP pinning: per-write timeout (`tcp_write_timeout_secs`), connection age and query caps, per-client (IPv4 / IPv6 /64) connection cap; regression `tests/hardening.rs`.
+- [x] H2/A2 no default password: `--init-config` (0600, random hashed password printed once), placeholder `change-me*` and empty passwords refused by `--check` and startup, installer uses it; L6 generated password never logged; L7 umask 0077, 0600 rewrites, hardened systemd units (`systemd-analyze verify` not run: no systemd on the dev machine; verify on the Linux host).
+- [x] BIND zone-file import and export removed (was H1 via `$INCLUDE`); JSON import/export stays.
+- [x] M1 Argon2 on a bounded blocking pool (503 + Retry-After when saturated). M2 rate limits keyed by IPv6 /64, count-min table (no eviction resets), slip; per-account/network back-off; 5 codes per session. M3 per-column account writes. M4 websocket re-validation + L4 Origin + L5 subprotocol token. M5 forwarder ID/0x20/question checks and UDP truncation. M6 re-enrollment needs the current factor, TOTP replay protection (`users.totp_last_step`). M7 password change signs out other sessions. M8 explicit proxy trust. M9 hickory-proto 0.26.1, lru 0.18.
+- [x] L1 web header timeout / connection cap, L11 PROXY header timeout and split v1 headers, L2 `__Host-` Secure cookies over HTTPS, L3 CSP with script hashes, L8 member events / actor IPs redacted below owner, L9 renamed root disables the previous root, L10 open-resolver coverage check in config and API.
+- [x] Conformance: 86/86 (new check: rate-limit slip replies). cargo-audit: no vulnerabilities (only the informational `paste` notice).
+- [x] Forward cache TTL caps (`cache_max_ttl`, `cache_negative_max_ttl`, console-overridable), cache stats and `POST /api/settings/forwarding/cache/flush`.
+- [ ] L13 admin-initiated MFA enrollment (forced enrollment still trusts the first sign-in after `mfa_required` is set). Not implemented: needs an out-of-band delivery of the secret (QR to the admin, handed over), a new state and UI.
+- [ ] Per-account back-off and code-attempt counters are in memory (reset on restart; the per-network request limit still applies). Persisting them would need an audited table.
+- [ ] Websocket rights are re-checked every 10 s and on zone/member changes, not instantly on session/token revocation (no revocation event on the bus yet).
+
 ## TSIG for zone transfers and NOTIFY (2026-09-27, verified)
 
 - [x] RFC 8945 hand-implemented in `src/dns/tsig.rs` (pure Rust: `hmac` + `sha1`/`sha2`, no new dependencies): hmac-sha256 (default), -sha384, -sha512, -sha1 (legacy). Constant-time MAC compare; truncated MACs follow §5.2.2.1 (too short/long = FORMERR, valid but shorter than full = signed BADTRUNC); fudge capped at 300 s.
@@ -35,9 +48,9 @@ Status as of 2026-09-27. Deployed to dns-test (musl build, /opt/rust-dns) with e
 
 ## In flight right now (uncommitted edits on disk)
 
-- [x] `src/ui/index.html`: zone page paging fix is built; the end-to-end `bind_import_and_record_paging` test covers the server-side paging API.
+- [x] `src/ui/index.html`: zone page paging fix is built; the end-to-end `json_import_and_record_paging` test covers the server-side paging API.
 - [x] Zone page and record filter verified in the browser (2026-09-27).
-- [ ] Browser check still owed for: BIND import modal, recovery-code modal after MFA enrollment, "New recovery codes" flow, users → "Sign this user out everywhere". In-app Browser is unavailable in this session.
+- [ ] Browser check still owed for: recovery-code modal after MFA enrollment, "New recovery codes" flow, users → "Sign this user out everywhere". In-app Browser is unavailable in this session.
 - [x] `scripts/conformance-local.sh` passes 85/85 (76 before TSIG); `RUN_COMPLIANCE=1 scripts/conformance-local.sh` builds and runs ISC genreport with every probe `ok`.
 - [x] `cargo fmt --all` and `cargo clippy --all-targets -- -D warnings` pass.
 - [x] `cargo test -- --test-threads=1` passes (34 unit + 3 end-to-end); serial run avoids an occasional collision in the tests' free-port helper.
@@ -136,4 +149,4 @@ Status as of 2026-09-27. Deployed to dns-test (musl build, /opt/rust-dns) with e
 - Forwarded answers are cached but not prefetched; SERVFAIL is not cached.
 - Cookie secret rotates on every restart (clients re-learn transparently).
 - `[server]`, `[web_console].bind`, `[database]`, logging file targets, and PROXY settings require a restart; everything else reloads on SIGHUP or `POST /api/admin/reload`.
-- hickory's zone parser inherits TTLs from the previous record; `src/zonefile.rs` pre-pass works around it for BIND import.
+- BIND zone-file import/export was removed in the security review (no zone-file parser is exposed any more).

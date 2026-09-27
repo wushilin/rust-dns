@@ -42,6 +42,8 @@ pub struct ApiError {
     pub status: StatusCode,
     pub message: String,
     pub code: Option<ErrorCode>,
+    /// Sent as `Retry-After` (seconds) when set.
+    pub retry_after: Option<u64>,
 }
 
 impl ApiError {
@@ -50,7 +52,15 @@ impl ApiError {
             status,
             message: message.into(),
             code: None,
+            retry_after: None,
         }
+    }
+    pub fn retry_after(mut self, secs: u64) -> Self {
+        self.retry_after = Some(secs);
+        self
+    }
+    pub fn too_many(m: impl Into<String>, retry_after: u64) -> Self {
+        Self::new(StatusCode::TOO_MANY_REQUESTS, m).retry_after(retry_after.max(1))
     }
     pub fn with_code(mut self, code: ErrorCode) -> Self {
         self.code = Some(code);
@@ -83,7 +93,22 @@ impl IntoResponse for ApiError {
             error: self.message,
             code: self.code,
         };
-        (self.status, Json(body)).into_response()
+        let mut resp = (self.status, Json(body)).into_response();
+        if let Some(s) = self.retry_after {
+            resp.headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, s.into());
+        }
+        resp
+    }
+}
+
+impl From<crate::auth::KdfBusy> for ApiError {
+    fn from(_: crate::auth::KdfBusy) -> Self {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "too many sign-ins or password changes in progress; retry in a moment",
+        )
+        .retry_after(1)
     }
 }
 

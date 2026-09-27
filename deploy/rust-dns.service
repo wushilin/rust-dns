@@ -7,7 +7,10 @@ Wants=network-online.target
 User=rust-dns
 Group=rust-dns
 WorkingDirectory=/var/lib/rust-dns
+# Create the config first with: rust-dns --init-config /etc/rust-dns/rust-dns.toml
+ExecStartPre=/usr/local/bin/rust-dns --check --config /etc/rust-dns/rust-dns.toml
 ExecStart=/usr/local/bin/rust-dns --config /etc/rust-dns/rust-dns.toml
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2
 # Bind port 53 without running as root.
@@ -17,6 +20,22 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+UMask=0077
 ReadWritePaths=/var/lib/rust-dns /etc/rust-dns
 LimitNOFILE=65536
 

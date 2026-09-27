@@ -3,13 +3,13 @@
 
 use super::client_ip::ClientIp;
 use super::error::{ApiError, ApiResult, ErrorCode};
-use super::openapi::{BadRequest, TooManyRequests, Unauthorized};
+use super::openapi::{BadRequest, ServiceUnavailable, TooManyRequests, Unauthorized};
 use super::types::*;
 use super::AppState;
 use crate::auth;
 use crate::model::*;
 use axum::extract::{FromRequestParts, State};
-use axum::http::{header, request::Parts, HeaderMap, HeaderValue, StatusCode};
+use axum::http::{header, request::Parts, HeaderMap, HeaderValue};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
@@ -17,7 +17,12 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use utoipa::ToSchema;
 
+/// Session cookie name on plain HTTP.
 pub const COOKIE: &str = "rdns_session";
+/// Session cookie name when it is `Secure` (HTTPS): the `__Host-` prefix
+/// makes browsers refuse it unless it is Secure, host-only and `Path=/`, so
+/// a sibling subdomain or a plain-HTTP page cannot plant or overwrite it.
+pub const SECURE_COOKIE: &str = "__Host-rdns_session";
 
 /// An authenticated principal on a request.
 #[derive(Clone, Debug)]
@@ -25,6 +30,8 @@ pub struct Caller {
     pub user: User,
     pub ip: IpAddr,
     pub session_id: Option<i64>,
+    /// The API token used, when `via` is `Token`.
+    pub token_id: Option<i64>,
     pub via: AuthVia,
 }
 
@@ -42,13 +49,34 @@ pub fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
         if let Ok(s) = v.to_str() {
             for part in s.split(';') {
                 let part = part.trim();
-                if let Some(val) = part.strip_prefix(name).and_then(|r| r.strip_prefix('=')) {
+                if let Some(val) = part
+                    .strip_prefix(name)
+                    .and_then(|r| r.strip_prefix('='))
+                    .filter(|v| !v.is_empty())
+                {
                     return Some(val.to_string());
                 }
             }
         }
     }
     None
+}
+
+/// Subprotocol that carries an API token on the websocket upgrade:
+/// `Sec-WebSocket-Protocol: rust-dns, rust-dns.bearer.<token>`.
+pub const WS_TOKEN_PROTOCOL_PREFIX: &str = "rust-dns.bearer.";
+/// The subprotocol the server selects (never the one with the token).
+pub const WS_PROTOCOL: &str = "rust-dns";
+
+pub fn ws_protocol_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get_all(header::SEC_WEBSOCKET_PROTOCOL)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .find_map(|p| p.trim().strip_prefix(WS_TOKEN_PROTOCOL_PREFIX))
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
 }
 
 pub fn bearer(headers: &HeaderMap) -> Option<String> {
@@ -62,21 +90,29 @@ pub fn bearer(headers: &HeaderMap) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
-fn set_cookie(state: &AppState, token: &str, max_age: i64) -> HeaderValue {
-    let secure = if state.cfg.web_console.secure_cookies {
-        "; Secure"
+/// The session cookie: `Secure` and `__Host-` prefixed when
+/// `secure_cookies` is on or a trusted proxy says the request came over
+/// HTTPS; the plain `rdns_session` otherwise (HTTP on a LAN keeps working).
+fn set_cookie(state: &AppState, https: bool, token: &str, max_age: i64) -> HeaderValue {
+    let v = if state.cfg.web_console.secure_cookies || https {
+        format!(
+            "{SECURE_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}; Secure"
+        )
     } else {
-        ""
+        format!("{COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}")
     };
-    HeaderValue::from_str(&format!(
-        "{COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure}"
-    ))
-    .unwrap()
+    HeaderValue::from_str(&v).unwrap()
+}
+
+/// The session token from either cookie name (the `__Host-` one first).
+/// Sessions started before the rename keep working under `rdns_session`.
+pub fn session_token(headers: &HeaderMap) -> Option<String> {
+    cookie_value(headers, SECURE_COOKIE).or_else(|| cookie_value(headers, COOKIE))
 }
 
 /// Load the session (any state) behind the cookie, if valid and unexpired.
 pub fn load_session(state: &AppState, headers: &HeaderMap) -> ApiResult<Option<(Session, User)>> {
-    let Some(tok) = cookie_value(headers, COOKIE) else {
+    let Some(tok) = session_token(headers) else {
         return Ok(None);
     };
     let Some(sess) = state.storage.get_session(&auth::sha256_hex(&tok))? else {
@@ -108,12 +144,16 @@ impl FromRequestParts<Arc<AppState>> for Caller {
             .unwrap_or(IpAddr::from([0, 0, 0, 0]));
         // API token first.
         let bearer_tok = bearer(&parts.headers).or_else(|| {
-            // Websocket clients cannot set headers: allow ?token= on that path only.
+            // Websocket clients cannot set headers. On that path only, accept
+            // the token as a subprotocol (`rust-dns.bearer.<token>`, kept out
+            // of URLs and proxy logs) or, deprecated, as `?token=`.
             // The API router is nested under /api, which strips the prefix here.
             if matches!(parts.uri.path(), "/ws" | "/api/ws") {
-                parts.uri.query().and_then(|q| {
-                    q.split('&')
-                        .find_map(|kv| kv.strip_prefix("token=").map(|v| v.to_string()))
+                ws_protocol_token(&parts.headers).or_else(|| {
+                    parts.uri.query().and_then(|q| {
+                        q.split('&')
+                            .find_map(|kv| kv.strip_prefix("token=").map(|v| v.to_string()))
+                    })
                 })
             } else {
                 None
@@ -137,6 +177,7 @@ impl FromRequestParts<Arc<AppState>> for Caller {
                 user,
                 ip,
                 session_id: None,
+                token_id: Some(info.id),
                 via: AuthVia::Token,
             });
         }
@@ -161,6 +202,7 @@ impl FromRequestParts<Arc<AppState>> for Caller {
                     user,
                     ip,
                     session_id: Some(sess.id),
+                    token_id: None,
                     via: AuthVia::Session,
                 })
             }
@@ -325,47 +367,51 @@ pub fn enroll_payload(user: &User, secret: &str) -> EnrollPayload {
     description = "Checks username and password and starts a cookie session. Depending on the account the session is active at once or still needs a TOTP code (`/auth/mfa`) or forced MFA enrollment (`/auth/enroll`).",
     request_body(content = LoginBody, example = json!({ "username": "root", "password": "rootpass123" })),
     responses(
-        (status = 200, description = "Credentials accepted. Sets the `rdns_session` cookie; check `status` for the next step.", body = LoginResponse,
-            headers(("Set-Cookie" = String, description = "`rdns_session=...; Path=/; HttpOnly; SameSite=Lax`"))),
+        (status = 200, description = "Credentials accepted. Sets the session cookie; check `status` for the next step.", body = LoginResponse,
+            headers(("Set-Cookie" = String, description = "`rdns_session=...; Path=/; HttpOnly; SameSite=Lax` over plain HTTP; `__Host-rdns_session=...; Path=/; HttpOnly; SameSite=Lax; Secure` over HTTPS (a trusted proxy sent `X-Forwarded-Proto: https`) or with `secure_cookies = true`."))),
         (status = 400, response = BadRequest),
         (status = 401, response = Unauthorized),
         (status = 429, response = TooManyRequests),
+        (status = 503, response = ServiceUnavailable),
     ),
     security(()),
 )]
 pub async fn login(
     State(state): State<Arc<AppState>>,
     ip: axum::Extension<ClientIp>,
+    https: axum::Extension<super::Https>,
     headers: HeaderMap,
     Json(body): Json<LoginBody>,
 ) -> ApiResult<Response> {
     let ip = ip.0 .0;
-    if !matches!(
-        state.login_limiter.check(ip),
-        crate::ratelimit::Decision::Allow
-    ) {
+    if !state.login_limiter.check(ip).allowed() {
         tracing::warn!(%ip, "login rate limit exceeded");
-        return Err(ApiError::new(
-            StatusCode::TOO_MANY_REQUESTS,
+        return Err(ApiError::too_many(
             "too many login attempts; try again in a minute",
+            60,
         ));
     }
     let username = body.username.trim().to_ascii_lowercase();
+    // Refused before the password is checked, so a refusal reveals nothing.
+    account_wait(&state, &username, ip)?;
     let user = state.storage.get_user_by_name(&username)?;
     let ok = match &user {
         Some(u) => {
-            auth::verify_password(&body.password, &u.password_hash) && u.disabled_at.is_none()
+            auth::verify_password_async(&body.password, &u.password_hash).await?
+                && u.disabled_at.is_none()
         }
         None => {
             // Burn similar time as a real verification to avoid user enumeration.
-            let _ = auth::verify_password(&body.password, "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHRzYWx0$k5T7bV4v2QG2kFQ0yYvL0qz5Hn4tq8mXwq5F3yqFq1o");
+            let _ = auth::verify_password_async(&body.password, "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHRzYWx0$k5T7bV4v2QG2kFQ0yYvL0qz5Hn4tq8mXwq5F3yqFq1o").await?;
             false
         }
     };
     if !ok {
+        state.guard.failure(&username, ip);
         tracing::warn!(%ip, user = %username, "failed login");
         return Err(ApiError::unauthorized("invalid username or password"));
     }
+    state.guard.success(&username, ip);
     let user = user.unwrap();
     let max_age = (state.cfg.web_console.session_ttl_hours.max(1) * 3600) as i64;
     let (status, sstate, secret, enroll) = if user.mfa_enrolled() {
@@ -390,8 +436,10 @@ pub async fn login(
         enroll,
     };
     let mut resp = Json(body).into_response();
-    resp.headers_mut()
-        .insert(header::SET_COOKIE, set_cookie(&state, &token, max_age));
+    resp.headers_mut().insert(
+        header::SET_COOKIE,
+        set_cookie(&state, https.0 .0, &token, max_age),
+    );
     Ok(resp)
 }
 
@@ -419,14 +467,8 @@ pub async fn mfa_verify(
     Json(body): Json<CodeBody>,
 ) -> ApiResult<Json<MfaVerifyResponse>> {
     let ip = ip.0 .0;
-    if !matches!(
-        state.login_limiter.check(ip),
-        crate::ratelimit::Decision::Allow
-    ) {
-        return Err(ApiError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many attempts",
-        ));
+    if !state.login_limiter.check(ip).allowed() {
+        return Err(ApiError::too_many("too many attempts", 60));
     }
     let Some((sess, user)) = load_session(&state, &headers)? else {
         return Err(ApiError::unauthorized("not signed in").with_code(ErrorCode::LoginRequired));
@@ -434,24 +476,31 @@ pub async fn mfa_verify(
     if sess.state != "mfa_pending" {
         return Err(ApiError::bad_request("session is not awaiting a code"));
     }
+    account_wait(&state, &user.username, ip)?;
     let secret = user
         .totp_secret
         .clone()
         .ok_or_else(|| ApiError::bad_request("MFA is not enrolled"))?;
     let code = body.code.trim();
     let is_totp = code.len() == 6 && code.chars().all(|c| c.is_ascii_digit());
-    let totp_ok = is_totp && auth::totp_verify(&secret, code);
+    let totp_step = if is_totp {
+        auth::totp_match(&secret, code, &state.clock)
+    } else {
+        None
+    };
     let recovery_hash = auth::sha256_hex(&auth::normalize_recovery_code(code));
     let actor = Actor {
         name: user.username.clone(),
         ip: ip.to_string(),
     };
-    // One transaction: a recovery code is consumed only if the session is activated.
+    // One transaction: a recovery code (or TOTP step) is consumed only if
+    // the session is activated. A TOTP code at or before the last accepted
+    // step is a replay and fails.
     let ok = state.accounts.run(&actor, "mfa_verify", |t| {
-        let ok = if is_totp {
-            totp_ok
-        } else {
-            t.use_recovery_code(&user, &recovery_hash)?
+        let ok = match (is_totp, totp_step) {
+            (true, Some(step)) => t.accept_totp_step(&user, step)?,
+            (true, None) => false,
+            (false, _) => t.use_recovery_code(&user, &recovery_hash)?,
         };
         if ok {
             t.set_session_state(&user, &sess, "active", None)?;
@@ -459,9 +508,11 @@ pub async fn mfa_verify(
         Ok(ok)
     })?;
     if !ok {
-        tracing::warn!(%ip, user = %user.username, "bad TOTP or recovery code");
-        return Err(ApiError::unauthorized("invalid code"));
+        tracing::warn!(%ip, user = %user.username, "bad, reused or expired TOTP or recovery code");
+        return Err(code_failed(&state, &user, &sess, ip));
     }
+    state.guard.code_success(sess.id);
+    state.guard.success(&user.username, ip);
     let left = state.storage.recovery_codes_left(user.id)?;
     tracing::info!(%ip, user = %user.username, method = if is_totp { "totp" } else { "recovery" }, recovery_codes_left = left, "mfa verified");
     Ok(Json(MfaVerifyResponse {
@@ -496,16 +547,10 @@ pub async fn enroll_verify(
     Json(body): Json<CodeBody>,
 ) -> ApiResult<Json<EnrollVerifyResponse>> {
     let ip = ip.0 .0;
-    if !matches!(
-        state.login_limiter.check(ip),
-        crate::ratelimit::Decision::Allow
-    ) {
-        return Err(ApiError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many attempts",
-        ));
+    if !state.login_limiter.check(ip).allowed() {
+        return Err(ApiError::too_many("too many attempts", 60));
     }
-    let Some((sess, mut user)) = load_session(&state, &headers)? else {
+    let Some((sess, user)) = load_session(&state, &headers)? else {
         return Err(ApiError::unauthorized("not signed in").with_code(ErrorCode::LoginRequired));
     };
     if sess.state != "enroll_pending" {
@@ -515,21 +560,19 @@ pub async fn enroll_verify(
         .pending_secret
         .clone()
         .ok_or_else(|| ApiError::internal("missing pending secret"))?;
-    if !auth::totp_verify(&secret, &body.code) {
-        return Err(ApiError::unauthorized(
-            "invalid code; check the time on your device",
-        ));
-    }
-    let before = user.clone();
-    user.totp_secret = Some(secret);
-    user.totp_enrolled_at = Some(now_rfc3339());
+    let Some(step) = auth::totp_match(&secret, &body.code, &state.clock) else {
+        return Err(code_failed(&state, &user, &sess, ip));
+    };
+    state.guard.code_success(sess.id);
     let (codes, hashes) = new_recovery_codes();
     let actor = Actor {
         name: user.username.clone(),
         ip: ip.to_string(),
     };
     let user = state.accounts.run(&actor, "mfa_enroll", |t| {
-        let user = t.update_user(&before, &user)?;
+        let user = t.set_mfa(user.id, Some(&secret))?;
+        // The enrollment code cannot be replayed at the next sign-in.
+        t.accept_totp_step(&user, step)?;
         t.set_recovery_codes(&user, &hashes)?;
         t.set_session_state(&user, &sess, "active", None)?;
         Ok(user)
@@ -602,6 +645,7 @@ pub async fn session_info(
 pub async fn logout(
     State(state): State<Arc<AppState>>,
     ip: axum::Extension<ClientIp>,
+    https: axum::Extension<super::Https>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     if let Some((sess, user)) = load_session(&state, &headers)? {
@@ -614,9 +658,50 @@ pub async fn logout(
         })?;
     }
     let mut resp = Json(StatusResponse::ok()).into_response();
-    resp.headers_mut()
-        .insert(header::SET_COOKIE, set_cookie(&state, "", 0));
+    // Clear whichever cookie the browser holds.
+    let h = resp.headers_mut();
+    h.append(header::SET_COOKIE, set_cookie(&state, https.0 .0, "", 0));
+    h.append(
+        header::SET_COOKIE,
+        HeaderValue::from_static("rdns_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"),
+    );
     Ok(resp)
+}
+
+/// 429 while `username` is in its failed-attempt back-off (see
+/// [`super::guard`]). Checked before any password or code is verified.
+pub fn account_wait(state: &AppState, username: &str, ip: IpAddr) -> ApiResult<()> {
+    match state.guard.wait(username, ip) {
+        None => Ok(()),
+        Some(w) => {
+            let secs = w.as_secs_f64().ceil().max(1.0) as u64;
+            Err(ApiError::too_many(
+                format!("too many failed attempts for this account; try again in {secs} seconds"),
+                secs,
+            ))
+        }
+    }
+}
+
+/// A wrong TOTP / recovery code or password on `sess`: count it toward the
+/// account back-off and the session's attempt limit. After
+/// [`super::guard::MAX_CODE_ATTEMPTS`] the session is deleted (audited) and
+/// the error asks the user to sign in again.
+pub fn code_failed(state: &AppState, user: &User, sess: &Session, ip: IpAddr) -> ApiError {
+    state.guard.failure(&user.username, ip);
+    if state.guard.code_failure(sess.id) {
+        let actor = Actor {
+            name: user.username.clone(),
+            ip: ip.to_string(),
+        };
+        let _ = state.accounts.run(&actor, "code_attempts_exceeded", |t| {
+            t.delete_session(user, sess, "too many invalid codes")
+        });
+        tracing::warn!(%ip, user = %user.username, session = sess.id, "too many invalid codes; session deleted");
+        return ApiError::unauthorized("too many invalid codes; sign in again")
+            .with_code(ErrorCode::LoginRequired);
+    }
+    ApiError::unauthorized("invalid code; check the time on your device")
 }
 
 /// A fresh set of recovery codes: (plaintext shown once, hashes to store).

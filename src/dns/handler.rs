@@ -7,7 +7,7 @@ use super::{DnsServer, Proto, Reply};
 use crate::model::QueryEvent;
 use crate::ratelimit::Decision;
 use crate::zones::{lookup, Lookup};
-use hickory_proto::op::{Edns, Header, Message, MessageType, OpCode, ResponseCode};
+use hickory_proto::op::{Edns, Message, MessageType, OpCode, ResponseCode};
 use hickory_proto::rr::rdata::opt::{EdnsCode, EdnsOption};
 use hickory_proto::rr::rdata::TXT;
 use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
@@ -21,13 +21,26 @@ pub const VERSION_STRING: &str = concat!("rust-dns ", env!("CARGO_PKG_VERSION"))
 
 /// Minimal header-only response for requests we cannot parse.
 fn header_only(id: u16, rcode: ResponseCode) -> Vec<u8> {
-    let mut h = Header::new();
-    h.set_id(id)
-        .set_message_type(MessageType::Response)
-        .set_response_code(rcode);
-    let mut m = Message::new();
-    m.set_header(h);
-    m.to_vec().unwrap_or_default()
+    Message::error_msg(id, OpCode::Query, rcode)
+        .to_vec()
+        .unwrap_or_default()
+}
+
+/// Rate-limit "slip" answer: the request's header and question with QR and
+/// TC set and nothing else. Never larger than the request, so it cannot be
+/// used for amplification, and it tells a genuine client to retry over TCP.
+fn slip_reply(req: &[u8]) -> Option<Vec<u8>> {
+    if req.len() < 12 || req[2] & 0x80 != 0 {
+        return None;
+    }
+    let span = super::forward::question_span(req)?;
+    let mut out = Vec::with_capacity(span.end);
+    out.extend_from_slice(&req[..2]);
+    out.push(0x80 | (req[2] & 0x78) | 0x02 | (req[2] & 0x01)); // QR, opcode, TC, RD
+    out.push(0);
+    out.extend_from_slice(&[0, 1, 0, 0, 0, 0, 0, 0]);
+    out.extend_from_slice(&req[span]);
+    Some(out)
 }
 
 /// Per-request context threaded through the handler.
@@ -67,8 +80,14 @@ impl DnsServer {
                 if matches!(d, Decision::RejectFirst) {
                     tracing::warn!(client = %client.ip(), "rate limit exceeded; dropping queries for this window");
                 }
-                // UDP: drop silently (no amplification). TCP: the peer is real, say REFUSED.
+                // UDP: drop silently (no amplification), except that every
+                // Nth limited query ("slip") gets an empty truncated answer so
+                // a real client whose address is being spoofed can retry over
+                // TCP. TCP: the peer is real, say REFUSED.
                 return match proto {
+                    Proto::Udp if d == Decision::Slip => {
+                        slip_reply(req).map(Reply::One).unwrap_or(Reply::None)
+                    }
                     Proto::Udp => Reply::None,
                     Proto::Tcp => req
                         .get(..2)
@@ -211,13 +230,14 @@ impl DnsServer {
     ) -> Vec<u8> {
         let t = &signed.tsig;
         let stripped = tsig::strip(req, signed);
-        let mut resp = Message::new();
-        resp.set_id(u16::from_be_bytes([req[0], req[1]]))
-            .set_message_type(MessageType::Response)
-            .set_response_code(ResponseCode::NotAuth);
+        let mut resp = Message::error_msg(
+            u16::from_be_bytes([req[0], req[1]]),
+            OpCode::Query,
+            ResponseCode::NotAuth,
+        );
         if let Ok(m) = Message::from_bytes(&stripped) {
-            resp.set_op_code(m.op_code());
-            for q in m.queries() {
+            resp.metadata.op_code = m.metadata.op_code;
+            for q in &m.queries {
                 resp.add_query(q.clone());
             }
         }
@@ -261,7 +281,7 @@ impl DnsServer {
                 return Reply::One(header_only(id, ResponseCode::FormErr));
             }
         };
-        if request.message_type() != MessageType::Query {
+        if request.metadata.message_type != MessageType::Query {
             return Reply::None;
         }
         let mut ctx = Ctx {
@@ -274,21 +294,18 @@ impl DnsServer {
                 .unwrap_or(0),
         };
 
-        let mut resp = Message::new();
-        resp.set_id(id)
-            .set_message_type(MessageType::Response)
-            .set_op_code(request.op_code());
-        if request.op_code() == OpCode::Query {
-            resp.set_recursion_desired(request.recursion_desired())
-                .set_recursion_available(rt.may_forward(client.ip()));
-            for q in request.queries() {
+        let mut resp = Message::response(id, request.metadata.op_code);
+        if request.metadata.op_code == OpCode::Query {
+            resp.metadata.recursion_desired = request.metadata.recursion_desired;
+            resp.metadata.recursion_available = rt.may_forward(client.ip());
+            for q in &request.queries {
                 resp.add_query(q.clone());
             }
         }
 
         // EDNS (RFC 6891): echo an OPT with our payload size, NSID and cookies.
         let mut cookie_valid = false;
-        if let Some(edns) = request.extensions() {
+        if let Some(edns) = &request.edns {
             let mut ours = Edns::new();
             ours.set_max_payload(rt.udp_max_payload)
                 .set_version(0)
@@ -296,7 +313,7 @@ impl DnsServer {
             ctx.udp_limit = (edns.max_payload() as usize).clamp(512, rt.udp_max_payload as usize);
             if edns.version() != 0 {
                 resp.set_edns(ours);
-                resp.set_response_code(ResponseCode::BADVERS);
+                resp.metadata.response_code = ResponseCode::BADVERS;
                 return Reply::One(self.finish(resp, &ctx, "error"));
             }
             if !rt.nsid.is_empty() && edns.options().get(EdnsCode::NSID).is_some() {
@@ -306,10 +323,10 @@ impl DnsServer {
             if rt.cookies {
                 if let Some(EdnsOption::Unknown(_, data)) = edns.options().get(EdnsCode::Cookie) {
                     use super::cookies::CookieCheck;
-                    match self.cookies.check(data, client.ip()) {
+                    match self.cookies.check(data.as_slice(), client.ip()) {
                         CookieCheck::Malformed => {
                             resp.set_edns(ours);
-                            resp.set_response_code(ResponseCode::FormErr);
+                            resp.metadata.response_code = ResponseCode::FormErr;
                             return Reply::One(self.finish(resp, &ctx, "error"));
                         }
                         CookieCheck::Valid(c) => {
@@ -321,7 +338,7 @@ impl DnsServer {
                             if rt.cookies_required && proto == Proto::Udp {
                                 self.stats.bad_cookie.fetch_add(1, Relaxed);
                                 resp.set_edns(ours);
-                                resp.set_response_code(ResponseCode::BADCOOKIE);
+                                resp.metadata.response_code = ResponseCode::BADCOOKIE;
                                 return Reply::One(self.finish(resp, &ctx, "error"));
                             }
                         }
@@ -332,15 +349,15 @@ impl DnsServer {
         }
         let _ = cookie_valid;
 
-        if request.op_code() != OpCode::Query {
-            resp.set_response_code(ResponseCode::NotImp);
+        if request.metadata.op_code != OpCode::Query {
+            resp.metadata.response_code = ResponseCode::NotImp;
             return Reply::One(self.finish(resp, &ctx, "error"));
         }
-        if request.queries().len() != 1 {
-            resp.set_response_code(ResponseCode::FormErr);
+        if request.queries.len() != 1 {
+            resp.metadata.response_code = ResponseCode::FormErr;
             return Reply::One(self.finish(resp, &ctx, "error"));
         }
-        let q = &request.queries()[0];
+        let q = &request.queries[0];
         let qname = q.name().clone();
         let qtype = q.query_type();
 
@@ -355,17 +372,17 @@ impl DnsServer {
                     0,
                     RData::TXT(TXT::new(vec![VERSION_STRING.to_string()])),
                 );
-                r.set_dns_class(DNSClass::CH);
+                r.dns_class = DNSClass::CH;
                 resp.add_answer(r);
-                resp.set_authoritative(true);
+                resp.metadata.authoritative = true;
             } else {
-                resp.set_response_code(ResponseCode::Refused);
+                resp.metadata.response_code = ResponseCode::Refused;
             }
             return Reply::One(self.finish(resp, &ctx, "auth"));
         }
         if q.query_class() != DNSClass::IN && q.query_class() != DNSClass::ANY {
             self.stats.refused.fetch_add(1, Relaxed);
-            resp.set_response_code(ResponseCode::Refused);
+            resp.metadata.response_code = ResponseCode::Refused;
             return Reply::One(self.finish(resp, &ctx, "refused"));
         }
 
@@ -401,7 +418,7 @@ impl DnsServer {
                     tracing::debug!(client = %client.ip(), zone = %qname, key = ?key_name, why, "zone transfer refused");
                 }
                 self.stats.refused.fetch_add(1, Relaxed);
-                resp.set_response_code(ResponseCode::Refused);
+                resp.metadata.response_code = ResponseCode::Refused;
                 return Reply::One(self.finish(resp, &ctx, "refused"));
             }
             let z = zone.expect("refused above when missing");
@@ -425,13 +442,13 @@ impl DnsServer {
                     .map(Reply::One)
                     .unwrap_or(Reply::None),
                 Proto::Udp => {
-                    resp.set_response_code(ResponseCode::Refused);
+                    resp.metadata.response_code = ResponseCode::Refused;
                     Reply::One(self.finish(resp, &ctx, "refused"))
                 }
             };
         }
         if qtype == RecordType::OPT {
-            resp.set_response_code(ResponseCode::FormErr);
+            resp.metadata.response_code = ResponseCode::FormErr;
             return Reply::One(self.finish(resp, &ctx, "error"));
         }
 
@@ -440,7 +457,7 @@ impl DnsServer {
             let key = crate::zones::key_of(&qname);
             if let Some(z) = catalog.find_zone(&key) {
                 self.stats.authoritative.fetch_add(1, Relaxed);
-                resp.set_authoritative(true);
+                resp.metadata.authoritative = true;
                 if z.existing.contains(&key) || z.records_at(&key).is_some() {
                     let hinfo =
                         hickory_proto::rr::rdata::HINFO::new("RFC8482".to_string(), String::new());
@@ -448,8 +465,8 @@ impl DnsServer {
                 } else if let Lookup::Answer(a) =
                     lookup(&catalog, &qname, RecordType::A, rt.auto_ptr)
                 {
-                    resp.set_response_code(a.rcode);
-                    resp.insert_name_servers(a.authority);
+                    resp.metadata.response_code = a.rcode;
+                    resp.insert_authorities(a.authority);
                 }
                 return Reply::One(self.finish(resp, &ctx, "auth"));
             }
@@ -461,58 +478,56 @@ impl DnsServer {
                 if a.rcode == ResponseCode::NXDomain {
                     self.stats.nxdomain.fetch_add(1, Relaxed);
                 }
-                resp.set_authoritative(a.authoritative);
-                resp.set_response_code(a.rcode);
+                resp.metadata.authoritative = a.authoritative;
+                resp.metadata.response_code = a.rcode;
                 resp.insert_answers(a.answers);
-                resp.insert_name_servers(a.authority);
+                resp.insert_authorities(a.authority);
                 resp.insert_additionals(a.additional);
                 Reply::One(self.finish(resp, &ctx, "auth"))
             }
             Lookup::NotOurs => {
-                if !rt.may_forward(client.ip()) || !request.recursion_desired() {
+                if !rt.may_forward(client.ip()) || !request.metadata.recursion_desired {
                     self.stats.refused.fetch_add(1, Relaxed);
-                    resp.set_response_code(ResponseCode::Refused);
+                    resp.metadata.response_code = ResponseCode::Refused;
                     return Reply::One(self.finish(resp, &ctx, "refused"));
                 }
                 let dnssec_ok = request
-                    .extensions()
+                    .edns
                     .as_ref()
                     .map(|e| e.flags().dnssec_ok)
                     .unwrap_or(false);
                 let key = super::fwdcache::Key::new(&qname, qtype, q.query_class(), dnssec_ok);
                 if rt.forwarding.cache_entries > 0 {
-                    if let Some(mut cached) = self.fwd_cache.get(&key) {
+                    if let Some(mut cached) = self.fwd_cache.get(&key, rt.cache_caps()) {
                         self.stats.cache_hits.fetch_add(1, Relaxed);
-                        cached.set_id(id);
-                        cached.set_recursion_desired(request.recursion_desired());
-                        cached.set_recursion_available(true);
-                        *cached.queries_mut() = request.queries().to_vec();
-                        match resp.extensions().clone() {
-                            Some(e) => {
-                                cached.set_edns(e);
-                            }
-                            None => {
-                                *cached.extensions_mut() = None;
-                            }
-                        }
+                        cached.metadata.id = id;
+                        cached.metadata.recursion_desired = request.metadata.recursion_desired;
+                        cached.metadata.recursion_available = true;
+                        cached.queries = request.queries.clone();
+                        cached.edns = resp.edns.clone();
                         return Reply::One(self.finish(cached, &ctx, "cache"));
                     }
                 }
                 match super::forward::forward(&rt.forwarding, req, proto).await {
                     Ok(bytes) => {
                         self.stats.forwarded.fetch_add(1, Relaxed);
-                        let (rcode, answers, result) = match Message::from_bytes(&bytes) {
+                        let parsed = Message::from_bytes(&bytes);
+                        let (rcode, answers, mut result) = match &parsed {
                             Ok(m) => {
                                 if rt.forwarding.cache_entries > 0
-                                    && !m.truncated()
+                                    && !m.metadata.truncation
                                     && matches!(
-                                        m.response_code(),
+                                        m.metadata.response_code,
                                         ResponseCode::NoError | ResponseCode::NXDomain
                                     )
                                 {
-                                    self.fwd_cache.store(key, &m);
+                                    self.fwd_cache.store(key, m, rt.cache_caps());
                                 }
-                                (m.response_code(), m.answers().len(), summarize(&m, &qname))
+                                (
+                                    m.metadata.response_code,
+                                    m.answers.len(),
+                                    summarize(m, &qname),
+                                )
                             }
                             Err(_) => (
                                 ResponseCode::ServFail,
@@ -520,13 +535,32 @@ impl DnsServer {
                                 vec!["unparseable upstream reply".into()],
                             ),
                         };
+                        // A reply fetched over TCP (after an upstream TC) can
+                        // exceed what this UDP client accepts: truncate it.
+                        let limit = ctx.udp_limit.saturating_sub(ctx.reserve);
+                        let bytes = match (&parsed, proto) {
+                            (Ok(m), Proto::Udp) if bytes.len() > limit => {
+                                self.stats.truncated.fetch_add(1, Relaxed);
+                                result.push(format!(
+                                    "truncated for UDP ({} bytes > {limit}); client retries over TCP",
+                                    bytes.len()
+                                ));
+                                m.truncate()
+                                    .to_vec()
+                                    .unwrap_or_else(|_| header_only(id, ResponseCode::ServFail))
+                            }
+                            (Err(_), Proto::Udp) if bytes.len() > limit => {
+                                header_only(id, ResponseCode::ServFail)
+                            }
+                            _ => bytes,
+                        };
                         self.emit(&ctx, &qname, qtype, rcode, answers, result, "forward");
                         Reply::One(bytes)
                     }
                     Err(e) => {
                         self.stats.errors.fetch_add(1, Relaxed);
                         tracing::warn!(name = %qname, error = %e, "forwarding failed");
-                        resp.set_response_code(ResponseCode::ServFail);
+                        resp.metadata.response_code = ResponseCode::ServFail;
                         Reply::One(self.finish(resp, &ctx, "error"))
                     }
                 }
@@ -537,7 +571,7 @@ impl DnsServer {
     /// Encode, truncate for UDP if needed, and emit the query event.
     fn finish(&self, resp: Message, ctx: &Ctx, source: &'static str) -> Vec<u8> {
         let (qname, qtype) = resp
-            .queries()
+            .queries
             .first()
             .map(|q| (q.name().clone(), q.query_type()))
             .unwrap_or_else(|| (Name::root(), RecordType::ANY));
@@ -545,7 +579,7 @@ impl DnsServer {
             Ok(b) => b,
             Err(e) => {
                 tracing::error!(error = %e, "failed to encode response");
-                header_only(resp.id(), ResponseCode::ServFail)
+                header_only(resp.metadata.id, ResponseCode::ServFail)
             }
         };
         let mut result = summarize(&resp, &qname);
@@ -555,7 +589,7 @@ impl DnsServer {
             let t = resp.truncate();
             bytes = t
                 .to_vec()
-                .unwrap_or_else(|_| header_only(resp.id(), ResponseCode::ServFail));
+                .unwrap_or_else(|_| header_only(resp.metadata.id, ResponseCode::ServFail));
             result.push(format!(
                 "truncated for UDP ({} bytes > {}); client retries over TCP",
                 resp.to_vec().map(|v| v.len()).unwrap_or(0),
@@ -566,8 +600,8 @@ impl DnsServer {
             ctx,
             &qname,
             qtype,
-            resp.response_code(),
-            resp.answers().len(),
+            resp.metadata.response_code,
+            resp.answers.len(),
             result,
             source,
         );
@@ -615,9 +649,9 @@ fn summarize(m: &Message, qname: &Name) -> Vec<String> {
         } else {
             r.record_type().to_string()
         };
-        let data = match r.data() {
+        let data = match &r.data {
             RData::Unknown { code, rdata } if *code == crate::zones::DNAME_TYPE => {
-                let mut dec = hickory_proto::serialize::binary::BinDecoder::new(rdata.anything());
+                let mut dec = hickory_proto::serialize::binary::BinDecoder::new(&rdata.anything);
                 Name::read(&mut dec)
                     .map(|n| n.to_ascii())
                     .unwrap_or_default()
@@ -630,11 +664,11 @@ fn summarize(m: &Message, qname: &Name) -> Vec<String> {
                 .to_string(),
             d => d.to_string(),
         };
-        let owner = crate::zones::key_of(r.name());
+        let owner = crate::zones::key_of(&r.name);
         let mut line = if owner == qkey {
             format!("{rtype} {data}")
         } else {
-            format!("{} {rtype} {data}", r.name())
+            format!("{} {rtype} {data}", r.name)
         };
         if line.len() > RESULT_MAX_CHARS {
             let mut cut = RESULT_MAX_CHARS;
@@ -646,23 +680,23 @@ fn summarize(m: &Message, qname: &Name) -> Vec<String> {
         }
         line
     };
-    for r in m.answers().iter().take(RESULT_MAX_ITEMS) {
+    for r in m.answers.iter().take(RESULT_MAX_ITEMS) {
         out.push(fmt(r));
     }
-    if m.answers().len() > RESULT_MAX_ITEMS {
-        out.push(format!("… {} more", m.answers().len() - RESULT_MAX_ITEMS));
+    if m.answers.len() > RESULT_MAX_ITEMS {
+        out.push(format!("… {} more", m.answers.len() - RESULT_MAX_ITEMS));
     }
-    if m.answers().is_empty() && !m.authoritative() {
+    if m.answers.is_empty() && !m.metadata.authoritative {
         let ns: Vec<String> = m
-            .name_servers()
+            .authorities
             .iter()
             .filter(|r| r.record_type() == RecordType::NS)
-            .map(|r| r.data().to_string())
+            .map(|r| r.data.to_string())
             .collect();
         if !ns.is_empty() {
             out.push(format!(
                 "referral to {} ({})",
-                m.name_servers()[0].name(),
+                m.authorities[0].name,
                 ns.join(", ")
             ));
         }
@@ -673,13 +707,12 @@ fn summarize(m: &Message, qname: &Name) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hickory_proto::serialize::txt::RDataParser;
 
     #[test]
     fn summarize_formats_answers_referrals_and_svcb() {
         let q = Name::from_ascii("www.example.com.").unwrap();
-        let mut m = Message::new();
-        m.set_authoritative(true);
+        let mut m = Message::new(0, MessageType::Response, OpCode::Query);
+        m.metadata.authoritative = true;
         m.add_answer(Record::from_rdata(
             q.clone(),
             60,
@@ -705,8 +738,8 @@ mod tests {
         );
         assert_eq!(out[2], "HTTPS 1 . alpn=h2,h3 ipv4hint=192.0.2.1");
 
-        let mut r = Message::new();
-        r.add_name_server(Record::from_rdata(
+        let mut r = Message::new(0, MessageType::Response, OpCode::Query);
+        r.add_authority(Record::from_rdata(
             Name::from_ascii("sub.example.com.").unwrap(),
             60,
             RData::NS(hickory_proto::rr::rdata::NS(
@@ -718,7 +751,7 @@ mod tests {
             vec!["referral to sub.example.com. (ns.sub.example.com.)"]
         );
 
-        let mut many = Message::new();
+        let mut many = Message::new(0, MessageType::Response, OpCode::Query);
         for i in 0..12 {
             many.add_answer(Record::from_rdata(
                 q.clone(),

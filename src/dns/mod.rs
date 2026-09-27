@@ -136,6 +136,12 @@ impl Runtime {
             forwarding.upstreams = o.upstreams.clone();
             forwarding.allowed_clients = o.allowed_clients.clone();
             forwarding.timeout_ms = o.timeout_ms;
+            if let Some(t) = o.cache_max_ttl {
+                forwarding.cache_max_ttl = t;
+            }
+            if let Some(t) = o.cache_negative_max_ttl {
+                forwarding.cache_negative_max_ttl = t;
+            }
         }
         Runtime {
             forward_acl: crate::config::parse_cidrs(&forwarding.allowed_clients),
@@ -156,6 +162,13 @@ impl Runtime {
         !self.forwarding.upstreams.is_empty() && self.forward_acl.iter().any(|c| c.contains(client))
     }
 
+    pub fn cache_caps(&self) -> fwdcache::Caps {
+        fwdcache::Caps {
+            max_ttl: self.forwarding.cache_max_ttl,
+            negative_max_ttl: self.forwarding.cache_negative_max_ttl,
+        }
+    }
+
     pub fn may_transfer(&self, client: std::net::IpAddr) -> bool {
         self.transfer_allow.iter().any(|c| c.contains(client))
     }
@@ -172,6 +185,8 @@ pub struct DnsServer {
     pub runtime: ArcSwap<Runtime>,
     pub stats: Arc<Stats>,
     pub tcp_slots: Arc<tokio::sync::Semaphore>,
+    /// Open TCP connections per client (IPv4 address / IPv6 /64).
+    pub tcp_per_client: Arc<tcp::PerClient>,
     pub cookies: cookies::CookieJar,
     pub fwd_cache: fwdcache::ForwardCache,
     /// TSIG keys (from the database), swapped whole after every change.
@@ -204,6 +219,7 @@ impl DnsServer {
             runtime: ArcSwap::from_pointee(Runtime::from_config(cfg, None)),
             stats: Arc::new(Stats::default()),
             tcp_slots,
+            tcp_per_client: Arc::new(tcp::PerClient::default()),
             cookies: cookies::CookieJar::new(),
             fwd_cache: fwdcache::ForwardCache::new(cfg.forwarding.cache_entries),
             tsig_keys: ArcSwap::from_pointee(keyring::Keyring::default()),
@@ -274,6 +290,7 @@ impl DnsServer {
             cfg.rate_limit.max_resolutions_per_second_per_address,
             cfg.rate_limit.max_tracked_addresses,
         );
+        self.limiter.set_slip(cfg.rate_limit.slip);
     }
 }
 

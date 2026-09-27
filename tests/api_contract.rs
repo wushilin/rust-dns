@@ -65,6 +65,11 @@ const EXPECTED_EXAMPLE_REJECTIONS: &[(&str, &str, &str)] = &[
         "post",
         "placeholder TOTP code 123456 -> 401 invalid code",
     ),
+    (
+        "/me/mfa/start",
+        "post",
+        "re-enrollment with the placeholder TOTP code 123456 -> 401 invalid code",
+    ),
 ];
 
 /// Operations that cannot be exercised over plain HTTP. Currently empty:
@@ -590,7 +595,10 @@ fn strict_conversion_rejects_undocumented_fields() {
     // allOf is merged, not intersected: fields of both parts are allowed, others are not.
     let schema = strict_schema(
         &spec,
-        &json!({ "$ref": "#/components/schemas/BindImportSummary" }),
+        &json!({ "allOf": [
+            { "$ref": "#/components/schemas/ImportSummary" },
+            { "type": "object", "required": ["skipped"], "properties": { "skipped": { "type": "array", "items": { "type": "string" } } } }
+        ] }),
     );
     let ok = json!({ "zones_created": 0, "zones_updated": 1, "records_added": 0, "records_removed": 0, "records_skipped": 0, "skipped": [] });
     assert!(validate(&schema, &ok, "allOf").is_empty());
@@ -655,6 +663,11 @@ path = "{db}"
 [web_console]
 bind = "127.0.0.1:{web_port}"
 login_attempts_per_minute = 10000
+# The flow sends many deliberately wrong passwords and codes.
+login_backoff_after = 100000
+# totp() may idle up to 30 s waiting for a fresh time step; keep pooled
+# keep-alive connections open across that wait.
+request_header_timeout_secs = 300
 [root]
 username = "root"
 password = "rootpass123"
@@ -694,17 +707,40 @@ fn agent() -> ureq::Agent {
         .build()
 }
 
-/// Minimal RFC 6238 TOTP (SHA-1, 30 s, 6 digits).
+/// Minimal RFC 6238 TOTP (SHA-1, 30 s, 6 digits). The server refuses a
+/// code whose time step is not later than the last one it accepted
+/// (replay protection), so each call gets the next unused step of the
+/// three the server accepts (previous, current, next), waiting for the
+/// next 30-second window when all three are used.
 fn totp(secret_b32: &str) -> String {
     use hmac::{Hmac, Mac};
+    static LAST: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
+        std::sync::Mutex::new(None);
     let key = data_encoding::BASE32_NOPAD
         .decode(secret_b32.trim_end_matches('=').as_bytes())
         .unwrap();
-    let step = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-        / 30;
+    let step = loop {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        let cur = now.as_secs() / 30;
+        let mut g = LAST.lock().unwrap();
+        let last = g
+            .get_or_insert_with(Default::default)
+            .get(secret_b32)
+            .copied();
+        let next = match last {
+            None => cur - 1,
+            Some(l) => (l + 1).max(cur - 1),
+        };
+        if next <= cur + 1 {
+            g.as_mut().unwrap().insert(secret_b32.to_string(), next);
+            break next;
+        }
+        drop(g);
+        let wait = 30 - now.as_secs() % 30;
+        std::thread::sleep(Duration::from_millis(wait * 1000 + 200));
+    };
     let mut mac = Hmac::<sha1::Sha1>::new_from_slice(&key).unwrap();
     mac.update(&step.to_be_bytes());
     let h = mac.finalize().into_bytes();
@@ -1380,6 +1416,27 @@ fn live_api_matches_spec() {
         );
         c.expect(&format!("POST {p} with a valid TOTP"), &r, 200);
     }
+    // Replacing an enrolled authenticator needs the current factor (M6).
+    let r = c.call(
+        Auth::Session(&root),
+        "post",
+        "/me/mfa/start",
+        &[],
+        "",
+        Body::None,
+    );
+    c.expect("re-enrollment without the current factor", &r, 401);
+    let ex = c.example("/me/mfa/start", "post");
+    c.send_example(Auth::Session(&root), "post", "/me/mfa/start", &[], "", &ex);
+    let r = c.call(
+        Auth::Session(&root),
+        "post",
+        "/me/mfa/start",
+        &[],
+        "",
+        Body::Json(&json!({ "code": totp(&root_secret) })),
+    );
+    c.expect("re-enrollment with the current TOTP", &r, 200);
     let r = c.call(
         Auth::Session(&root),
         "post",
@@ -1654,15 +1711,6 @@ fn live_api_matches_spec() {
         Body::None,
     );
     c.expect("unknown export format", &r, 400);
-    let r = c.call(
-        Auth::Session(&root),
-        "post",
-        "/zones/{zone}/import-bind",
-        &[],
-        "",
-        Body::Text("www IN A"),
-    );
-    c.expect("malformed zone file", &r, 400);
     let r = c.call(
         Auth::Session(&root),
         "get",

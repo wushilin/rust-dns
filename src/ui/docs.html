@@ -28,6 +28,7 @@
     displayRequestDuration: true,
     defaultModelsExpandDepth: 0,
     persistAuthorization: false,
+    validatorUrl: null, // no third-party validator badge (and no CSP violation)
     // Session-cookie writes must carry the CSRF header; harmless for bearer tokens.
     requestInterceptor: (req) => { req.headers['X-Requested-With'] = 'rust-dns'; return req; },
   });

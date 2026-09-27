@@ -48,7 +48,7 @@ examples/api/99-cleanup.sh        # removes everything the scripts created
 | `02-zones.sh` | Create a forward zone and IPv4 / IPv6 reverse zones, list, update SOA timers. |
 | `03-records.sh` | One record of every type: A, AAAA, CNAME, NS, MX, TXT, SRV, wildcard, CAA, HTTPS, SVCB, TLSA, SSHFP, NAPTR, HINFO, DNAME, PTR (v4 and v6), an internationalised name. Then search, update, delete, and two validation errors. |
 | `04-access.sh` | Users, editor / viewer access per zone, ownership transfer, sign-out, disable. |
-| `05-import-export.sh` | Export BIND and JSON; import JSON and a BIND zone file (`zones/example.com.zone`). |
+| `05-import-export.sh` | Export one zone or every zone as JSON; import a JSON document. |
 | `06-operations.sh` | Health, status, change log, metrics, config reload, integrity check. |
 
 Set `ZONE=yourzone.example` to use a zone name other than `example.com`.

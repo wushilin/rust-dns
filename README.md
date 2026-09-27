@@ -21,8 +21,12 @@ Single static binary, one SQLite file, one TOML config. Zero JavaScript build.
 - UDP and TCP on any set of bind addresses and any port, IPv4 and IPv6.
 - Optional forwarding of foreign names to upstream resolvers, restricted to an
   allow-list of client networks so you never become an open resolver.
-- Per-client rate limiting (N queries per second per address) with an LRU cap
-  on tracked addresses so a flood cannot exhaust memory.
+- Per-client rate limiting (N queries per second per IPv4 address or IPv6 /64)
+  in a fixed-size counter table: memory is bounded and a flood from many
+  (spoofed) sources cannot reset a limited client. Every Nth limited UDP query
+  gets an empty truncated answer ("slip") so real clients can retry over TCP.
+- DNS over TCP with per-read and per-write timeouts, per-connection query and
+  age limits, and a per-client connection cap.
 - PROXY protocol v1/v2 for DNS-over-TCP behind HAProxy or a cloud NLB.
 - DNS Cookies (RFC 7873), EDNS NSID, outbound AXFR and NOTIFY for secondaries (TSIG-authenticated, RFC 8945),
   plus IDN zone and record names.
@@ -38,8 +42,9 @@ Single static binary, one SQLite file, one TOML config. Zero JavaScript build.
   Argon2id on first start). Admins manage users; each zone has an owner who
   grants `editor` or `viewer` access to other users.
 - Per-user API tokens for scripts and automation.
-- JSON export/import of everything, BIND zone-file export per zone.
-- BIND zone-file import, server side search and paging for large zones, and an
+- JSON export/import of everything (transactional). BIND zone-file import and
+  export were removed.
+- Server side search and paging for large zones, and an
   OpenAPI 3.1 document at `/api/openapi.json`, generated from the code (see
   [API documentation](#api-documentation)).
 - Recovery codes for MFA, session lists and revocation, and an admin action to
@@ -61,15 +66,20 @@ Single static binary, one SQLite file, one TOML config. Zero JavaScript build.
   are deleted after a retention period (default 30 days). Re-posting the same
   record with a new expiry renews it.
 - Real client IP behind proxies: PROXY protocol, then `X-Forwarded-For`, then
-  `X-Real-IP`, then the socket address, honoured only from trusted networks.
+  `X-Real-IP`, then the socket address, honoured only from the proxies listed
+  in `proxy_trust` (nothing is trusted by default).
 - Prometheus metrics at `/metrics`, structured logs (text or JSON).
 
 ## Quick start
 
 ```
 cargo build --release
-./target/release/rust-dns            # writes rust-dns.toml with a random root password, prints it once
+./target/release/rust-dns --init-config rust-dns.toml   # mode 0600, random root password printed once
+./target/release/rust-dns --config rust-dns.toml
 ```
+
+(Starting without a config file also creates one with a random password; it is
+printed once on stderr and never logged.)
 
 Open http://127.0.0.1:8053, sign in as `root`, create a zone, add records:
 
@@ -98,22 +108,30 @@ default_hostmaster = "hostmaster@example.com"
 [forwarding]
 upstreams = ["1.1.1.1:53"]    # empty = foreign names are REFUSED
 allowed_clients = ["10.0.0.0/8", "192.168.0.0/16", "fc00::/7"]
+cache_entries = 10000
+cache_max_ttl = 86400         # cap on how long an answer is cached (never raises TTLs)
+cache_negative_max_ttl = 3600 # cap for NXDOMAIN / no-data answers
 
 [rate_limit]
-max_resolutions_per_second_per_address = 500
-max_tracked_addresses = 10000
+max_resolutions_per_second_per_address = 500   # per IPv4 address / IPv6 /64
+max_tracked_addresses = 10000                  # fixed table size
+slip = 2                      # every 2nd limited UDP query gets an empty TC=1 answer; 0 = drop
 
 [tcp_dns]                     # PROXY protocol for DNS over TCP (UDP has none)
 proxy_on = false
 proxy_version = 2             # 1 or 2
-proxy_trust = "192.168.44.0/24;fe80::/64"   # empty = local LAN ranges
+proxy_trust = "10.0.0.10/32"  # the proxy's own address; required with proxy_on
 
 [web_console]
 bind = "127.0.0.1:8053"
 proxy_on = false              # PROXY protocol on the console listener
 proxy_version = 2
-proxy_trust = ""              # also governs X-Forwarded-For / X-Real-IP trust
-secure_cookies = false        # true when behind HTTPS
+proxy_trust = ""              # proxies whose PROXY header / X-Forwarded-* are believed; empty = none
+secure_cookies = false        # force Secure cookies (automatic when a trusted proxy says HTTPS)
+login_attempts_per_minute = 10
+login_backoff_after = 5       # failed attempts per account and network before waits start
+request_header_timeout_secs = 60
+max_connections = 512
 
 [backup]
 dir = "backups"                # empty disables scheduled online backups
@@ -122,7 +140,7 @@ keep = 7
 
 [root]
 username = "root"
-password = "change-me"        # replaced by an Argon2 hash on first start
+password = "..."              # plaintext is replaced by an Argon2 hash at start; "change-me" and "" are refused
 mfa_required = false
 
 [changelog]
@@ -143,6 +161,61 @@ Put the console behind a TLS reverse proxy for anything beyond localhost.
 starting listeners or changing the file.
 Scheduled backups use SQLite's online backup API; the configured number of
 timestamped database snapshots is retained.
+
+## Security
+
+Before exposing rust-dns to the internet, note:
+
+- **No default password.** `--init-config` (and a first start without a
+  config) generates a random root password, stores only its Argon2 hash and
+  writes the file with mode 0600. `--check` and startup refuse an empty root
+  password and the sample's `change-me` placeholder. Files the server creates
+  (config rewrites, database, backups, logs) are owner-only (umask 0077); the
+  systemd units add `UMask=0077` and the usual sandboxing.
+- **Proxy trust is explicit.** `X-Forwarded-For`, `X-Real-IP`,
+  `X-Forwarded-Proto` and PROXY protocol headers are believed only from the
+  addresses in `proxy_trust`; an empty list trusts nobody (earlier versions
+  trusted every private address when it was empty). `proxy_on = true` without
+  `proxy_trust` is a configuration error. Name the proxy itself (e.g.
+  `127.0.0.1/32`), not a whole network: a startup warning flags entries wider
+  than /24 (IPv4) or /64 (IPv6), since every host on such a network (for
+  example all containers on a Docker bridge) could claim any client address.
+- **Cookies.** Over plain HTTP the session cookie is `rdns_session`
+  (HttpOnly, SameSite=Lax), so LAN use keeps working. When a trusted proxy
+  sends `X-Forwarded-Proto: https`, or `secure_cookies = true`, it is
+  `__Host-rdns_session` with `Secure`. Existing `rdns_session` sessions keep
+  working until they expire. Send HSTS at the TLS proxy (rust-dns adds
+  `Strict-Transport-Security` itself only on requests a trusted proxy marks
+  as HTTPS).
+- **Sign-in protection.** Per client (IPv4 address / IPv6 /64) request
+  limits; per account and network, exponential waits after
+  `login_backoff_after` failures (up to 15 minutes); per account from all
+  networks, waits capped at one minute (a distributed attack is slowed, the
+  owner is never locked out for long); 5 wrong codes end an MFA-pending or
+  signed-in session. TOTP codes are single-use (the last accepted time step
+  is stored). Replacing an enrolled authenticator needs the current code or
+  password. Changing your password signs out your other sessions; API tokens
+  are not affected (revoke them separately). Argon2 runs on a small bounded
+  worker pool; when it is saturated sign-ins get 503 with `Retry-After`
+  instead of slowing DNS.
+- **Websocket.** Streams re-check the session/token and zone rights every 10
+  seconds and on membership changes, and close (1008) when revoked. Cookie
+  upgrades must come from the same origin. Scripts pass the token as the
+  subprotocol `rust-dns.bearer.<token>`; `?token=` still works but is
+  deprecated (URLs end up in proxy logs).
+- **Forwarding.** Upstream queries use a fresh random ID and 0x20 case
+  randomisation; replies must match ID, QR, opcode and question exactly.
+  Forwarded answers are truncated to the client's UDP size. ACLs that would
+  make an open resolver (a /0, or anything shorter than /8 IPv4 or /16 global
+  IPv6, or entries covering more than 1/16 of IPv4 together) are refused in
+  the config file and the console.
+- **Web listener.** Request headers must arrive within
+  `request_header_timeout_secs`, at most `max_connections` connections are
+  served, and pages are served with a strict Content-Security-Policy (scripts
+  by hash, no inline handlers, `object-src 'none'`, `frame-ancestors 'self'`).
+- **TSIG is unaffected** by these changes.
+- **BIND zone-file import and export were removed** (the parser followed
+  `$INCLUDE` to files on the server). JSON import/export remains.
 
 ## Securing zone transfers with TSIG
 
@@ -218,20 +291,20 @@ curl -H "Authorization: Bearer rdns_…" -H "content-type: application/json" \
 | POST/PUT/DELETE | `/api/zones`, `/api/zones/{zone}` | admin creates; owner edits/deletes |
 | POST/PUT/DELETE | `/api/zones/{zone}/records[/{id}]` | editor or owner |
 | PUT/DELETE | `/api/zones/{zone}/members/{username}` | owner grants `editor`/`viewer` |
-| GET | `/api/zones/{zone}/export?format=json\|bind`, `/api/export` | |
+| GET | `/api/zones/{zone}/export`, `/api/export` | JSON export document |
 | POST | `/api/import?mode=merge\|replace` | JSON export document |
 | GET | `/api/changelog?after=<offset>&limit=` | DNS changes; rows of one transaction share `txn`. `resync_required` when the cursor fell behind retention |
 | GET | `/api/audit?after=<id>&limit=` | account and security changes (admin) |
 | GET | `/docs` | interactive API explorer (Swagger UI, bundled); also the console's "API explorer" section |
 | GET | `/api/users/{id}/rights?via=session\|token` | effective rights of a user or of their API tokens (self or admin) |
-| GET | `/api/ws?after=<offset>&queries=true` | websocket: `change` and `query` events |
+| GET | `/api/ws?after=<offset>&queries=true` | websocket: `change` and `query` events; tokens as subprotocol `rust-dns.bearer.<token>` |
 | GET/POST/PUT/DELETE | `/api/users[/{id}]`, `/api/users/{id}/reset-mfa` | admin |
 | GET/POST | `/api/users/{id}/sessions`, `/sessions/revoke` | inspect or revoke all user sessions (admin) |
 | GET/POST/DELETE | `/api/tokens[/{id}]` | own tokens |
 | PUT/POST | `/api/me/password`, `/api/me/mfa/start|confirm|disable` | self service |
 | POST | `/api/me/mfa/recovery` | regenerate recovery codes with TOTP |
 | GET | `/api/status`, `/metrics`, `/api/health` | |
-| POST | `/api/zones/{zone}/import-bind?mode=merge\|replace` | import a BIND zone file |
+| GET/PUT/DELETE | `/api/settings/forwarding`, POST `/api/settings/forwarding/cache/flush` | forwarding upstreams, ACL, cache caps; cache stats and flush (admin) |
 
 The zone records endpoint accepts `q`, `offset`, and `limit` for server side
 search and paging. The console displays 500 records per page by default.
@@ -305,19 +378,20 @@ cargo test --test openapi_spec     # completeness of the generated document (ids
 cargo test --bin rust-dns openapi  # docs/openapi.json equals the document generated from the code (UPDATE_OPENAPI=1 refreshes it)
 node tests/ui/duration.test.js     # console duration parser (1m, 1h, 6d12h14s)
 cargo test                          # unit tests + end-to-end (spawns the binary, drives API and DNS)
-scripts/conformance.py <zone> <ip> <port>   # 85 RFC conformance checks (incl. TSIG) (needs dnspython and a seeded zone)
+scripts/conformance.py <zone> <ip> <port>   # 86 RFC conformance checks (incl. TSIG) (needs dnspython and a seeded zone)
 scripts/compliance.sh <zone> <ip> <port>    # ISC DNS Compliance Testing (genreport), builds it on first run
 scripts/e2e-dig.sh <zone> <ip> <port>       # human-readable dig walkthrough
 scripts/conformance-local.sh                # starts a temporary server, seeds it, runs all probes
 scripts/load-test-local.sh                  # short UDP load probe; intended for Linux
 ```
 
-Current status: the Rust suite passes (80 unit, 6 end-to-end including
-`tests/tsig.rs`, 5 API contract and 8 OpenAPI document tests), and the
-end-to-end tests include BIND import, paged record listing and TSIG-signed
-transfers and NOTIFY. The seeded
-conformance runner passes 85/85, and ISC genreport reports all protocol and
-record-type probes as `ok`. BIND's `named-checkzone` loads exported zone files.
+Current status: the Rust suite passes (unit tests, end-to-end tests in
+`tests/e2e.rs`, `tests/tsig.rs`, `tests/forwarding.rs` and
+`tests/hardening.rs` (security regressions: TCP pinning, init-config,
+password logging, TOTP replay across restarts, websocket revocation and
+origin, cookies, slow clients, CSP), API contract and OpenAPI document
+tests). The seeded conformance runner passes 86/86, and ISC genreport reports
+all protocol and record-type probes as `ok`.
 CI runs formatting, clippy, the Rust test suite, conformance, and a short Linux
 UDP load probe.
 
@@ -333,7 +407,7 @@ ceiling is the OS loopback path, not the server. Resident memory stays around
 
 - DNSSEC signing (NSEC/NSEC3, key management, DS publication).
 - Changelog follower mode and inbound NOTIFY/secondary service.
-- DNS over TLS/HTTPS, response tuple rate limiting, and per-zone forwarding,
+- DNS over TLS/HTTPS, response tuple rate limiting (RRL by answer), and per-zone forwarding,
   reverse-zone, transfer ACL, and NOTIFY overrides.
 - Console sorting and bulk record tools, WebAuthn, static musl multi-arch
   publishing, Debian packaging, and a Homebrew formula.

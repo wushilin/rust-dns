@@ -1,6 +1,7 @@
 //! Resolve the real client address: PROXY protocol source, then
 //! X-Forwarded-For, then X-Real-IP, then the socket peer, honouring headers
-//! only when they arrive from a trusted proxy.
+//! only when they arrive from a trusted proxy. Trusted means listed in
+//! `[web_console].proxy_trust`; an empty list trusts nobody.
 
 use crate::config::Cidr;
 use axum::http::HeaderMap;
@@ -17,6 +18,20 @@ pub struct ClientIp(pub IpAddr);
 
 fn trusted(cidrs: &[Cidr], ip: IpAddr) -> bool {
     cidrs.iter().any(|c| c.contains(ip))
+}
+
+/// `X-Forwarded-Proto: https` from a trusted proxy (the first value, set by
+/// the proxy nearest the client).
+pub fn forwarded_https(conn: &ConnInfo, headers: &HeaderMap, cidrs: &[Cidr]) -> bool {
+    // The HTTP headers were written by whoever talks HTTP to us: the peer.
+    if !trusted(cidrs, conn.remote.ip().to_canonical()) {
+        return false;
+    }
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("https"))
 }
 
 pub fn resolve(conn: &ConnInfo, headers: &HeaderMap, cidrs: &[Cidr]) -> IpAddr {
@@ -149,5 +164,42 @@ mod tests {
             resolve(&conn("10.0.0.1:1", None), &hdr(&[]), &cidrs),
             "10.0.0.1".parse::<IpAddr>().unwrap()
         );
+    }
+
+    /// M8 regression: with no proxy configured, forwarded headers used to
+    /// be believed from every private/loopback address (LAN fallback), so a
+    /// client on the same host or network could claim any address and dodge
+    /// per-address rate limits.
+    #[test]
+    fn nothing_is_trusted_without_proxy_trust() {
+        let cfg: crate::config::Config = toml::from_str("").unwrap();
+        let cidrs = cfg.web_console.proxy.trusted_cidrs();
+        assert!(cidrs.is_empty());
+        for remote in ["127.0.0.1:1", "10.0.0.1:1", "192.168.1.5:1", "[::1]:1"] {
+            let h = hdr(&[
+                ("x-forwarded-for", "198.51.100.77"),
+                ("x-real-ip", "198.51.100.78"),
+                ("x-forwarded-proto", "https"),
+            ]);
+            let c = conn(remote, None);
+            assert_eq!(
+                resolve(&c, &h, &cidrs),
+                c.remote.ip().to_canonical(),
+                "{remote}: headers ignored"
+            );
+            assert!(!forwarded_https(&c, &h, &cidrs));
+        }
+        // Listed proxy: believed.
+        let cidrs = parse_cidrs(&["127.0.0.1/32".into()]);
+        let h = hdr(&[
+            ("x-forwarded-for", "198.51.100.77"),
+            ("x-forwarded-proto", "https"),
+        ]);
+        assert_eq!(
+            resolve(&conn("127.0.0.1:1", None), &h, &cidrs),
+            "198.51.100.77".parse::<IpAddr>().unwrap()
+        );
+        assert!(forwarded_https(&conn("127.0.0.1:1", None), &h, &cidrs));
+        assert!(!forwarded_https(&conn("127.0.0.2:1", None), &h, &cidrs));
     }
 }

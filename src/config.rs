@@ -54,10 +54,20 @@ pub struct ServerConfig {
     pub udp_max_payload: u16,
     /// Synthesize PTR answers from A/AAAA records when no explicit PTR exists.
     pub auto_ptr: bool,
-    /// Idle timeout for TCP connections, seconds.
+    /// Idle timeout for TCP connections, seconds (also bounds each read).
     pub tcp_idle_timeout_secs: u64,
+    /// Longest a single TCP write may take, seconds. A client that stops
+    /// reading is disconnected after this (each AXFR message is one write).
+    pub tcp_write_timeout_secs: u64,
+    /// No new query is read on a TCP connection older than this, seconds.
+    pub tcp_max_connection_secs: u64,
+    /// Queries served on one TCP connection before it is closed.
+    pub tcp_max_queries_per_connection: u32,
     /// Maximum concurrent DNS-over-TCP connections.
     pub max_tcp_connections: usize,
+    /// Maximum concurrent DNS-over-TCP connections per client (an IPv4
+    /// address or an IPv6 /64). 0 = no per-client limit.
+    pub max_tcp_connections_per_client: usize,
     /// Answer ANY queries minimally (RFC 8482) to prevent amplification.
     pub minimal_any: bool,
     /// Default SOA primary nameserver for new zones, e.g. "ns1.example.com".
@@ -84,15 +94,50 @@ pub struct ForwardingConfig {
     pub allowed_clients: Vec<String>,
     /// Cache forwarded answers for their TTL. 0 disables.
     pub cache_entries: usize,
+    /// Longest a positive forwarded answer is cached, seconds (the
+    /// response's own lowest TTL is used when shorter; never raised).
+    pub cache_max_ttl: u32,
+    /// Longest a negative answer (NXDOMAIN / no data) is cached, seconds;
+    /// otherwise min(SOA MINIMUM, SOA TTL) as in RFC 2308.
+    pub cache_negative_max_ttl: u32,
+}
+
+/// Largest accepted forwarding cache TTL cap (one week).
+pub const MAX_CACHE_TTL_CAP: u32 = 604_800;
+
+/// Problems with a pair of cache TTL caps.
+pub fn cache_cap_problems(max_ttl: u32, negative_max_ttl: u32) -> Vec<String> {
+    let mut errs = Vec::new();
+    for (k, v) in [
+        ("cache_max_ttl", max_ttl),
+        ("cache_negative_max_ttl", negative_max_ttl),
+    ] {
+        if !(1..=MAX_CACHE_TTL_CAP).contains(&v) {
+            errs.push(format!(
+                "{k} must be between 1 and {MAX_CACHE_TTL_CAP} seconds (got {v})"
+            ));
+        }
+    }
+    if negative_max_ttl > max_ttl {
+        errs.push(format!(
+            "cache_negative_max_ttl ({negative_max_ttl}) must not exceed cache_max_ttl ({max_ttl})"
+        ));
+    }
+    errs
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RateLimitConfig {
-    /// 0 disables rate limiting.
+    /// Per client: an IPv4 address, or an IPv6 /64. 0 disables rate limiting.
     pub max_resolutions_per_second_per_address: u32,
-    /// Upper bound on tracked client addresses (LRU eviction beyond this).
+    /// Size of the fixed counter table (memory is bounded by this; floods
+    /// from many sources cannot evict or reset a limited client).
     pub max_tracked_addresses: usize,
+    /// Every Nth rate-limited UDP query gets an empty truncated (TC=1) answer
+    /// instead of being dropped, so a genuine client whose address is being
+    /// spoofed can retry over TCP. 0 = always drop.
+    pub slip: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -191,7 +236,9 @@ pub struct ProxyConfig {
     /// 1 or 2.
     pub proxy_version: u8,
     /// Peers trusted to send PROXY headers (and, on the web console,
-    /// X-Forwarded-For / X-Real-IP). `"cidr;cidr"` or a list. Empty = LAN ranges.
+    /// X-Forwarded-For / X-Real-IP / X-Forwarded-Proto). `"cidr;cidr"` or a
+    /// list. Empty = nobody: forwarded client information is ignored, and
+    /// `proxy_on = true` is a configuration error.
     pub proxy_trust: ProxyTrust,
 }
 
@@ -206,12 +253,27 @@ impl Default for ProxyConfig {
 }
 
 impl ProxyConfig {
+    /// Peers whose forwarded client information is believed. Only what is
+    /// listed in `proxy_trust`: an empty list trusts nobody.
     pub fn trusted_cidrs(&self) -> Vec<Cidr> {
-        let list = self.proxy_trust.entries();
-        if list.is_empty() {
-            return parse_cidrs(&LAN_RANGES.iter().map(|s| s.to_string()).collect::<Vec<_>>());
-        }
-        parse_cidrs(&list)
+        parse_cidrs(&self.proxy_trust.entries())
+    }
+
+    /// Entries that trust a whole network rather than the proxy itself
+    /// (shorter than /24 for IPv4 or /64 for IPv6): anything on that
+    /// network, e.g. every container on a Docker bridge, can then claim to
+    /// be any client.
+    pub fn broad_trust_entries(&self) -> Vec<String> {
+        self.proxy_trust
+            .entries()
+            .into_iter()
+            .filter(|e| {
+                Cidr::parse(e).is_some_and(|c| match c.ip {
+                    IpAddr::V4(_) => c.prefix < 24,
+                    IpAddr::V6(_) => c.prefix < 64,
+                })
+            })
+            .collect()
     }
 }
 
@@ -243,17 +305,6 @@ impl ProxyTrust {
     }
 }
 
-pub const LAN_RANGES: [&str; 8] = [
-    "127.0.0.0/8",
-    "::1/128",
-    "10.0.0.0/8",
-    "172.16.0.0/12",
-    "192.168.0.0/16",
-    "169.254.0.0/16",
-    "fc00::/7",
-    "fe80::/10",
-];
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WebConfig {
@@ -262,10 +313,23 @@ pub struct WebConfig {
     #[serde(flatten)]
     pub proxy: ProxyConfig,
     pub session_ttl_hours: u64,
-    /// Mark the session cookie `Secure` (set when served over HTTPS via a proxy).
+    /// Always mark the session cookie `Secure` (and name it
+    /// `__Host-rdns_session`). Also automatic per request when a trusted
+    /// proxy sends `X-Forwarded-Proto: https`.
     pub secure_cookies: bool,
-    /// Failed login attempts allowed per address per minute.
+    /// Sign-in requests (password or code) allowed per client address
+    /// (IPv6: per /64) per minute.
     pub login_attempts_per_minute: u32,
+    /// Failed passwords/codes for one account from one network (IPv4
+    /// address, IPv6 /64) before each further attempt must wait (1 s, 2 s,
+    /// 4 s ... up to 15 min). Across all networks the account gets four
+    /// times as many, then waits of at most one minute.
+    pub login_backoff_after: u32,
+    /// Seconds a client has to send a request's headers; also how long an
+    /// idle keep-alive connection stays open.
+    pub request_header_timeout_secs: u64,
+    /// Concurrent web connections (including websockets); more are refused.
+    pub max_connections: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -315,7 +379,11 @@ impl Default for ServerConfig {
             udp_max_payload: 1232,
             auto_ptr: true,
             tcp_idle_timeout_secs: 10,
+            tcp_write_timeout_secs: 10,
+            tcp_max_connection_secs: 120,
+            tcp_max_queries_per_connection: 200,
             max_tcp_connections: 1000,
+            max_tcp_connections_per_client: 16,
             minimal_any: true,
             default_primary_ns: String::new(),
             default_hostmaster: String::new(),
@@ -340,6 +408,8 @@ impl Default for ForwardingConfig {
                 "fe80::/10".into(),
             ],
             cache_entries: 10_000,
+            cache_max_ttl: 86_400,
+            cache_negative_max_ttl: 3_600,
         }
     }
 }
@@ -348,6 +418,7 @@ impl Default for RateLimitConfig {
         RateLimitConfig {
             max_resolutions_per_second_per_address: 500,
             max_tracked_addresses: 10_000,
+            slip: 2,
         }
     }
 }
@@ -367,6 +438,9 @@ impl Default for WebConfig {
             session_ttl_hours: 12,
             secure_cookies: false,
             login_attempts_per_minute: 10,
+            login_backoff_after: 5,
+            request_header_timeout_secs: 60,
+            max_connections: 512,
         }
     }
 }
@@ -409,7 +483,11 @@ tcp = true
 udp_max_payload = 1232
 auto_ptr = true          # synthesize PTR answers from A/AAAA records
 tcp_idle_timeout_secs = 10
+tcp_write_timeout_secs = 10         # a client that stops reading is dropped after this
+tcp_max_connection_secs = 120       # no new query is read on an older connection
+tcp_max_queries_per_connection = 200
 max_tcp_connections = 1000
+max_tcp_connections_per_client = 16 # per IPv4 address / IPv6 /64; 0 = unlimited
 minimal_any = true       # RFC 8482: minimal ANY answers (anti-amplification)
 default_primary_ns = ""  # SOA MNAME for new zones, e.g. "ns1.example.com"; empty = ns1.<zone>
 default_hostmaster = ""  # SOA RNAME for new zones, e.g. "hostmaster@example.com"; empty = hostmaster.<zone>
@@ -423,6 +501,8 @@ timeout_ms = 2000
 # Only these networks may use forwarding; never open this to the internet.
 allowed_clients = ["127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7", "fe80::/10"]
 cache_entries = 10000    # TTL-aware cache for forwarded answers; 0 = off
+cache_max_ttl = 86400    # cap on how long a forwarded answer is cached (its own TTL if lower; never raised)
+cache_negative_max_ttl = 3600  # cap for NXDOMAIN/no-data answers (otherwise min(SOA MINIMUM, SOA TTL))
 
 [transfer]
 allow = []               # networks allowed to AXFR zones (for BIND/NSD secondaries), e.g. ["203.0.113.5/32"]
@@ -432,8 +512,9 @@ notify = []              # secondaries to NOTIFY on change, e.g. ["203.0.113.5:5
                          # [{ address = "203.0.113.5:53", key = "hn-secondary." }]
 
 [rate_limit]
-max_resolutions_per_second_per_address = 500
+max_resolutions_per_second_per_address = 500   # per IPv4 address / IPv6 /64
 max_tracked_addresses = 10000
+slip = 2                 # every 2nd limited UDP query gets an empty TC=1 answer; 0 = drop all
 
 [database]
 path = "rust-dns.db"
@@ -447,21 +528,24 @@ keep = 7
 [tcp_dns]
 proxy_on = false
 proxy_version = 2        # 1 or 2
-proxy_trust = ""         # "192.168.44.0/24;fe80::/64" - peers allowed to send PROXY headers; empty = local LAN ranges
+proxy_trust = ""         # "192.0.2.10/32;2001:db8::10/128" - the proxies allowed to send PROXY headers; empty = none (required with proxy_on)
 
 [web_console]
 bind = "127.0.0.1:8053"
 enabled = true
 proxy_on = false         # accept PROXY protocol from trusted peers
 proxy_version = 2        # 1 or 2
-proxy_trust = ""         # also governs X-Forwarded-For / X-Real-IP trust; empty = local LAN ranges
+proxy_trust = ""         # proxies whose PROXY header / X-Forwarded-For / X-Real-IP / X-Forwarded-Proto are believed; empty = none
 session_ttl_hours = 12
-secure_cookies = false   # set true when served over HTTPS
-login_attempts_per_minute = 10
+secure_cookies = false   # always mark the session cookie Secure; it is also Secure automatically when a trusted proxy sends X-Forwarded-Proto: https
+request_header_timeout_secs = 60  # a client must send each request's headers within this (also the keep-alive idle limit)
+max_connections = 512    # concurrent web connections (websockets included)
+login_attempts_per_minute = 10  # sign-in requests per client address (IPv6: per /64) per minute
+login_backoff_after = 5  # failed attempts per account and network before waits start (account-wide: 4x, waits <= 1 min)
 
 [root]
 username = "root"
-password = "__PASSWORD__"   # plaintext is hashed in place on first start
+password = "__PASSWORD__"   # plaintext is hashed in place at start; "change-me" and "" are refused
 mfa_required = false
 
 [changelog]
@@ -482,15 +566,111 @@ max_files = 10           # rotated files to keep per log
 compress = true          # gzip rotated files
 "#;
 
-/// Load the config, creating a default file with a random root password if
-/// it does not exist. Hashes a plaintext root password in place.
+/// The sample configuration printed by `--print-sample-config`: the root
+/// password is the placeholder `change-me`, which rust-dns refuses to run with.
+pub fn sample_with_placeholder() -> String {
+    format!(
+        "# [root].password below is a placeholder: rust-dns refuses to start (and --check fails)\n\
+         # until it is changed. `rust-dns --init-config <path>` writes a config with a random\n\
+         # root password instead.\n{}",
+        SAMPLE.replace("__PASSWORD__", PLACEHOLDER_PASSWORD)
+    )
+}
+
+/// The documented placeholder root password; never accepted.
+pub const PLACEHOLDER_PASSWORD: &str = "change-me";
+
+/// Create `path` readable and writable by the owner only (0600 on unix).
+/// Fails if it already exists: nothing is ever overwritten.
+pub fn create_private(path: &Path, text: &str) -> Result<()> {
+    use std::io::Write;
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    let mut f = o
+        .open(path)
+        .with_context(|| format!("creating {} (it must not exist yet)", path.display()))?;
+    f.write_all(text.as_bytes())
+        .and_then(|()| f.sync_all())
+        .with_context(|| format!("writing {}", path.display()))
+}
+
+/// Replace `path` atomically with `text`, leaving it owner-only (0600).
+fn rewrite_private(path: &Path, text: &str) -> Result<()> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "rust-dns.toml".into());
+    let tmp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    create_private(&tmp, text)?;
+    std::fs::rename(&tmp, path).with_context(|| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("replacing {}", path.display())
+    })
+}
+
+/// A fresh configuration with a random root password, stored already
+/// hashed. Returns (config text, root username, plaintext password).
+pub fn generate() -> Result<(String, String, String)> {
+    let pw = crate::auth::random_token(18);
+    let hash = crate::auth::hash_password(&pw)?;
+    let text = SAMPLE.replace("__PASSWORD__", &hash).replace(
+        "   # plaintext is hashed in place at start; \"change-me\" and \"\" are refused",
+        "   # Argon2 hash; set a new plaintext here to change it (hashed at start)",
+    );
+    Ok((text, RootConfig::default().username, pw))
+}
+
+/// `--init-config`: write a new config (0600) with a random root password.
+/// Refuses to touch an existing file. Returns (username, plaintext password).
+pub fn init_config(path: &Path) -> Result<(String, String)> {
+    if path.exists() {
+        anyhow::bail!(
+            "{} already exists; refusing to overwrite it",
+            path.display()
+        );
+    }
+    let (text, user, pw) = generate()?;
+    create_private(path, &text)?;
+    Ok((user, pw))
+}
+
+/// Refuse an empty root password and the documented placeholder, whether
+/// still in plaintext or already hashed by an earlier start.
+pub fn check_root_password(cfg: &Config) -> Result<()> {
+    let pw = cfg.root.password.trim();
+    if pw.is_empty() {
+        anyhow::bail!("[root].password must be set (run `rust-dns --init-config <path>` to generate a config with a random password)");
+    }
+    let placeholder = if crate::auth::is_password_hash(pw) {
+        crate::auth::verify_password(PLACEHOLDER_PASSWORD, pw)
+    } else {
+        // Also the examples' "change-me-please" and similar.
+        pw.to_ascii_lowercase().starts_with(PLACEHOLDER_PASSWORD) || pw == "__PASSWORD__"
+    };
+    if placeholder {
+        anyhow::bail!(
+            "[root].password is the placeholder \"{PLACEHOLDER_PASSWORD}\"; set a real password in the config file (it is hashed on start) or generate a new config with `rust-dns --init-config <path>`"
+        );
+    }
+    Ok(())
+}
+
+/// Load the config, creating a default file (0600) with a random root
+/// password if it does not exist; the password is returned so the caller
+/// can print it once (never logged). Hashes a plaintext root password in
+/// place, rewriting the file owner-only.
 pub fn load_or_init(path: &Path) -> Result<(Config, Option<String>)> {
     let mut generated_password = None;
     if !path.exists() {
-        let pw = crate::auth::random_token(12);
-        let text = SAMPLE.replace("__PASSWORD__", &pw);
-        std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
-        tracing::info!(path = %path.display(), "wrote default configuration");
+        let (text, _, pw) = generate()?;
+        create_private(path, &text)?;
+        tracing::info!(path = %path.display(), "wrote default configuration (mode 0600)");
         generated_password = Some(pw);
     }
     let text =
@@ -498,20 +678,34 @@ pub fn load_or_init(path: &Path) -> Result<(Config, Option<String>)> {
     let mut cfg: Config =
         toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
     validate(&cfg).with_context(|| format!("validating {}", path.display()))?;
-    if cfg.root.password.is_empty() {
-        anyhow::bail!("[root].password must be set in {}", path.display());
-    }
+    check_root_password(&cfg).with_context(|| format!("in {}", path.display()))?;
     if !crate::auth::is_password_hash(&cfg.root.password) {
         let hash = crate::auth::hash_password(&cfg.root.password)?;
         let mut doc: toml_edit::DocumentMut =
             text.parse().context("re-parsing config for rewrite")?;
         doc["root"]["password"] = toml_edit::value(hash.clone());
-        std::fs::write(path, doc.to_string())
-            .with_context(|| format!("rewriting {}", path.display()))?;
-        tracing::info!("hashed the plaintext [root].password in the configuration file");
+        rewrite_private(path, &doc.to_string())?;
+        tracing::info!(
+            "hashed the plaintext [root].password in the configuration file (now mode 0600)"
+        );
         cfg.root.password = hash;
     }
+    warn_if_world_readable(path);
     Ok((cfg, generated_password))
+}
+
+fn warn_if_world_readable(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(m) = std::fs::metadata(path) {
+            if m.permissions().mode() & 0o007 != 0 {
+                tracing::warn!(path = %path.display(), mode = format!("{:o}", m.permissions().mode() & 0o777), "the configuration file is readable by other users; chmod 600 it");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 /// Parse and validate an existing configuration without creating or rewriting it.
@@ -520,8 +714,8 @@ pub fn check(path: &Path) -> Result<Config> {
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let cfg: Config =
         toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-    anyhow::ensure!(!cfg.root.password.is_empty(), "[root].password must be set");
     validate(&cfg).with_context(|| format!("validating {}", path.display()))?;
+    check_root_password(&cfg).with_context(|| format!("in {}", path.display()))?;
     Ok(cfg)
 }
 
@@ -540,6 +734,20 @@ pub fn validate(cfg: &Config) -> Result<()> {
     }
     if !s.udp && !s.tcp {
         errs.push("[server].udp and [server].tcp are both false; enable at least one".into());
+    }
+    for (key, v) in [
+        ("tcp_idle_timeout_secs", s.tcp_idle_timeout_secs),
+        ("tcp_write_timeout_secs", s.tcp_write_timeout_secs),
+        ("tcp_max_connection_secs", s.tcp_max_connection_secs),
+        (
+            "tcp_max_queries_per_connection",
+            s.tcp_max_queries_per_connection as u64,
+        ),
+        ("max_tcp_connections", s.max_tcp_connections as u64),
+    ] {
+        if v == 0 {
+            errs.push(format!("[server].{key} must be greater than zero"));
+        }
     }
     if s.udp_max_payload < 512 {
         errs.push(format!(
@@ -585,6 +793,15 @@ pub fn validate(cfg: &Config) -> Result<()> {
         &cfg.forwarding.allowed_clients,
         &mut errs,
     );
+    for e in open_resolver_problems(&cfg.forwarding.allowed_clients) {
+        errs.push(format!("[forwarding].allowed_clients: {e}"));
+    }
+    for e in cache_cap_problems(
+        cfg.forwarding.cache_max_ttl,
+        cfg.forwarding.cache_negative_max_ttl,
+    ) {
+        errs.push(format!("[forwarding].{e}"));
+    }
     if cfg.forwarding.timeout_ms == 0 {
         errs.push("[forwarding].timeout_ms must be greater than zero".into());
     }
@@ -638,6 +855,17 @@ pub fn validate(cfg: &Config) -> Result<()> {
             &p.proxy_trust.entries(),
             &mut errs,
         );
+        if p.proxy_on && p.proxy_trust.entries().is_empty() {
+            errs.push(format!(
+                "{section}.proxy_on = true needs {section}.proxy_trust listing the proxy's address (e.g. \"127.0.0.1/32\"); nobody is trusted by default"
+            ));
+        }
+    }
+    if cfg.web_console.request_header_timeout_secs == 0 {
+        errs.push("[web_console].request_header_timeout_secs must be greater than zero".into());
+    }
+    if cfg.web_console.max_connections == 0 {
+        errs.push("[web_console].max_connections must be greater than zero".into());
     }
 
     // [web_console] vs DNS TCP listener
@@ -720,8 +948,8 @@ fn check_cidrs(key: &str, list: &[String], errs: &mut Vec<String>) {
 /// A CIDR block used for trusted-proxy checks.
 #[derive(Debug, Clone, Copy)]
 pub struct Cidr {
-    ip: IpAddr,
-    prefix: u8,
+    pub ip: IpAddr,
+    pub prefix: u8,
 }
 
 impl Cidr {
@@ -763,6 +991,102 @@ impl Cidr {
             _ => false,
         }
     }
+}
+
+/// Shortest IPv4 prefix one forwarding ACL entry may have.
+pub const MIN_ACL_PREFIX_V4: u8 = 8;
+/// Shortest IPv6 prefix for an entry that includes global addresses.
+pub const MIN_ACL_PREFIX_V6: u8 = 16;
+
+/// Why a forwarding ACL would (nearly) make this an open resolver, if it
+/// would: an entry shorter than /8 (IPv4) or /16 (IPv6, outside the
+/// ULA/link-local/loopback ranges), or entries that together cover more
+/// than 1/16 of IPv4 or 1/256 of IPv6. Catches `0.0.0.0/0` as well as
+/// splits such as `0.0.0.0/1` + `128.0.0.0/1`.
+pub fn open_resolver_problems(list: &[String]) -> Vec<String> {
+    let local_v6: Vec<Cidr> = ["fc00::/7", "fe80::/10", "::1/128", "::/128"]
+        .iter()
+        .filter_map(|c| Cidr::parse(c))
+        .collect();
+    let mut errs = Vec::new();
+    let mut v4: Vec<(u64, u64)> = Vec::new();
+    let mut v6: Vec<(u128, u128)> = Vec::new();
+    for raw in list {
+        let Some(c) = Cidr::parse(raw.trim()) else {
+            continue; // reported by the CIDR syntax check
+        };
+        match c.ip {
+            IpAddr::V4(a) => {
+                if c.prefix < MIN_ACL_PREFIX_V4 {
+                    errs.push(format!(
+                        "'{raw}' covers {} of the IPv4 internet and would make this an open resolver; list your own networks (at most /{MIN_ACL_PREFIX_V4} each)",
+                        share(1u128 << (32 - c.prefix), 1u128 << 32)
+                    ));
+                }
+                let size = 1u64 << (32 - c.prefix);
+                let start = u32::from(a) as u64 & !(size - 1);
+                v4.push((start, start + size));
+            }
+            IpAddr::V6(a) => {
+                let inside_local = local_v6
+                    .iter()
+                    .any(|l| l.prefix <= c.prefix && l.contains(IpAddr::V6(a)));
+                if inside_local {
+                    continue;
+                }
+                if c.prefix < MIN_ACL_PREFIX_V6 {
+                    errs.push(format!(
+                        "'{raw}' covers a large part of the IPv6 internet and would make this an open resolver; list your own networks (at most /{MIN_ACL_PREFIX_V6} each for global addresses)"
+                    ));
+                    continue;
+                }
+                let size = 1u128 << (128 - c.prefix as u32);
+                let start = u128::from(a) & !(size - 1);
+                v6.push((start, start.saturating_add(size)));
+            }
+        }
+    }
+    let covered4 = merged_len(
+        v4.into_iter()
+            .map(|(a, b)| (a as u128, b as u128))
+            .collect(),
+    );
+    if errs.is_empty() && covered4 > 1u128 << 28 {
+        errs.push(format!(
+            "together the IPv4 entries cover {} of all addresses; that is an open resolver in all but name. List your own networks",
+            share(covered4, 1u128 << 32)
+        ));
+    }
+    let covered6 = merged_len(v6);
+    if errs.is_empty() && covered6 > 1u128 << 120 {
+        errs.push("together the IPv6 entries cover more than 1/256 of all addresses; that is an open resolver in all but name. List your own networks".into());
+    }
+    errs
+}
+
+fn share(part: u128, whole: u128) -> String {
+    format!("{:.1}%", part as f64 * 100.0 / whole as f64)
+}
+
+/// Total length of the union of half-open ranges.
+fn merged_len(mut r: Vec<(u128, u128)>) -> u128 {
+    r.sort();
+    let mut total: u128 = 0;
+    let mut cur: Option<(u128, u128)> = None;
+    for (a, b) in r {
+        match cur {
+            Some((ca, cb)) if a <= cb => cur = Some((ca, cb.max(b))),
+            Some((ca, cb)) => {
+                total = total.saturating_add(cb - ca);
+                cur = Some((a, b));
+            }
+            None => cur = Some((a, b)),
+        }
+    }
+    if let Some((ca, cb)) = cur {
+        total = total.saturating_add(cb - ca);
+    }
+    total
 }
 
 pub fn parse_cidrs(list: &[String]) -> Vec<Cidr> {
@@ -814,7 +1138,11 @@ mod tests {
         assert_eq!(t.web_console.proxy.proxy_version, 1);
         assert_eq!(t.tcp_dns.proxy_trust.entries(), vec!["10.1.0.0/16"]);
         assert_eq!(t.tcp_dns.trusted_cidrs().len(), 1);
-        assert_eq!(cfg.tcp_dns.trusted_cidrs().len(), LAN_RANGES.len());
+        assert!(
+            cfg.tcp_dns.trusted_cidrs().is_empty(),
+            "an empty proxy_trust trusts nobody"
+        );
+        assert!(cfg.web_console.proxy.trusted_cidrs().is_empty());
         validate(&cfg).unwrap();
         validate(&empty).unwrap();
         validate(&t).unwrap();
@@ -929,6 +1257,85 @@ notify = ["192.0.2.1:53", { address = "192.0.2.2:5300", key = "other." }, { addr
         );
     }
 
+    /// L10 regression: only a literal "/0" was refused (and only in the
+    /// API): "0.0.0.0/1" + "128.0.0.0/1" passed, and the config file was
+    /// not checked at all.
+    #[test]
+    fn open_resolver_acls_are_refused_everywhere() {
+        let bad: &[&[&str]] = &[
+            &["0.0.0.0/0"],
+            &["::/0"],
+            &["0.0.0.0/1", "128.0.0.0/1"],
+            &["10.0.0.0/7"],
+            &["2000::/3"],
+            &["2001:db8::/15"],
+        ];
+        for list in bad {
+            let list: Vec<String> = list.iter().map(|s| s.to_string()).collect();
+            assert!(!open_resolver_problems(&list).is_empty(), "{list:?}");
+            let text = format!("[forwarding]\nallowed_clients = {list:?}");
+            let msg = err_of(&text);
+            assert!(msg.contains("open resolver"), "{msg}");
+        }
+        // Many /8s that add up to a large share.
+        let many: Vec<String> = (1..=20).map(|i| format!("{}.0.0.0/8", i * 10)).collect();
+        assert!(open_resolver_problems(&many)
+            .iter()
+            .any(|e| e.contains("together")));
+        // The defaults and ordinary networks are fine.
+        let ok = ForwardingConfig::default().allowed_clients;
+        assert!(open_resolver_problems(&ok).is_empty(), "{ok:?}");
+        let ok: Vec<String> = [
+            "203.0.113.0/24",
+            "198.51.100.7",
+            "2001:db8:1::/48",
+            "fd00::/8",
+            "100.64.0.0/10",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert!(open_resolver_problems(&ok).is_empty());
+    }
+
+    #[test]
+    fn cache_ttl_caps_are_validated_and_default() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.forwarding.cache_max_ttl, 86_400);
+        assert_eq!(cfg.forwarding.cache_negative_max_ttl, 3_600);
+        let msg = err_of("[forwarding]\ncache_max_ttl = 0");
+        assert!(
+            msg.contains("[forwarding].cache_max_ttl must be between"),
+            "{msg}"
+        );
+        let msg = err_of("[forwarding]\ncache_max_ttl = 700000");
+        assert!(msg.contains("cache_max_ttl must be between"), "{msg}");
+        let msg = err_of("[forwarding]\ncache_max_ttl = 60\ncache_negative_max_ttl = 120");
+        assert!(msg.contains("must not exceed"), "{msg}");
+        let cfg: Config =
+            toml::from_str("[forwarding]\ncache_max_ttl = 600\ncache_negative_max_ttl = 60")
+                .unwrap();
+        validate(&cfg).unwrap();
+    }
+
+    #[test]
+    fn proxy_on_needs_an_explicit_trust_list() {
+        let msg = err_of("[web_console]\nproxy_on = true");
+        assert!(msg.contains("[web_console].proxy_on = true needs"), "{msg}");
+        let msg = err_of("[tcp_dns]\nproxy_on = true");
+        assert!(msg.contains("[tcp_dns].proxy_on = true needs"), "{msg}");
+        let cfg: Config =
+            toml::from_str("[web_console]\nproxy_on = true\nproxy_trust = \"127.0.0.1/32\"")
+                .unwrap();
+        validate(&cfg).unwrap();
+        assert!(cfg.web_console.proxy.broad_trust_entries().is_empty());
+        let cfg: Config = toml::from_str("[web_console]\nproxy_trust = \"172.16.0.0/12\"").unwrap();
+        assert_eq!(
+            cfg.web_console.proxy.broad_trust_entries(),
+            vec!["172.16.0.0/12"]
+        );
+    }
+
     #[test]
     fn validate_bad_cidr() {
         let msg = err_of("[forwarding]\nallowed_clients = [\"10.0.0.0/8\", \"10.0.0/8\"]");
@@ -1000,5 +1407,97 @@ notify = ["192.0.2.1:53", { address = "192.0.2.2:5300", key = "other." }, { addr
         let cfg: Config =
             toml::from_str("[server]\ndefault_hostmaster = \"hostmaster.example.com\"").unwrap();
         validate(&cfg).unwrap();
+    }
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "rust-dns-cfgtest-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[cfg(unix)]
+    fn mode(p: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    /// A2 regression: a fresh install must not run with a known password.
+    #[test]
+    fn init_config_writes_a_private_file_with_a_random_hashed_password() {
+        let d = scratch("init");
+        let p = d.join("rust-dns.toml");
+        let (user, pw) = init_config(&p).unwrap();
+        assert_eq!(user, "root");
+        assert!(pw.len() >= 20, "random password: {pw}");
+        #[cfg(unix)]
+        assert_eq!(mode(&p), 0o600);
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(!text.contains(&pw), "the plaintext is never written");
+        let cfg = check(&p).unwrap();
+        assert!(crate::auth::is_password_hash(&cfg.root.password));
+        assert!(crate::auth::verify_password(&pw, &cfg.root.password));
+        // Never overwrites.
+        let err = format!("{:#}", init_config(&p).unwrap_err());
+        assert!(err.contains("already exists"), "{err}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), text);
+        // Two runs give different passwords.
+        let (_, pw2) = init_config(&d.join("other.toml")).unwrap();
+        assert_ne!(pw, pw2);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A2 regression: the documented placeholder and an empty password are
+    /// refused by --check and at startup, also once hashed by an old start.
+    #[test]
+    fn placeholder_and_empty_root_passwords_are_refused() {
+        let d = scratch("placeholder");
+        let p = d.join("c.toml");
+        std::fs::write(&p, sample_with_placeholder()).unwrap();
+        let err = format!("{:#}", check(&p).unwrap_err());
+        assert!(err.contains("placeholder"), "{err}");
+        let err = format!("{:#}", load_or_init(&p).unwrap_err());
+        assert!(err.contains("placeholder"), "{err}");
+        assert!(
+            std::fs::read_to_string(&p)
+                .unwrap()
+                .contains("\"change-me\""),
+            "a refused config is not rewritten"
+        );
+        let hashed = crate::auth::hash_password("change-me").unwrap();
+        std::fs::write(&p, SAMPLE.replace("__PASSWORD__", &hashed)).unwrap();
+        assert!(format!("{:#}", check(&p).unwrap_err()).contains("placeholder"));
+        std::fs::write(&p, SAMPLE.replace("__PASSWORD__", "Change-Me-Please")).unwrap();
+        assert!(format!("{:#}", check(&p).unwrap_err()).contains("placeholder"));
+        std::fs::write(&p, SAMPLE.replace("__PASSWORD__", "")).unwrap();
+        assert!(format!("{:#}", check(&p).unwrap_err()).contains("must be set"));
+        std::fs::write(&p, SAMPLE.replace("__PASSWORD__", "a-real-password")).unwrap();
+        check(&p).unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// L7: the hashing rewrite and first-start creation leave the file 0600.
+    #[cfg(unix)]
+    #[test]
+    fn config_rewrites_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = scratch("perms");
+        let p = d.join("c.toml");
+        std::fs::write(&p, SAMPLE.replace("__PASSWORD__", "a-real-password")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let (cfg, generated) = load_or_init(&p).unwrap();
+        assert!(generated.is_none());
+        assert!(crate::auth::is_password_hash(&cfg.root.password));
+        assert_eq!(mode(&p), 0o600, "rewritten owner-only");
+        let fresh = d.join("fresh.toml");
+        let (cfg, generated) = load_or_init(&fresh).unwrap();
+        let pw = generated.expect("a generated password");
+        assert!(crate::auth::verify_password(&pw, &cfg.root.password));
+        assert_eq!(mode(&fresh), 0o600);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

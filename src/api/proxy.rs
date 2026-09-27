@@ -21,14 +21,41 @@ pub enum ProxyHeader {
     Rejected(&'static str),
 }
 
+/// Longest time a peer gets to deliver its whole PROXY header.
+pub const HEADER_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Peek at the stream; if a PROXY header of `version` (1 or 2) is present,
-/// consume it and return the original source address.
+/// consume it and return the original source address. The whole header
+/// must arrive within [`HEADER_TIMEOUT`], possibly split across several
+/// TCP segments; a peer that stalls mid-header is rejected.
 pub async fn read_proxy_header(stream: &mut TcpStream, version: u8) -> ProxyHeader {
+    match tokio::time::timeout(HEADER_TIMEOUT, read_proxy_header_inner(stream, version)).await {
+        Ok(r) => r,
+        Err(_) => ProxyHeader::Rejected("PROXY header not received in time"),
+    }
+}
+
+/// Peek until the first bytes either rule out a PROXY header or are enough
+/// to recognise one (a partial signature waits for more data).
+async fn peek_signature(stream: &mut TcpStream, buf: &mut [u8; 16]) -> usize {
+    loop {
+        let n = match stream.peek(buf).await {
+            Ok(n) => n,
+            Err(_) => return 0,
+        };
+        let partial_v2 = n < V2_SIG.len() && buf[..n] == V2_SIG[..n];
+        let partial_v1 = n < 6 && buf[..n] == b"PROXY "[..n];
+        if n == 0 || !(partial_v1 || partial_v2) {
+            return n;
+        }
+        // More of the header is on its way; peek does not wait for it.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+async fn read_proxy_header_inner(stream: &mut TcpStream, version: u8) -> ProxyHeader {
     let mut peek = [0u8; 16];
-    let n = match tokio::time::timeout(Duration::from_secs(3), stream.peek(&mut peek)).await {
-        Ok(Ok(n)) => n,
-        _ => return ProxyHeader::Absent,
-    };
+    let n = peek_signature(stream, &mut peek).await;
     let is_v2 = n >= 12 && peek[..12] == V2_SIG;
     let is_v1 = n >= 6 && &peek[..6] == b"PROXY ";
     match (version, is_v1, is_v2) {
@@ -49,26 +76,22 @@ pub async fn read_proxy_header(stream: &mut TcpStream, version: u8) -> ProxyHead
 }
 
 /// `None` = malformed; `Some(None)` = valid but carries no address (UNKNOWN).
+/// Reads byte by byte up to the CRLF (at most 107 bytes), so nothing after
+/// the header is consumed and a header split across segments is fine.
 async fn read_v1(stream: &mut TcpStream) -> Option<Option<SocketAddr>> {
-    // Up to 107 bytes terminated by CRLF.
-    let mut buf = [0u8; 108];
-    let mut have = 0;
-    let line_len = loop {
-        let n = tokio::time::timeout(Duration::from_secs(3), stream.peek(&mut buf))
-            .await
-            .ok()?
-            .ok()?;
-        if let Some(pos) = buf[..n].windows(2).position(|w| w == b"\r\n") {
-            break pos + 2;
+    let mut line = Vec::with_capacity(108);
+    loop {
+        let mut b = [0u8; 1];
+        stream.read_exact(&mut b).await.ok()?;
+        line.push(b[0]);
+        if line.ends_with(b"\r\n") {
+            break;
         }
-        if n >= buf.len() || n == have {
+        if line.len() >= 107 {
             return None;
         }
-        have = n;
-    };
-    let mut line = vec![0u8; line_len];
-    stream.read_exact(&mut line).await.ok()?;
-    let text = std::str::from_utf8(&line[..line_len - 2]).ok()?;
+    }
+    let text = std::str::from_utf8(&line[..line.len() - 2]).ok()?;
     let parts: Vec<&str> = text.split(' ').collect();
     // PROXY TCP4 src dst sport dport
     if parts.len() == 6 && (parts[1] == "TCP4" || parts[1] == "TCP6") {
@@ -171,6 +194,59 @@ mod tests {
             "version mismatch is rejected"
         );
         assert_eq!(&rest, b"GET / HTTP/1.0\r\n\r\n");
+    }
+
+    /// L1/L11 regression: a v1 header split across TCP segments used to be
+    /// rejected (a second peek saw no new bytes yet).
+    #[tokio::test]
+    async fn v1_split_across_segments() {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut c = TcpStream::connect(addr).await.unwrap();
+            c.set_nodelay(true).unwrap();
+            for part in [
+                &b"PRO"[..],
+                b"XY TCP4 203.0.113.9 10.0.",
+                b"0.1 51234 443\r",
+                b"\nGET / HTTP/1.0\r\n\r\n",
+            ] {
+                c.write_all(part).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(60)).await;
+            }
+            c
+        });
+        let (mut s, _) = l.accept().await.unwrap();
+        let src = read_proxy_header(&mut s, 1).await;
+        let _keep = client.await.unwrap();
+        assert_eq!(
+            src,
+            ProxyHeader::Source("203.0.113.9:51234".parse().unwrap())
+        );
+        let mut rest = vec![0u8; 18];
+        s.read_exact(&mut rest).await.unwrap();
+        assert_eq!(&rest, b"GET / HTTP/1.0\r\n\r\n");
+    }
+
+    /// L11 regression: a v2 header whose body never arrives used to block
+    /// the connection task forever (no timeout on the body read).
+    #[tokio::test]
+    async fn v2_stalled_header_times_out() {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut c = TcpStream::connect(addr).await.unwrap();
+            let mut h = V2_SIG.to_vec();
+            h.extend_from_slice(&[0x21, 0x11, 0, 12, 203, 0]); // promises 12 bytes, sends 2
+            c.write_all(&h).await.unwrap();
+            c
+        });
+        let (mut s, _) = l.accept().await.unwrap();
+        let started = std::time::Instant::now();
+        let r = read_proxy_header(&mut s, 2).await;
+        let _keep = client.await.unwrap();
+        assert!(matches!(r, ProxyHeader::Rejected(_)), "{r:?}");
+        assert!(started.elapsed() < HEADER_TIMEOUT + Duration::from_secs(1));
     }
 
     #[tokio::test]

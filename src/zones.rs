@@ -6,16 +6,15 @@ use hickory_proto::op::ResponseCode;
 use hickory_proto::rr::rdata::{A, AAAA, CNAME, MX, NS, NULL, PTR, SOA, SRV, TXT};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
-use hickory_proto::serialize::txt::RDataParser;
 
-/// DNAME is not modelled by hickory 0.25; it is carried as an unknown type 39
+/// DNAME is not modelled by hickory; it is carried as an unknown type 39
 /// whose RDATA is the uncompressed target name (RFC 6672 §2.1).
 pub const DNAME_TYPE: RecordType = RecordType::Unknown(39);
 
 fn dname_rdata(target: &Name) -> Option<RData> {
     let mut bytes = Vec::with_capacity(target.len() + 2);
     let mut enc = BinEncoder::new(&mut bytes);
-    enc.set_canonical_names(true);
+    enc.set_canonical_form(true);
     target.emit(&mut enc).ok()?;
     Some(RData::Unknown {
         code: DNAME_TYPE,
@@ -143,10 +142,10 @@ pub fn apex_ns(z: &ZoneData) -> Vec<Record> {
 /// Glue: A/AAAA for names referenced by NS/MX/SRV answers when we hold them.
 fn add_glue(catalog: &Catalog, records: &[Record], out: &mut Vec<Record>) {
     for r in records {
-        let target = match r.data() {
+        let target = match &r.data {
             RData::NS(ns) => &ns.0,
-            RData::MX(mx) => mx.exchange(),
-            RData::SRV(srv) => srv.target(),
+            RData::MX(mx) => &mx.exchange,
+            RData::SRV(srv) => &srv.target,
             _ => continue,
         };
         let key = key_of(target);
@@ -371,7 +370,7 @@ fn resolve_into(
         if let Some(c) = rs.iter().find(|r| r.rtype == Rt::CNAME) {
             if qtype != RecordType::CNAME && qtype != RecordType::ANY {
                 if let Some(rr) = to_rr(zone, c, qname) {
-                    if let RData::CNAME(t) = rr.data() {
+                    if let RData::CNAME(t) = &rr.data {
                         cname_target = Some(t.0.clone());
                     }
                     ans.answers.push(rr);
@@ -444,53 +443,6 @@ fn resolve_into(
     if let Some(soa) = soa_record(z, zone.minimum.min(zone.default_ttl)) {
         ans.authority.push(soa);
     }
-}
-
-/// BIND-style zone file text for export.
-pub fn to_zone_file(z: &ZoneData) -> String {
-    use std::fmt::Write;
-    let zone = &z.zone;
-    let mut s = String::new();
-    let _ = writeln!(s, "$ORIGIN {}", z.apex);
-    let _ = writeln!(s, "$TTL {}", zone.default_ttl);
-    let _ = writeln!(
-        s,
-        "@\t{}\tIN\tSOA\t{} {} {} {} {} {} {}",
-        zone.default_ttl,
-        zone.soa_mname,
-        zone.soa_rname,
-        zone.serial,
-        zone.refresh,
-        zone.retry,
-        zone.expire,
-        zone.minimum
-    );
-    let has_ns = z
-        .records_at(&z.apex)
-        .map(|rs| rs.iter().any(|r| r.rtype == Rt::NS))
-        .unwrap_or(false);
-    if !has_ns {
-        let _ = writeln!(s, "@\t{}\tIN\tNS\t{}", zone.default_ttl, zone.soa_mname);
-    }
-    let mut owners: Vec<&String> = z.names.keys().collect();
-    owners.sort_by(|a, b| (a.len(), a).cmp(&(b.len(), b)));
-    for owner in owners {
-        let mut recs: Vec<&StoredRecord> = z.names[owner].iter().collect();
-        recs.sort_by_key(|r| (r.rtype, r.value.clone()));
-        for r in recs {
-            let ttl = r.ttl.unwrap_or(zone.default_ttl);
-            let value = match r.rtype {
-                Rt::TXT => txt_chunks(&r.value)
-                    .iter()
-                    .map(|c| format!("\"{}\"", c.replace('\\', "\\\\").replace('"', "\\\"")))
-                    .collect::<Vec<_>>()
-                    .join(" "),
-                _ => r.value.clone(),
-            };
-            let _ = writeln!(s, "{}\t{}\tIN\t{}\t{}", r.name, ttl, r.rtype, value);
-        }
-    }
-    s
 }
 
 #[cfg(test)]
@@ -566,7 +518,7 @@ mod tests {
         assert_eq!(a.answers.len(), 1);
         assert!(a.authoritative);
         assert_eq!(
-            a.answers[0].name().to_ascii(),
+            a.answers[0].name.to_ascii(),
             "WWW.example.com.",
             "case preserved"
         );
@@ -593,8 +545,8 @@ mod tests {
     fn cname_chase() {
         let a = q("alias.example.com.", RecordType::A);
         assert_eq!(a.answers.len(), 2);
-        assert!(matches!(a.answers[0].data(), RData::CNAME(_)));
-        assert!(matches!(a.answers[1].data(), RData::A(_)));
+        assert!(matches!(&a.answers[0].data, RData::CNAME(_)));
+        assert!(matches!(&a.answers[1].data, RData::A(_)));
         let a = q("alias.example.com.", RecordType::CNAME);
         assert_eq!(a.answers.len(), 1);
         let a = q("ext.example.com.", RecordType::A);
@@ -610,7 +562,7 @@ mod tests {
     fn wildcard() {
         let a = q("foo.apps.example.com.", RecordType::A);
         assert_eq!(a.answers.len(), 1);
-        assert_eq!(a.answers[0].name().to_ascii(), "foo.apps.example.com.");
+        assert_eq!(a.answers[0].name.to_ascii(), "foo.apps.example.com.");
         let a = q("foo.apps.example.com.", RecordType::AAAA);
         assert_eq!(a.rcode, ResponseCode::NoError, "wildcard NODATA");
         let a = q("apps.example.com.", RecordType::A);
@@ -621,7 +573,7 @@ mod tests {
         );
         let a = q("x.apps.example.com.", RecordType::A);
         assert_eq!(
-            a.answers[0].data().to_string(),
+            &a.answers[0].data.to_string(),
             "10.0.0.10",
             "explicit name beats wildcard"
         );
@@ -696,7 +648,7 @@ mod tests {
     fn dname_and_new_types() {
         let a = q("example.com.", RecordType::CAA);
         assert_eq!(a.answers.len(), 1);
-        assert!(matches!(a.answers[0].data(), RData::CAA(_)));
+        assert!(matches!(&a.answers[0].data, RData::CAA(_)));
         let a = q("example.com.", RecordType::HTTPS);
         assert_eq!(a.answers.len(), 1);
         // DNAME at old.example.com -> www.example.com: host.old.example.com resolves to host.www.example.com (NXDOMAIN target here)
@@ -705,21 +657,12 @@ mod tests {
         let a = q("a.old.example.com.", RecordType::A);
         assert_eq!(a.rcode, ResponseCode::NoError);
         assert!(
-            matches!(a.answers[0].data(), RData::Unknown { code, .. } if *code == DNAME_TYPE),
+            matches!(&a.answers[0].data, RData::Unknown { code, .. } if *code == DNAME_TYPE),
             "DNAME first"
         );
         assert!(
-            matches!(a.answers[1].data(), RData::CNAME(c) if c.0.to_ascii() == "a.www.example.com."),
+            matches!(&a.answers[1].data, RData::CNAME(c) if c.0.to_ascii() == "a.www.example.com."),
             "synthesized CNAME"
         );
-    }
-
-    #[test]
-    fn zone_file() {
-        let c = catalog();
-        let text = to_zone_file(&c.zones["example.com."]);
-        assert!(text.contains("$ORIGIN example.com."));
-        assert!(text.contains("IN\tSOA"));
-        assert!(text.contains("a.b\t60\tIN\tTXT\t\"hello\""));
     }
 }

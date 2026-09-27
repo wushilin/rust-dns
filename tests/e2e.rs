@@ -1,7 +1,7 @@
 //! End-to-end test: spawn the real binary on random ports, drive the API as
 //! the root user, and verify DNS answers over UDP and TCP with hickory-proto.
 
-use hickory_proto::op::{Message, MessageType, Query, ResponseCode};
+use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
 use hickory_proto::serialize::binary::BinDecodable;
 use std::io::{Read, Write};
@@ -71,6 +71,11 @@ allow = ["127.0.0.0/8"]
 path = "{db}"
 [web_console]
 bind = "127.0.0.1:{web_port}"
+# totp() may idle up to 30 s waiting for a fresh time step.
+request_header_timeout_secs = 300
+# The flows make deliberate failed attempts; the back-off has its own tests.
+login_backoff_after = 1000
+login_attempts_per_minute = 1000
 [root]
 username = "root"
 password = "rootpass123"
@@ -144,10 +149,8 @@ fn post(a: &ureq::Agent, url: &str, body: serde_json::Value) -> (u16, serde_json
 fn query_udp(port: u16, name: &str, rtype: RecordType) -> Message {
     let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
     sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-    let mut m = Message::new();
-    m.set_id(4242)
-        .set_message_type(MessageType::Query)
-        .set_recursion_desired(true);
+    let mut m = Message::new(4242, MessageType::Query, OpCode::Query);
+    m.metadata.recursion_desired = true;
     m.add_query(Query::query(Name::from_ascii(name).unwrap(), rtype));
     sock.send_to(&m.to_vec().unwrap(), ("127.0.0.1", port))
         .unwrap();
@@ -159,8 +162,7 @@ fn query_udp(port: u16, name: &str, rtype: RecordType) -> Message {
 fn query_tcp(port: u16, name: &str, rtype: RecordType) -> Message {
     let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-    let mut m = Message::new();
-    m.set_id(7).set_message_type(MessageType::Query);
+    let mut m = Message::new(7, MessageType::Query, OpCode::Query);
     m.add_query(Query::query(Name::from_ascii(name).unwrap(), rtype));
     let w = m.to_vec().unwrap();
     s.write_all(&(w.len() as u16).to_be_bytes()).unwrap();
@@ -238,35 +240,35 @@ fn api_then_dns_roundtrip() {
     // DNS answers.
     let p = srv.dns_port;
     let r = query_udp(p, "www.example.test.", RecordType::A);
-    assert_eq!(r.response_code(), ResponseCode::NoError);
-    assert!(r.authoritative());
+    assert_eq!(r.metadata.response_code, ResponseCode::NoError);
+    assert!(r.metadata.authoritative);
     assert!(
-        matches!(r.answers()[0].data(), RData::A(a) if a.0 == std::net::Ipv4Addr::new(10, 0, 0, 1))
+        matches!(&r.answers[0].data, RData::A(a) if a.0 == std::net::Ipv4Addr::new(10, 0, 0, 1))
     );
 
     let r = query_tcp(p, "www.example.test.", RecordType::AAAA);
-    assert_eq!(r.answers().len(), 1);
+    assert_eq!(r.answers.len(), 1);
 
     let r = query_udp(p, "alias.example.test.", RecordType::A);
-    assert_eq!(r.answers().len(), 2, "CNAME + A");
+    assert_eq!(r.answers.len(), 2, "CNAME + A");
 
     let r = query_udp(p, "deep.apps.example.test.", RecordType::A);
-    assert_eq!(r.answers().len(), 1, "wildcard");
+    assert_eq!(r.answers.len(), 1, "wildcard");
 
     let r = query_udp(p, "missing.example.test.", RecordType::A);
-    assert_eq!(r.response_code(), ResponseCode::NXDomain);
-    assert_eq!(r.name_servers().len(), 1, "SOA in authority");
+    assert_eq!(r.metadata.response_code, ResponseCode::NXDomain);
+    assert_eq!(r.authorities.len(), 1, "SOA in authority");
 
     let r = query_udp(p, "example.test.", RecordType::MX);
-    assert_eq!(r.answers().len(), 1);
-    assert_eq!(r.additionals().len(), 1, "glue for mail");
+    assert_eq!(r.answers.len(), 1);
+    assert_eq!(r.additionals.len(), 1, "glue for mail");
 
     let r = query_udp(p, "1.0.0.10.in-addr.arpa.", RecordType::PTR);
-    assert_eq!(r.answers().len(), 1, "auto PTR");
+    assert_eq!(r.answers.len(), 1, "auto PTR");
 
     let r = query_udp(p, "example.org.", RecordType::A);
     assert_eq!(
-        r.response_code(),
+        r.metadata.response_code,
         ResponseCode::Refused,
         "no forwarders configured"
     );
@@ -300,7 +302,7 @@ fn api_then_dns_roundtrip() {
         .unwrap();
     let r = query_udp(p, "www.example.test.", RecordType::A);
     assert!(
-        matches!(r.answers()[0].data(), RData::A(a) if a.0 == std::net::Ipv4Addr::new(10, 0, 0, 2))
+        matches!(&r.answers[0].data, RData::A(a) if a.0 == std::net::Ipv4Addr::new(10, 0, 0, 2))
     );
     // TTL on update: absent keeps it, a number sets it, null resets to the zone default.
     let put = |body: serde_json::Value| -> serde_json::Value {
@@ -323,8 +325,8 @@ fn api_then_dns_roundtrip() {
         "null switches to the zone default"
     );
     let after = query_udp(p, "example.test.", RecordType::SOA);
-    let serial = |m: &Message| match m.answers()[0].data() {
-        RData::SOA(s) => s.serial(),
+    let serial = |m: &Message| match &m.answers[0].data {
+        RData::SOA(s) => s.serial,
         _ => 0,
     };
     assert!(serial(&after) > serial(&before), "serial bumped");
@@ -360,7 +362,7 @@ fn api_then_dns_roundtrip() {
     assert_eq!(s, 200, "{summary}");
     assert_eq!(summary["zones_created"], 1);
     let r = query_udp(p, "www.copy.test.", RecordType::A);
-    assert_eq!(r.answers().len(), 1);
+    assert_eq!(r.answers.len(), 1);
 
     // API token works as bearer auth.
     let (s, t) = post(
@@ -394,20 +396,19 @@ fn api_then_dns_roundtrip() {
         assert_eq!(s, 201, "{n} {t}: {r}");
     }
     let r = query_udp(p, "example.test.", RecordType::CAA);
-    assert!(matches!(r.answers()[0].data(), RData::CAA(_)));
+    assert!(matches!(&r.answers[0].data, RData::CAA(_)));
     let r = query_udp(p, "example.test.", RecordType::HTTPS);
-    assert!(matches!(r.answers()[0].data(), RData::HTTPS(_)));
+    assert!(matches!(&r.answers[0].data, RData::HTTPS(_)));
     let r = query_udp(p, "host.old.example.test.", RecordType::A);
-    assert_eq!(r.answers().len(), 2, "DNAME + synthesized CNAME");
+    assert_eq!(r.answers.len(), 2, "DNAME + synthesized CNAME");
     let r = query_udp(p, "xn--bcher-kva.example.test.", RecordType::A);
-    assert_eq!(r.answers().len(), 1, "IDN stored as punycode");
+    assert_eq!(r.answers.len(), 1, "IDN stored as punycode");
 
     // AXFR over TCP from an allowed client: SOA first and last.
     {
         let mut s = TcpStream::connect(("127.0.0.1", p)).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-        let mut m = Message::new();
-        m.set_id(9).set_message_type(MessageType::Query);
+        let mut m = Message::new(9, MessageType::Query, OpCode::Query);
         m.add_query(Query::query(
             Name::from_ascii("example.test.").unwrap(),
             RecordType::AXFR,
@@ -423,7 +424,7 @@ fn api_then_dns_roundtrip() {
             let mut buf = vec![0u8; u16::from_be_bytes(len) as usize];
             s.read_exact(&mut buf).unwrap();
             let msg = Message::from_bytes(&buf).unwrap();
-            for r in msg.answers() {
+            for r in msg.answers {
                 if r.record_type() == RecordType::SOA {
                     soas += 1;
                 }
@@ -436,7 +437,7 @@ fn api_then_dns_roundtrip() {
     }
     let r = query_udp(p, "example.test.", RecordType::AXFR);
     assert_eq!(
-        r.response_code(),
+        r.metadata.response_code,
         ResponseCode::Refused,
         "AXFR over UDP refused"
     );
@@ -460,7 +461,7 @@ fn api_then_dns_roundtrip() {
     assert!(rec["expires_at"].is_string());
     assert_eq!(
         query_udp(p, "lease.example.test.", RecordType::A)
-            .answers()
+            .answers
             .len(),
         1
     );
@@ -477,7 +478,7 @@ fn api_then_dns_roundtrip() {
     std::thread::sleep(Duration::from_millis(2600));
     let gone = query_udp(p, "lease.example.test.", RecordType::A);
     assert_eq!(
-        gone.response_code(),
+        gone.metadata.response_code,
         ResponseCode::NXDomain,
         "expired record no longer answers"
     );
@@ -575,6 +576,20 @@ fn rbac_and_mfa_enrollment() {
         serde_json::json!({ "code": code }),
     );
     assert_eq!(s, 200, "{v2}");
+    // M6 regression: the code just used cannot be replayed to sign in.
+    let replay = agent();
+    let (_, lv) = post(
+        &replay,
+        &format!("{web}/api/auth/login"),
+        serde_json::json!({ "username": "bob", "password": "bobpass123" }),
+    );
+    assert_eq!(lv["status"], "mfa_required");
+    let (s, _) = post(
+        &replay,
+        &format!("{web}/api/auth/mfa"),
+        serde_json::json!({ "code": code }),
+    );
+    assert_eq!(s, 401, "a TOTP code is accepted only once");
     let codes: Vec<String> = v2["recovery_codes"]
         .as_array()
         .unwrap()
@@ -827,7 +842,7 @@ fn rbac_and_mfa_enrollment() {
 }
 
 #[test]
-fn bind_import_and_record_paging() {
+fn json_import_and_record_paging() {
     let srv = start();
     let a = agent();
     let web = srv.web.clone();
@@ -837,14 +852,26 @@ fn bind_import_and_record_paging() {
         &format!("{web}/api/zones"),
         serde_json::json!({ "name": "imp.test" }),
     );
-    let zone_text = "$ORIGIN imp.test.\n$TTL 600\n@ IN SOA ns1.imp.test. hostmaster.imp.test. 1 1 1 1 1\n@ IN NS ns1.imp.test.\nns1 IN A 10.9.9.1\nweb 120 IN A 10.9.9.2\nweb IN AAAA 2001:db8::9\n@ IN MX 10 mail.imp.test.\n@ IN TXT \"v=spf1 -all\"\n@ IN CAA 0 issue \"letsencrypt.org\"\n";
+    let doc = serde_json::json!({
+        "version": 1,
+        "exported_at": "2026-01-01T00:00:00Z",
+        "zones": [{
+            "name": "imp.test",
+            "records": [
+                { "name": "@", "type": "NS", "value": "ns1.imp.test." },
+                { "name": "ns1", "type": "A", "value": "10.9.9.1" },
+                { "name": "web", "type": "A", "value": "10.9.9.2", "ttl": 120 },
+                { "name": "web", "type": "AAAA", "value": "2001:db8::9" },
+                { "name": "@", "type": "MX", "value": "10 mail.imp.test." },
+                { "name": "@", "type": "TXT", "value": "v=spf1 -all" },
+                { "name": "@", "type": "CAA", "value": "0 issue \"letsencrypt.org\"" }
+            ]
+        }]
+    });
     let r = a
-        .post(&format!(
-            "{web}/api/zones/imp.test/import-bind?mode=replace"
-        ))
+        .post(&format!("{web}/api/import?mode=replace"))
         .set("X-Requested-With", "rust-dns")
-        .set("Content-Type", "text/plain")
-        .send_string(zone_text)
+        .send_json(doc)
         .unwrap();
     let v: serde_json::Value = r.into_json().unwrap();
     assert_eq!(v["records_added"], 7, "{v}");
@@ -861,19 +888,9 @@ fn bind_import_and_record_paging() {
         .find(|r| r["name"] == "web" && r["type"] == "A")
         .unwrap();
     assert_eq!(web_a["ttl"], 120, "explicit TTL kept");
-    let web_aaaa = recs["records"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|r| r["name"] == "web" && r["type"] == "AAAA")
-        .unwrap();
-    assert_eq!(
-        web_aaaa["ttl"], 600,
-        "$TTL applied, not the previous record's TTL"
-    );
     let p = srv.dns_port;
     let r = query_udp(p, "imp.test.", RecordType::CAA);
-    assert_eq!(r.answers().len(), 1);
+    assert_eq!(r.answers.len(), 1);
 
     // Paging and search.
     for i in 0..30 {
@@ -915,7 +932,23 @@ fn bind_import_and_record_paging() {
         .unwrap()
         .into_json()
         .unwrap();
-    assert!(spec["paths"]["/zones/{zone}/import-bind"].is_object());
+    assert!(spec["paths"]["/import"].is_object());
+    // BIND zone-file import and export were removed.
+    assert!(spec["paths"]["/zones/{zone}/import-bind"].is_null());
+    let gone = a
+        .post(&format!("{web}/api/zones/imp.test/import-bind"))
+        .set("X-Requested-With", "rust-dns")
+        .set("Content-Type", "text/plain")
+        .send_string("$INCLUDE /etc/passwd\n");
+    assert!(
+        matches!(gone, Err(ureq::Error::Status(404 | 405, _))),
+        "import-bind is gone"
+    );
+    assert!(matches!(
+        a.get(&format!("{web}/api/zones/imp.test/export?format=bind"))
+            .call(),
+        Err(ureq::Error::Status(400, _))
+    ));
 }
 
 fn send(
@@ -1158,17 +1191,12 @@ fn token_tags_and_last_use() {
     assert_eq!(s, 404);
 }
 
-/// Minimal RFC 6238 TOTP (SHA-1, 30 s, 6 digits) for the test.
-fn totp(secret_b32: &str) -> String {
+/// TOTP (RFC 6238, SHA-1, 30 s, 6 digits) for an explicit time step.
+fn totp_at(secret_b32: &str, step: u64) -> String {
     use hmac::{Hmac, Mac};
     let key = data_encoding::BASE32_NOPAD
         .decode(secret_b32.as_bytes())
         .unwrap();
-    let step = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-        / 30;
     let mut mac = Hmac::<sha1::Sha1>::new_from_slice(&key).unwrap();
     mac.update(&step.to_be_bytes());
     let h = mac.finalize().into_bytes();
@@ -1178,4 +1206,33 @@ fn totp(secret_b32: &str) -> String {
         | ((h[o + 2] as u32) << 8)
         | h[o + 3] as u32;
     format!("{:06}", bin % 1_000_000)
+}
+
+/// A TOTP code the server has not seen yet: the server refuses a code whose
+/// step is not later than the last one it accepted (replay protection), so
+/// each call takes the next unused step of the three accepted (previous,
+/// current, next), waiting for the next 30-second window when needed.
+fn totp(secret_b32: &str) -> String {
+    static LAST: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
+        std::sync::Mutex::new(None);
+    loop {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        let cur = now.as_secs() / 30;
+        let mut g = LAST.lock().unwrap();
+        let map = g.get_or_insert_with(Default::default);
+        let next = match map.get(secret_b32) {
+            None => cur - 1,
+            Some(l) => (l + 1).max(cur - 1),
+        };
+        if next <= cur + 1 {
+            map.insert(secret_b32.to_string(), next);
+            return totp_at(secret_b32, next);
+        }
+        drop(g);
+        std::thread::sleep(Duration::from_millis(
+            (30 - now.as_secs() % 30) * 1000 + 200,
+        ));
+    }
 }

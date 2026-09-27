@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS users (
     totp_enrolled_at TEXT,
     disabled_at      TEXT,
     created_at       TEXT NOT NULL,
-    updated_at       TEXT NOT NULL
+    updated_at       TEXT NOT NULL,
+    totp_last_step   INTEGER
 );
 CREATE TABLE IF NOT EXISTS sessions (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -199,8 +200,21 @@ fn migrate_api_tokens(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Users gained `totp_last_step` (TOTP replay protection).
+fn migrate_users(conn: &Connection) -> Result<()> {
+    let cols: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('users')")?
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    if !cols.is_empty() && !cols.iter().any(|c| c == "totp_last_step") {
+        conn.execute_batch("ALTER TABLE users ADD COLUMN totp_last_step INTEGER")?;
+    }
+    Ok(())
+}
+
 /// Bring databases created by older versions up to the current schema.
 fn migrate(conn: &Connection) -> Result<()> {
+    migrate_users(conn)?;
     let cols: Vec<String> = conn
         .prepare("SELECT name FROM pragma_table_info('changelog')")?
         .query_map([], |r| r.get(0))?

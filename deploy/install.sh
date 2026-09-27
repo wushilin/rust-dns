@@ -5,7 +5,8 @@
 #
 # Layout:
 #   /opt/rust-dns/bin/rust-dns        binary (root-owned)
-#   /opt/rust-dns/etc/rust-dns.toml   config (rust-dns-owned: the plaintext root password is hashed in place)
+#   /opt/rust-dns/etc/rust-dns.toml   config (rust-dns-owned, 0600; a new one gets a random root password,
+#                                     shown once by this script; a plaintext password is hashed in place)
 #   /opt/rust-dns/data/               database and backups
 #   /opt/rust-dns/logs/               log files (rotated by rust-dns itself)
 # An existing config is never overwritten. Upgrades replace only the binary and unit.
@@ -24,25 +25,29 @@ if ! id rust-dns >/dev/null 2>&1; then
 fi
 
 install -d -o root -g root -m 0755 "$PREFIX" "$PREFIX/bin"
-install -d -o rust-dns -g rust-dns -m 0750 "$PREFIX/etc" "$PREFIX/data" "$PREFIX/data/backups" "$PREFIX/logs"
+install -d -o rust-dns -g rust-dns -m 0700 "$PREFIX/etc" "$PREFIX/data" "$PREFIX/data/backups" "$PREFIX/logs"
 
 # Replace the binary atomically.
 install -o root -g root -m 0755 "$BIN" "$PREFIX/bin/rust-dns.new"
 mv -f "$PREFIX/bin/rust-dns.new" "$PREFIX/bin/rust-dns"
 
 CFG="$PREFIX/etc/rust-dns.toml"
+CREDS=""
 if [ ! -e "$CFG" ]; then
   if [ -n "$INIT_CFG" ]; then
-    install -o rust-dns -g rust-dns -m 0640 "$INIT_CFG" "$CFG"
+    install -o rust-dns -g rust-dns -m 0600 "$INIT_CFG" "$CFG"
     echo "installed config $CFG"
   else
-    "$PREFIX/bin/rust-dns" --print-sample-config > "$CFG"
-    chown rust-dns:rust-dns "$CFG"; chmod 0640 "$CFG"
-    echo "wrote sample config $CFG (set [root].password before starting)"
+    # A new config with a random root password (stored hashed, file mode 0600).
+    # The plaintext is printed once, here, and nowhere else.
+    CREDS="$("$PREFIX/bin/rust-dns" --init-config "$CFG")"
+    chown rust-dns:rust-dns "$CFG"; chmod 0600 "$CFG"
+    echo "wrote new config $CFG"
   fi
 else
   echo "keeping existing config $CFG"
 fi
+# Refuses the "change-me" placeholder and an empty root password.
 "$PREFIX/bin/rust-dns" --check --config "$CFG"
 
 cat > "$UNIT" <<UNITEOF
@@ -72,8 +77,20 @@ ProtectHome=true
 PrivateTmp=true
 PrivateDevices=true
 ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
 ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
 RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+UMask=0077
 ReadWritePaths=$PREFIX/etc $PREFIX/data $PREFIX/logs
 LimitNOFILE=65536
 
@@ -92,3 +109,10 @@ else
 fi
 sleep 1
 systemctl --no-pager --lines=0 status rust-dns | head -5
+if [ -n "$CREDS" ]; then
+  echo
+  echo "=================================================================="
+  echo " New rust-dns root login (shown once; the config stores a hash):"
+  echo "$CREDS" | sed -n 's/^root \(username\|password\): /   \1: /p'
+  echo "=================================================================="
+fi

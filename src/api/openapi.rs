@@ -47,7 +47,7 @@ This document is generated from the server's code, so it always matches the runn
         (name = "Zones", description = "Create, inspect, update and delete zones."),
         (name = "Records", description = "Search and edit resource records inside a zone."),
         (name = "Access", description = "Zone membership (editor/viewer) and effective rights."),
-        (name = "Import/Export", description = "JSON export documents and BIND zone files."),
+        (name = "Import/Export", description = "JSON export documents (export and re-import)."),
         (name = "Change log", description = "DNS change log, account audit log and the realtime WebSocket."),
         (name = "Users", description = "User administration (administrators)."),
         (name = "Tokens", description = "API tokens for scripts and automation."),
@@ -57,7 +57,7 @@ This document is generated from the server's code, so it always matches the runn
     security(("bearer" = []), ("cookie" = [])),
     components(
         schemas(ErrorBody, crate::model::QueryEvent),
-        responses(BadRequest, InvalidRequest, Unauthorized, Forbidden, NotFound, Conflict, TooManyRequests),
+        responses(BadRequest, InvalidRequest, Unauthorized, Forbidden, NotFound, Conflict, TooManyRequests, ServiceUnavailable),
     ),
     modifiers(&Security),
 )]
@@ -78,7 +78,7 @@ impl Modify for Security {
             "cookie",
             SecurityScheme::ApiKey(ApiKey::Cookie(ApiKeyValue::with_description(
                 super::session::COOKIE,
-                "Session cookie set by POST /auth/login. Cookie writes also need `X-Requested-With: rust-dns`.",
+                "Session cookie set by POST /auth/login (named `__Host-rdns_session` over HTTPS). Cookie writes also need `X-Requested-With: rust-dns`.",
             ))),
         );
     }
@@ -138,7 +138,16 @@ error_response!(
     "Not found (zones the caller cannot see also return 404)."
 );
 error_response!(Conflict, "Conflicts with existing data.");
-error_response!(TooManyRequests, "Login rate limit exceeded.");
+error_response!(
+    TooManyRequests,
+    "Too many attempts: the per-client rate limit (an IPv4 address or IPv6 /64), the account's failed-attempt back-off, or the session's code-attempt limit. `Retry-After` says when to try again.",
+    Some(serde_json::json!({ "error": "too many failed attempts for this account; try again in 4 seconds", "code": null }))
+);
+error_response!(
+    ServiceUnavailable,
+    "Too many password checks are running at once (they are CPU-bound and deliberately limited so DNS stays fast). Retry after `Retry-After` seconds.",
+    Some(serde_json::json!({ "error": "too many sign-ins or password changes in progress; retry in a moment", "code": null }))
+);
 
 /// Assemble the final document from the operations collected by the API
 /// router (paths relative to `/api`) and the root router (`/metrics`).

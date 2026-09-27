@@ -263,7 +263,8 @@ fn body_taking_handlers_document_a_request_body() {
             h.method,
             h.path
         );
-        let wants_json = h.params.contains("Json(");
+        // `Json(..)`, or raw `Bytes` parsed as optional JSON by the handler.
+        let wants_json = h.params.contains("Json(") || h.params.contains("body::Bytes");
         // A bare `String` extractor (not inside Path/Query) is the raw request body.
         let wants_text = h.params.contains("body: String");
         let content = &op["requestBody"]["content"];

@@ -3,7 +3,7 @@
 
 use super::tsig::{self, Chain, ResponseVerifier, SignParams};
 use super::DnsServer;
-use hickory_proto::op::{Header, Message, MessageType, OpCode, Query};
+use hickory_proto::op::{Message, MessageType, OpCode, Query};
 use hickory_proto::rr::{Name, RecordType};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -55,13 +55,8 @@ pub fn build_notify(
     now: u64,
 ) -> Option<(Vec<u8>, Vec<u8>)> {
     let name = Name::from_ascii(crate::model::zone_fqdn(zone)).ok()?;
-    let mut h = Header::new();
-    h.set_id(id)
-        .set_message_type(MessageType::Query)
-        .set_op_code(OpCode::Notify)
-        .set_authoritative(true);
-    let mut m = Message::new();
-    m.set_header(h);
+    let mut m = Message::new(id, MessageType::Query, OpCode::Notify);
+    m.metadata.authoritative = true;
     m.add_query(Query::query(name, RecordType::SOA));
     let bytes = m.to_vec().ok()?;
     Some(match key {
@@ -165,7 +160,7 @@ mod tests {
         verify(&m, &s, Some(&key), Chain::Request, now).unwrap();
         let parsed =
             hickory_proto::serialize::binary::BinDecodable::from_bytes(&tsig::strip(&m, &s))
-                .map(|m: Message| (m.op_code(), m.queries()[0].name().to_ascii()))
+                .map(|m: Message| (m.metadata.op_code, m.queries[0].name().to_ascii()))
                 .unwrap();
         assert_eq!(parsed, (OpCode::Notify, "example.com.".to_string()));
         let (u, mac) = build_notify("example.com", 77, None, now).unwrap();

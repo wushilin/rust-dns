@@ -23,4 +23,4 @@ bind = "127.0.0.1:8053"
 
 [root]
 username = "root"
-password = "change-me-please"
+password = "change-me-please"   # placeholder: rust-dns refuses to start until you set your own

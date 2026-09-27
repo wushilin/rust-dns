@@ -2,7 +2,7 @@
 
 use crate::cache::ZoneData;
 use crate::zones::{apex_ns, soa_record, to_rr};
-use hickory_proto::op::{Header, Message, MessageType, OpCode, Query};
+use hickory_proto::op::{Message, MessageType, OpCode, Query};
 use hickory_proto::rr::{Name, Record, RecordType};
 
 /// Message size we try to stay under for each AXFR chunk.
@@ -43,8 +43,8 @@ pub fn build(z: &ZoneData, id: u16, query: &Query) -> Vec<Vec<u8>> {
     let mut current = new_message(id, query);
     let mut current_len = 0usize;
     for rr in records {
-        let est = rr.name().len() + 12 + rr.data().to_string().len();
-        if current_len + est > CHUNK_BYTES && !current.answers().is_empty() {
+        let est = rr.name.len() + 12 + rr.data.to_string().len();
+        if current_len + est > CHUNK_BYTES && !current.answers.is_empty() {
             out.push(current.to_vec().unwrap_or_default());
             current = new_message(id, query);
             current_len = 0;
@@ -57,13 +57,8 @@ pub fn build(z: &ZoneData, id: u16, query: &Query) -> Vec<Vec<u8>> {
 }
 
 fn new_message(id: u16, query: &Query) -> Message {
-    let mut h = Header::new();
-    h.set_id(id)
-        .set_message_type(MessageType::Response)
-        .set_op_code(OpCode::Query)
-        .set_authoritative(true);
-    let mut m = Message::new();
-    m.set_header(h);
+    let mut m = Message::new(id, MessageType::Response, OpCode::Query);
+    m.metadata.authoritative = true;
     m.add_query(query.clone());
     m
 }

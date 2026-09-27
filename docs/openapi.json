@@ -40,13 +40,13 @@
         },
         "responses": {
           "200": {
-            "description": "Credentials accepted. Sets the `rdns_session` cookie; check `status` for the next step.",
+            "description": "Credentials accepted. Sets the session cookie; check `status` for the next step.",
             "headers": {
               "Set-Cookie": {
                 "schema": {
                   "type": "string"
                 },
-                "description": "`rdns_session=...; Path=/; HttpOnly; SameSite=Lax`"
+                "description": "`rdns_session=...; Path=/; HttpOnly; SameSite=Lax` over plain HTTP; `__Host-rdns_session=...; Path=/; HttpOnly; SameSite=Lax; Secure` over HTTPS (a trusted proxy sent `X-Forwarded-Proto: https`) or with `secure_cookies = true`."
               }
             },
             "content": {
@@ -65,6 +65,9 @@
           },
           "429": {
             "$ref": "#/components/responses/TooManyRequests"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
           }
         },
         "security": []
@@ -252,7 +255,7 @@
           "Account"
         ],
         "summary": "Change own password",
-        "description": "Needs an interactive (cookie) session. Not available to root, whose password is set in the configuration file.",
+        "description": "Needs an interactive (cookie) session. Not available to root, whose password is set in the configuration file. Every other session of the user is signed out; API tokens keep working (revoke them separately).",
         "operationId": "change_password",
         "requestBody": {
           "content": {
@@ -290,6 +293,12 @@
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
           }
         }
       }
@@ -300,8 +309,28 @@
           "Account"
         ],
         "summary": "Start voluntary MFA enrollment",
-        "description": "Needs an interactive (cookie) session.",
+        "description": "Needs an interactive (cookie) session. Replacing an already enrolled authenticator also needs the current TOTP code or the password.",
         "operationId": "mfa_start",
+        "requestBody": {
+          "description": "Only when MFA is already enrolled (replacing the authenticator): the current TOTP `code` or the account `password`. Otherwise send no body or `{}`.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ReauthBody"
+                  }
+                ]
+              },
+              "example": {
+                "code": "123456"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "Secret, otpauth URI and QR SVG; confirm with /me/mfa/confirm.",
@@ -313,11 +342,20 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
           }
         }
       }
@@ -362,6 +400,9 @@
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
           }
         }
       }
@@ -406,6 +447,9 @@
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
           }
         }
       }
@@ -450,6 +494,9 @@
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
           }
         }
       }
@@ -1301,33 +1348,25 @@
           {
             "name": "format",
             "in": "query",
-            "description": "`bind` (alias `zone`) returns a zone file.",
+            "description": "Only `json` is supported.",
             "required": false,
             "schema": {
               "type": "string",
               "default": "json",
               "enum": [
-                "json",
-                "bind",
-                "zone"
+                "json"
               ]
             }
           }
         ],
         "responses": {
           "200": {
-            "description": "Download (`Content-Disposition: attachment`). JSON export document, or a BIND zone file with `format=bind`.",
+            "description": "Download (`Content-Disposition: attachment`): JSON export document.",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ExportDoc"
                 }
-              },
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                },
-                "example": "$ORIGIN example.com.\n@ 3600 IN SOA ns1.example.com. hostmaster.example.com. ( 2026011501 3600 600 1209600 300 )\nwww 300 IN A 192.0.2.10\n"
               }
             }
           },
@@ -1336,77 +1375,6 @@
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
-          },
-          "404": {
-            "$ref": "#/components/responses/NotFound"
-          }
-        }
-      }
-    },
-    "/zones/{zone}/import-bind": {
-      "post": {
-        "tags": [
-          "Import/Export"
-        ],
-        "summary": "Import a BIND zone file into this zone",
-        "description": "Needs the owner role. Records only; SOA values in the file are ignored. Names are relative to the zone origin.",
-        "operationId": "import_bind",
-        "parameters": [
-          {
-            "name": "zone",
-            "in": "path",
-            "description": "Zone name, e.g. `example.com`.",
-            "required": true,
-            "schema": {
-              "type": "string"
-            },
-            "example": "example.com"
-          },
-          {
-            "name": "mode",
-            "in": "query",
-            "description": "`merge` adds missing zones and records; `replace` replaces the records\nof each zone in the document.",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "merge",
-              "enum": [
-                "merge",
-                "replace"
-              ]
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "text/plain": {
-              "schema": {
-                "type": "string"
-              },
-              "example": "$ORIGIN example.com.\n$TTL 3600\nwww   300 IN A    192.0.2.10\nwww       IN AAAA 2001:db8::10\n@         IN MX   10 mail.example.com.\nmail      IN A    192.0.2.25\n"
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Import summary; unsupported or invalid entries are listed in `skipped`.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/BindImportSummary"
-                }
-              }
-            }
-          },
-          "400": {
-            "$ref": "#/components/responses/BadRequest"
-          },
-          "401": {
-            "$ref": "#/components/responses/Unauthorized"
-          },
-          "403": {
-            "$ref": "#/components/responses/Forbidden"
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
@@ -1539,7 +1507,7 @@
           "Change log"
         ],
         "summary": "DNS change log (WAL-style offsets)",
-        "description": "One row per committed fact (zone, record, serial, member); rows from one transaction share `txn` and `command`. Rolled-back operations never appear. Non-admins see only their zones.",
+        "description": "One row per committed fact (zone, record, serial, member); rows from one transaction share `txn` and `command`. Rolled-back operations never appear. Non-admins see only their zones; membership rows and other users' `actor_ip` (empty string) only on zones they own.",
         "operationId": "get_changelog",
         "parameters": [
           {
@@ -1698,7 +1666,7 @@
           "Change log"
         ],
         "summary": "WebSocket stream (not callable from Swagger UI)",
-        "description": "WebSocket upgrade; Swagger UI cannot open it, use a WebSocket client (e.g. `websocat 'ws://host/api/ws?after=0&token=rdns_...'`). Streams change events (resumable with `after`) and, with `queries=true`, live DNS queries for zones the caller owns. Browsers authenticate with the session cookie; other clients may pass `?token=`.",
+        "description": "WebSocket upgrade; Swagger UI cannot open it, use a WebSocket client. Streams change events (resumable with `after`) and, with `queries=true`, live DNS queries for zones the caller owns.\n\nBrowsers authenticate with the session cookie; the page's `Origin` must match the host. Other clients send an API token as a subprotocol: `Sec-WebSocket-Protocol: rust-dns, rust-dns.bearer.<token>` (the server selects `rust-dns`), e.g. `websocat --protocol 'rust-dns, rust-dns.bearer.rdns_...' ws://host/api/ws?after=0`. `?token=` still works but is deprecated: URLs end up in proxy logs.\n\nThe stream re-checks the credentials and zone rights every 10 seconds and on membership changes; when the session or token is revoked or the account is disabled it closes with code 1008.",
         "operationId": "websocket",
         "parameters": [
           {
@@ -1724,8 +1692,9 @@
           {
             "name": "token",
             "in": "query",
-            "description": "API token (only accepted on this path, for clients that cannot set headers).",
+            "description": "Deprecated: API token in the URL (ends up in logs). Use the `rust-dns.bearer.<token>` subprotocol.",
             "required": false,
+            "deprecated": true,
             "schema": {
               "type": "string"
             }
@@ -1740,6 +1709,9 @@
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
           }
         }
       }
@@ -1815,6 +1787,9 @@
           },
           "409": {
             "$ref": "#/components/responses/Conflict"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
           }
         }
       }
@@ -1876,6 +1851,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
           }
         }
       },
@@ -2482,6 +2460,8 @@
                   "192.168.0.0/16",
                   "fd00::/8"
                 ],
+                "cache_max_ttl": 86400,
+                "cache_negative_max_ttl": 3600,
                 "timeout_ms": 2000,
                 "upstreams": [
                   "1.1.1.1",
@@ -2579,6 +2559,34 @@
           },
           "400": {
             "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
+    "/settings/forwarding/cache/flush": {
+      "post": {
+        "tags": [
+          "Server"
+        ],
+        "summary": "Empty the forwarding cache (admin)",
+        "description": "Drops every cached forwarded answer; the next queries go to the upstreams. Audited as `settings.forwarding.cache_flush`. Needs `server_admin`.",
+        "operationId": "flush_forward_cache",
+        "responses": {
+          "200": {
+            "description": "Flushed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CacheFlushResult"
+                }
+              }
+            }
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
@@ -2989,35 +2997,26 @@
           "token"
         ]
       },
-      "BindImportSummary": {
-        "allOf": [
-          {
-            "$ref": "#/components/schemas/ImportSummary"
-          },
-          {
-            "type": "object",
-            "required": [
-              "skipped"
-            ],
-            "properties": {
-              "skipped": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                },
-                "description": "Zone-file entries that were not imported, with the reason."
-              }
-            }
-          }
+      "CacheFlushResult": {
+        "type": "object",
+        "description": "Result of a cache flush.",
+        "required": [
+          "status",
+          "dropped"
         ],
-        "description": "Import summary of a BIND zone file.",
+        "properties": {
+          "status": {
+            "$ref": "#/components/schemas/OkStatus"
+          },
+          "dropped": {
+            "type": "integer",
+            "description": "Entries removed.",
+            "minimum": 0
+          }
+        },
         "example": {
-          "records_added": 3,
-          "records_removed": 0,
-          "records_skipped": 0,
-          "skipped": [],
-          "zones_created": 0,
-          "zones_updated": 1
+          "dropped": 42,
+          "status": "ok"
         }
       },
       "ChangeEvent": {
@@ -3595,6 +3594,56 @@
           }
         }
       },
+      "ForwardCacheInfo": {
+        "type": "object",
+        "description": "Forwarding cache size and counters since start.",
+        "required": [
+          "enabled",
+          "entries",
+          "capacity",
+          "hits",
+          "misses",
+          "hit_rate"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "False when `[forwarding].cache_entries = 0`."
+          },
+          "entries": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "capacity": {
+            "type": "integer",
+            "description": "`[forwarding].cache_entries` (fixed at startup).",
+            "minimum": 0
+          },
+          "hits": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "misses": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "hit_rate": {
+            "type": "number",
+            "format": "double",
+            "description": "hits / (hits + misses); 0 when there were no lookups."
+          }
+        },
+        "example": {
+          "capacity": 10000,
+          "enabled": true,
+          "entries": 42,
+          "hit_rate": 0.9,
+          "hits": 900,
+          "misses": 100
+        }
+      },
       "ForwardCacheStatus": {
         "type": "object",
         "required": [
@@ -3630,7 +3679,9 @@
         "required": [
           "upstreams",
           "allowed_clients",
-          "timeout_ms"
+          "timeout_ms",
+          "cache_max_ttl",
+          "cache_negative_max_ttl"
         ],
         "properties": {
           "upstreams": {
@@ -3648,6 +3699,16 @@
           "timeout_ms": {
             "type": "integer",
             "format": "int64",
+            "minimum": 0
+          },
+          "cache_max_ttl": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "cache_negative_max_ttl": {
+            "type": "integer",
+            "format": "int32",
             "minimum": 0
           }
         }
@@ -3673,12 +3734,26 @@
             "items": {
               "type": "string"
             },
-            "description": "CIDR networks or single addresses. `0.0.0.0/0` and `::/0` are refused (open resolver)."
+            "description": "CIDR networks or single addresses. Anything that would make this an\nopen resolver is refused: an entry shorter than /8 (IPv4) or /16\n(global IPv6), or entries covering over 1/16 of IPv4 together."
           },
           "timeout_ms": {
             "type": "integer",
             "format": "int64",
             "description": "100 to 30000.",
+            "minimum": 0
+          },
+          "cache_max_ttl": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Cap on how long positive answers are cached, 1 to 604800 seconds.\nOmitted: the config file's `cache_max_ttl`.",
+            "example": 86400,
+            "minimum": 0
+          },
+          "cache_negative_max_ttl": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Cap on how long negative answers are cached, 1 to 604800 seconds and\nnot above the positive cap. Omitted: the config file's value.",
+            "example": 3600,
             "minimum": 0
           }
         },
@@ -3725,7 +3800,10 @@
           "source",
           "updated_by",
           "updated_at",
-          "config"
+          "cache_max_ttl",
+          "cache_negative_max_ttl",
+          "config",
+          "cache"
         ],
         "properties": {
           "upstreams": {
@@ -3773,9 +3851,26 @@
             "format": "date-time",
             "description": "When the override was saved (`null` when the config file applies)."
           },
+          "cache_max_ttl": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Longest a positive answer is cached, seconds (in effect).",
+            "example": 86400,
+            "minimum": 0
+          },
+          "cache_negative_max_ttl": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Longest a negative answer is cached, seconds (in effect).",
+            "example": 3600,
+            "minimum": 0
+          },
           "config": {
             "$ref": "#/components/schemas/ForwardingFileValues",
             "description": "The config file's values, for comparison and reset."
+          },
+          "cache": {
+            "$ref": "#/components/schemas/ForwardCacheInfo"
           }
         }
       },
@@ -4266,6 +4361,31 @@
             "format": "int32",
             "minimum": 0
           }
+        }
+      },
+      "ReauthBody": {
+        "type": "object",
+        "description": "Body of `POST /me/mfa/start` when replacing an enrolled authenticator.",
+        "properties": {
+          "code": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A current TOTP code of the enrolled authenticator.",
+            "example": "123456"
+          },
+          "password": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "password",
+            "description": "Or the account password."
+          }
+        },
+        "example": {
+          "code": "123456"
         }
       },
       "Record": {
@@ -6147,12 +6267,30 @@
           }
         }
       },
-      "TooManyRequests": {
-        "description": "Login rate limit exceeded.",
+      "ServiceUnavailable": {
+        "description": "Too many password checks are running at once (they are CPU-bound and deliberately limited so DNS stays fast). Retry after `Retry-After` seconds.",
         "content": {
           "application/json": {
             "schema": {
               "$ref": "#/components/schemas/Error"
+            },
+            "example": {
+              "code": null,
+              "error": "too many sign-ins or password changes in progress; retry in a moment"
+            }
+          }
+        }
+      },
+      "TooManyRequests": {
+        "description": "Too many attempts: the per-client rate limit (an IPv4 address or IPv6 /64), the account's failed-attempt back-off, or the session's code-attempt limit. `Retry-After` says when to try again.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "example": {
+              "code": null,
+              "error": "too many failed attempts for this account; try again in 4 seconds"
             }
           }
         }
@@ -6183,7 +6321,7 @@
         "type": "apiKey",
         "in": "cookie",
         "name": "rdns_session",
-        "description": "Session cookie set by POST /auth/login. Cookie writes also need `X-Requested-With: rust-dns`."
+        "description": "Session cookie set by POST /auth/login (named `__Host-rdns_session` over HTTPS). Cookie writes also need `X-Requested-With: rust-dns`."
       }
     }
   },
@@ -6218,7 +6356,7 @@
     },
     {
       "name": "Import/Export",
-      "description": "JSON export documents and BIND zone files."
+      "description": "JSON export documents (export and re-import)."
     },
     {
       "name": "Change log",

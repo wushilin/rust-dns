@@ -16,6 +16,8 @@ timeout_ms = 1500
 # Only LAN clients may use forwarding. Never add 0.0.0.0/0 here.
 allowed_clients = ["127.0.0.0/8", "::1/128", "192.168.0.0/16", "10.0.0.0/8", "fd00::/8", "fe80::/10"]
 cache_entries = 20000
+cache_max_ttl = 86400          # never cache longer than this (TTLs are never raised)
+cache_negative_max_ttl = 3600  # NXDOMAIN / no-data
 
 [rate_limit]
 max_resolutions_per_second_per_address = 500
@@ -35,7 +37,7 @@ session_ttl_hours = 24
 
 [root]
 username = "root"
-password = "change-me-please"
+password = "change-me-please"   # placeholder: rust-dns refuses to start until you set your own
 mfa_required = false
 
 [changelog]

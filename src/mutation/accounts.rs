@@ -51,6 +51,16 @@ pub struct AuditRecord {
     pub detail: serde_json::Value,
 }
 
+/// Fields an administrator may change on a user; `None` = leave as is.
+#[derive(Debug, Clone, Default)]
+pub struct UserChanges {
+    pub display_name: Option<String>,
+    pub is_admin: Option<bool>,
+    pub mfa_required: Option<bool>,
+    pub disabled: Option<bool>,
+    pub password_hash: Option<String>,
+}
+
 /// The only handle an account operation gets on the database.
 pub struct AuditTx<'a> {
     // Visible to sibling mutation modules (e.g. `settings`) that add audited writes.
@@ -103,18 +113,13 @@ impl<'a> AuditTx<'a> {
         Ok(user)
     }
 
-    /// Write `after` over `before`. The audit detail lists what changed;
-    /// secrets are reported only as "changed".
-    pub fn update_user(&mut self, before: &User, after: &User) -> Result<User> {
-        self.conn.execute(
-            "UPDATE users SET password_hash=?2, display_name=?3, is_admin=?4, mfa_required=?5, totp_secret=?6,
-             totp_enrolled_at=?7, disabled_at=?8, updated_at=?9 WHERE id=?1",
-            params![
-                before.id, after.password_hash, after.display_name, after.is_admin as i64, after.mfa_required as i64,
-                after.totp_secret, after.totp_enrolled_at, after.disabled_at, now_rfc3339()
-            ],
-        )?;
-        let user = db::get_user(self.conn, before.id)?.expect("exists");
+    fn load_user(&self, id: i64) -> Result<User> {
+        db::get_user(self.conn, id)?.context("user not found")
+    }
+
+    /// Audit what changed between two versions of a user. Secrets are
+    /// reported only as "changed".
+    fn audit_user_change(&mut self, before: &User, user: &User) {
         let mut changed = serde_json::Map::new();
         if before.display_name != user.display_name {
             changed.insert(
@@ -164,6 +169,109 @@ impl<'a> AuditTx<'a> {
                 serde_json::Value::Object(changed),
             );
         }
+    }
+
+    /// Administrator edit. Only the fields set in `ch` are written, each
+    /// as its own column update, and the audit "before" is read inside this
+    /// transaction: a concurrent self-service change (password, MFA) is
+    /// neither overwritten nor able to overwrite this one.
+    pub fn change_user(&mut self, user_id: i64, ch: &UserChanges) -> Result<User> {
+        let before = self.load_user(user_id)?;
+        let now = now_rfc3339();
+        if let Some(d) = &ch.display_name {
+            self.conn.execute(
+                "UPDATE users SET display_name = ?2, updated_at = ?3 WHERE id = ?1",
+                params![user_id, d, now],
+            )?;
+        }
+        if let Some(a) = ch.is_admin {
+            self.conn.execute(
+                "UPDATE users SET is_admin = ?2, updated_at = ?3 WHERE id = ?1",
+                params![user_id, a as i64, now],
+            )?;
+        }
+        if let Some(m) = ch.mfa_required {
+            self.conn.execute(
+                "UPDATE users SET mfa_required = ?2, updated_at = ?3 WHERE id = ?1",
+                params![user_id, m as i64, now],
+            )?;
+        }
+        if let Some(d) = ch.disabled {
+            self.conn.execute(
+                "UPDATE users SET disabled_at = CASE WHEN ?2 THEN COALESCE(disabled_at, ?3) ELSE NULL END, updated_at = ?3 WHERE id = ?1",
+                params![user_id, d, now],
+            )?;
+        }
+        if let Some(h) = &ch.password_hash {
+            self.conn.execute(
+                "UPDATE users SET password_hash = ?2, updated_at = ?3 WHERE id = ?1",
+                params![user_id, h, now],
+            )?;
+        }
+        let user = self.load_user(user_id)?;
+        self.audit_user_change(&before, &user);
+        Ok(user)
+    }
+
+    /// Set a new password hash (self-service or administrator). Touches only
+    /// `password_hash`.
+    pub fn set_password(&mut self, user_id: i64, password_hash: &str) -> Result<User> {
+        self.change_user(
+            user_id,
+            &UserChanges {
+                password_hash: Some(password_hash.to_string()),
+                ..UserChanges::default()
+            },
+        )
+    }
+
+    /// Enroll (`Some(secret)`) or remove (`None`) TOTP. Touches only the MFA
+    /// columns; the replay marker starts over with the new secret.
+    pub fn set_mfa(&mut self, user_id: i64, secret: Option<&str>) -> Result<User> {
+        let before = self.load_user(user_id)?;
+        let enrolled_at = secret.map(|_| now_rfc3339());
+        self.conn.execute(
+            "UPDATE users SET totp_secret = ?2, totp_enrolled_at = ?3, totp_last_step = NULL, updated_at = ?4 WHERE id = ?1",
+            params![user_id, secret, enrolled_at, now_rfc3339()],
+        )?;
+        let user = self.load_user(user_id)?;
+        self.audit_user_change(&before, &user);
+        Ok(user)
+    }
+
+    /// Record that a TOTP code of time step `step` was accepted for `user`.
+    /// Returns false (and writes nothing) when that step or a later one was
+    /// already used: the code is a replay and must be refused. Security
+    /// state, so it is written and audited like any other account change.
+    pub fn accept_totp_step(&mut self, user: &User, step: u64) -> Result<bool> {
+        let step = step as i64;
+        let n = self.conn.execute(
+            "UPDATE users SET totp_last_step = ?2 WHERE id = ?1 AND totp_secret IS NOT NULL
+             AND (totp_last_step IS NULL OR totp_last_step < ?2)",
+            params![user.id, step],
+        )?;
+        if n > 0 {
+            self.push(
+                "totp.accept",
+                Some(user.id),
+                &user.username,
+                serde_json::json!({ "step": step }),
+            );
+        }
+        Ok(n > 0)
+    }
+
+    /// Disable an account (e.g. the previous root after a rename) and sign
+    /// it out everywhere.
+    pub fn disable_user(&mut self, user_id: i64, reason: &str) -> Result<User> {
+        let user = self.change_user(
+            user_id,
+            &UserChanges {
+                disabled: Some(true),
+                ..UserChanges::default()
+            },
+        )?;
+        self.delete_user_sessions(&user, reason)?;
         Ok(user)
     }
 
@@ -194,10 +302,24 @@ impl<'a> AuditTx<'a> {
                 db::row_to_user,
             )
             .ok();
+        // A renamed root: the previous root account must not stay an
+        // administrator with its old password. It loses root, is disabled
+        // and signed out everywhere (re-enable it in the console if wanted).
+        let previous: Vec<(i64, String)> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id, username FROM users WHERE is_root = 1 AND username <> ?1")?;
+            let rows = stmt.query_map(params![username], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
         let demoted = self.conn.execute(
             "UPDATE users SET is_root = 0 WHERE is_root = 1 AND username <> ?1",
             params![username],
         )?;
+        for (id, name) in &previous {
+            tracing::warn!(previous = %name, new = %username, "the root account was renamed in the configuration; disabling the previous root account and signing it out");
+            self.disable_user(*id, "root renamed in the configuration")?;
+        }
         let now = now_rfc3339();
         self.conn.execute(
             "INSERT INTO users (username, password_hash, display_name, is_admin, is_root, mfa_required, created_at, updated_at)
@@ -238,7 +360,10 @@ impl<'a> AuditTx<'a> {
                 "root.demote_previous",
                 None,
                 username,
-                serde_json::json!({ "demoted": demoted }),
+                serde_json::json!({
+                    "demoted": demoted,
+                    "disabled": previous.iter().map(|(_, n)| n).collect::<Vec<_>>(),
+                }),
             );
         }
         if let Some(detail) = changed {
@@ -521,10 +646,6 @@ impl Accounts {
         self.run(actor, "create_user", |t| t.create_user(u))
     }
 
-    pub fn update_user(&self, actor: &Actor, before: &User, after: &User) -> Result<User> {
-        self.run(actor, "update_user", |t| t.update_user(before, after))
-    }
-
     pub fn sync_root(
         &self,
         username: &str,
@@ -624,10 +745,17 @@ mod tests {
         let s = Arc::new(Storage::open_memory().unwrap());
         let a = Accounts::new(s.clone());
         let u = a.create_user(&actor(), &new_user("alice")).unwrap();
-        let mut after = u.clone();
-        after.is_admin = true;
-        after.password_hash = "h2".into();
-        a.update_user(&actor(), &u, &after).unwrap();
+        a.run(&actor(), "update_user", |t| {
+            t.change_user(
+                u.id,
+                &UserChanges {
+                    is_admin: Some(true),
+                    password_hash: Some("h2".into()),
+                    ..UserChanges::default()
+                },
+            )
+        })
+        .unwrap();
         let log = s.audit_after(0, 100).unwrap();
         assert_eq!(
             log.iter().map(|r| r.action.as_str()).collect::<Vec<_>>(),
@@ -767,5 +895,141 @@ mod tests {
             log[2].detail["tags"],
             serde_json::json!({ "before": ["ci", "deploy"], "after": ["ansible"] })
         );
+    }
+    /// M3 regression: a self-service write used to write every column from
+    /// the caller's stale snapshot, reverting a concurrent admin change
+    /// (e.g. a demotion or disable). Column updates cannot clobber.
+    #[test]
+    fn self_service_writes_do_not_revert_admin_changes() {
+        let s = Arc::new(Storage::open_memory().unwrap());
+        let a = Accounts::new(s.clone());
+        let u = a.create_user(&actor(), &new_user("mallory")).unwrap();
+        a.run(&actor(), "promote", |t| {
+            t.change_user(
+                u.id,
+                &UserChanges {
+                    is_admin: Some(true),
+                    ..Default::default()
+                },
+            )
+        })
+        .unwrap();
+        // The user's request loaded its snapshot (admin, enabled) ...
+        let stale = s.get_user(u.id).unwrap().unwrap();
+        assert!(stale.is_admin);
+        // ... an administrator demotes and disables the account ...
+        a.run(&actor(), "update_user", |t| {
+            t.change_user(
+                u.id,
+                &UserChanges {
+                    is_admin: Some(false),
+                    disabled: Some(true),
+                    ..Default::default()
+                },
+            )
+        })
+        .unwrap();
+        // ... and then the user's password change and MFA enrollment commit.
+        a.run(&actor(), "change_password", |t| {
+            t.set_password(stale.id, "new-hash")
+        })
+        .unwrap();
+        a.run(&actor(), "mfa_enroll", |t| {
+            t.set_mfa(stale.id, Some("SECRET"))
+        })
+        .unwrap();
+        let now = s.get_user(u.id).unwrap().unwrap();
+        assert!(!now.is_admin, "demotion survives");
+        assert!(now.disabled_at.is_some(), "disable survives");
+        assert_eq!(now.password_hash, "new-hash");
+        assert_eq!(now.totp_secret.as_deref(), Some("SECRET"));
+        // And an admin edit does not undo a concurrent password change.
+        a.run(&actor(), "change_password", |t| {
+            t.set_password(u.id, "newer")
+        })
+        .unwrap();
+        a.run(&actor(), "update_user", |t| {
+            t.change_user(
+                u.id,
+                &UserChanges {
+                    display_name: Some("M".into()),
+                    ..Default::default()
+                },
+            )
+        })
+        .unwrap();
+        assert_eq!(s.get_user(u.id).unwrap().unwrap().password_hash, "newer");
+    }
+
+    /// M6 regression: a TOTP step can be used once.
+    #[test]
+    fn totp_steps_cannot_be_replayed() {
+        let s = Arc::new(Storage::open_memory().unwrap());
+        let a = Accounts::new(s.clone());
+        let u = a.create_user(&actor(), &new_user("tina")).unwrap();
+        let u = a
+            .run(&actor(), "mfa_enroll", |t| t.set_mfa(u.id, Some("S")))
+            .unwrap();
+        assert!(a
+            .run(&actor(), "mfa", |t| t.accept_totp_step(&u, 100))
+            .unwrap());
+        assert!(
+            !a.run(&actor(), "mfa", |t| t.accept_totp_step(&u, 100))
+                .unwrap(),
+            "same step"
+        );
+        assert!(
+            !a.run(&actor(), "mfa", |t| t.accept_totp_step(&u, 99))
+                .unwrap(),
+            "older step"
+        );
+        assert!(a
+            .run(&actor(), "mfa", |t| t.accept_totp_step(&u, 101))
+            .unwrap());
+        // Re-enrollment starts over.
+        let u = a
+            .run(&actor(), "mfa_enroll", |t| t.set_mfa(u.id, Some("S2")))
+            .unwrap();
+        assert!(a
+            .run(&actor(), "mfa", |t| t.accept_totp_step(&u, 50))
+            .unwrap());
+    }
+
+    /// L9 regression: renaming root in the config used to leave the old root
+    /// as an enabled administrator with its old password.
+    #[test]
+    fn renamed_root_disables_the_previous_root() {
+        let s = Arc::new(Storage::open_memory().unwrap());
+        let a = Accounts::new(s.clone());
+        let old = a.sync_root("root", "hash1", false).unwrap();
+        let sess = Session {
+            id: 0,
+            token_hash: "t".into(),
+            user_id: old.id,
+            state: "active".into(),
+            pending_secret: None,
+            ip: "127.0.0.1".into(),
+            user_agent: String::new(),
+            created_at: now_rfc3339(),
+            expires_at: "2999-01-01T00:00:00.000Z".into(),
+            last_seen_at: now_rfc3339(),
+        };
+        a.run(&actor(), "login", |t| t.create_session(&old, &sess))
+            .unwrap();
+        let new = a.sync_root("admin", "hash2", false).unwrap();
+        assert!(new.is_root && new.disabled_at.is_none());
+        let old = s.get_user(old.id).unwrap().unwrap();
+        assert!(!old.is_root);
+        assert!(old.disabled_at.is_some(), "previous root is disabled");
+        assert!(
+            s.list_sessions(old.id).unwrap().is_empty(),
+            "and signed out"
+        );
+        let log = s.audit_after(0, 100).unwrap();
+        let demote = log
+            .iter()
+            .find(|r| r.action == "root.demote_previous")
+            .unwrap();
+        assert_eq!(demote.detail["disabled"], serde_json::json!(["root"]));
     }
 }

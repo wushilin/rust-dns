@@ -24,10 +24,10 @@ dir = "/var/lib/rust-dns/backups"
 bind = "0.0.0.0:8053"
 proxy_on = true
 proxy_version = 2
-proxy_trust = "10.0.0.10/32"             # also the only source trusted for X-Forwarded-For
-secure_cookies = true
+proxy_trust = "10.0.0.10/32"             # required with proxy_on; the only source trusted for PROXY / X-Forwarded-*
+secure_cookies = true                    # HTTPS terminates at HAProxy (PROXY protocol carries no X-Forwarded-Proto)
 
 [root]
 username = "root"
-password = "change-me-please"
+password = "change-me-please"   # placeholder: rust-dns refuses to start until you set your own
 mfa_required = true

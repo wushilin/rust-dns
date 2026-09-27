@@ -226,14 +226,20 @@ sent = 700
 for _ in range(sent):
     s.sendto(wire, (IP, PORT))
 got = 0
+slipped = 0
 try:
     while True:
-        s.recvfrom(4096)
-        got += 1
+        data, _ = s.recvfrom(4096)
+        # Rate-limit "slip" replies: TC=1, no answer records ([rate_limit].slip).
+        if len(data) >= 12 and data[2] & 0x02 and data[6:8] == b"\x00\x00":
+            slipped += 1
+        else:
+            got += 1
 except socket.timeout:
     pass
 s.close()
 check("per-address rate limit drops UDP beyond 500/s", 0 < got <= 520, f"got {got} of {sent}")
+check("rate limit slip: some limited queries get an empty TC=1 reply (retry over TCP)", 0 < slipped <= sent - got, f"{slipped} slip replies")
 time.sleep(1.1)
 r = q("www", "A")
 check("rate limit window resets", r.answer)

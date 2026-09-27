@@ -11,6 +11,8 @@ bind = ["0.0.0.0", "::"]
 port = 53
 udp_max_payload = 1232
 auto_ptr = false                         # public reverse zones are delegated separately
+tcp_write_timeout_secs = 10              # drop TCP clients that stop reading
+max_tcp_connections_per_client = 16      # per IPv4 address / IPv6 /64
 minimal_any = true                       # RFC 8482, limits amplification
 default_primary_ns = "ns1.example.com"
 default_hostmaster = "hostmaster@example.com"
@@ -30,7 +32,8 @@ notify = ["198.51.100.53:53"]            # or [{ address = "198.51.100.53:53", k
 
 [rate_limit]
 max_resolutions_per_second_per_address = 200
-max_tracked_addresses = 100000           # bounded memory under a flood
+max_tracked_addresses = 100000           # fixed counter table: bounded memory, floods cannot reset it
+slip = 2                                 # every 2nd limited UDP query: empty TC=1 answer (retry over TCP)
 
 [database]
 path = "/var/lib/rust-dns/rust-dns.db"
@@ -42,14 +45,17 @@ keep = 28
 
 [web_console]
 bind = "127.0.0.1:8053"                  # only the reverse proxy reaches it
-proxy_trust = "127.0.0.1/32;::1/128"     # trust X-Forwarded-For from the local proxy only
-secure_cookies = true                    # console is served over HTTPS
+proxy_trust = "127.0.0.1/32;::1/128"     # trust X-Forwarded-For / X-Forwarded-Proto from the local proxy only (nothing is trusted by default)
+secure_cookies = true                    # console is served over HTTPS (__Host- cookie, Secure)
+login_backoff_after = 5                  # failed attempts per account and network before waits start
+request_header_timeout_secs = 30
+max_connections = 256
 session_ttl_hours = 8
 login_attempts_per_minute = 5
 
 [root]
 username = "root"
-password = "change-me-please"
+password = "change-me-please"   # placeholder: rust-dns refuses to start until you set your own
 mfa_required = true                      # root must enroll TOTP at first sign-in
 
 [changelog]

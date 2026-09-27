@@ -330,11 +330,13 @@ impl ZonePerm {
     pub fn label(self) -> &'static str {
         match self {
             ZonePerm::View => "See records, SOA settings and the zone's change log",
-            ZonePerm::Export => "Export the zone as JSON or a BIND zone file",
+            ZonePerm::Export => "Export the zone as JSON",
             ZonePerm::EditRecords => "Add, change and delete records",
             ZonePerm::EditSettings => "Change SOA settings (TTLs, timers, name servers)",
             ZonePerm::ManageAccess => "See and grant editor or viewer access to other users",
-            ZonePerm::Import => "Import records (JSON or BIND), including replacing all records",
+            ZonePerm::Import => {
+                "Import records from a JSON export, including replacing all records"
+            }
             ZonePerm::DeleteZone => "Delete the zone and all its records",
             ZonePerm::WatchQueries => "See live DNS queries for names in the zone",
         }
@@ -773,7 +775,6 @@ pub fn normalize_value(rtype: RecordType, value: &str) -> Result<String, Invalid
         | RecordType::NAPTR
         | RecordType::HINFO => {
             // Validate with hickory's presentation-format parser and store the canonical text.
-            use hickory_proto::serialize::txt::RDataParser;
             hickory_proto::rr::RData::try_from_str(rtype.to_hickory(), v).map_err(|e| {
                 Invalid(format!(
                     "{rtype} value: {e} (example: {})",

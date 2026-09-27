@@ -12,7 +12,7 @@ use crate::model::GlobalPerm;
 use crate::mutation::settings;
 use axum::extract::State;
 use axum::Json;
-use hickory_proto::op::{Message, MessageType, Query};
+use hickory_proto::op::{Message, MessageType, OpCode, Query};
 use hickory_proto::rr::{Name, RecordType};
 use hickory_proto::serialize::binary::BinDecodable;
 use serde::{Deserialize, Serialize};
@@ -38,6 +38,32 @@ pub struct ForwardingFileValues {
     pub upstreams: Vec<String>,
     pub allowed_clients: Vec<String>,
     pub timeout_ms: u64,
+    pub cache_max_ttl: u32,
+    pub cache_negative_max_ttl: u32,
+}
+
+/// Forwarding cache size and counters since start.
+#[derive(Debug, Serialize, ToSchema)]
+#[schema(example = json!({ "enabled": true, "entries": 42, "capacity": 10000, "hits": 900, "misses": 100, "hit_rate": 0.9 }))]
+pub struct ForwardCacheInfo {
+    /// False when `[forwarding].cache_entries = 0`.
+    pub enabled: bool,
+    pub entries: usize,
+    /// `[forwarding].cache_entries` (fixed at startup).
+    pub capacity: usize,
+    pub hits: u64,
+    pub misses: u64,
+    /// hits / (hits + misses); 0 when there were no lookups.
+    pub hit_rate: f64,
+}
+
+/// Result of a cache flush.
+#[derive(Debug, Serialize, ToSchema)]
+#[schema(example = json!({ "status": "ok", "dropped": 42 }))]
+pub struct CacheFlushResult {
+    pub status: crate::api::types::OkStatus,
+    /// Entries removed.
+    pub dropped: usize,
 }
 
 /// Forwarding settings in effect.
@@ -58,8 +84,15 @@ pub struct ForwardingView {
     /// When the override was saved (`null` when the config file applies).
     #[schema(required = true, format = DateTime)]
     pub updated_at: Option<String>,
+    /// Longest a positive answer is cached, seconds (in effect).
+    #[schema(example = 86400)]
+    pub cache_max_ttl: u32,
+    /// Longest a negative answer is cached, seconds (in effect).
+    #[schema(example = 3600)]
+    pub cache_negative_max_ttl: u32,
     /// The config file's values, for comparison and reset.
     pub config: ForwardingFileValues,
+    pub cache: ForwardCacheInfo,
 }
 
 /// New forwarding settings. Upstreams are IP addresses with an optional port
@@ -70,10 +103,22 @@ pub struct ForwardingView {
 pub struct ForwardingInput {
     /// At most 8, tried in order. An empty list turns forwarding off.
     pub upstreams: Vec<String>,
-    /// CIDR networks or single addresses. `0.0.0.0/0` and `::/0` are refused (open resolver).
+    /// CIDR networks or single addresses. Anything that would make this an
+    /// open resolver is refused: an entry shorter than /8 (IPv4) or /16
+    /// (global IPv6), or entries covering over 1/16 of IPv4 together.
     pub allowed_clients: Vec<String>,
     /// 100 to 30000.
     pub timeout_ms: u64,
+    /// Cap on how long positive answers are cached, 1 to 604800 seconds.
+    /// Omitted: the config file's `cache_max_ttl`.
+    #[serde(default)]
+    #[schema(nullable = false, example = 86400)]
+    pub cache_max_ttl: Option<u32>,
+    /// Cap on how long negative answers are cached, 1 to 604800 seconds and
+    /// not above the positive cap. Omitted: the config file's value.
+    #[serde(default)]
+    #[schema(nullable = false, example = 3600)]
+    pub cache_negative_max_ttl: Option<u32>,
 }
 
 /// Upstreams to probe before saving.
@@ -125,6 +170,9 @@ fn view(s: &AppState) -> ApiResult<ForwardingView> {
             .collect(),
         allowed_clients: rt.forwarding.allowed_clients.clone(),
         timeout_ms: rt.forwarding.timeout_ms,
+        cache_max_ttl: rt.forwarding.cache_max_ttl,
+        cache_negative_max_ttl: rt.forwarding.cache_negative_max_ttl,
+        cache: cache_info(s),
         source,
         updated_by,
         updated_at,
@@ -137,8 +185,58 @@ fn view(s: &AppState) -> ApiResult<ForwardingView> {
                 .collect(),
             allowed_clients: cfg.forwarding.allowed_clients.clone(),
             timeout_ms: cfg.forwarding.timeout_ms,
+            cache_max_ttl: cfg.forwarding.cache_max_ttl,
+            cache_negative_max_ttl: cfg.forwarding.cache_negative_max_ttl,
         },
     })
+}
+
+fn cache_info(s: &AppState) -> ForwardCacheInfo {
+    let st = s.dns.fwd_cache.stats();
+    let lookups = st.hits + st.misses;
+    ForwardCacheInfo {
+        enabled: s.dns.runtime.load().forwarding.cache_entries > 0,
+        entries: st.entries,
+        capacity: st.capacity,
+        hits: st.hits,
+        misses: st.misses,
+        hit_rate: if lookups == 0 {
+            0.0
+        } else {
+            st.hits as f64 / lookups as f64
+        },
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/settings/forwarding/cache/flush",
+    tag = "Server",
+    operation_id = "flush_forward_cache",
+    summary = "Empty the forwarding cache (admin)",
+    description = "Drops every cached forwarded answer; the next queries go to the upstreams. Audited as `settings.forwarding.cache_flush`. Needs `server_admin`.",
+    responses(
+        (status = 200, description = "Flushed.", body = CacheFlushResult),
+        (status = 401, response = Unauthorized),
+        (status = 403, response = Forbidden),
+    ),
+)]
+pub async fn flush_forward_cache(
+    State(s): St,
+    caller: Caller,
+) -> ApiResult<Json<CacheFlushResult>> {
+    s.require(&caller, GlobalPerm::ServerAdmin)?;
+    let actor = caller.actor();
+    let dropped = s.accounts.run(&actor, "flush_forward_cache", |t| {
+        let n = s.dns.fwd_cache.clear();
+        t.note_cache_flush(n);
+        Ok(n)
+    })?;
+    tracing::info!(actor = %actor.name, dropped, "forwarding cache flushed");
+    Ok(Json(CacheFlushResult {
+        status: crate::api::types::OkStatus::Ok,
+        dropped,
+    }))
 }
 
 #[utoipa::path(
@@ -166,7 +264,7 @@ pub async fn get_forwarding(State(s): St, caller: Caller) -> ApiResult<Json<Forw
     operation_id = "update_forwarding_settings",
     summary = "Change upstream resolvers (admin)",
     description = "Saves forwarding settings that override `[forwarding]` in the config file and applies them at once (no restart). The change and its audit entry are one transaction. Needs `server_admin`.",
-    request_body(content = ForwardingInput, example = json!({ "upstreams": ["1.1.1.1", "[2606:4700:4700::1111]:53"], "allowed_clients": ["192.168.0.0/16", "fd00::/8"], "timeout_ms": 2000 })),
+    request_body(content = ForwardingInput, example = json!({ "upstreams": ["1.1.1.1", "[2606:4700:4700::1111]:53"], "allowed_clients": ["192.168.0.0/16", "fd00::/8"], "timeout_ms": 2000, "cache_max_ttl": 86400, "cache_negative_max_ttl": 3600 })),
     responses(
         (status = 200, description = "Saved and applied.", body = ForwardingView),
         (status = 400, response = BadRequest),
@@ -180,8 +278,15 @@ pub async fn update_forwarding(
     Json(input): Json<ForwardingInput>,
 ) -> ApiResult<Json<ForwardingView>> {
     s.require(&caller, GlobalPerm::ServerAdmin)?;
-    let next = settings::validate(&input.upstreams, &input.allowed_clients, input.timeout_ms)
-        .map_err(|errs| ApiError::bad_request(errs.join("; ")))?;
+    let file = s.reloader.current.load().forwarding.clone();
+    let next = settings::validate(
+        &input.upstreams,
+        &input.allowed_clients,
+        input.timeout_ms,
+        (input.cache_max_ttl, input.cache_negative_max_ttl),
+        &file,
+    )
+    .map_err(|errs| ApiError::bad_request(errs.join("; ")))?;
     let before = settings::load_forwarding(&s.storage)?.map(|(f, _, _)| f);
     let actor = caller.actor();
     s.accounts.run(&actor, "update_forwarding", |t| {
@@ -282,10 +387,8 @@ pub async fn test_upstreams(
 }
 
 async fn probe(raw: String, addr: std::net::SocketAddr, timeout_ms: u64) -> UpstreamTestResult {
-    let mut m = Message::new();
-    m.set_id(rand::random::<u16>())
-        .set_message_type(MessageType::Query)
-        .set_recursion_desired(true);
+    let mut m = Message::new(rand::random::<u16>(), MessageType::Query, OpCode::Query);
+    m.metadata.recursion_desired = true;
     m.add_query(Query::query(Name::root(), RecordType::NS));
     let req = match m.to_vec() {
         Ok(b) => b,
@@ -314,7 +417,7 @@ async fn probe(raw: String, addr: std::net::SocketAddr, timeout_ms: u64) -> Upst
     match res {
         Ok(Ok(bytes)) => match Message::from_bytes(&bytes) {
             Ok(reply) => {
-                let rcode = reply.response_code();
+                let rcode = reply.metadata.response_code;
                 let ok = matches!(rcode, hickory_proto::op::ResponseCode::NoError);
                 UpstreamTestResult {
                     upstream: raw,

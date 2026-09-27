@@ -12,7 +12,6 @@ mod ratelimit;
 mod reload;
 mod storage;
 mod ui;
-mod zonefile;
 mod zones;
 
 use clap::Parser;
@@ -30,9 +29,15 @@ struct Cli {
     /// Path to the TOML configuration (created with defaults if missing).
     #[arg(short, long, env = "RUST_DNS_CONFIG", default_value = "rust-dns.toml")]
     config: PathBuf,
-    /// Print a sample configuration and exit.
+    /// Print a sample configuration and exit. Its root password is the
+    /// placeholder "change-me", which must be changed before starting.
     #[arg(long)]
     print_sample_config: bool,
+    /// Write a new configuration file (mode 0600) with a random root
+    /// password, print the credentials once to stdout, and exit. Refuses to
+    /// overwrite an existing file.
+    #[arg(long, value_name = "PATH")]
+    init_config: Option<PathBuf>,
     /// Validate the selected configuration and exit without starting listeners.
     #[arg(long)]
     check: bool,
@@ -41,8 +46,29 @@ struct Cli {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    // Everything this process creates (database, WAL, backups, logs, config)
+    // is private to the service user.
+    #[cfg(unix)]
+    unsafe {
+        libc::umask(0o077);
+    }
     if cli.print_sample_config {
-        print!("{}", config::SAMPLE.replace("__PASSWORD__", "change-me"));
+        print!("{}", config::sample_with_placeholder());
+        return Ok(());
+    }
+    if let Some(path) = &cli.init_config {
+        let (user, pw) = match config::init_config(path) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("rust-dns: {e:#}");
+                std::process::exit(1);
+            }
+        };
+        // stdout only, never the log: the plaintext exists nowhere else.
+        println!("wrote {} (mode 0600)", path.display());
+        println!("root username: {user}");
+        println!("root password: {pw}");
+        println!("(shown once; the file stores only an Argon2 hash)");
         return Ok(());
     }
     if cli.check {
@@ -60,6 +86,14 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     logging::init(&cfg.logging)?;
+    for (section, p) in [
+        ("[web_console]", &cfg.web_console.proxy),
+        ("[tcp_dns]", &cfg.tcp_dns),
+    ] {
+        for e in p.broad_trust_entries() {
+            tracing::warn!(entry = %e, "{section}.proxy_trust trusts a whole network: any host on it (e.g. every container on a Docker bridge) can claim to be any client; list only the proxy's own address");
+        }
+    }
     let cfg = Arc::new(cfg);
     tracing::info!(version = env!("CARGO_PKG_VERSION"), config = %cli.config.display(), "starting rust-dns");
 
@@ -73,7 +107,8 @@ async fn main() -> anyhow::Result<()> {
         cfg.root.mfa_required,
     )?;
     if let Some(pw) = generated {
-        tracing::warn!(username = %root.username, password = %pw, "generated root credentials (also stored hashed in the config file)");
+        // stderr only: the plaintext must never reach the log files.
+        tracing::warn!(username = %root.username, config = %cli.config.display(), "generated a new configuration with a random root password (printed once on stderr, not logged)");
         eprintln!("\n  Root login: {}  /  {}\n  (the plaintext is only shown once; the config now holds a hash)\n", root.username, pw);
     }
     let cache = Arc::new(cache::Cache::new(cache::Catalog::empty()));
@@ -95,6 +130,7 @@ async fn main() -> anyhow::Result<()> {
         Duration::from_secs(1),
         cfg.rate_limit.max_tracked_addresses,
     ));
+    limiter.set_slip(cfg.rate_limit.slip);
     let dns = Arc::new(dns::DnsServer::new(
         cache.clone(),
         bus.clone(),
@@ -168,6 +204,8 @@ async fn main() -> anyhow::Result<()> {
             Duration::from_secs(60),
             10_000,
         ),
+        guard: api::guard::AttemptGuard::new(cfg.web_console.login_backoff_after),
+        clock: auth::system_clock(),
         trusted: cfg.web_console.proxy.trusted_cidrs(),
         started: std::time::Instant::now(),
     });

@@ -332,16 +332,6 @@ pub struct MemberList {
     pub members: Vec<Member>,
 }
 
-/// Import summary of a BIND zone file.
-#[derive(Debug, Serialize, ToSchema)]
-#[schema(example = json!({ "zones_created": 0, "zones_updated": 1, "records_added": 3, "records_removed": 0, "records_skipped": 0, "skipped": [] }))]
-pub struct BindImportSummary {
-    #[serde(flatten)]
-    pub summary: crate::mutation::ImportSummary,
-    /// Zone-file entries that were not imported, with the reason.
-    pub skipped: Vec<String>,
-}
-
 // ---- logs -------------------------------------------------------------------------
 
 /// Change log entries plus retention bounds.
