@@ -1,0 +1,5668 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "rust-dns API",
+    "description": "Management API of the rust-dns authoritative DNS server.\n\n**Authentication.** Either\n* a cookie session: `POST /auth/login` (then `/auth/mfa` if MFA is enabled) sets the `rdns_session` cookie, which the browser sends automatically; or\n* an API token: `Authorization: Bearer rdns_...` (create one under *Tokens*; use the **Authorize** button).\n\n**CSRF guard.** Cookie-authenticated writes (POST/PUT/DELETE) must send the header `X-Requested-With: rust-dns`, otherwise they fail with 403 `code: csrf`. The Swagger UI in the web console adds this header automatically. Bearer-token requests do not need it.\n\n**Live server.** \"Try it out\" sends real requests to this server with the caller's permissions: changes are committed, logged and served over DNS immediately.\n\nErrors are JSON `{\"error\": \"...\", \"code\": null|\"...\"}`. Zones the caller cannot see return 404.\n\nThis document is generated from the server's code, so it always matches the running version.",
+    "license": {
+      "name": "Apache-2.0",
+      "identifier": "Apache-2.0"
+    },
+    "version": "0.1.0"
+  },
+  "servers": [
+    {
+      "url": "/api",
+      "description": "This server"
+    }
+  ],
+  "paths": {
+    "/auth/login": {
+      "post": {
+        "tags": [
+          "Auth"
+        ],
+        "summary": "Sign in (step 1)",
+        "description": "Checks username and password and starts a cookie session. Depending on the account the session is active at once or still needs a TOTP code (`/auth/mfa`) or forced MFA enrollment (`/auth/enroll`).",
+        "operationId": "login",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginBody"
+              },
+              "example": {
+                "password": "rootpass123",
+                "username": "root"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Credentials accepted. Sets the `rdns_session` cookie; check `status` for the next step.",
+            "headers": {
+              "Set-Cookie": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "`rdns_session=...; Path=/; HttpOnly; SameSite=Lax`"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoginResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        },
+        "security": []
+      }
+    },
+    "/auth/mfa": {
+      "post": {
+        "tags": [
+          "Auth"
+        ],
+        "summary": "Sign in (step 2): TOTP or recovery code",
+        "description": "For a session in `mfa_required` state (cookie from /auth/login). Accepts a 6-digit TOTP code or a one-time recovery code.",
+        "operationId": "login_mfa",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CodeBody"
+              },
+              "example": {
+                "code": "123456"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Session is now active.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MfaVerifyResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        },
+        "security": [
+          {
+            "cookie": []
+          }
+        ]
+      }
+    },
+    "/auth/enroll": {
+      "post": {
+        "tags": [
+          "Auth"
+        ],
+        "summary": "Complete forced MFA enrollment",
+        "description": "For a session in `enroll_required` state: confirm the secret from the login response with a TOTP code.",
+        "operationId": "login_enroll",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CodeBody"
+              },
+              "example": {
+                "code": "123456"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Enrolled; session active. Recovery codes are shown once.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnrollVerifyResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        },
+        "security": [
+          {
+            "cookie": []
+          }
+        ]
+      }
+    },
+    "/auth/session": {
+      "get": {
+        "tags": [
+          "Auth"
+        ],
+        "summary": "State of the current cookie session",
+        "description": "Lets a client resume the right sign-in step. Never fails for a missing or expired cookie: that is `anonymous`.",
+        "operationId": "get_session",
+        "responses": {
+          "200": {
+            "description": "Session state (`anonymous` without a valid cookie).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionInfo"
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
+    "/auth/logout": {
+      "post": {
+        "tags": [
+          "Auth"
+        ],
+        "summary": "Sign out",
+        "description": "Deletes the cookie session if there is one. Always succeeds.",
+        "operationId": "logout",
+        "responses": {
+          "200": {
+            "description": "Signed out; the cookie is cleared.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                },
+                "example": {
+                  "status": "ok"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "cookie": []
+          },
+          {}
+        ]
+      }
+    },
+    "/me": {
+      "get": {
+        "tags": [
+          "Account"
+        ],
+        "summary": "Current user, client IP and auth method",
+        "operationId": "whoami",
+        "responses": {
+          "200": {
+            "description": "Caller.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WhoAmI"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/me/password": {
+      "put": {
+        "tags": [
+          "Account"
+        ],
+        "summary": "Change own password",
+        "description": "Needs an interactive (cookie) session. Not available to root, whose password is set in the configuration file.",
+        "operationId": "change_password",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PasswordBody"
+              },
+              "example": {
+                "current_password": "rootpass123",
+                "new_password": "a-new-long-password"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Changed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                },
+                "example": {
+                  "status": "ok"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
+    "/me/mfa/start": {
+      "post": {
+        "tags": [
+          "Account"
+        ],
+        "summary": "Start voluntary MFA enrollment",
+        "description": "Needs an interactive (cookie) session.",
+        "operationId": "mfa_start",
+        "responses": {
+          "200": {
+            "description": "Secret, otpauth URI and QR SVG; confirm with /me/mfa/confirm.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnrollPayload"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
+    "/me/mfa/confirm": {
+      "post": {
+        "tags": [
+          "Account"
+        ],
+        "summary": "Confirm MFA enrollment",
+        "description": "Confirms the secret from /me/mfa/start with a TOTP code.",
+        "operationId": "mfa_confirm",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CodeBody"
+              },
+              "example": {
+                "code": "123456"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Enrolled; recovery codes shown once.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserWithRecoveryCodes"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
+    "/me/mfa/disable": {
+      "post": {
+        "tags": [
+          "Account"
+        ],
+        "summary": "Disable MFA",
+        "description": "Not allowed when MFA is required for the account. Needs a current TOTP code.",
+        "operationId": "mfa_disable",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CodeBody"
+              },
+              "example": {
+                "code": "123456"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "MFA disabled.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/User"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
+    "/me/mfa/recovery": {
+      "post": {
+        "tags": [
+          "Account"
+        ],
+        "summary": "Regenerate recovery codes",
+        "description": "Needs a current TOTP code; the previous recovery codes stop working.",
+        "operationId": "mfa_regenerate_recovery",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CodeBody"
+              },
+              "example": {
+                "code": "123456"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "New recovery codes (old ones stop working).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecoveryCodes"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
+    "/me/sessions": {
+      "get": {
+        "tags": [
+          "Account"
+        ],
+        "summary": "List own sessions",
+        "operationId": "list_my_sessions",
+        "responses": {
+          "200": {
+            "description": "Sessions.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionList"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/me/sessions/{id}": {
+      "delete": {
+        "tags": [
+          "Account"
+        ],
+        "summary": "Revoke one of my sessions",
+        "description": "Needs an interactive (cookie) session.",
+        "operationId": "revoke_my_session",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Session id.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Revoked.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                },
+                "example": {
+                  "status": "revoked"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/me/sessions/revoke-others": {
+      "post": {
+        "tags": [
+          "Account"
+        ],
+        "summary": "Sign out everywhere else",
+        "description": "Needs an interactive (cookie) session; keeps the current one.",
+        "operationId": "revoke_other_sessions",
+        "responses": {
+          "200": {
+            "description": "Other sessions revoked.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RevokedCount"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
+    "/zones": {
+      "get": {
+        "tags": [
+          "Zones"
+        ],
+        "summary": "Zones visible to the caller",
+        "operationId": "list_zones",
+        "responses": {
+          "200": {
+            "description": "Zones with the caller's role.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ZoneList"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Zones"
+        ],
+        "summary": "Create a zone",
+        "description": "Needs `create_zones`. The owner defaults to the caller.",
+        "operationId": "create_zone",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ZoneInput"
+              },
+              "example": {
+                "default_ttl": 3600,
+                "name": "example.com",
+                "soa_mname": "ns1.example.com.",
+                "soa_rname": "hostmaster@example.com"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ZoneView"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        }
+      }
+    },
+    "/zones/{zone}": {
+      "get": {
+        "tags": [
+          "Zones"
+        ],
+        "summary": "Zone with the first page of records and its members",
+        "operationId": "get_zone",
+        "parameters": [
+          {
+            "name": "zone",
+            "in": "path",
+            "description": "Zone name, e.g. `example.com`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "example.com"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Zone.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ZoneDetail"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "Zones"
+        ],
+        "summary": "Update SOA settings / owner",
+        "description": "Needs the owner role; changing `owner` needs `transfer_ownership` (administrators). Omitted fields are unchanged.",
+        "operationId": "update_zone",
+        "parameters": [
+          {
+            "name": "zone",
+            "in": "path",
+            "description": "Zone name, e.g. `example.com`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "example.com"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ZoneInput"
+              },
+              "example": {
+                "default_ttl": 3600,
+                "minimum": 300,
+                "refresh": 7200,
+                "retry": 900
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Updated zone.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ZoneView"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Zones"
+        ],
+        "summary": "Delete a zone and all its records",
+        "description": "Needs the owner role.",
+        "operationId": "delete_zone",
+        "parameters": [
+          {
+            "name": "zone",
+            "in": "path",
+            "description": "Zone name, e.g. `example.com`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "example.com"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Deleted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ZoneDeleted"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/zones/{zone}/records": {
+      "get": {
+        "tags": [
+          "Records"
+        ],
+        "summary": "Search / page records",
+        "operationId": "list_records",
+        "parameters": [
+          {
+            "name": "zone",
+            "in": "path",
+            "description": "Zone name, e.g. `example.com`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "example.com"
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "description": "Search text matched against name, type and value.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "www"
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 0,
+              "minimum": 0
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size (clamped to 1-5000).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 500,
+              "maximum": 5000,
+              "minimum": 1
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of records.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecordPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Records"
+        ],
+        "summary": "Create a record",
+        "description": "Needs the editor role. To register a name that disappears unless renewed, send `expires_in` (seconds) or `expires_at`; posting the identical record again with a new expiry renews it (200).",
+        "operationId": "create_record",
+        "parameters": [
+          {
+            "name": "zone",
+            "in": "path",
+            "description": "Zone name, e.g. `example.com`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "example.com"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecordInput"
+              },
+              "examples": {
+                "A": {
+                  "summary": "A record",
+                  "value": {
+                    "name": "www",
+                    "ttl": 300,
+                    "type": "A",
+                    "value": "192.0.2.10"
+                  }
+                },
+                "AAAA": {
+                  "summary": "AAAA record",
+                  "value": {
+                    "name": "www",
+                    "ttl": 300,
+                    "type": "AAAA",
+                    "value": "2001:db8::10"
+                  }
+                },
+                "CNAME": {
+                  "summary": "CNAME record",
+                  "value": {
+                    "name": "docs",
+                    "type": "CNAME",
+                    "value": "www.example.com."
+                  }
+                },
+                "MX": {
+                  "summary": "MX record (zone default TTL)",
+                  "value": {
+                    "name": "@",
+                    "type": "MX",
+                    "value": "10 mail.example.com."
+                  }
+                },
+                "TXT": {
+                  "summary": "TXT record",
+                  "value": {
+                    "name": "@",
+                    "type": "TXT",
+                    "value": "v=spf1 -all"
+                  }
+                },
+                "expiring": {
+                  "summary": "Self-registration: A record that expires in 24 hours unless renewed",
+                  "value": {
+                    "expires_in": 86400,
+                    "name": "laptop-42",
+                    "type": "A",
+                    "value": "192.0.2.42"
+                  }
+                }
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Renewed: an identical record (same name, type and value) already existed and the request carried an expiry, or the existing one had expired. Its expiry was replaced.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Record"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Record"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        }
+      }
+    },
+    "/zones/{zone}/records/{id}": {
+      "put": {
+        "tags": [
+          "Records"
+        ],
+        "summary": "Update a record",
+        "description": "Needs the editor role. Send only the fields you change: omitted fields, including `ttl`, keep their current values. Send `\"ttl\": null` to switch to the zone default TTL.",
+        "operationId": "update_record",
+        "parameters": [
+          {
+            "name": "zone",
+            "in": "path",
+            "description": "Zone name, e.g. `example.com`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "example.com"
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Record id.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "example": 1
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecordInput"
+              },
+              "example": {
+                "ttl": 600,
+                "value": "192.0.2.20"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Updated record.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Record"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Records"
+        ],
+        "summary": "Delete a record",
+        "description": "Needs the editor role.",
+        "operationId": "delete_record",
+        "parameters": [
+          {
+            "name": "zone",
+            "in": "path",
+            "description": "Zone name, e.g. `example.com`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "example.com"
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Record id.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "example": 1
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The deleted record.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Record"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/zones/{zone}/members/{username}": {
+      "put": {
+        "tags": [
+          "Access"
+        ],
+        "summary": "Grant editor or viewer access",
+        "description": "Needs the owner role on the zone.",
+        "operationId": "set_member",
+        "parameters": [
+          {
+            "name": "zone",
+            "in": "path",
+            "description": "Zone name, e.g. `example.com`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "example.com"
+          },
+          {
+            "name": "username",
+            "in": "path",
+            "description": "Username of the member.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "alice"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemberBody"
+              },
+              "example": {
+                "role": "editor"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Members after the change.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemberList"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Access"
+        ],
+        "summary": "Revoke access",
+        "description": "Needs the owner role on the zone.",
+        "operationId": "remove_member",
+        "parameters": [
+          {
+            "name": "zone",
+            "in": "path",
+            "description": "Zone name, e.g. `example.com`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "example.com"
+          },
+          {
+            "name": "username",
+            "in": "path",
+            "description": "Username of the member.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "alice"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Members after the change.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemberList"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/users/{id}/rights": {
+      "get": {
+        "tags": [
+          "Access"
+        ],
+        "summary": "Effective rights of a user or of their API tokens",
+        "description": "Administrators may read anyone's; users their own.",
+        "operationId": "get_user_rights",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "User id.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "example": 1
+          },
+          {
+            "name": "via",
+            "in": "query",
+            "description": "`token` shows what the user's API tokens may do.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "session",
+              "enum": [
+                "session",
+                "token"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Rights generated from the same permission table the API enforces.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Rights"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/zones/{zone}/export": {
+      "get": {
+        "tags": [
+          "Import/Export"
+        ],
+        "summary": "Export one zone",
+        "operationId": "export_zone",
+        "parameters": [
+          {
+            "name": "zone",
+            "in": "path",
+            "description": "Zone name, e.g. `example.com`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "example.com"
+          },
+          {
+            "name": "format",
+            "in": "query",
+            "description": "`bind` (alias `zone`) returns a zone file.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "json",
+              "enum": [
+                "json",
+                "bind",
+                "zone"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Download (`Content-Disposition: attachment`). JSON export document, or a BIND zone file with `format=bind`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExportDoc"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "$ORIGIN example.com.\n@ 3600 IN SOA ns1.example.com. hostmaster.example.com. ( 2026011501 3600 600 1209600 300 )\nwww 300 IN A 192.0.2.10\n"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/zones/{zone}/import-bind": {
+      "post": {
+        "tags": [
+          "Import/Export"
+        ],
+        "summary": "Import a BIND zone file into this zone",
+        "description": "Needs the owner role. Records only; SOA values in the file are ignored. Names are relative to the zone origin.",
+        "operationId": "import_bind",
+        "parameters": [
+          {
+            "name": "zone",
+            "in": "path",
+            "description": "Zone name, e.g. `example.com`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "example.com"
+          },
+          {
+            "name": "mode",
+            "in": "query",
+            "description": "`merge` adds missing zones and records; `replace` replaces the records\nof each zone in the document.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "merge",
+              "enum": [
+                "merge",
+                "replace"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "text/plain": {
+              "schema": {
+                "type": "string"
+              },
+              "example": "$ORIGIN example.com.\n$TTL 3600\nwww   300 IN A    192.0.2.10\nwww       IN AAAA 2001:db8::10\n@         IN MX   10 mail.example.com.\nmail      IN A    192.0.2.25\n"
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Import summary; unsupported or invalid entries are listed in `skipped`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BindImportSummary"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/export": {
+      "get": {
+        "tags": [
+          "Import/Export"
+        ],
+        "summary": "Export all visible zones as JSON",
+        "operationId": "export_all",
+        "responses": {
+          "200": {
+            "description": "Export document (`Content-Disposition: attachment; filename=\"rust-dns-export.json\"`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExportDoc"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/import": {
+      "post": {
+        "tags": [
+          "Import/Export"
+        ],
+        "summary": "Import a JSON export document",
+        "description": "Callers with `create_zones` may create zones; others can only import into zones where they are owner.",
+        "operationId": "import_json",
+        "parameters": [
+          {
+            "name": "mode",
+            "in": "query",
+            "description": "`merge` adds missing zones and records; `replace` replaces the records\nof each zone in the document.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "merge",
+              "enum": [
+                "merge",
+                "replace"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExportDoc"
+              },
+              "example": {
+                "exported_at": "2026-01-15T09:30:00.000Z",
+                "version": 1,
+                "zones": [
+                  {
+                    "default_ttl": 3600,
+                    "name": "example.com",
+                    "records": [
+                      {
+                        "name": "@",
+                        "type": "NS",
+                        "value": "ns1.example.com."
+                      },
+                      {
+                        "name": "www",
+                        "ttl": 300,
+                        "type": "A",
+                        "value": "192.0.2.10"
+                      },
+                      {
+                        "name": "www",
+                        "type": "AAAA",
+                        "value": "2001:db8::10"
+                      },
+                      {
+                        "name": "@",
+                        "type": "MX",
+                        "value": "10 mail.example.com."
+                      }
+                    ],
+                    "soa_mname": "ns1.example.com.",
+                    "soa_rname": "hostmaster.example.com."
+                  }
+                ]
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Summary.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImportSummary"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        }
+      }
+    },
+    "/changelog": {
+      "get": {
+        "tags": [
+          "Change log"
+        ],
+        "summary": "DNS change log (WAL-style offsets)",
+        "description": "One row per committed fact (zone, record, serial, member); rows from one transaction share `txn` and `command`. Rolled-back operations never appear. Non-admins see only their zones.",
+        "operationId": "get_changelog",
+        "parameters": [
+          {
+            "name": "after",
+            "in": "query",
+            "description": "Return entries after this offset/id (oldest first). Omit for the most\nrecent entries.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Max entries (1-2000).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 200,
+              "maximum": 2000,
+              "minimum": 1
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Entries plus retention bounds.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangelogPage"
+                },
+                "example": {
+                  "entries": [
+                    {
+                      "action": "create",
+                      "actor": "root",
+                      "actor_ip": "192.0.2.1",
+                      "command": "create_record",
+                      "entity": "record",
+                      "entity_id": 42,
+                      "offset": 17,
+                      "payload": {
+                        "kind": "record_created",
+                        "record": {
+                          "created_at": "2026-01-15T09:30:00.000Z",
+                          "expires_at": null,
+                          "id": 42,
+                          "name": "www",
+                          "ttl": 300,
+                          "type": "A",
+                          "updated_at": "2026-01-15T09:30:00.000Z",
+                          "value": "192.0.2.10",
+                          "zone_id": 1
+                        }
+                      },
+                      "ts": "2026-01-15T10:02:11.482Z",
+                      "txn": "01J0Z8X4K5T3",
+                      "zone": "example.com"
+                    }
+                  ],
+                  "latest_offset": 17,
+                  "oldest_offset": 1,
+                  "resync_required": false
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/audit": {
+      "get": {
+        "tags": [
+          "Change log"
+        ],
+        "summary": "Account and security audit log (admin)",
+        "description": "Users, MFA, recovery codes, sessions, API tokens, root sync. Each entry was written in the same transaction as the change. Needs `view_audit`.",
+        "operationId": "get_audit",
+        "parameters": [
+          {
+            "name": "after",
+            "in": "query",
+            "description": "Return entries after this offset/id (oldest first). Omit for the most\nrecent entries.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Max entries (1-2000).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 200,
+              "maximum": 2000,
+              "minimum": 1
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Entries.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuditPage"
+                },
+                "example": {
+                  "entries": [
+                    {
+                      "action": "user_created",
+                      "actor": "root",
+                      "actor_ip": "192.0.2.1",
+                      "detail": {
+                        "is_admin": false,
+                        "username": "alice"
+                      },
+                      "id": 5,
+                      "operation": "create_user",
+                      "target": "alice",
+                      "target_user_id": 2,
+                      "ts": "2026-01-15T10:02:11.482Z",
+                      "txn": "01J0Z8Y1QW2E"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
+    "/ws": {
+      "get": {
+        "tags": [
+          "Change log"
+        ],
+        "summary": "WebSocket stream (not callable from Swagger UI)",
+        "description": "WebSocket upgrade; Swagger UI cannot open it, use a WebSocket client (e.g. `websocat 'ws://host/api/ws?after=0&token=rdns_...'`). Streams change events (resumable with `after`) and, with `queries=true`, live DNS queries for zones the caller owns. Browsers authenticate with the session cookie; other clients may pass `?token=`.",
+        "operationId": "websocket",
+        "parameters": [
+          {
+            "name": "after",
+            "in": "query",
+            "description": "Replay change events after this offset first (WAL-style cursor).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "queries",
+            "in": "query",
+            "description": "Also stream live DNS queries.",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          {
+            "name": "token",
+            "in": "query",
+            "description": "API token (only accepted on this path, for clients that cannot set headers).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "101": {
+            "description": "Switching protocols. Text frames are JSON: `{\"type\":\"hello\",...}`, `{\"type\":\"change\",\"event\":ChangeEvent}`, `{\"type\":\"query\",\"event\":QueryEvent}`, `{\"type\":\"resync\",\"head\":N}` (see the ChangeEvent and QueryEvent schemas)."
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/users": {
+      "get": {
+        "tags": [
+          "Users"
+        ],
+        "summary": "List users (admin)",
+        "operationId": "list_users",
+        "responses": {
+          "200": {
+            "description": "Users.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserList"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Users"
+        ],
+        "summary": "Create a user (admin)",
+        "operationId": "create_user",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UserBody"
+              },
+              "example": {
+                "display_name": "Alice Example",
+                "is_admin": false,
+                "mfa_required": false,
+                "password": "correct-horse-battery",
+                "username": "alice"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/User"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        }
+      }
+    },
+    "/users/{id}": {
+      "put": {
+        "tags": [
+          "Users"
+        ],
+        "summary": "Update a user (admin)",
+        "description": "All fields optional. Changing the password or disabling the account signs the user out everywhere.",
+        "operationId": "update_user",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "User id.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "example": 1
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UserBody"
+              },
+              "example": {
+                "display_name": "Alice Example",
+                "mfa_required": true
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Updated user.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/User"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Users"
+        ],
+        "summary": "Delete a user (admin)",
+        "operationId": "delete_user",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "User id.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "example": 1
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Deleted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                },
+                "example": {
+                  "status": "deleted"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/users/{id}/reset-mfa": {
+      "post": {
+        "tags": [
+          "Users"
+        ],
+        "summary": "Reset a user's MFA and sign them out (admin)",
+        "operationId": "reset_user_mfa",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "User id.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "example": 1
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Updated user.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/User"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/users/{id}/sessions": {
+      "get": {
+        "tags": [
+          "Users"
+        ],
+        "summary": "List a user's sessions (admin)",
+        "operationId": "list_user_sessions",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "User id.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "example": 1
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Sessions.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionList"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
+    "/users/{id}/sessions/revoke": {
+      "post": {
+        "tags": [
+          "Users"
+        ],
+        "summary": "Sign a user out everywhere (admin)",
+        "operationId": "revoke_user_sessions",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "User id.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "example": 1
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Revoked.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RevokedCount"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/tokens": {
+      "get": {
+        "tags": [
+          "Tokens"
+        ],
+        "summary": "List API tokens",
+        "description": "Active tokens with their tags, last use time and last client IP. Filter with `tag` (exact, case-sensitive match).",
+        "operationId": "list_tokens",
+        "parameters": [
+          {
+            "name": "all",
+            "in": "query",
+            "description": "Administrators: list every user's tokens.",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          {
+            "name": "tag",
+            "in": "query",
+            "description": "Only tokens carrying exactly this tag (case-sensitive, surrounding spaces ignored).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "ci"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Tokens (own, or everyone's with `all=true` for admins).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenList"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Tokens"
+        ],
+        "summary": "Create an API token",
+        "description": "The token acts with exactly the caller's rights. Tokens do not expire; revoke them when no longer needed. Optional `tags` label the token (change them later with `PUT /tokens/{id}`).",
+        "operationId": "create_token",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TokenBody"
+              },
+              "example": {
+                "name": "ci-deploy",
+                "tags": [
+                  "ci",
+                  "deploy"
+                ]
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Created. The plaintext token is returned only once.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenCreated"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
+    "/tokens/{id}": {
+      "put": {
+        "tags": [
+          "Tokens"
+        ],
+        "summary": "Update an API token's tags",
+        "description": "Replaces the tag list. Own tokens; administrators (`manage_users`) may update anyone's. Revoked tokens cannot be changed (404). A change is recorded in the audit log as `token.update` with the tags before and after.",
+        "operationId": "update_token",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Token id.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TokenUpdateBody"
+              },
+              "example": {
+                "tags": [
+                  "ci",
+                  "deploy",
+                  "prod"
+                ]
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Updated token.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenInfo"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Tokens"
+        ],
+        "summary": "Revoke an API token",
+        "description": "Own tokens; administrators may revoke anyone's.",
+        "operationId": "revoke_token",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Token id.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Revoked.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                },
+                "example": {
+                  "status": "revoked"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "tags": [
+          "Server"
+        ],
+        "summary": "Liveness probe",
+        "description": "Cheap database ping (no integrity scan). No authentication.",
+        "operationId": "health",
+        "responses": {
+          "200": {
+            "description": "Database reachable.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Database unavailable (details are only logged).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                },
+                "example": {
+                  "database": "unavailable",
+                  "status": "error"
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "tags": [
+          "Server"
+        ],
+        "summary": "This OpenAPI document",
+        "description": "Generated from the server's route and type definitions, so it always matches the running server.",
+        "operationId": "get_openapi",
+        "responses": {
+          "200": {
+            "description": "OpenAPI 3.1 JSON.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
+    "/status": {
+      "get": {
+        "tags": [
+          "Server"
+        ],
+        "summary": "Server status, counters and runtime settings",
+        "operationId": "get_status",
+        "responses": {
+          "200": {
+            "description": "Status.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServerStatus"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/admin/reload": {
+      "post": {
+        "tags": [
+          "Server"
+        ],
+        "summary": "Reload the config file (admin)",
+        "description": "Re-reads the configuration file and applies runtime settings. Needs `server_admin`.",
+        "operationId": "reload_config",
+        "responses": {
+          "200": {
+            "description": "Reloaded.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReloadResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
+    "/admin/integrity": {
+      "get": {
+        "tags": [
+          "Server"
+        ],
+        "summary": "Full database integrity check (admin)",
+        "description": "Runs `PRAGMA quick_check` over the whole database; may be slow on large databases. Needs `server_admin`.",
+        "operationId": "integrity_check",
+        "responses": {
+          "200": {
+            "description": "Database is consistent.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IntegrityResult"
+                },
+                "example": {
+                  "status": "ok"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "500": {
+            "description": "Check could not run.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IntegrityResult"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Integrity check failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IntegrityResult"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/settings/forwarding": {
+      "get": {
+        "tags": [
+          "Server"
+        ],
+        "summary": "Forwarding settings in effect (admin)",
+        "description": "Upstream resolvers, allowed client networks and timeout currently in effect, whether they come from the config file or were saved from the console, and the config file's own values. Needs `server_admin`.",
+        "operationId": "get_forwarding_settings",
+        "responses": {
+          "200": {
+            "description": "Settings in effect.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ForwardingView"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "Server"
+        ],
+        "summary": "Change upstream resolvers (admin)",
+        "description": "Saves forwarding settings that override `[forwarding]` in the config file and applies them at once (no restart). The change and its audit entry are one transaction. Needs `server_admin`.",
+        "operationId": "update_forwarding_settings",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ForwardingInput"
+              },
+              "example": {
+                "allowed_clients": [
+                  "192.168.0.0/16",
+                  "fd00::/8"
+                ],
+                "timeout_ms": 2000,
+                "upstreams": [
+                  "1.1.1.1",
+                  "[2606:4700:4700::1111]:53"
+                ]
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Saved and applied.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ForwardingView"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Server"
+        ],
+        "summary": "Use the config file's forwarding settings again (admin)",
+        "description": "Removes the console override; `[forwarding]` from the config file applies at once. No-op when there is no override. Needs `server_admin`.",
+        "operationId": "reset_forwarding_settings",
+        "responses": {
+          "200": {
+            "description": "Config file values in effect.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ForwardingView"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
+    "/settings/forwarding/test": {
+      "post": {
+        "tags": [
+          "Server"
+        ],
+        "summary": "Probe upstream resolvers (admin)",
+        "description": "Sends a recursive `. NS` query to each upstream over UDP and reports whether and how fast it answered. Nothing is saved. Needs `server_admin`.",
+        "operationId": "test_upstreams",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpstreamTestInput"
+              },
+              "example": {
+                "timeout_ms": 1000,
+                "upstreams": [
+                  "1.1.1.1",
+                  "8.8.8.8:53"
+                ]
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "One result per upstream, in order.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpstreamTestReport"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
+    "/metrics": {
+      "servers": [
+        {
+          "url": "/",
+          "description": "Server root (not under /api)"
+        }
+      ],
+      "get": {
+        "tags": [
+          "Server"
+        ],
+        "summary": "Prometheus metrics",
+        "description": "Mounted at the server root (`/metrics`), not under `/api`. Requires authentication (a bearer API token for scrapers).",
+        "operationId": "get_metrics",
+        "responses": {
+          "200": {
+            "description": "Prometheus text exposition format 0.0.4.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "# HELP rustdns_queries_total DNS queries received\n# TYPE rustdns_queries_total counter\nrustdns_queries_total 0\n"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AuditPage": {
+        "type": "object",
+        "required": [
+          "entries"
+        ],
+        "properties": {
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AuditRecord"
+            }
+          }
+        }
+      },
+      "AuditRecord": {
+        "type": "object",
+        "description": "A committed audit row, as stored and returned by the API.",
+        "required": [
+          "id",
+          "ts",
+          "txn",
+          "operation",
+          "actor",
+          "actor_ip",
+          "action",
+          "target_user_id",
+          "target",
+          "detail"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "ts": {
+            "type": "string",
+            "format": "date-time",
+            "example": "2026-01-15T09:30:00.000Z"
+          },
+          "txn": {
+            "type": "string",
+            "description": "Shared by every row written in the same transaction."
+          },
+          "operation": {
+            "type": "string",
+            "description": "The API operation (create_user, login, revoke_token, ...)."
+          },
+          "actor": {
+            "type": "string"
+          },
+          "actor_ip": {
+            "type": "string"
+          },
+          "action": {
+            "type": "string",
+            "description": "What happened (user_created, session_created, token_revoked, ...)."
+          },
+          "target_user_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "target": {
+            "type": "string"
+          },
+          "detail": {
+            "type": "object"
+          }
+        },
+        "example": {
+          "action": "user_created",
+          "actor": "root",
+          "actor_ip": "192.0.2.1",
+          "detail": {
+            "is_admin": false,
+            "username": "alice"
+          },
+          "id": 5,
+          "operation": "create_user",
+          "target": "alice",
+          "target_user_id": 2,
+          "ts": "2026-01-15T10:02:11.482Z",
+          "txn": "01J0Z8Y1QW2E"
+        }
+      },
+      "AuthVia": {
+        "type": "string",
+        "description": "How the caller authenticated.",
+        "enum": [
+          "session",
+          "token"
+        ]
+      },
+      "BindImportSummary": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ImportSummary"
+          },
+          {
+            "type": "object",
+            "required": [
+              "skipped"
+            ],
+            "properties": {
+              "skipped": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Zone-file entries that were not imported, with the reason."
+              }
+            }
+          }
+        ],
+        "description": "Import summary of a BIND zone file.",
+        "example": {
+          "records_added": 3,
+          "records_removed": 0,
+          "records_skipped": 0,
+          "skipped": [],
+          "zones_created": 0,
+          "zones_updated": 1
+        }
+      },
+      "ChangeEvent": {
+        "type": "object",
+        "description": "One changelog entry; also the event broadcast after every mutation.",
+        "required": [
+          "offset",
+          "ts",
+          "actor",
+          "actor_ip",
+          "action",
+          "entity",
+          "zone",
+          "entity_id",
+          "payload",
+          "txn",
+          "command"
+        ],
+        "properties": {
+          "offset": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Monotonic, never reused (WAL-style cursor)."
+          },
+          "ts": {
+            "type": "string",
+            "format": "date-time",
+            "example": "2026-01-15T09:30:00.000Z"
+          },
+          "actor": {
+            "type": "string"
+          },
+          "actor_ip": {
+            "type": "string"
+          },
+          "action": {
+            "type": "string",
+            "description": "create | update | delete | import"
+          },
+          "entity": {
+            "type": "string",
+            "description": "zone | record | member | ..."
+          },
+          "zone": {
+            "type": "string"
+          },
+          "entity_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "payload": {
+            "type": "object",
+            "description": "The exact committed fact, tagged by `kind`: zone_created, zone_updated,\nzone_deleted, record_created, record_updated, record_deleted,\nserial_bumped, member_set, member_removed."
+          },
+          "txn": {
+            "type": "string",
+            "description": "Shared by every row committed in the same transaction."
+          },
+          "command": {
+            "type": "string",
+            "description": "Operation that produced the change (create_record, import, ...)."
+          }
+        },
+        "example": {
+          "action": "create",
+          "actor": "root",
+          "actor_ip": "192.0.2.1",
+          "command": "create_record",
+          "entity": "record",
+          "entity_id": 42,
+          "offset": 17,
+          "payload": {
+            "kind": "record_created",
+            "record": {
+              "created_at": "2026-01-15T09:30:00.000Z",
+              "expires_at": null,
+              "id": 42,
+              "name": "www",
+              "ttl": 300,
+              "type": "A",
+              "updated_at": "2026-01-15T09:30:00.000Z",
+              "value": "192.0.2.10",
+              "zone_id": 1
+            }
+          },
+          "ts": "2026-01-15T10:02:11.482Z",
+          "txn": "01J0Z8X4K5T3",
+          "zone": "example.com"
+        }
+      },
+      "ChangelogPage": {
+        "type": "object",
+        "description": "Change log entries plus retention bounds.",
+        "required": [
+          "entries",
+          "oldest_offset",
+          "latest_offset",
+          "resync_required"
+        ],
+        "properties": {
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChangeEvent"
+            }
+          },
+          "oldest_offset": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "latest_offset": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "resync_required": {
+            "type": "boolean",
+            "description": "`after` fell behind retention; refetch full state."
+          }
+        }
+      },
+      "ChangelogStatus": {
+        "type": "object",
+        "required": [
+          "oldest_offset",
+          "latest_offset",
+          "head",
+          "retention_days"
+        ],
+        "properties": {
+          "oldest_offset": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "latest_offset": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "head": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "retention_days": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "CodeBody": {
+        "type": "object",
+        "required": [
+          "code"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "6-digit TOTP code (or, for /auth/mfa, a recovery code).",
+            "example": "123456"
+          }
+        },
+        "example": {
+          "code": "123456"
+        }
+      },
+      "DeletedStatus": {
+        "type": "string",
+        "description": "Always `deleted`.",
+        "enum": [
+          "deleted"
+        ]
+      },
+      "DnsCounters": {
+        "type": "object",
+        "description": "DNS counters since start.",
+        "required": [
+          "queries",
+          "udp",
+          "tcp",
+          "authoritative",
+          "forwarded",
+          "cache_hits",
+          "refused",
+          "nxdomain",
+          "errors",
+          "rate_limited",
+          "truncated",
+          "bad_cookie",
+          "transfers",
+          "notifies"
+        ],
+        "properties": {
+          "queries": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Queries received.",
+            "minimum": 0
+          },
+          "udp": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Queries over UDP.",
+            "minimum": 0
+          },
+          "tcp": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Queries over TCP.",
+            "minimum": 0
+          },
+          "authoritative": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Authoritative answers.",
+            "minimum": 0
+          },
+          "forwarded": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Answers forwarded to an upstream resolver.",
+            "minimum": 0
+          },
+          "cache_hits": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Forwarded answers served from the cache.",
+            "minimum": 0
+          },
+          "refused": {
+            "type": "integer",
+            "format": "int64",
+            "description": "REFUSED answers.",
+            "minimum": 0
+          },
+          "nxdomain": {
+            "type": "integer",
+            "format": "int64",
+            "description": "NXDOMAIN answers.",
+            "minimum": 0
+          },
+          "errors": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Malformed or failed queries.",
+            "minimum": 0
+          },
+          "rate_limited": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Queries dropped by rate limiting.",
+            "minimum": 0
+          },
+          "truncated": {
+            "type": "integer",
+            "format": "int64",
+            "description": "UDP responses truncated.",
+            "minimum": 0
+          },
+          "bad_cookie": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Requests with an invalid or malformed DNS cookie.",
+            "minimum": 0
+          },
+          "transfers": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Zone transfers (AXFR) served.",
+            "minimum": 0
+          },
+          "notifies": {
+            "type": "integer",
+            "format": "int64",
+            "description": "NOTIFY messages sent.",
+            "minimum": 0
+          }
+        }
+      },
+      "EnrollPayload": {
+        "type": "object",
+        "description": "TOTP enrollment data.",
+        "required": [
+          "secret",
+          "otpauth_uri",
+          "qr_svg"
+        ],
+        "properties": {
+          "secret": {
+            "type": "string",
+            "description": "Base32 TOTP secret."
+          },
+          "otpauth_uri": {
+            "type": "string"
+          },
+          "qr_svg": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "SVG QR code of `otpauth_uri` (null if it could not be rendered)."
+          }
+        },
+        "example": {
+          "otpauth_uri": "otpauth://totp/rust-dns:alice?secret=JBSWY3DPEHPK3PXP&issuer=rust-dns",
+          "qr_svg": "<svg xmlns=\"http://www.w3.org/2000/svg\" ...></svg>",
+          "secret": "JBSWY3DPEHPK3PXP"
+        }
+      },
+      "EnrollVerifyResponse": {
+        "type": "object",
+        "required": [
+          "status",
+          "user",
+          "recovery_codes"
+        ],
+        "properties": {
+          "status": {
+            "$ref": "#/components/schemas/OkStatus"
+          },
+          "user": {
+            "$ref": "#/components/schemas/User"
+          },
+          "recovery_codes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Shown once."
+          }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "description": "Every non-2xx JSON error has this shape.",
+        "required": [
+          "error",
+          "code"
+        ],
+        "properties": {
+          "error": {
+            "type": "string",
+            "description": "Human-readable message."
+          },
+          "code": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ErrorCode",
+                "description": "Machine-readable reason when one applies: `login_required`,\n`mfa_required`, `enroll_required` (401) or `csrf` (403, cookie write\nwithout `X-Requested-With: rust-dns`). `invalid_request`: the request\ncould not be parsed (malformed JSON, wrong field type or value,\nunparsable path or query parameter, missing JSON content type)."
+              }
+            ]
+          }
+        },
+        "example": {
+          "code": null,
+          "error": "zone 'example.org' not found"
+        }
+      },
+      "ErrorCode": {
+        "type": "string",
+        "description": "Machine-readable reason carried by some errors.",
+        "enum": [
+          "login_required",
+          "mfa_required",
+          "enroll_required",
+          "csrf",
+          "invalid_request"
+        ]
+      },
+      "ExportDoc": {
+        "type": "object",
+        "description": "JSON export / import document.",
+        "required": [
+          "version",
+          "exported_at",
+          "zones"
+        ],
+        "properties": {
+          "version": {
+            "type": "integer",
+            "format": "int32",
+            "example": 1,
+            "minimum": 0
+          },
+          "exported_at": {
+            "type": "string",
+            "format": "date-time",
+            "example": "2026-01-15T09:30:00.000Z"
+          },
+          "zones": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ExportZone"
+            }
+          }
+        },
+        "example": {
+          "exported_at": "2026-01-15T09:30:00.000Z",
+          "version": 1,
+          "zones": [
+            {
+              "default_ttl": 3600,
+              "name": "example.com",
+              "records": [
+                {
+                  "name": "@",
+                  "type": "NS",
+                  "value": "ns1.example.com."
+                },
+                {
+                  "name": "www",
+                  "ttl": 300,
+                  "type": "A",
+                  "value": "192.0.2.10"
+                },
+                {
+                  "name": "www",
+                  "type": "AAAA",
+                  "value": "2001:db8::10"
+                },
+                {
+                  "name": "@",
+                  "type": "MX",
+                  "value": "10 mail.example.com."
+                }
+              ],
+              "soa_mname": "ns1.example.com.",
+              "soa_rname": "hostmaster.example.com."
+            }
+          ]
+        }
+      },
+      "ExportRecord": {
+        "type": "object",
+        "description": "One record of an export document; `ttl: null` (or omitted) means the\nzone default.",
+        "required": [
+          "name",
+          "type",
+          "value"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "type": {
+            "$ref": "#/components/schemas/RecordType"
+          },
+          "value": {
+            "type": "string"
+          },
+          "ttl": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "expires_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Exported expiry. Records already expired at import time are skipped."
+          }
+        }
+      },
+      "ExportZone": {
+        "type": "object",
+        "description": "One zone of an export document. On import, omitted SOA fields fall back\nto the server defaults (new zones) or are left unchanged.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "serial": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "maximum": 4294967295,
+            "minimum": 0
+          },
+          "soa_mname": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "soa_rname": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "refresh": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "retry": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "expire": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "minimum": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "default_ttl": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "owner": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "records": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ExportRecord"
+            },
+            "default": []
+          }
+        }
+      },
+      "ForwardCacheStatus": {
+        "type": "object",
+        "required": [
+          "entries",
+          "capacity",
+          "hits",
+          "misses"
+        ],
+        "properties": {
+          "entries": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "capacity": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "hits": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "misses": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "ForwardingFileValues": {
+        "type": "object",
+        "description": "Forwarding values from the config file (shown next to an override).",
+        "required": [
+          "upstreams",
+          "allowed_clients",
+          "timeout_ms"
+        ],
+        "properties": {
+          "upstreams": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "allowed_clients": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "ForwardingInput": {
+        "type": "object",
+        "description": "New forwarding settings. Upstreams are IP addresses with an optional port\n(53 when omitted): `1.1.1.1`, `8.8.8.8:53`, `2606:4700:4700::1111`,\n`[2001:4860:4860::8888]:53`. Host names are not accepted.",
+        "required": [
+          "upstreams",
+          "allowed_clients",
+          "timeout_ms"
+        ],
+        "properties": {
+          "upstreams": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "At most 8, tried in order. An empty list turns forwarding off."
+          },
+          "allowed_clients": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "CIDR networks or single addresses. `0.0.0.0/0` and `::/0` are refused (open resolver)."
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "100 to 30000.",
+            "minimum": 0
+          }
+        },
+        "example": {
+          "allowed_clients": [
+            "192.168.0.0/16",
+            "fd00::/8"
+          ],
+          "timeout_ms": 2000,
+          "upstreams": [
+            "1.1.1.1",
+            "[2606:4700:4700::1111]:53"
+          ]
+        }
+      },
+      "ForwardingStatus": {
+        "type": "object",
+        "required": [
+          "upstreams",
+          "allowed_clients"
+        ],
+        "properties": {
+          "upstreams": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "allowed_clients": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ForwardingView": {
+        "type": "object",
+        "description": "Forwarding settings in effect.",
+        "required": [
+          "upstreams",
+          "allowed_clients",
+          "timeout_ms",
+          "source",
+          "updated_by",
+          "updated_at",
+          "config"
+        ],
+        "properties": {
+          "upstreams": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Upstream resolvers in effect, `ip:port`, tried in order. Empty: foreign names are refused.",
+            "example": [
+              "192.168.44.99:53",
+              "8.8.8.8:53"
+            ]
+          },
+          "allowed_clients": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Client networks allowed to use forwarding.",
+            "example": [
+              "192.168.0.0/16"
+            ]
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Timeout per upstream, milliseconds.",
+            "minimum": 0
+          },
+          "source": {
+            "$ref": "#/components/schemas/SettingSource"
+          },
+          "updated_by": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Who saved the override (`null` when the config file applies)."
+          },
+          "updated_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When the override was saved (`null` when the config file applies)."
+          },
+          "config": {
+            "$ref": "#/components/schemas/ForwardingFileValues",
+            "description": "The config file's values, for comparison and reset."
+          }
+        }
+      },
+      "GlobalPerm": {
+        "type": "string",
+        "description": "Something a caller may do outside any one zone.",
+        "enum": [
+          "create_zones",
+          "transfer_ownership",
+          "manage_users",
+          "view_audit",
+          "server_admin",
+          "manage_own_tokens",
+          "change_own_password",
+          "manage_own_mfa",
+          "manage_own_sessions"
+        ]
+      },
+      "GlobalRight": {
+        "type": "object",
+        "description": "One account-level permission and whether the user holds it.",
+        "required": [
+          "perm",
+          "label",
+          "allowed",
+          "reason",
+          "requires_admin",
+          "requires_session"
+        ],
+        "properties": {
+          "perm": {
+            "$ref": "#/components/schemas/GlobalPerm"
+          },
+          "label": {
+            "type": "string"
+          },
+          "allowed": {
+            "type": "boolean"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why it is denied."
+          },
+          "requires_admin": {
+            "type": "boolean"
+          },
+          "requires_session": {
+            "type": "boolean"
+          }
+        }
+      },
+      "Health": {
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "$ref": "#/components/schemas/OkOrError"
+          },
+          "version": {
+            "type": "string",
+            "description": "Present when ok."
+          },
+          "database": {
+            "type": "string",
+            "description": "`unavailable` on error."
+          }
+        },
+        "example": {
+          "status": "ok",
+          "version": "0.1.0"
+        }
+      },
+      "ImportSummary": {
+        "type": "object",
+        "description": "What an import changed.",
+        "required": [
+          "zones_created",
+          "zones_updated",
+          "records_added",
+          "records_removed",
+          "records_skipped"
+        ],
+        "properties": {
+          "zones_created": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "zones_updated": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "records_added": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "records_removed": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "records_skipped": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "example": {
+          "records_added": 3,
+          "records_removed": 0,
+          "records_skipped": 0,
+          "zones_created": 0,
+          "zones_updated": 1
+        }
+      },
+      "IntegrityResult": {
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "$ref": "#/components/schemas/OkOrError"
+          },
+          "detail": {
+            "type": "string",
+            "description": "What failed (only on error)."
+          }
+        },
+        "example": {
+          "status": "ok"
+        }
+      },
+      "ListenerStatus": {
+        "type": "object",
+        "required": [
+          "bind",
+          "port",
+          "udp",
+          "tcp"
+        ],
+        "properties": {
+          "bind": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "port": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "udp": {
+            "type": "boolean"
+          },
+          "tcp": {
+            "type": "boolean"
+          }
+        }
+      },
+      "LoginBody": {
+        "type": "object",
+        "required": [
+          "username",
+          "password"
+        ],
+        "properties": {
+          "username": {
+            "type": "string",
+            "example": "root"
+          },
+          "password": {
+            "type": "string",
+            "format": "password",
+            "example": "rootpass123"
+          }
+        },
+        "example": {
+          "password": "rootpass123",
+          "username": "root"
+        }
+      },
+      "LoginResponse": {
+        "type": "object",
+        "required": [
+          "status",
+          "user",
+          "enroll"
+        ],
+        "properties": {
+          "status": {
+            "$ref": "#/components/schemas/LoginStatus",
+            "description": "`ok`: signed in. `mfa_required`: POST /auth/mfa next.\n`enroll_required`: scan `enroll` and POST /auth/enroll."
+          },
+          "user": {
+            "$ref": "#/components/schemas/User"
+          },
+          "enroll": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EnrollPayload",
+                "description": "TOTP enrollment data; non-null only when `status` is `enroll_required`."
+              }
+            ]
+          }
+        },
+        "example": {
+          "enroll": null,
+          "status": "ok",
+          "user": {
+            "created_at": "2026-01-15T09:30:00.000Z",
+            "disabled_at": null,
+            "display_name": "",
+            "id": 1,
+            "is_admin": true,
+            "is_root": true,
+            "mfa_enrolled": false,
+            "mfa_required": false,
+            "totp_enrolled_at": null,
+            "username": "root"
+          }
+        }
+      },
+      "LoginStatus": {
+        "type": "string",
+        "description": "Next step after the password was accepted.",
+        "enum": [
+          "ok",
+          "mfa_required",
+          "enroll_required"
+        ]
+      },
+      "Member": {
+        "type": "object",
+        "description": "A user granted access to a zone that is not its owner.",
+        "required": [
+          "user_id",
+          "username",
+          "role",
+          "created_at"
+        ],
+        "properties": {
+          "user_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "username": {
+            "type": "string"
+          },
+          "role": {
+            "$ref": "#/components/schemas/MemberRole",
+            "description": "editor | viewer"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "example": "2026-01-15T09:30:00.000Z"
+          }
+        },
+        "example": {
+          "created_at": "2026-01-15T09:30:00.000Z",
+          "role": "editor",
+          "user_id": 2,
+          "username": "alice"
+        }
+      },
+      "MemberBody": {
+        "type": "object",
+        "required": [
+          "role"
+        ],
+        "properties": {
+          "role": {
+            "$ref": "#/components/schemas/MemberRole",
+            "description": "`editor` or `viewer`."
+          }
+        },
+        "example": {
+          "role": "editor"
+        }
+      },
+      "MemberList": {
+        "type": "object",
+        "required": [
+          "members"
+        ],
+        "properties": {
+          "members": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Member"
+            }
+          }
+        },
+        "example": {
+          "members": [
+            {
+              "created_at": "2026-01-15T09:30:00.000Z",
+              "role": "editor",
+              "user_id": 2,
+              "username": "alice"
+            }
+          ]
+        }
+      },
+      "MemberRole": {
+        "type": "string",
+        "description": "Role of a zone member (the owner is not a member).",
+        "enum": [
+          "editor",
+          "viewer"
+        ],
+        "example": "editor"
+      },
+      "MfaVerifyResponse": {
+        "type": "object",
+        "required": [
+          "status",
+          "user",
+          "recovery_codes_left",
+          "used_recovery_code"
+        ],
+        "properties": {
+          "status": {
+            "$ref": "#/components/schemas/OkStatus"
+          },
+          "user": {
+            "$ref": "#/components/schemas/User"
+          },
+          "recovery_codes_left": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "used_recovery_code": {
+            "type": "boolean",
+            "description": "True when a one-time recovery code (not a TOTP code) was used."
+          }
+        }
+      },
+      "OkOrError": {
+        "type": "string",
+        "description": "`ok` or `error`.",
+        "enum": [
+          "ok",
+          "error"
+        ]
+      },
+      "OkStatus": {
+        "type": "string",
+        "description": "Always `ok`.",
+        "enum": [
+          "ok"
+        ]
+      },
+      "PasswordBody": {
+        "type": "object",
+        "required": [
+          "current_password",
+          "new_password"
+        ],
+        "properties": {
+          "current_password": {
+            "type": "string",
+            "format": "password",
+            "example": "rootpass123"
+          },
+          "new_password": {
+            "type": "string",
+            "format": "password",
+            "example": "a-new-long-password",
+            "minLength": 8
+          }
+        },
+        "example": {
+          "current_password": "rootpass123",
+          "new_password": "a-new-long-password"
+        }
+      },
+      "QueryEvent": {
+        "type": "object",
+        "description": "Emitted for every DNS query the server answers (streamed over `/ws`).",
+        "required": [
+          "ts",
+          "client",
+          "proto",
+          "name",
+          "qtype",
+          "rcode",
+          "answers",
+          "result",
+          "source",
+          "duration_us"
+        ],
+        "properties": {
+          "ts": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "client": {
+            "type": "string"
+          },
+          "proto": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "qtype": {
+            "type": "string"
+          },
+          "rcode": {
+            "type": "string"
+          },
+          "answers": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "result": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "What was returned, one entry per answer record in presentation form\n(\"A 192.0.2.10\", \"CNAME www.example.com.\"), plus notes for referrals\nand truncation. Capped in length; empty for negative answers."
+          },
+          "source": {
+            "type": "string",
+            "description": "auth | forward | refused | error"
+          },
+          "duration_us": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "RateLimitStatus": {
+        "type": "object",
+        "required": [
+          "tracked_addresses",
+          "max_tracked_addresses",
+          "max_resolutions_per_second_per_address"
+        ],
+        "properties": {
+          "tracked_addresses": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "max_tracked_addresses": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "max_resolutions_per_second_per_address": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "Record": {
+        "type": "object",
+        "description": "A record as stored. `name` is relative to the zone: `@` for the apex,\n`www`, `*`, `_sip._tcp` and so on.",
+        "required": [
+          "id",
+          "zone_id",
+          "name",
+          "type",
+          "value",
+          "ttl",
+          "created_at",
+          "updated_at",
+          "expires_at"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "zone_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "name": {
+            "type": "string",
+            "description": "Relative to the zone: `@` (apex), `www`, `*.apps`, `_sip._tcp`."
+          },
+          "type": {
+            "$ref": "#/components/schemas/RecordType"
+          },
+          "value": {
+            "type": "string",
+            "description": "Presentation format, e.g. `10 mail.example.com.` for MX."
+          },
+          "ttl": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The record's TTL; `null` means the zone default TTL applies.",
+            "minimum": 0
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "example": "2026-01-15T09:30:00.000Z"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "example": "2026-01-15T09:30:00.000Z"
+          },
+          "expires_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When the record stops being served (RFC 3339, UTC); `null` = never.\nExpired records stay visible in the console and are deleted after\n`[expiry].retention_days` (default 30).",
+            "example": "2026-10-01T00:00:00.000Z"
+          }
+        },
+        "example": {
+          "created_at": "2026-01-15T09:30:00.000Z",
+          "expires_at": null,
+          "id": 42,
+          "name": "www",
+          "ttl": 300,
+          "type": "A",
+          "updated_at": "2026-01-15T09:30:00.000Z",
+          "value": "192.0.2.10",
+          "zone_id": 1
+        }
+      },
+      "RecordInput": {
+        "type": "object",
+        "description": "Input for creating or updating a record. Create: `type` is required,\n`name` defaults to `@`. Update: omitted fields keep their current values,\nincluding `ttl`; `\"ttl\": null` switches to the zone default.",
+        "properties": {
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "example": "www"
+          },
+          "type": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RecordType"
+              }
+            ]
+          },
+          "value": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "example": "192.0.2.10"
+          },
+          "ttl": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Omitted: keep the current TTL (update) or use the zone default (create).\n`null`: zone default. A number: that TTL.",
+            "example": 300,
+            "minimum": 0
+          },
+          "expires_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When the record stops being served, RFC 3339 (e.g. \"2026-10-01T00:00:00Z\").\nAbsent: keep the current expiry (update) or never expire (create).\n`null`: never expire. Must be in the future. Do not combine with\n`expires_in`.",
+            "example": "2026-10-01T00:00:00Z"
+          },
+          "expires_in": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Alternative to `expires_at`: seconds from now.",
+            "example": 86400,
+            "minimum": 1
+          }
+        },
+        "example": {
+          "name": "www",
+          "ttl": 300,
+          "type": "A",
+          "value": "192.0.2.10"
+        }
+      },
+      "RecordPage": {
+        "type": "object",
+        "description": "A page of records.",
+        "required": [
+          "records",
+          "total",
+          "offset",
+          "limit"
+        ],
+        "properties": {
+          "records": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Record"
+            }
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Matches before paging."
+          },
+          "offset": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "example": {
+          "limit": 500,
+          "offset": 0,
+          "records": [
+            {
+              "created_at": "2026-01-15T09:30:00.000Z",
+              "expires_at": null,
+              "id": 42,
+              "name": "www",
+              "ttl": 300,
+              "type": "A",
+              "updated_at": "2026-01-15T09:30:00.000Z",
+              "value": "192.0.2.10",
+              "zone_id": 1
+            }
+          ],
+          "total": 1
+        }
+      },
+      "RecordType": {
+        "type": "string",
+        "description": "Record types the server stores and serves.",
+        "enum": [
+          "A",
+          "AAAA",
+          "CNAME",
+          "DNAME",
+          "PTR",
+          "NS",
+          "MX",
+          "TXT",
+          "SRV",
+          "CAA",
+          "HTTPS",
+          "SVCB",
+          "TLSA",
+          "SSHFP",
+          "NAPTR",
+          "HINFO"
+        ],
+        "example": "A"
+      },
+      "RecoveryCodes": {
+        "type": "object",
+        "required": [
+          "recovery_codes"
+        ],
+        "properties": {
+          "recovery_codes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Shown once; the previous codes stop working."
+          }
+        },
+        "example": {
+          "recovery_codes": [
+            "abcd-efgh-ijkl",
+            "mnop-qrst-uvwx"
+          ]
+        }
+      },
+      "ReloadResult": {
+        "type": "object",
+        "required": [
+          "status",
+          "notes"
+        ],
+        "properties": {
+          "status": {
+            "$ref": "#/components/schemas/OkStatus"
+          },
+          "notes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "What changed / what needs a restart."
+          }
+        }
+      },
+      "RevokedCount": {
+        "type": "object",
+        "required": [
+          "status",
+          "revoked"
+        ],
+        "properties": {
+          "status": {
+            "$ref": "#/components/schemas/OkStatus"
+          },
+          "revoked": {
+            "type": "integer",
+            "description": "Number of sessions signed out.",
+            "minimum": 0
+          }
+        },
+        "example": {
+          "revoked": 2,
+          "status": "ok"
+        }
+      },
+      "Rights": {
+        "type": "object",
+        "description": "Effective rights of a user (or of their API tokens).",
+        "required": [
+          "user",
+          "via",
+          "active_tokens",
+          "global",
+          "zones",
+          "zone_permissions",
+          "notes"
+        ],
+        "properties": {
+          "user": {
+            "$ref": "#/components/schemas/User"
+          },
+          "via": {
+            "$ref": "#/components/schemas/AuthVia"
+          },
+          "active_tokens": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "global": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GlobalRight"
+            }
+          },
+          "zones": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ZoneRights"
+            }
+          },
+          "zone_permissions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ZonePermInfo"
+            },
+            "description": "Legend: every zone permission and the minimum role it needs."
+          },
+          "notes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "RoleSource": {
+        "type": "string",
+        "description": "Where a zone role comes from.",
+        "enum": [
+          "administrator",
+          "owner",
+          "member"
+        ]
+      },
+      "ServerStatus": {
+        "type": "object",
+        "description": "Server status, counters and runtime settings.",
+        "required": [
+          "version",
+          "uptime_secs",
+          "zones",
+          "records",
+          "visible_zones",
+          "changelog",
+          "dns",
+          "forward_cache",
+          "rate_limit",
+          "listeners",
+          "forwarding",
+          "transfer",
+          "auto_ptr",
+          "cookies",
+          "nsid",
+          "catalog_built_at"
+        ],
+        "properties": {
+          "version": {
+            "type": "string"
+          },
+          "uptime_secs": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "zones": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "records": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "visible_zones": {
+            "type": "integer",
+            "description": "Zones the caller can see.",
+            "minimum": 0
+          },
+          "changelog": {
+            "$ref": "#/components/schemas/ChangelogStatus"
+          },
+          "dns": {
+            "$ref": "#/components/schemas/DnsCounters"
+          },
+          "forward_cache": {
+            "$ref": "#/components/schemas/ForwardCacheStatus"
+          },
+          "rate_limit": {
+            "$ref": "#/components/schemas/RateLimitStatus"
+          },
+          "listeners": {
+            "$ref": "#/components/schemas/ListenerStatus"
+          },
+          "forwarding": {
+            "$ref": "#/components/schemas/ForwardingStatus"
+          },
+          "transfer": {
+            "$ref": "#/components/schemas/TransferStatus"
+          },
+          "auto_ptr": {
+            "type": "boolean"
+          },
+          "cookies": {
+            "type": "boolean",
+            "description": "Whether DNS cookies (RFC 7873) are enabled."
+          },
+          "nsid": {
+            "type": "string",
+            "description": "EDNS NSID reply; empty when off."
+          },
+          "catalog_built_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the in-memory zone catalog was last rebuilt."
+          }
+        }
+      },
+      "SessionEntry": {
+        "type": "object",
+        "description": "A signed-in browser session.",
+        "required": [
+          "id",
+          "ip",
+          "user_agent",
+          "created_at",
+          "last_seen_at",
+          "expires_at",
+          "current"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "ip": {
+            "type": "string"
+          },
+          "user_agent": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "example": "2026-01-15T09:30:00.000Z"
+          },
+          "last_seen_at": {
+            "type": "string",
+            "format": "date-time",
+            "example": "2026-01-15T09:30:00.000Z"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "example": "2026-01-15T09:30:00.000Z"
+          },
+          "current": {
+            "type": "boolean",
+            "description": "True for the session making this request (always false in the admin view)."
+          }
+        },
+        "example": {
+          "created_at": "2026-01-15T09:30:00.000Z",
+          "current": true,
+          "expires_at": "2026-01-16T09:30:00.000Z",
+          "id": 3,
+          "ip": "192.0.2.1",
+          "last_seen_at": "2026-01-15T10:02:11.482Z",
+          "user_agent": "Mozilla/5.0"
+        }
+      },
+      "SessionInfo": {
+        "type": "object",
+        "description": "`user` and `enroll` are absent when `status` is `anonymous`.",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "$ref": "#/components/schemas/SessionStatus"
+          },
+          "user": {
+            "$ref": "#/components/schemas/User"
+          },
+          "enroll": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EnrollPayload",
+                "description": "TOTP enrollment data; non-null only when `status` is `enroll_required`."
+              }
+            ]
+          }
+        },
+        "example": {
+          "enroll": null,
+          "status": "ok",
+          "user": {
+            "created_at": "2026-01-15T09:30:00.000Z",
+            "disabled_at": null,
+            "display_name": "",
+            "id": 1,
+            "is_admin": true,
+            "is_root": true,
+            "mfa_enrolled": false,
+            "mfa_required": false,
+            "totp_enrolled_at": null,
+            "username": "root"
+          }
+        }
+      },
+      "SessionList": {
+        "type": "object",
+        "required": [
+          "sessions"
+        ],
+        "properties": {
+          "sessions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SessionEntry"
+            }
+          }
+        }
+      },
+      "SessionStatus": {
+        "type": "string",
+        "description": "State of the cookie session.",
+        "enum": [
+          "anonymous",
+          "ok",
+          "mfa_required",
+          "enroll_required"
+        ]
+      },
+      "SettingSource": {
+        "type": "string",
+        "description": "Where the forwarding settings in effect come from.",
+        "enum": [
+          "config",
+          "console"
+        ]
+      },
+      "StatusResponse": {
+        "type": "object",
+        "description": "Acknowledgement of an action without further data.",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "$ref": "#/components/schemas/StatusValue"
+          }
+        },
+        "example": {
+          "status": "ok"
+        }
+      },
+      "StatusValue": {
+        "type": "string",
+        "description": "Outcome of a simple action.",
+        "enum": [
+          "ok",
+          "revoked",
+          "deleted"
+        ]
+      },
+      "TokenBody": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "example": "ci-deploy",
+            "maxLength": 100
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Optional labels: at most 16, each 1-256 characters of `[A-Za-z0-9_-]`\nafter trimming (case is kept); duplicates are dropped.",
+            "example": [
+              "ci",
+              "deploy"
+            ],
+            "maxItems": 16
+          }
+        },
+        "example": {
+          "name": "ci-deploy",
+          "tags": [
+            "ci",
+            "deploy"
+          ]
+        }
+      },
+      "TokenCreated": {
+        "type": "object",
+        "required": [
+          "token",
+          "info"
+        ],
+        "properties": {
+          "token": {
+            "type": "string",
+            "description": "Plaintext `rdns_...` token; shown only once. Send as\n`Authorization: Bearer <token>`."
+          },
+          "info": {
+            "$ref": "#/components/schemas/TokenInfo"
+          }
+        },
+        "example": {
+          "info": {
+            "created_at": "2026-01-15T09:30:00.000Z",
+            "id": 7,
+            "last_used_at": null,
+            "last_used_ip": null,
+            "name": "ci-deploy",
+            "revoked_at": null,
+            "tags": [
+              "ci",
+              "deploy"
+            ],
+            "user_id": 1
+          },
+          "token": "rdns_3q2+7w..."
+        }
+      },
+      "TokenInfo": {
+        "type": "object",
+        "description": "An API token (never includes the secret).",
+        "required": [
+          "id",
+          "user_id",
+          "name",
+          "tags",
+          "created_at",
+          "last_used_at",
+          "last_used_ip",
+          "revoked_at"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "user_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "name": {
+            "type": "string"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Labels for finding and grouping tokens (`[A-Za-z0-9_-]`, case kept,\n1-256 characters each, at most 16, sorted and de-duplicated).",
+            "example": [
+              "ci",
+              "deploy"
+            ],
+            "maxItems": 16
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "example": "2026-01-15T09:30:00.000Z"
+          },
+          "last_used_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Last successful authentication with this token. Refreshed at most once\na minute (immediately when the client IP changes), so it may lag\nreal use by up to 60 seconds. `null`: never used."
+          },
+          "last_used_ip": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Client IP of the last successful authentication (after trusted-proxy\nresolution). `null`: never used.",
+            "example": "192.0.2.10"
+          },
+          "revoked_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          }
+        },
+        "example": {
+          "created_at": "2026-01-15T09:30:00.000Z",
+          "id": 7,
+          "last_used_at": "2026-01-16T08:00:00.000Z",
+          "last_used_ip": "192.0.2.10",
+          "name": "ci-deploy",
+          "revoked_at": null,
+          "tags": [
+            "ci",
+            "deploy"
+          ],
+          "user_id": 1
+        }
+      },
+      "TokenList": {
+        "type": "object",
+        "required": [
+          "tokens"
+        ],
+        "properties": {
+          "tokens": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TokenListEntry"
+            }
+          }
+        },
+        "example": {
+          "tokens": [
+            {
+              "created_at": "2026-01-15T09:30:00.000Z",
+              "id": 7,
+              "last_used_at": "2026-01-16T08:00:00.000Z",
+              "last_used_ip": "192.0.2.10",
+              "name": "ci-deploy",
+              "revoked_at": null,
+              "tags": [
+                "ci",
+                "deploy"
+              ],
+              "user_id": 1,
+              "username": "root"
+            }
+          ]
+        }
+      },
+      "TokenListEntry": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/TokenInfo"
+          },
+          {
+            "type": "object",
+            "required": [
+              "username"
+            ],
+            "properties": {
+              "username": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Owner username."
+              }
+            }
+          }
+        ]
+      },
+      "TokenUpdateBody": {
+        "type": "object",
+        "required": [
+          "tags"
+        ],
+        "properties": {
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The complete new tag list (replaces the old one; `[]` clears it).\nAt most 16, each 1-256 characters of `[A-Za-z0-9_-]` after trimming\n(case is kept); duplicates are dropped.",
+            "example": [
+              "ci",
+              "deploy",
+              "prod"
+            ],
+            "maxItems": 16
+          }
+        },
+        "example": {
+          "tags": [
+            "ci",
+            "deploy",
+            "prod"
+          ]
+        }
+      },
+      "TransferStatus": {
+        "type": "object",
+        "required": [
+          "allow",
+          "notify"
+        ],
+        "properties": {
+          "allow": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "notify": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "UpstreamTestInput": {
+        "type": "object",
+        "description": "Upstreams to probe before saving.",
+        "required": [
+          "upstreams"
+        ],
+        "properties": {
+          "upstreams": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Per-upstream timeout, milliseconds (default 2000, 100 to 30000).",
+            "minimum": 0
+          }
+        },
+        "example": {
+          "timeout_ms": 1500,
+          "upstreams": [
+            "1.1.1.1",
+            "8.8.8.8:53"
+          ]
+        }
+      },
+      "UpstreamTestReport": {
+        "type": "object",
+        "required": [
+          "results"
+        ],
+        "properties": {
+          "results": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UpstreamTestResult"
+            }
+          }
+        }
+      },
+      "UpstreamTestResult": {
+        "type": "object",
+        "required": [
+          "upstream",
+          "ok",
+          "ms",
+          "rcode",
+          "error"
+        ],
+        "properties": {
+          "upstream": {
+            "type": "string",
+            "description": "As entered."
+          },
+          "ok": {
+            "type": "boolean",
+            "description": "True when the upstream answered a recursive query for `. NS`."
+          },
+          "ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Round-trip time in milliseconds when it answered.",
+            "minimum": 0
+          },
+          "rcode": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Response code when it answered, e.g. \"No Error\"."
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why it failed."
+          }
+        }
+      },
+      "User": {
+        "type": "object",
+        "description": "A user account as the API shows it (no secrets).",
+        "required": [
+          "id",
+          "username",
+          "display_name",
+          "is_admin",
+          "is_root",
+          "mfa_required",
+          "mfa_enrolled",
+          "totp_enrolled_at",
+          "disabled_at",
+          "created_at"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "username": {
+            "type": "string"
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "is_admin": {
+            "type": "boolean"
+          },
+          "is_root": {
+            "type": "boolean"
+          },
+          "mfa_required": {
+            "type": "boolean",
+            "description": "The user must enroll a TOTP authenticator at the next sign-in."
+          },
+          "mfa_enrolled": {
+            "type": "boolean"
+          },
+          "totp_enrolled_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "disabled_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "example": "2026-01-15T09:30:00.000Z"
+          }
+        },
+        "example": {
+          "created_at": "2026-01-15T09:30:00.000Z",
+          "disabled_at": null,
+          "display_name": "Alice Example",
+          "id": 2,
+          "is_admin": false,
+          "is_root": false,
+          "mfa_enrolled": false,
+          "mfa_required": false,
+          "totp_enrolled_at": null,
+          "username": "alice"
+        }
+      },
+      "UserBody": {
+        "type": "object",
+        "description": "Create: `username` and `password` (min. 8 characters) are required.\nUpdate: every field is optional; setting `password` or `disabled: true`\nsigns the user out everywhere. The root account's password is managed in\nthe config file.",
+        "properties": {
+          "username": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Create only; ignored on update.",
+            "example": "alice"
+          },
+          "password": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "password",
+            "example": "correct-horse-battery",
+            "minLength": 8
+          },
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "example": "Alice Example",
+            "maxLength": 100
+          },
+          "is_admin": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "example": false
+          },
+          "mfa_required": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "The user must enroll a TOTP authenticator at the next sign-in.",
+            "example": false
+          },
+          "disabled": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Update only.",
+            "example": false
+          }
+        }
+      },
+      "UserList": {
+        "type": "object",
+        "required": [
+          "users"
+        ],
+        "properties": {
+          "users": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/User"
+            }
+          }
+        },
+        "example": {
+          "users": [
+            {
+              "created_at": "2026-01-15T09:30:00.000Z",
+              "disabled_at": null,
+              "display_name": "",
+              "id": 1,
+              "is_admin": true,
+              "is_root": true,
+              "mfa_enrolled": false,
+              "mfa_required": false,
+              "totp_enrolled_at": null,
+              "username": "root"
+            },
+            {
+              "created_at": "2026-01-15T09:30:00.000Z",
+              "disabled_at": null,
+              "display_name": "Alice Example",
+              "id": 2,
+              "is_admin": false,
+              "is_root": false,
+              "mfa_enrolled": false,
+              "mfa_required": false,
+              "totp_enrolled_at": null,
+              "username": "alice"
+            }
+          ]
+        }
+      },
+      "UserWithRecoveryCodes": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/User"
+          },
+          {
+            "type": "object",
+            "required": [
+              "recovery_codes"
+            ],
+            "properties": {
+              "recovery_codes": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Shown once."
+              }
+            }
+          }
+        ],
+        "description": "A user plus freshly generated recovery codes."
+      },
+      "WhoAmI": {
+        "type": "object",
+        "description": "The caller.",
+        "required": [
+          "user",
+          "ip",
+          "via"
+        ],
+        "properties": {
+          "user": {
+            "$ref": "#/components/schemas/User"
+          },
+          "ip": {
+            "type": "string",
+            "description": "Client IP as resolved by the server (proxy aware)."
+          },
+          "via": {
+            "$ref": "#/components/schemas/AuthVia"
+          }
+        },
+        "example": {
+          "ip": "192.0.2.1",
+          "user": {
+            "created_at": "2026-01-15T09:30:00.000Z",
+            "disabled_at": null,
+            "display_name": "",
+            "id": 1,
+            "is_admin": true,
+            "is_root": true,
+            "mfa_enrolled": false,
+            "mfa_required": false,
+            "totp_enrolled_at": null,
+            "username": "root"
+          },
+          "via": "session"
+        }
+      },
+      "Zone": {
+        "type": "object",
+        "description": "A zone as stored. Names are stored lower-case without the trailing dot.",
+        "required": [
+          "id",
+          "name",
+          "serial",
+          "soa_mname",
+          "soa_rname",
+          "refresh",
+          "retry",
+          "expire",
+          "minimum",
+          "default_ttl",
+          "created_at",
+          "updated_at",
+          "owner_id"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "name": {
+            "type": "string",
+            "description": "Lower-case, no trailing dot (`.` for the root zone).",
+            "example": "example.com"
+          },
+          "serial": {
+            "type": "integer",
+            "format": "int64",
+            "description": "SOA serial (unsigned 32-bit, so it may exceed the int32 range).",
+            "maximum": 4294967295,
+            "minimum": 0
+          },
+          "soa_mname": {
+            "type": "string",
+            "example": "ns1.example.com."
+          },
+          "soa_rname": {
+            "type": "string",
+            "example": "hostmaster.example.com."
+          },
+          "refresh": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "retry": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "expire": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "minimum": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "default_ttl": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "example": "2026-01-15T09:30:00.000Z"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "example": "2026-01-15T09:30:00.000Z"
+          },
+          "owner_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          }
+        }
+      },
+      "ZoneDeleted": {
+        "type": "object",
+        "required": [
+          "status",
+          "zone"
+        ],
+        "properties": {
+          "status": {
+            "$ref": "#/components/schemas/DeletedStatus"
+          },
+          "zone": {
+            "type": "string"
+          }
+        },
+        "example": {
+          "status": "deleted",
+          "zone": "example.com"
+        }
+      },
+      "ZoneDetail": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ZoneView"
+          },
+          {
+            "type": "object",
+            "required": [
+              "records",
+              "record_total",
+              "record_page",
+              "members"
+            ],
+            "properties": {
+              "records": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Record"
+                },
+                "description": "First page of records (use /zones/{zone}/records to page or search)."
+              },
+              "record_total": {
+                "type": "integer",
+                "format": "int64"
+              },
+              "record_page": {
+                "type": "integer",
+                "example": 500,
+                "minimum": 0
+              },
+              "members": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Member"
+                },
+                "description": "Empty unless the caller may manage access (owner)."
+              }
+            }
+          }
+        ],
+        "description": "A zone with the first page of records and its members.",
+        "example": {
+          "created_at": "2026-01-15T09:30:00.000Z",
+          "default_ttl": 3600,
+          "expire": 1209600,
+          "fqdn": "example.com.",
+          "id": 1,
+          "members": [
+            {
+              "created_at": "2026-01-15T09:30:00.000Z",
+              "role": "editor",
+              "user_id": 2,
+              "username": "alice"
+            }
+          ],
+          "minimum": 300,
+          "name": "example.com",
+          "owner": "root",
+          "owner_id": 1,
+          "record_count": 1,
+          "record_page": 500,
+          "record_total": 1,
+          "records": [
+            {
+              "created_at": "2026-01-15T09:30:00.000Z",
+              "expires_at": null,
+              "id": 42,
+              "name": "www",
+              "ttl": 300,
+              "type": "A",
+              "updated_at": "2026-01-15T09:30:00.000Z",
+              "value": "192.0.2.10",
+              "zone_id": 1
+            }
+          ],
+          "refresh": 3600,
+          "retry": 600,
+          "role": "owner",
+          "serial": 2026011501,
+          "soa_mname": "ns1.example.com.",
+          "soa_rname": "hostmaster.example.com.",
+          "updated_at": "2026-01-15T09:30:00.000Z"
+        }
+      },
+      "ZoneInput": {
+        "type": "object",
+        "description": "Input for creating or updating a zone. Create: `name` is required, other\nfields fall back to server defaults. Update: omitted fields are left\nunchanged (`name` is ignored).",
+        "properties": {
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "example": "example.com"
+          },
+          "soa_mname": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "example": "ns1.example.com."
+          },
+          "soa_rname": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`hostmaster.example.com.` or `hostmaster@example.com`",
+            "example": "hostmaster@example.com"
+          },
+          "refresh": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "example": 3600,
+            "minimum": 0
+          },
+          "retry": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "example": 600,
+            "minimum": 0
+          },
+          "expire": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "example": 1209600,
+            "minimum": 0
+          },
+          "minimum": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "example": 300,
+            "minimum": 0
+          },
+          "default_ttl": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "example": 3600,
+            "minimum": 0
+          },
+          "owner": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Owner username. Create: defaults to the caller. Update: administrators\nonly; empty string clears the owner."
+          }
+        }
+      },
+      "ZoneList": {
+        "type": "object",
+        "required": [
+          "zones"
+        ],
+        "properties": {
+          "zones": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ZoneView"
+            }
+          }
+        },
+        "example": {
+          "zones": [
+            {
+              "created_at": "2026-01-15T09:30:00.000Z",
+              "default_ttl": 3600,
+              "expire": 1209600,
+              "fqdn": "example.com.",
+              "id": 1,
+              "minimum": 300,
+              "name": "example.com",
+              "owner": "root",
+              "owner_id": 1,
+              "record_count": 3,
+              "refresh": 3600,
+              "retry": 600,
+              "role": "owner",
+              "serial": 2026011501,
+              "soa_mname": "ns1.example.com.",
+              "soa_rname": "hostmaster.example.com.",
+              "updated_at": "2026-01-15T09:30:00.000Z"
+            }
+          ]
+        }
+      },
+      "ZonePerm": {
+        "type": "string",
+        "description": "Something a caller may do inside one zone. Granted when the caller's role\non the zone is at least [`ZonePerm::min_role`].",
+        "enum": [
+          "view",
+          "export",
+          "edit_records",
+          "edit_settings",
+          "manage_access",
+          "import",
+          "delete_zone",
+          "watch_queries"
+        ]
+      },
+      "ZonePermInfo": {
+        "type": "object",
+        "required": [
+          "perm",
+          "label",
+          "min_role"
+        ],
+        "properties": {
+          "perm": {
+            "$ref": "#/components/schemas/ZonePerm"
+          },
+          "label": {
+            "type": "string"
+          },
+          "min_role": {
+            "$ref": "#/components/schemas/ZoneRole"
+          }
+        }
+      },
+      "ZoneRights": {
+        "type": "object",
+        "description": "The user's role on one zone and what it allows.",
+        "required": [
+          "zone",
+          "role",
+          "source",
+          "permissions"
+        ],
+        "properties": {
+          "zone": {
+            "type": "string"
+          },
+          "role": {
+            "$ref": "#/components/schemas/ZoneRole"
+          },
+          "source": {
+            "$ref": "#/components/schemas/RoleSource"
+          },
+          "permissions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ZonePerm"
+            }
+          }
+        }
+      },
+      "ZoneRole": {
+        "type": "string",
+        "description": "What a caller may do with a zone.",
+        "enum": [
+          "viewer",
+          "editor",
+          "owner"
+        ],
+        "example": "owner"
+      },
+      "ZoneView": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Zone"
+          },
+          {
+            "type": "object",
+            "required": [
+              "fqdn",
+              "owner",
+              "role",
+              "record_count"
+            ],
+            "properties": {
+              "fqdn": {
+                "type": "string",
+                "example": "example.com."
+              },
+              "owner": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Owner username."
+              },
+              "role": {
+                "$ref": "#/components/schemas/ZoneRole",
+                "description": "The caller's role on this zone."
+              },
+              "record_count": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          }
+        ],
+        "description": "A zone with the caller's view of it.",
+        "example": {
+          "created_at": "2026-01-15T09:30:00.000Z",
+          "default_ttl": 3600,
+          "expire": 1209600,
+          "fqdn": "example.com.",
+          "id": 1,
+          "minimum": 300,
+          "name": "example.com",
+          "owner": "root",
+          "owner_id": 1,
+          "record_count": 3,
+          "refresh": 3600,
+          "retry": 600,
+          "role": "owner",
+          "serial": 2026011501,
+          "soa_mname": "ns1.example.com.",
+          "soa_rname": "hostmaster.example.com.",
+          "updated_at": "2026-01-15T09:30:00.000Z"
+        }
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "Invalid input: rejected by validation, or the request could not be parsed (`code: invalid_request`).",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Conflict": {
+        "description": "Conflicts with existing data.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Forbidden": {
+        "description": "Not allowed, or cookie write without `X-Requested-With: rust-dns` (`code`: csrf).",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "example": {
+              "code": "csrf",
+              "error": "missing X-Requested-With: rust-dns header"
+            }
+          }
+        }
+      },
+      "InvalidRequest": {
+        "description": "Invalid request: malformed JSON, wrong field type or value, or an unparsable path or query parameter (`code: invalid_request`).",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "Not found (zones the caller cannot see also return 404).",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "TooManyRequests": {
+        "description": "Login rate limit exceeded.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Unauthorized": {
+        "description": "Not signed in / invalid token (`code`: login_required, mfa_required, enroll_required).",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "example": {
+              "code": "login_required",
+              "error": "not signed in"
+            }
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "bearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "rdns_...",
+        "description": "API token from POST /tokens."
+      },
+      "cookie": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "rdns_session",
+        "description": "Session cookie set by POST /auth/login. Cookie writes also need `X-Requested-With: rust-dns`."
+      }
+    }
+  },
+  "security": [
+    {
+      "bearer": []
+    },
+    {
+      "cookie": []
+    }
+  ],
+  "tags": [
+    {
+      "name": "Auth",
+      "description": "Sign in and out. Sign in here first (cookie session), or authorize with an API token."
+    },
+    {
+      "name": "Account",
+      "description": "The caller's own profile, password, MFA and sessions."
+    },
+    {
+      "name": "Zones",
+      "description": "Create, inspect, update and delete zones."
+    },
+    {
+      "name": "Records",
+      "description": "Search and edit resource records inside a zone."
+    },
+    {
+      "name": "Access",
+      "description": "Zone membership (editor/viewer) and effective rights."
+    },
+    {
+      "name": "Import/Export",
+      "description": "JSON export documents and BIND zone files."
+    },
+    {
+      "name": "Change log",
+      "description": "DNS change log, account audit log and the realtime WebSocket."
+    },
+    {
+      "name": "Users",
+      "description": "User administration (administrators)."
+    },
+    {
+      "name": "Tokens",
+      "description": "API tokens for scripts and automation."
+    },
+    {
+      "name": "Server",
+      "description": "Health, status, metrics and server administration."
+    }
+  ]
+}

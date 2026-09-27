@@ -1,0 +1,211 @@
+name: Release
+
+# Builds rust-dns for Linux, Windows and FreeBSD on x86_64 and aarch64.
+# Every build is smoke-tested on its own platform (scripts/smoke-release.py:
+# start, API, DNS over UDP and TCP) wherever the runner can execute it.
+#
+#   push a tag vX.Y.Z      -> build, test, publish a GitHub release
+#                             (tags with a '-' such as v1.2.0-rc.1 are pre-releases)
+#   run manually           -> build and test only; archives are kept as workflow artifacts
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        name: Version from tag (must match Cargo.toml)
+        run: |
+          crate=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            tag="${GITHUB_REF_NAME#v}"
+            case "$tag" in
+              "$crate"|"$crate"-*) ;;
+              *) echo "::error::tag v$tag does not match Cargo.toml version $crate"; exit 1 ;;
+            esac
+            echo "version=$tag" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=$crate-dev.${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+  linux:
+    needs: version
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-musl
+          - arch: aarch64
+            target: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - uses: mlugg/setup-zig@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - name: Build (static musl)
+        run: cargo zigbuild --release --target ${{ matrix.target }}
+      - name: Register qemu for aarch64
+        if: matrix.arch == 'aarch64'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      - name: Smoke test
+        run: |
+          file target/${{ matrix.target }}/release/rust-dns
+          python3 scripts/smoke-release.py target/${{ matrix.target }}/release/rust-dns
+      - name: Package
+        run: |
+          name=rust-dns-${{ needs.version.outputs.version }}-linux-${{ matrix.arch }}
+          mkdir -p "dist/$name"
+          cp target/${{ matrix.target }}/release/rust-dns README.md "dist/$name/"
+          cp -r examples "dist/$name/"
+          cp deploy/install.sh "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  windows:
+    needs: version
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-pc-windows-msvc
+          - arch: aarch64
+            target: aarch64-pc-windows-msvc
+    env:
+      # Static C runtime: no Visual C++ redistributable needed on the target.
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Smoke test
+        # An x64 runner cannot execute arm64 binaries; that build is compiled only.
+        if: matrix.arch == 'x86_64'
+        run: python scripts/smoke-release.py target/${{ matrix.target }}/release/rust-dns.exe
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = "rust-dns-${{ needs.version.outputs.version }}-windows-${{ matrix.arch }}"
+          New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
+          Copy-Item target/${{ matrix.target }}/release/rust-dns.exe, README.md "dist/$name/"
+          Copy-Item -Recurse examples "dist/$name/"
+          Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.arch }}
+          path: dist/*.zip
+          if-no-files-found: error
+
+  freebsd:
+    needs: version
+    runs-on: ubuntu-latest
+    # aarch64 runs under full-system emulation and takes a while.
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            vm_arch: ""
+          - arch: aarch64
+            vm_arch: aarch64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and smoke test in a FreeBSD VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "14.3"
+          arch: ${{ matrix.vm_arch }}
+          usesh: true
+          envs: "VERSION ARCH CARGO_PROFILE_RELEASE_LTO CARGO_PROFILE_RELEASE_CODEGEN_UNITS"
+          prepare: |
+            sed -i '' 's/quarterly/latest/' /etc/pkg/FreeBSD.conf
+            pkg install -y rust python3
+          run: |
+            set -e
+            rustc --version
+            cargo build --release
+            file target/release/rust-dns
+            python3 scripts/smoke-release.py target/release/rust-dns
+            name="rust-dns-$VERSION-freebsd-$ARCH"
+            mkdir -p "dist/$name"
+            cp target/release/rust-dns README.md "dist/$name/"
+            cp -r examples "dist/$name/"
+            tar -C dist -czf "dist/$name.tar.gz" "$name"
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+          # Thin LTO under emulation keeps the aarch64 build to a reasonable time.
+          CARGO_PROFILE_RELEASE_LTO: ${{ matrix.arch == 'aarch64' && 'thin' || 'true' }}
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: ${{ matrix.arch == 'aarch64' && '8' || '1' }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: freebsd-${{ matrix.arch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: [version, linux, windows, freebsd]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+      - name: Publish GitHub release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pre=""
+          case "${GITHUB_REF_NAME}" in *-*) pre="--prerelease" ;; esac
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --repo "${GITHUB_REPOSITORY}" --title "rust-dns ${GITHUB_REF_NAME}" \
+            --generate-notes $pre
+      - name: Keep archives (manual run)
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-dns-${{ needs.version.outputs.version }}
+          path: dist/*

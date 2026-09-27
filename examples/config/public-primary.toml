@@ -1,0 +1,62 @@
+# Internet-facing primary nameserver for your own domains.
+# - No forwarding: foreign names get REFUSED (never an open resolver).
+# - Zone transfers and NOTIFY to a secondary (e.g. a BIND/NSD box or a
+#   provider's secondary DNS service).
+# - Console bound to localhost and published through a TLS reverse proxy
+#   (see examples/proxy/nginx.conf).
+
+[server]
+bind = ["0.0.0.0", "::"]
+port = 53
+udp_max_payload = 1232
+auto_ptr = false                         # public reverse zones are delegated separately
+minimal_any = true                       # RFC 8482, limits amplification
+default_primary_ns = "ns1.example.com"
+default_hostmaster = "hostmaster@example.com"
+nsid = "ns1"                             # identifies this node in dig +nsid output
+cookies = true
+cookies_required = false                 # strict mode breaks resolvers without cookie support
+max_tcp_connections = 2000
+
+[forwarding]
+upstreams = []                           # authoritative only
+
+[transfer]
+allow = ["198.51.100.53/32", "2001:db8:53::53/128"]    # your secondary nameserver(s)
+notify = ["198.51.100.53:53"]
+
+[rate_limit]
+max_resolutions_per_second_per_address = 200
+max_tracked_addresses = 100000           # bounded memory under a flood
+
+[database]
+path = "/var/lib/rust-dns/rust-dns.db"
+
+[backup]
+dir = "/var/lib/rust-dns/backups"
+interval_hours = 6
+keep = 28
+
+[web_console]
+bind = "127.0.0.1:8053"                  # only the reverse proxy reaches it
+proxy_trust = "127.0.0.1/32;::1/128"     # trust X-Forwarded-For from the local proxy only
+secure_cookies = true                    # console is served over HTTPS
+session_ttl_hours = 8
+login_attempts_per_minute = 5
+
+[root]
+username = "root"
+password = "change-me-please"
+mfa_required = true                      # root must enroll TOTP at first sign-in
+
+[changelog]
+retention_days = 365
+
+[logging]
+format = "json"                          # for Loki / Elasticsearch / journald pipelines
+level = "info"
+log_queries = false
+file = "/var/log/rust-dns/rust-dns.log"
+max_size_mb = 100
+max_files = 20
+compress = true

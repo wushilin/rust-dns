@@ -1,0 +1,26 @@
+# Minimal local setup for trying rust-dns.
+# DNS on 127.0.0.1:5300 (no root needed), console on http://127.0.0.1:8053.
+#
+#   cp examples/config/minimal.toml rust-dns.toml
+#   rust-dns --config rust-dns.toml
+#   dig @127.0.0.1 -p 5300 www.example.com
+#
+# The plaintext password below is replaced by an Argon2 hash on first start,
+# so work on a copy of this file.
+
+[server]
+bind = ["127.0.0.1"]
+port = 5300
+
+[database]
+path = "rust-dns.db"
+
+[backup]
+dir = ""                 # no scheduled backups for a scratch instance
+
+[web_console]
+bind = "127.0.0.1:8053"
+
+[root]
+username = "root"
+password = "change-me-please"

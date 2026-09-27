@@ -1,0 +1,35 @@
+# Example Prometheus alert rules for rust-dns /metrics.
+groups:
+  - name: rust-dns
+    rules:
+      - alert: RustDnsRateLimitedClients
+        expr: sum(rate(rustdns_rate_limited_total[5m])) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: rust-dns is dropping queries due to client rate limits
+
+      - alert: RustDnsRefusedSpike
+        expr: sum(rate(rustdns_answers_refused_total[5m])) > 20
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: rust-dns REFUSED responses have increased
+
+      - alert: RustDnsErrors
+        expr: sum(rate(rustdns_errors_total[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: rust-dns is reporting malformed or failed DNS queries
+
+      - alert: RustDnsBadCookies
+        expr: sum(rate(rustdns_bad_cookie_total[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: rust-dns is receiving invalid DNS cookies

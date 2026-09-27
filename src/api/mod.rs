@@ -1,0 +1,328 @@
+//! HTTP server: REST API, websocket, embedded UI. Connections are accepted
+//! by hand so PROXY protocol headers can be read before HTTP starts.
+
+pub mod client_ip;
+pub mod error;
+pub mod openapi;
+pub mod proxy;
+pub mod routes;
+pub mod session;
+pub mod settings;
+pub mod types;
+pub mod ws;
+
+use crate::cache::Cache;
+use crate::config::{Cidr, Config};
+use crate::dns::DnsServer;
+use crate::events::Bus;
+use crate::mutation::Mutator;
+use crate::ratelimit::RateLimiter;
+use crate::storage::Storage;
+use axum::extract::Request;
+use axum::http::header;
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
+use axum::Router;
+use client_ip::{ClientIp, ConnInfo};
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tower::Service;
+use utoipa::OpenApi;
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
+
+pub struct AppState {
+    pub cfg: Arc<Config>,
+    pub storage: Arc<Storage>,
+    pub cache: Arc<Cache>,
+    pub mutator: Arc<Mutator>,
+    pub accounts: Arc<crate::mutation::accounts::Accounts>,
+    pub bus: Arc<Bus>,
+    pub dns: Arc<DnsServer>,
+    pub reloader: Arc<crate::reload::Reloader>,
+    pub limiter: Arc<RateLimiter>,
+    pub login_limiter: RateLimiter,
+    pub trusted: Vec<Cidr>,
+    pub started: Instant,
+}
+
+async fn client_ip_layer(
+    axum::extract::State(s): axum::extract::State<Arc<AppState>>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    let ip = match req.extensions().get::<ConnInfo>() {
+        Some(ci) => client_ip::resolve(ci, req.headers(), &s.trusted),
+        None => std::net::IpAddr::from([0, 0, 0, 0]),
+    };
+    req.extensions_mut().insert(ClientIp(ip));
+    let mut resp = next.run(req).await;
+    let h = resp.headers_mut();
+    h.insert("x-content-type-options", "nosniff".parse().unwrap());
+    // The console embeds its own API explorer (/docs) in a frame; other sites may not.
+    h.insert("x-frame-options", "SAMEORIGIN".parse().unwrap());
+    h.insert(
+        "content-security-policy",
+        "frame-ancestors 'self'".parse().unwrap(),
+    );
+    h.insert("referrer-policy", "same-origin".parse().unwrap());
+    resp
+}
+
+/// Requests rejected by the framework before a handler runs (malformed JSON,
+/// wrong field types, unknown enum values, unparsable path or query parameters,
+/// a missing JSON content type) come back as plain text with 400, 415 or 422.
+/// Turn them into the documented JSON error so every API error has one shape.
+async fn json_errors(req: Request, next: Next) -> Response {
+    let resp = next.run(req).await;
+    let plain_text = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("text/plain"));
+    if !(resp.status().is_client_error() && plain_text) {
+        return resp;
+    }
+    let status = match resp.status().as_u16() {
+        415 | 422 => axum::http::StatusCode::BAD_REQUEST,
+        _ => resp.status(),
+    };
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap_or_default();
+    let message = String::from_utf8_lossy(&bytes).trim().to_string();
+    let message = if message.is_empty() {
+        "invalid request".to_string()
+    } else {
+        message
+    };
+    (
+        status,
+        axum::Json(error::ErrorBody {
+            error: message,
+            code: Some(error::ErrorCode::InvalidRequest),
+        }),
+    )
+        .into_response()
+}
+
+async fn ui_docs() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        crate::ui::DOCS_HTML,
+    )
+        .into_response()
+}
+
+/// Serve a vendored static asset, gzip-compressed when the client accepts it.
+fn static_asset(
+    headers: &axum::http::HeaderMap,
+    content_type: &'static str,
+    gz: &'static [u8],
+    raw: &'static std::sync::OnceLock<Vec<u8>>,
+) -> Response {
+    let accepts_gzip = headers
+        .get(header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(',').any(|e| e.trim().starts_with("gzip")));
+    let etag = format!("\"swagger-{}\"", crate::ui::SWAGGER_VERSION.trim());
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        == Some(etag.as_str())
+    {
+        return (axum::http::StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response();
+    }
+    let base = [
+        (header::CONTENT_TYPE, content_type.to_string()),
+        (header::CACHE_CONTROL, "public, max-age=86400".to_string()),
+        (header::VARY, "Accept-Encoding".to_string()),
+        (header::ETAG, etag),
+    ];
+    if accepts_gzip {
+        let mut r = (base, gz).into_response();
+        r.headers_mut()
+            .insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+        r
+    } else {
+        (base, crate::ui::gunzipped(raw, gz)).into_response()
+    }
+}
+
+async fn swagger_js(headers: axum::http::HeaderMap) -> Response {
+    static RAW: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    static_asset(
+        &headers,
+        "application/javascript; charset=utf-8",
+        crate::ui::SWAGGER_JS_GZ,
+        &RAW,
+    )
+}
+
+async fn swagger_css(headers: axum::http::HeaderMap) -> Response {
+    static RAW: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    static_asset(
+        &headers,
+        "text/css; charset=utf-8",
+        crate::ui::SWAGGER_CSS_GZ,
+        &RAW,
+    )
+}
+
+async fn ui_index() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        crate::ui::INDEX_HTML,
+    )
+        .into_response()
+}
+
+/// Every API route, mounted under `/api`. Each `routes!` entry both mounts
+/// the handler and adds its `#[utoipa::path]` operation to the OpenAPI
+/// document, so routes and documentation cannot drift apart. Handlers that
+/// share a path go into one `routes!` call.
+fn api_router() -> OpenApiRouter<Arc<AppState>> {
+    OpenApiRouter::with_openapi(openapi::ApiDoc::openapi())
+        .routes(routes!(session::login))
+        .routes(routes!(session::mfa_verify))
+        .routes(routes!(session::enroll_verify))
+        .routes(routes!(session::session_info))
+        .routes(routes!(session::logout))
+        .routes(routes!(routes::whoami))
+        .routes(routes!(routes::change_password))
+        .routes(routes!(routes::mfa_start))
+        .routes(routes!(routes::mfa_confirm))
+        .routes(routes!(routes::mfa_disable))
+        .routes(routes!(routes::mfa_recovery_regen))
+        .routes(routes!(routes::my_sessions))
+        .routes(routes!(routes::revoke_my_session))
+        .routes(routes!(routes::revoke_other_sessions))
+        .routes(routes!(routes::list_zones, routes::create_zone))
+        .routes(routes!(
+            routes::get_zone,
+            routes::update_zone,
+            routes::delete_zone
+        ))
+        .routes(routes!(routes::list_records, routes::create_record))
+        .routes(routes!(routes::update_record, routes::delete_record))
+        .routes(routes!(routes::set_member, routes::remove_member))
+        .routes(routes!(routes::user_rights))
+        .routes(routes!(routes::export_zone))
+        .routes(routes!(routes::import_bind))
+        .routes(routes!(routes::export_all))
+        .routes(routes!(routes::import))
+        .routes(routes!(routes::changelog))
+        .routes(routes!(routes::audit))
+        .routes(routes!(ws::ws))
+        .routes(routes!(routes::list_users, routes::create_user))
+        .routes(routes!(routes::update_user, routes::delete_user))
+        .routes(routes!(routes::reset_user_mfa))
+        .routes(routes!(routes::user_sessions))
+        .routes(routes!(routes::revoke_user_sessions))
+        .routes(routes!(routes::list_tokens, routes::create_token))
+        .routes(routes!(routes::update_token, routes::revoke_token))
+        .routes(routes!(routes::health))
+        .routes(routes!(routes::openapi))
+        .routes(routes!(routes::status))
+        .routes(routes!(routes::reload_config))
+        .routes(routes!(routes::integrity_check))
+        .routes(routes!(
+            settings::get_forwarding,
+            settings::update_forwarding,
+            settings::reset_forwarding
+        ))
+        .routes(routes!(settings::test_upstreams))
+}
+
+/// Documented routes mounted at the server root rather than under `/api`.
+fn root_router() -> OpenApiRouter<Arc<AppState>> {
+    OpenApiRouter::new().routes(routes!(routes::metrics))
+}
+
+/// The OpenAPI document generated from the routers above.
+pub fn openapi_doc() -> utoipa::openapi::OpenApi {
+    let (_, api) = api_router().split_for_parts();
+    let (_, root) = root_router().split_for_parts();
+    openapi::finish(api, root)
+}
+
+pub fn router(state: Arc<AppState>) -> Router {
+    let (api, _) = api_router().split_for_parts();
+    let (root, _) = root_router().split_for_parts();
+    // Serialize the document once, now, so /api/openapi.json only copies bytes.
+    openapi::spec_json();
+    // Console pages are not part of the API document.
+    let mut app = Router::new()
+        .nest("/api", api.layer(middleware::from_fn(json_errors)))
+        .merge(root);
+    if state.cfg.web_console.enabled {
+        app = app
+            .route("/", get(ui_index))
+            .route("/index.html", get(ui_index))
+            .route("/docs", get(ui_docs))
+            .route("/docs/swagger-ui-bundle.js", get(swagger_js))
+            .route("/docs/swagger-ui.css", get(swagger_css));
+    }
+    app.layer(middleware::from_fn_with_state(
+        state.clone(),
+        client_ip_layer,
+    ))
+    .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024))
+    .with_state(state)
+}
+
+pub async fn serve(state: Arc<AppState>) -> anyhow::Result<()> {
+    let addr = state.cfg.web_console.bind;
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("cannot bind web listener {addr}: {e}"))?;
+    tracing::info!(%addr, proxy_on = state.cfg.web_console.proxy.proxy_on, "web console and API listening");
+    let app = router(state.clone());
+    loop {
+        let (mut stream, remote) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "web accept failed");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            }
+        };
+        let app = app.clone();
+        let proxy_cfg = state.cfg.web_console.proxy.clone();
+        let trusted = state.trusted.clone();
+        tokio::spawn(async move {
+            let proxy_src = if proxy_cfg.proxy_on && trusted.iter().any(|c| c.contains(remote.ip()))
+            {
+                match proxy::read_proxy_header(&mut stream, proxy_cfg.proxy_version).await {
+                    proxy::ProxyHeader::Source(src) => Some(src),
+                    proxy::ProxyHeader::Absent => None,
+                    proxy::ProxyHeader::Rejected(why) => {
+                        tracing::warn!(%remote, why, "rejecting web connection");
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            let info = ConnInfo { remote, proxy_src };
+            let svc = hyper::service::service_fn(move |mut req: Request<hyper::body::Incoming>| {
+                req.extensions_mut().insert(info);
+                let mut app = app.clone();
+                async move { app.call(req).await }
+            });
+            let io = TokioIo::new(stream);
+            let builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+            if let Err(e) = builder.serve_connection_with_upgrades(io, svc).await {
+                tracing::debug!(%remote, error = %e, "connection ended with error");
+            }
+        });
+    }
+}

@@ -1,0 +1,1843 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rust-dns</title>
+<style>
+:root {
+  --bg: #f5f6f8; --panel: #ffffff; --line: #e3e6ea; --text: #1c2128; --muted: #667085;
+  --accent: #2f6df6; --accent-ink: #ffffff; --danger: #d92d20; --ok: #12b76a; --warn: #f79009;
+  --chip: #eef2ff; --chip-ink: #3538cd; --shadow: 0 1px 2px rgba(16,24,40,.06), 0 1px 3px rgba(16,24,40,.08);
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f1216; --panel: #171b21; --line: #262c35; --text: #e6e9ee; --muted: #8a93a3;
+    --accent: #5b8cff; --danger: #f04438; --ok: #32d583; --warn: #fdb022; --chip: #1f2a44; --chip-ink: #a5b4fc;
+    --shadow: 0 1px 2px rgba(0,0,0,.4);
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0f1216; --panel: #171b21; --line: #262c35; --text: #e6e9ee; --muted: #8a93a3;
+  --accent: #5b8cff; --danger: #f04438; --ok: #32d583; --warn: #fdb022; --chip: #1f2a44; --chip-ink: #a5b4fc;
+  --shadow: 0 1px 2px rgba(0,0,0,.4);
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body { background: var(--bg); color: var(--text); font: 14px/1.45 var(--sans); }
+a { color: var(--accent); text-decoration: none; }
+button, input, select, textarea { font: inherit; color: inherit; }
+h1, h2, h3 { margin: 0; font-weight: 600; }
+h1 { font-size: 20px; } h2 { font-size: 16px; } h3 { font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+code, .mono { font-family: var(--mono); font-size: 12.5px; }
+.hidden { display: none !important; }
+
+/* ---- login ---- */
+#login { min-height: 100%; display: grid; place-items: center; padding: 16px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); }
+#login .card { width: 100%; max-width: 380px; padding: 28px; }
+.brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 18px; }
+.brand .logo { width: 30px; height: 30px; border-radius: 8px; background: linear-gradient(135deg, var(--accent), #7c3aed); display: grid; place-items: center; color: #fff; font-size: 14px; }
+.field { display: flex; flex-direction: column; gap: 6px; margin-top: 14px; }
+.field label { font-size: 12.5px; color: var(--muted); font-weight: 500; }
+input[type=text], input[type=search], input[type=password], input[type=number], select, textarea {
+  width: 100%; padding: 9px 11px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); outline: none;
+}
+input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent); }
+.btn { display: inline-flex; align-items: center; gap: 6px; padding: 8px 14px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel); cursor: pointer; font-weight: 500; white-space: nowrap; }
+.btn:hover { border-color: var(--muted); }
+.btn.primary { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
+.btn.primary:hover { filter: brightness(1.08); }
+.btn.danger { color: var(--danger); }
+.btn.danger:hover { background: color-mix(in srgb, var(--danger) 10%, transparent); border-color: var(--danger); }
+.btn.sm { padding: 5px 10px; font-size: 12.5px; }
+.btn.ghost { border-color: transparent; }
+.btn:disabled { opacity: .5; cursor: default; }
+.error { color: var(--danger); font-size: 13px; margin-top: 10px; min-height: 18px; }
+.hint { color: var(--muted); font-size: 12.5px; }
+.qr { width: 180px; height: 180px; border-radius: 8px; overflow: hidden; background: #fff; margin: 12px auto; }
+.qr svg { width: 100%; height: 100%; display: block; }
+
+/* ---- shell ---- */
+#app { display: grid; grid-template-columns: var(--side-w, 236px) minmax(0, 1fr); grid-template-areas: "side main"; min-height: 100%; }
+#side { grid-area: side; background: var(--panel); border-right: 1px solid var(--line); padding: 14px 10px 10px; display: flex; flex-direction: column; position: sticky; top: 0; height: 100vh; height: 100dvh; overflow-y: auto; overflow-x: hidden; z-index: 41; }
+#side .side-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 2px 2px 8px 6px; }
+#side .brand { min-width: 0; white-space: nowrap; }
+.icon-btn { display: inline-grid; place-items: center; width: 32px; height: 32px; padding: 0; border-radius: 8px; border: 1px solid transparent; background: none; cursor: pointer; color: var(--muted); flex: none; }
+.icon-btn:hover { background: var(--bg); color: var(--text); border-color: var(--line); }
+.icon-btn.sm { width: 26px; height: 26px; border-radius: 6px; }
+.icon-btn svg { width: 18px; height: 18px; display: block; }
+.icon-btn.sm svg { width: 15px; height: 15px; }
+.ico svg, .nav-ico svg { width: 18px; height: 18px; display: block; }
+.ico { display: inline-grid; place-items: center; }
+.ico.s svg { width: 15px; height: 15px; }
+#side nav { display: flex; flex-direction: column; gap: 2px; }
+#side .nav-sec { font-size: 11px; font-weight: 600; letter-spacing: .07em; text-transform: uppercase; color: var(--muted); padding: 14px 12px 6px; white-space: nowrap; }
+#side nav a, #side .who a { position: relative; display: flex; align-items: center; gap: 12px; padding: 8px 12px; border-radius: 8px; color: var(--text); white-space: nowrap; }
+#side nav a:hover, #side .who a:hover { background: var(--bg); }
+#side .nav-ico { width: 18px; flex: none; color: var(--muted); display: grid; place-items: center; }
+#side nav a:hover .nav-ico { color: var(--text); }
+#side nav a.active { background: var(--chip); color: var(--chip-ink); font-weight: 600; }
+#side nav a.active .nav-ico { color: var(--accent); }
+#side nav a.active::before { content: ''; position: absolute; left: -10px; top: 7px; bottom: 7px; width: 3px; border-radius: 0 3px 3px 0; background: var(--accent); }
+#side .spacer { flex: 1; min-height: 12px; }
+#side .who { border-top: 1px solid var(--line); padding-top: 10px; font-size: 12.5px; color: var(--muted); }
+#side .who-row { display: flex; align-items: center; gap: 10px; padding: 4px 12px 8px; min-width: 0; }
+#side .who-text { min-width: 0; overflow: hidden; }
+#side .who-text b { color: var(--text); display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#side .who a { color: var(--muted); }
+.status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--warn); flex: none; }
+.status-dot.on { background: var(--ok); } .status-dot.off { background: var(--danger); }
+#mtop { display: none; }
+#nav-backdrop { display: none; }
+#main { grid-area: main; padding: 24px 28px; max-width: 1400px; width: 100%; min-width: 0; }
+@media (min-width: 861px) {
+  #app.nav-collapsed { --side-w: 64px; }
+  #app.nav-collapsed #side { padding-left: 8px; padding-right: 8px; }
+  #app.nav-collapsed #side .lbl, #app.nav-collapsed #side .brand-name, #app.nav-collapsed #side .who-text { display: none; }
+  #app.nav-collapsed #side .side-head { flex-direction: column; padding: 2px 0 8px; gap: 10px; }
+  #app.nav-collapsed #side nav a, #app.nav-collapsed #side .who a { justify-content: center; padding: 9px 0; }
+  #app.nav-collapsed #side nav a.active::before { left: -8px; }
+  #app.nav-collapsed #side .nav-sec { font-size: 0; height: 1px; padding: 0; margin: 10px 10px; background: var(--line); }
+  #app.nav-collapsed #side .who-row { justify-content: center; padding: 4px 0 8px; }
+  #app.nav-collapsed #nav-collapse svg { transform: scaleX(-1); }
+}
+.topbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 18px; flex-wrap: wrap; }
+.topbar > * { min-width: 0; }
+.topbar .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.grid { display: grid; gap: 14px; }
+.grid > * { min-width: 0; }
+.two { grid-template-columns: 1fr 1fr; }
+.tiles { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); }
+.tile { padding: 14px 16px; }
+.tile .k { color: var(--muted); font-size: 12px; }
+.tile .v { font-size: 22px; font-weight: 600; margin-top: 4px; font-variant-numeric: tabular-nums; }
+.panel { padding: 16px 18px; }
+.panel h2 { margin-bottom: 10px; }
+.tw { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.card:has(> table) { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+th { font-size: 12px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .03em; }
+tr:hover td { background: color-mix(in srgb, var(--bg) 60%, transparent); }
+tr.clickable:hover td { background: color-mix(in srgb, var(--accent) 6%, transparent); }
+td.actions { text-align: right; white-space: nowrap; }
+td.actions .btn { margin-left: 4px; }
+.tag { display: inline-flex; align-items: center; gap: 3px; padding: 1px 8px; margin: 3px 4px 0 0; border-radius: 999px; font-size: 11.5px; font-weight: 500; background: var(--chip); color: var(--chip-ink); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; max-width: 100%; word-break: break-all; }
+.tag[data-filter] { cursor: pointer; }
+.tag[data-filter]:hover { outline: 1px solid var(--accent); }
+.tag button { border: 0; background: none; color: inherit; cursor: pointer; font-size: 14px; line-height: 1; padding: 0 0 0 2px; opacity: .7; }
+.tag button:hover { opacity: 1; }
+.tag-input { display: flex; flex-wrap: wrap; align-items: center; gap: 2px; min-height: 38px; padding: 3px 8px 6px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); cursor: text; }
+.tag-input:focus-within { border-color: var(--accent); }
+.tag-msg.error { color: var(--danger); }
+.tag-input input { flex: 1; min-width: 120px; border: 0 !important; outline: 0; box-shadow: none !important; padding: 4px 2px 0 !important; background: transparent; }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11.5px; font-weight: 600; background: var(--chip); color: var(--chip-ink); }
+.badge.ok { background: color-mix(in srgb, var(--ok) 15%, transparent); color: var(--ok); }
+.badge.warn { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
+.badge.bad { background: color-mix(in srgb, var(--danger) 14%, transparent); color: var(--danger); }
+.badge.muted { background: var(--line); color: var(--muted); }
+.row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.row.between { justify-content: space-between; }
+.toolbar { margin-bottom: 12px; }
+.toolbar input[type=text], .toolbar input[type=search] { max-width: 280px; }
+.empty { color: var(--muted); padding: 24px; text-align: center; }
+.kv { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 6px 16px; font-size: 13px; }
+.kv .k { color: var(--muted); }
+.kv > span { min-width: 0; overflow-wrap: anywhere; }
+.clickable { cursor: pointer; }
+.scroll { max-height: 60vh; overflow: auto; }
+pre { margin: 0; white-space: pre-wrap; word-break: break-all; font-family: var(--mono); font-size: 12px; background: var(--bg); padding: 10px; border-radius: 8px; }
+pre.json { word-break: break-word; overflow-wrap: anywhere; line-height: 1.5; font-size: 12.5px; }
+.j-k { color: var(--chip-ink); } .j-s { color: var(--ok); } .j-n { color: var(--warn); } .j-b { color: var(--danger); }
+.ellip { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.clamp { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; cursor: pointer; }
+.clamp.open { display: block; }
+
+/* copyable command / value */
+.cmd { display: flex; align-items: center; gap: 6px; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 4px 4px 4px 10px; margin-top: 6px; min-width: 0; }
+.cmd code { flex: 1; min-width: 0; overflow-x: auto; white-space: nowrap; padding: 3px 0; }
+.cmd .icon-btn { width: 28px; height: 28px; }
+.cval { display: inline-flex; align-items: center; gap: 2px; max-width: 100%; }
+.cval code { overflow-wrap: anywhere; }
+.note { border-radius: 8px; padding: 9px 12px; font-size: 13px; margin-top: 10px; background: var(--bg); display: flex; gap: 8px; align-items: flex-start; }
+.note .ico { margin-top: 1px; flex: none; }
+.note.warn { background: color-mix(in srgb, var(--warn) 13%, transparent); }
+.note.warn .ico { color: var(--warn); }
+.note.info .ico { color: var(--accent); }
+
+/* ---- zone page ---- */
+.back { display: inline-flex; align-items: center; gap: 4px; font-size: 13px; color: var(--muted); }
+.back:hover { color: var(--accent); }
+.zname { overflow-wrap: anywhere; font-size: 20px; }
+.zhead { margin-bottom: 16px; }
+.zhead .topbar { margin: 4px 0 12px; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.chip-btn { display: inline-flex; align-items: center; gap: 7px; padding: 6px 12px 6px 10px; border-radius: 999px; border: 1px solid var(--line); background: var(--panel); cursor: pointer; font-size: 13px; font-weight: 500; color: var(--text); white-space: nowrap; }
+.chip-btn .ico { color: var(--muted); }
+.chip-btn .sub { color: var(--muted); font-weight: 400; }
+.chip-btn:hover { border-color: var(--accent); }
+.chip-btn:hover .ico { color: var(--accent); }
+.chip-btn.warn { border-color: color-mix(in srgb, var(--warn) 55%, var(--line)); }
+.chip-btn.warn .ico { color: var(--warn); }
+.chip-btn.on { background: var(--chip); color: var(--chip-ink); border-color: transparent; }
+.chips .meta { color: var(--muted); font-size: 12.5px; margin-left: 4px; }
+.rtool { display: flex; align-items: center; gap: 12px; padding: 14px 16px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.rtool h2 { margin: 0; display: flex; align-items: center; gap: 8px; white-space: nowrap; }
+.rtool .search { flex: 1 1 220px; max-width: 360px; margin-left: auto; position: relative; }
+.rtool .search .ico { position: absolute; left: 10px; top: 50%; transform: translateY(-50%); color: var(--muted); pointer-events: none; }
+.rtool .search input { padding-left: 32px; }
+.rtool .btn.primary { flex: none; }
+table.records th:first-child, table.records td:first-child { padding-left: 16px; }
+table.records th:last-child, table.records td:last-child { padding-right: 16px; }
+table.records tbody tr:last-child td { border-bottom: 0; }
+table.records td.c-val { min-width: 180px; }
+@media (max-width: 640px) {
+  .rtool { padding: 12px; gap: 10px; }
+  .rtool .search { order: 3; flex-basis: 100%; max-width: none; margin-left: 0; }
+  .rtool .btn.primary { margin-left: auto; }
+  table.records thead { display: none; }
+  table.records, table.records tbody { display: block; }
+  table.records tr { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; padding: 10px 12px; border-bottom: 1px solid var(--line); }
+  table.records tbody tr:last-child { border-bottom: 0; }
+  table.records td { display: block; border: 0; padding: 0 !important; }
+  table.records td.c-name { flex: 1 1 auto; min-width: 0; font-weight: 600; overflow-wrap: anywhere; }
+  table.records td.c-type { order: -1; }
+  table.records td.c-act { order: 1; margin-left: auto; }
+  table.records td.c-val { order: 2; flex-basis: 100%; min-width: 0; }
+  table.records td.c-ttl, table.records td.c-exp { order: 3; font-size: 12px; }
+  table.records td.c-ttl::before { content: 'TTL '; color: var(--muted); }
+  table.records td.c-exp::before { content: '· expires '; color: var(--muted); }
+  table.records td.empty { flex-basis: 100%; }
+}
+
+/* ---- slide-over panel (zone SOA / delegation / dig / access) ---- */
+#drawer-root { position: fixed; inset: 0; z-index: 45; display: none; }
+#drawer-root.open { display: block; }
+#drawer-root .scrim { position: absolute; inset: 0; background: rgba(10,14,20,.35); }
+#drawer { position: absolute; top: 0; right: 0; bottom: 0; width: min(580px, 100%); background: var(--panel); border-left: 1px solid var(--line); box-shadow: -8px 0 30px rgba(0,0,0,.18); display: flex; flex-direction: column; animation: slidein .18s ease-out; }
+@keyframes slidein { from { transform: translateX(40px); opacity: .4; } to { transform: none; opacity: 1; } }
+#drawer .d-head { padding: 16px 18px 0; border-bottom: 1px solid var(--line); flex: none; }
+#drawer .d-title { display: flex; align-items: flex-start; gap: 10px; }
+#drawer .d-title h2 { flex: 1; min-width: 0; overflow-wrap: anywhere; font-size: 16px; margin-top: 4px; }
+#drawer .tabs { margin: 12px 0 0; border-bottom: 0; overflow-x: auto; }
+#drawer .d-body { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 16px 18px 28px; overscroll-behavior: contain; }
+#drawer .d-body h3 { margin: 20px 0 8px; }
+#drawer .d-body h3:first-child { margin-top: 0; }
+#drawer p { margin: 8px 0; }
+.facts { display: grid; gap: 2px; }
+.fact { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 2px 14px; padding: 9px 0; border-bottom: 1px solid var(--line); }
+.fact:last-child { border-bottom: 0; }
+.fact .fk { color: var(--muted); font-size: 12.5px; font-weight: 500; }
+.fact .fk small { display: block; font-family: var(--mono); font-size: 11px; opacity: .8; }
+.fact .fv { min-width: 0; overflow-wrap: anywhere; }
+.fact .fd { grid-column: 2; color: var(--muted); font-size: 12.5px; }
+.nslist { display: grid; gap: 8px; margin-top: 8px; }
+.ns-item { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+.ns-item .glue { margin-top: 6px; display: grid; gap: 4px; font-size: 13px; }
+ol.steps { margin: 8px 0 0; padding-left: 20px; display: grid; gap: 10px; }
+ol.steps li { padding-left: 2px; }
+@media (max-width: 520px) {
+  .fact { grid-template-columns: minmax(0, 1fr); }
+  .fact .fd { grid-column: 1; }
+}
+
+.rz-list { display: grid; gap: 8px; }
+.rz { border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; }
+.rz-h { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
+.rz-n { font-weight: 600; overflow-wrap: anywhere; }
+.rz-p { display: flex; flex-wrap: wrap; gap: 4px 6px; margin-top: 6px; }
+.perm { font-size: 12px; padding: 1px 8px; border-radius: 6px; background: var(--bg); color: var(--muted); }
+/* ---- modal ---- */
+#modal-root { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; background: rgba(10,14,20,.45); z-index: 50; padding: 16px; }
+#modal-root.open { display: flex; }
+.modal { width: 100%; max-width: 520px; max-height: calc(100vh - 32px); max-height: calc(100dvh - 32px); display: flex; flex-direction: column; overflow: hidden; }
+.modal.md { max-width: 640px; }
+.modal.lg { max-width: 780px; }
+.modal .m-head { flex: none; display: flex; align-items: flex-start; gap: 10px; padding: 16px 16px 14px 22px; border-bottom: 1px solid var(--line); }
+.modal .m-head h2 { flex: 1; min-width: 0; margin: 4px 0 0; overflow-wrap: anywhere; }
+.modal .m-body { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 16px 22px 20px; overscroll-behavior: contain; }
+.modal .m-body > :first-child { margin-top: 0; }
+.modal .m-foot { flex: none; display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; padding: 12px 22px; border-top: 1px solid var(--line); background: var(--panel); }
+.modal .m-body .foot { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; margin-top: 18px; }
+.modal h2 { margin-bottom: 14px; }
+.modal .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 0 14px; }
+.modal .cols > * { min-width: 0; }
+.rec-top { display: grid; grid-template-columns: minmax(0, 1fr) 150px; gap: 0 14px; }
+.owner-prev { font-size: 12.5px; color: var(--muted); margin-top: 2px; overflow-wrap: anywhere; }
+.owner-prev b { color: var(--text); font-family: var(--mono); font-weight: 600; font-size: 12.5px; }
+.field .hint.bad { color: var(--danger); }
+.field input.bad, .field textarea.bad { border-color: var(--danger); }
+.quick { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 2px; }
+.quick button { font-size: 11.5px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); background: none; cursor: pointer; color: var(--muted); }
+.quick button:hover { border-color: var(--accent); color: var(--accent); }
+textarea { resize: vertical; }
+.tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin: 0 0 14px; }
+.tabs button { background: none; border: 0; border-bottom: 2px solid transparent; padding: 8px 12px; cursor: pointer; color: var(--muted); font-weight: 500; white-space: nowrap; display: inline-flex; align-items: center; gap: 6px; }
+.tabs button.on { color: var(--text); border-bottom-color: var(--accent); }
+.seg { display: inline-flex; align-self: flex-start; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; flex-wrap: wrap; }
+.seg label { padding: 6px 12px; cursor: pointer; font-size: 13px; }
+.seg input { display: none; }
+.seg label:has(input:checked) { background: var(--chip); color: var(--chip-ink); font-weight: 600; }
+.io-summary { background: var(--bg); border-radius: 8px; padding: 10px 12px; font-size: 13px; margin-top: 10px; overflow-wrap: anywhere; }
+.io-summary.warn { background: color-mix(in srgb, var(--warn) 14%, transparent); }
+.io-summary.bad { background: color-mix(in srgb, var(--danger) 12%, transparent); color: var(--danger); }
+
+/* ---- toasts ---- */
+#toasts { position: fixed; right: 16px; bottom: 16px; display: flex; flex-direction: column; gap: 8px; z-index: 60; align-items: flex-end; }
+.toast { background: var(--text); color: var(--bg); padding: 10px 14px; border-radius: 8px; box-shadow: var(--shadow); font-size: 13px; max-width: 360px; }
+.toast.err { background: var(--danger); color: #fff; }
+.toast.ok { background: var(--ok); color: #fff; }
+
+/* live query log */
+#queries tbody tr { animation: fade .3s ease-out; }
+@keyframes fade { from { background: color-mix(in srgb, var(--accent) 14%, transparent); } to { background: transparent; } }
+
+@media (max-width: 860px) {
+  #app { grid-template-columns: minmax(0, 1fr); grid-template-areas: "mtop" "main"; grid-template-rows: auto 1fr; }
+  #mtop { grid-area: mtop; display: flex; align-items: center; gap: 10px; padding: 10px 12px; background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 30; }
+  #mtop .brand { font-size: 16px; flex: 1; }
+  #mtop .brand .logo { width: 26px; height: 26px; }
+  #side { position: fixed; left: 0; top: 0; bottom: 0; width: min(280px, 85vw); transform: translateX(-105%); transition: transform .2s ease; box-shadow: none; }
+  #app.nav-open #side { transform: none; box-shadow: 8px 0 30px rgba(0,0,0,.25); }
+  #app.nav-open #nav-backdrop { display: block; position: fixed; inset: 0; background: rgba(10,14,20,.4); z-index: 40; }
+  #nav-collapse { display: none; }
+  #main { padding: 16px; }
+  .two { grid-template-columns: 1fr; }
+  .modal .cols { grid-template-columns: 1fr; }
+}
+@media (max-width: 520px) {
+  #modal-root { padding: 8px; align-items: flex-end; }
+  .modal { max-height: calc(100vh - 16px); max-height: calc(100dvh - 16px); }
+  .modal .m-head { padding-left: 16px; }
+  .modal .m-body { padding: 14px 16px 18px; }
+  .modal .m-foot { padding: 10px 16px; }
+  .rec-top { grid-template-columns: minmax(0, 1fr) 118px; }
+  #toasts { left: 16px; align-items: stretch; }
+  .toast { max-width: none; }
+}
+</style>
+</head>
+<body>
+
+<!-- ================= LOGIN ================= -->
+<div id="login" class="hidden">
+  <div class="card">
+    <div class="brand"><span class="logo">D</span> rust-dns</div>
+    <div id="login-step-password">
+      <div class="field"><label>Username</label><input type="text" id="li-user" autocomplete="username" autofocus></div>
+      <div class="field"><label>Password</label><input type="password" id="li-pass" autocomplete="current-password"></div>
+      <div class="error" id="li-err"></div>
+      <button class="btn primary" id="li-btn" style="width:100%;justify-content:center">Sign in</button>
+    </div>
+    <div id="login-step-mfa" class="hidden">
+      <p class="hint" style="margin-top:14px">Enter the 6-digit code from your authenticator app, or a recovery code.</p>
+      <div class="field"><label>Code</label><input type="text" id="mfa-code" autocomplete="one-time-code" maxlength="12"></div>
+      <div class="error" id="mfa-err"></div>
+      <button class="btn primary" id="mfa-btn" style="width:100%;justify-content:center">Verify</button>
+      <button class="btn ghost" id="mfa-cancel" style="width:100%;justify-content:center;margin-top:6px">Cancel</button>
+    </div>
+    <div id="login-step-enroll" class="hidden">
+      <p class="hint" style="margin-top:14px">Two-factor authentication is required for this account. Scan the QR code with an authenticator app, then enter the code it shows.</p>
+      <div class="qr" id="enroll-qr"></div>
+      <div class="hint">Manual entry: <code id="enroll-secret"></code></div>
+      <div class="field"><label>Code</label><input type="text" id="enroll-code" inputmode="numeric" autocomplete="one-time-code" maxlength="6"></div>
+      <div class="error" id="enroll-err"></div>
+      <button class="btn primary" id="enroll-btn" style="width:100%;justify-content:center">Activate</button>
+      <button class="btn ghost" id="enroll-cancel" style="width:100%;justify-content:center;margin-top:6px">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- ================= APP ================= -->
+<div id="app" class="hidden">
+  <header id="mtop">
+    <button class="icon-btn" id="nav-open" title="Menu" aria-label="Open menu" data-ico="menu"></button>
+    <div class="brand"><span class="logo">D</span> rust-dns</div>
+    <span class="status-dot" id="ws-dot-m" title="connecting"></span>
+  </header>
+  <aside id="side">
+    <div class="side-head">
+      <div class="brand"><span class="logo">D</span><span class="brand-name">rust-dns</span></div>
+      <button class="icon-btn" id="nav-collapse" title="Collapse sidebar" aria-label="Collapse sidebar" data-ico="sidebar"></button>
+    </div>
+    <nav id="nav">
+      <div class="nav-sec">DNS</div>
+      <a href="#/dashboard" data-nav="dashboard" title="Dashboard"><span class="nav-ico" data-ico="dashboard"></span><span class="lbl">Dashboard</span></a>
+      <a href="#/zones" data-nav="zones" title="Zones"><span class="nav-ico" data-ico="globe"></span><span class="lbl">Zones</span></a>
+      <a href="#/queries" data-nav="queries" title="Live queries"><span class="nav-ico" data-ico="pulse"></span><span class="lbl">Live queries</span></a>
+      <a href="#/changelog" data-nav="changelog" title="Changelog"><span class="nav-ico" data-ico="list"></span><span class="lbl">Changelog</span></a>
+      <div class="nav-sec" data-admin>Admin</div>
+      <a href="#/users" data-nav="users" data-admin title="Users"><span class="nav-ico" data-ico="users"></span><span class="lbl">Users</span></a>
+      <a href="#/audit" data-nav="audit" data-admin title="Audit log"><span class="nav-ico" data-ico="shield"></span><span class="lbl">Audit log</span></a>
+      <a href="#/server" data-nav="server" data-admin title="Server settings"><span class="nav-ico" data-ico="sliders"></span><span class="lbl">Server settings</span></a>
+      <div class="nav-sec">Account</div>
+      <a href="#/tokens" data-nav="tokens" title="API tokens"><span class="nav-ico" data-ico="key"></span><span class="lbl">API tokens</span></a>
+      <a href="#/api" data-nav="api" title="API explorer"><span class="nav-ico" data-ico="code"></span><span class="lbl">API explorer</span></a>
+      <a href="#/account" data-nav="account" title="Account"><span class="nav-ico" data-ico="user"></span><span class="lbl">Account</span></a>
+    </nav>
+    <div class="spacer"></div>
+    <div class="who">
+      <div class="who-row" id="who-row"><span class="status-dot" id="ws-dot"></span><span class="who-text"><b id="who-name"></b><span id="ws-text">connecting</span></span></div>
+      <a href="#" id="logout" title="Sign out"><span class="nav-ico" data-ico="logout"></span><span class="lbl">Sign out</span></a>
+    </div>
+  </aside>
+  <div id="nav-backdrop"></div>
+  <main id="main"></main>
+</div>
+
+<div id="drawer-root"><div class="scrim"></div><div id="drawer" role="dialog" aria-modal="true"></div></div>
+<div id="modal-root"><div class="card modal" id="modal" role="dialog" aria-modal="true"></div></div>
+<div id="toasts"></div>
+
+<script>
+'use strict';
+// ---------------------------------------------------------------------------
+// tiny helpers
+// ---------------------------------------------------------------------------
+const $ = (s, r = document) => r.querySelector(s);
+const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmtTime = ts => { if (!ts) return ''; const d = new Date(ts); return isNaN(d) ? ts : d.toLocaleString(); };
+const ago = ts => { const s = Math.max(0, (Date.now() - new Date(ts)) / 1000); if (s < 60) return `${Math.floor(s)}s ago`; if (s < 3600) return `${Math.floor(s/60)}m ago`; if (s < 86400) return `${Math.floor(s/3600)}h ago`; return `${Math.floor(s/86400)}d ago`; };
+const uptime = s => { const d = Math.floor(s/86400), h = Math.floor(s%86400/3600), m = Math.floor(s%3600/60); return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m ${s%60}s`; };
+const num = n => (n ?? 0).toLocaleString();
+
+// Icons: 24px stroke glyphs, currentColor, so they follow the theme.
+const ICONS = {
+  dashboard: '<rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/>',
+  globe: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/>',
+  pulse: '<path d="M3 12h4l3-8 4 16 3-8h4"/>',
+  list: '<path d="M9 6h12M9 12h12M9 18h12"/><path d="M4.5 6h.01M4.5 12h.01M4.5 18h.01" stroke-width="2.6"/>',
+  users: '<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0"/><path d="M16 4.6a3.5 3.5 0 0 1 0 6.8M18 14.3a6.5 6.5 0 0 1 3.5 5.7"/>',
+  shield: '<path d="M12 3l8 3v6c0 4.5-3.4 8.3-8 9-4.6-.7-8-4.5-8-9V6z"/><path d="M9 12l2 2 4-4"/>',
+  sliders: '<path d="M4 6h9M19 6h1M4 12h3M13 12h7M4 18h11M21 18h-1"/><circle cx="16" cy="6" r="2.2"/><circle cx="10" cy="12" r="2.2"/><circle cx="17.8" cy="18" r="2.2"/>',
+  key: '<circle cx="8" cy="15" r="4"/><path d="M11 12l9-9M16.5 6.5l3 3M14 9l2 2"/>',
+  code: '<path d="M8 7l-5 5 5 5M16 7l5 5-5 5M13.5 4l-3 16"/>',
+  user: '<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>',
+  logout: '<path d="M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3M10 17l5-5-5-5M15 12H3"/>',
+  sidebar: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16M15.5 10l-2 2 2 2"/>',
+  menu: '<path d="M4 6h16M4 12h16M4 18h16"/>',
+  copy: '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/>',
+  check: '<path d="M5 12.5l4.5 4.5L19 7.5"/>',
+  close: '<path d="M6 6l12 12M18 6L6 18"/>',
+  plus: '<path d="M12 5v14M5 12h14"/>',
+  search: '<circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/>',
+  info: '<circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5v.01"/>',
+  warn: '<path d="M12 3.5l9.5 16.5h-19z"/><path d="M12 10v4.5M12 17.2v.01"/>',
+  deleg: '<path d="M3 12h10M9 7l5 5-5 5"/><path d="M16 4h4v16h-4"/>',
+  term: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M13 15h4"/>',
+  lock: '<rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>',
+  back: '<path d="M15 6l-6 6 6 6"/>',
+};
+const ico = (name, cls = '') => `<span class="ico ${cls}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name] || ''}</svg></span>`;
+$$('[data-ico]').forEach(el => { el.innerHTML = ico(el.dataset.ico); });
+
+function toast(msg, kind = '') {
+  const t = document.createElement('div'); t.className = 'toast ' + kind; t.textContent = msg;
+  $('#toasts').appendChild(t); setTimeout(() => t.remove(), kind === 'err' ? 6000 : 3000);
+}
+
+// `opts.full`: resolve to { status, data } instead of the body (e.g. 201 created vs 200 renewed).
+async function api(method, path, body, opts = {}) {
+  const opt = { method, headers: { 'x-requested-with': 'rust-dns' } };
+  if (body !== undefined) { opt.headers['content-type'] = 'application/json'; opt.body = JSON.stringify(body); }
+  const r = await fetch('/api' + path, opt);
+  let data = null;
+  const ct = r.headers.get('content-type') || '';
+  if (ct.includes('json')) data = await r.json(); else data = await r.text();
+  if (!r.ok) {
+    if (r.status === 401 && data && (data.code === 'login_required')) { showLogin(); }
+    const e = new Error((data && data.error) || `${r.status} ${r.statusText}`); e.status = r.status; e.code = data && data.code; throw e;
+  }
+  return opts.full ? { status: r.status, data } : data;
+}
+const GET = p => api('GET', p), POST = (p, b) => api('POST', p, b ?? {}), PUT = (p, b) => api('PUT', p, b), DEL = p => api('DELETE', p);
+
+// ---------------------------------------------------------------------------
+// clipboard: [data-copy] anywhere copies its value
+// ---------------------------------------------------------------------------
+async function copyText(text) {
+  try { if (navigator.clipboard && window.isSecureContext) { await navigator.clipboard.writeText(text); return true; } } catch {}
+  try {
+    const ta = document.createElement('textarea'); ta.value = text; ta.setAttribute('readonly', ''); ta.style.cssText = 'position:fixed;top:-1000px;opacity:0';
+    document.body.appendChild(ta); ta.select(); const ok = document.execCommand('copy'); ta.remove(); return ok;
+  } catch { return false; }
+}
+const copyBtn = (value, title = 'Copy') => `<button type="button" class="icon-btn sm" data-copy="${esc(value)}" title="${esc(title)}" aria-label="${esc(title)}">${ico('copy')}</button>`;
+const cmdBlock = cmd => `<div class="cmd"><code>${esc(cmd)}</code>${copyBtn(cmd, 'Copy command')}</div>`;
+const copyVal = v => `<span class="cval"><code>${esc(v)}</code>${copyBtn(v)}</span>`;
+document.addEventListener('click', async e => {
+  const b = e.target.closest('[data-copy]'); if (!b) return;
+  e.preventDefault(); e.stopPropagation();
+  if (await copyText(b.dataset.copy)) { toast('Copied', 'ok'); b.innerHTML = ico('check'); setTimeout(() => { b.innerHTML = ico('copy'); }, 1200); }
+  else toast('Copy failed: select the text and copy it manually', 'err');
+});
+
+// ---------------------------------------------------------------------------
+// modal: sized to the viewport; the title and the button row stay put, the
+// body scrolls. `opts.size`: 'md' (640px) or 'lg' (780px).
+// ---------------------------------------------------------------------------
+function openModal(html, onOpen, opts = {}) {
+  const m = $('#modal');
+  m.className = 'card modal' + (opts.size ? ' ' + opts.size : ''); m.style.maxWidth = '';
+  m.innerHTML = `<div class="m-body">${html}</div>`;
+  const body = m.firstElementChild;
+  const h = body.firstElementChild;
+  if (h && h.tagName === 'H2') {
+    const head = document.createElement('div'); head.className = 'm-head';
+    head.appendChild(h);
+    head.insertAdjacentHTML('beforeend', `<button type="button" class="icon-btn" data-close title="Close (Esc)" aria-label="Close">${ico('close')}</button>`);
+    m.insertBefore(head, body);
+  }
+  const foot = body.lastElementChild;
+  if (foot && foot.classList.contains('foot')) { foot.className = 'm-foot'; m.appendChild(foot); }
+  $('#modal-root').classList.add('open');
+  const first = body.querySelector('input:not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=file]),select,textarea'); if (first) setTimeout(() => first.focus(), 30);
+  m.querySelectorAll('[data-close]').forEach(b => b.onclick = closeModal);
+  if (onOpen) onOpen(m);
+}
+function closeModal() { $('#modal-root').classList.remove('open'); const m = $('#modal'); m.innerHTML = ''; m.className = 'card modal'; m.style.maxWidth = ''; }
+const modalOpen = () => $('#modal-root').classList.contains('open');
+$('#modal-root').addEventListener('click', e => { if (e.target === $('#modal-root')) closeModal(); });
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape') return;
+  if (modalOpen()) closeModal();
+  else if ($('#drawer-root').classList.contains('open')) closeDrawer();
+  else $('#app').classList.remove('nav-open');
+});
+function confirmModal(title, text, okLabel = 'Delete') {
+  return new Promise(res => {
+    openModal(`<h2>${esc(title)}</h2><p>${esc(text)}</p><div class="foot"><button class="btn" data-close>Cancel</button><button class="btn danger" id="cf-ok">${esc(okLabel)}</button></div>`);
+    $('#cf-ok').onclick = () => { closeModal(); res(true); };
+    $$('[data-close]').forEach(b => b.addEventListener('click', () => res(false), { once: true }));
+  });
+}
+
+// ---------------------------------------------------------------------------
+// slide-over panel (right side)
+// ---------------------------------------------------------------------------
+function openDrawer(html) { $('#drawer').innerHTML = html; $('#drawer-root').classList.add('open'); }
+function closeDrawer() { $('#drawer-root').classList.remove('open'); $('#drawer').innerHTML = ''; S.panel = null; $$('.chip-btn.on').forEach(c => c.classList.remove('on')); }
+$('#drawer-root .scrim').addEventListener('click', closeDrawer);
+
+// ---------------------------------------------------------------------------
+// navigation: collapsible rail on desktop, drawer on phones
+// ---------------------------------------------------------------------------
+const NAV_KEY = 'rust-dns.nav-collapsed';
+function setNavCollapsed(on) {
+  $('#app').classList.toggle('nav-collapsed', on);
+  const b = $('#nav-collapse'); b.title = on ? 'Expand sidebar' : 'Collapse sidebar'; b.setAttribute('aria-label', b.title);
+}
+try { setNavCollapsed(localStorage.getItem(NAV_KEY) === '1'); } catch { setNavCollapsed(false); }
+$('#nav-collapse').onclick = () => {
+  const on = !$('#app').classList.contains('nav-collapsed'); setNavCollapsed(on);
+  try { localStorage.setItem(NAV_KEY, on ? '1' : '0'); } catch {}
+};
+$('#nav-open').onclick = () => $('#app').classList.add('nav-open');
+$('#nav-backdrop').onclick = () => $('#app').classList.remove('nav-open');
+$('#nav').addEventListener('click', e => { if (e.target.closest('a')) $('#app').classList.remove('nav-open'); });
+
+// ---------------------------------------------------------------------------
+// state
+// ---------------------------------------------------------------------------
+const S = { user: null, zones: [], zone: null, panel: null, status: null, queries: [], changes: [], lastOffset: null, ws: null, wsTimer: null, paused: false, filter: '' };
+const RTYPES = ['A', 'AAAA', 'CNAME', 'DNAME', 'PTR', 'NS', 'MX', 'TXT', 'SRV', 'CAA', 'HTTPS', 'SVCB', 'TLSA', 'SSHFP', 'NAPTR', 'HINFO'];
+const VALUE_HINT = { A: '10.0.0.1', AAAA: '2001:db8::1', CNAME: 'target.example.com', DNAME: 'other.example.com', PTR: 'host.example.com', NS: 'ns1.example.com', MX: '10 mail.example.com', TXT: 'v=spf1 -all', SRV: '10 20 5060 sip.example.com', CAA: '0 issue "letsencrypt.org"', HTTPS: '1 . alpn=h2,h3', SVCB: '1 svc.example.com. port=8443', TLSA: '3 1 1 <sha256 hex>', SSHFP: '4 2 <sha256 hex>', NAPTR: '100 10 "S" "SIP+D2U" "" _sip._udp.example.com.', HINFO: '"x86_64" "Linux"' };
+
+// ---------------------------------------------------------------------------
+// login flow
+// ---------------------------------------------------------------------------
+function showLogin(step = 'password') {
+  closeModal(); disconnectWs();
+  $('#app').classList.add('hidden'); $('#login').classList.remove('hidden');
+  for (const s of ['password', 'mfa', 'enroll']) $('#login-step-' + s).classList.toggle('hidden', s !== step);
+  $('#li-err').textContent = ''; $('#mfa-err').textContent = ''; $('#enroll-err').textContent = '';
+  const f = { password: '#li-user', mfa: '#mfa-code', enroll: '#enroll-code' }[step]; setTimeout(() => $(f).focus(), 30);
+}
+function showEnroll(enroll) {
+  $('#enroll-qr').innerHTML = enroll.qr_svg || ''; $('#enroll-secret').textContent = enroll.secret; showLogin('enroll');
+}
+function recoveryModal(codes, then) {
+  openModal(`<h2>Recovery codes</h2><p class="hint">Each code signs you in once if you lose your authenticator. Store them somewhere safe; they will not be shown again.</p>
+    <pre style="font-size:14px;line-height:1.8">${codes.map(esc).join('\n')}</pre>
+    <div class="foot"><button class="btn" id="rc-copy">Copy</button><button class="btn primary" data-close>I saved them</button></div>`, m => {
+    $('#rc-copy').onclick = () => { navigator.clipboard?.writeText(codes.join('\n')); toast('Copied', 'ok'); };
+    if (then) $$('[data-close]', m).forEach(b => b.addEventListener('click', then, { once: true }));
+  });
+}
+async function handleAuthResult(r) {
+  if (r.status === 'ok' && r.recovery_codes) { $('#login').classList.add('hidden'); S.user = r.user; recoveryModal(r.recovery_codes, () => enterApp()); return; }
+  if (r.status === 'ok') { S.user = r.user; if (r.used_recovery_code) toast(`Signed in with a recovery code; ${r.recovery_codes_left} left`, 'err'); await enterApp(); }
+  else if (r.status === 'mfa_required') showLogin('mfa');
+  else if (r.status === 'enroll_required') showEnroll(r.enroll);
+  else showLogin();
+}
+$('#li-btn').onclick = async () => {
+  $('#li-err').textContent = ''; $('#li-btn').disabled = true;
+  try { await handleAuthResult(await POST('/auth/login', { username: $('#li-user').value, password: $('#li-pass').value })); }
+  catch (e) { $('#li-err').textContent = e.message; }
+  finally { $('#li-btn').disabled = false; }
+};
+$('#li-pass').addEventListener('keydown', e => e.key === 'Enter' && $('#li-btn').click());
+$('#li-user').addEventListener('keydown', e => e.key === 'Enter' && $('#li-pass').focus());
+$('#mfa-btn').onclick = async () => {
+  $('#mfa-err').textContent = '';
+  try { await handleAuthResult(await POST('/auth/mfa', { code: $('#mfa-code').value })); } catch (e) { $('#mfa-err').textContent = e.message; }
+};
+$('#mfa-code').addEventListener('keydown', e => e.key === 'Enter' && $('#mfa-btn').click());
+$('#enroll-btn').onclick = async () => {
+  $('#enroll-err').textContent = '';
+  try { await handleAuthResult(await POST('/auth/enroll', { code: $('#enroll-code').value })); } catch (e) { $('#enroll-err').textContent = e.message; }
+};
+$('#enroll-code').addEventListener('keydown', e => e.key === 'Enter' && $('#enroll-btn').click());
+$('#mfa-cancel').onclick = $('#enroll-cancel').onclick = async () => { await POST('/auth/logout').catch(() => {}); showLogin(); };
+$('#logout').onclick = async e => { e.preventDefault(); await POST('/auth/logout').catch(() => {}); S.user = null; showLogin(); };
+
+// ---------------------------------------------------------------------------
+// app shell + routing
+// ---------------------------------------------------------------------------
+async function enterApp() {
+  $('#login').classList.add('hidden'); $('#app').classList.remove('hidden');
+  $('#who-name').textContent = S.user.username + (S.user.is_admin ? ' · admin' : '');
+  $$('[data-admin]').forEach(a => a.classList.toggle('hidden', !S.user.is_admin));
+  await refreshZones();
+  connectWs();
+  route();
+}
+window.addEventListener('hashchange', route);
+async function route() {
+  if (!S.user) return;
+  const h = location.hash.replace(/^#\/?/, '') || 'dashboard';
+  const [page, arg] = h.split('/').map(decodeURIComponent);
+  $$('#side nav a').forEach(a => a.classList.toggle('active', a.dataset.nav === page));
+  $('#app').classList.remove('nav-open');
+  if (S.panel && !(page === 'zones' && arg === S.panel.zone)) closeDrawer();
+  const views = { dashboard: viewDashboard, zones: arg ? () => viewZone(arg) : viewZones, queries: viewQueries, changelog: viewChangelog, audit: viewAudit, server: viewServer, api: viewApi, users: viewUsers, tokens: viewTokens, account: viewAccount };
+  const v = views[page] || viewDashboard;
+  try { await v(); } catch (e) { if (e.code !== 'login_required') { $('#main').innerHTML = `<div class="empty">${esc(e.message)}</div>`; } }
+}
+async function refreshZones() { S.zones = (await GET('/zones')).zones; }
+
+// ---------------------------------------------------------------------------
+// websocket (realtime)
+// ---------------------------------------------------------------------------
+function setWs(state, text) {
+  for (const d of [$('#ws-dot'), $('#ws-dot-m')]) { d.className = 'status-dot ' + state; d.title = 'Live updates: ' + text; }
+  $('#ws-text').textContent = text; $('#who-row').title = 'Live updates: ' + text;
+}
+function disconnectWs() { if (S.ws) { S.ws.onclose = null; S.ws.close(); S.ws = null; } clearTimeout(S.wsTimer); }
+function connectWs() {
+  disconnectWs();
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const after = S.lastOffset != null ? `after=${S.lastOffset}&` : '';
+  const ws = new WebSocket(`${proto}://${location.host}/api/ws?${after}queries=true`);
+  S.ws = ws; setWs('', 'connecting');
+  ws.onopen = () => setWs('on', 'live');
+  ws.onclose = () => { setWs('off', 'reconnecting'); S.wsTimer = setTimeout(connectWs, 2000); };
+  ws.onmessage = ev => {
+    const m = JSON.parse(ev.data);
+    if (m.type === 'hello') { if (S.lastOffset == null) S.lastOffset = m.head; }
+    else if (m.type === 'resync') { S.lastOffset = m.head; toast('Reconnected after a gap; reloading'); refreshZones().then(route); }
+    else if (m.type === 'change') onChange(m.event);
+    else if (m.type === 'query') onQuery(m.event);
+  };
+}
+// Change events arrive one per committed fact; a single transaction (an import,
+// a zone delete) can produce hundreds. Refresh once per burst, toast once per txn.
+let changeBurst = null;
+const toastedTxns = new Set();
+function onChange(e) {
+  S.lastOffset = Math.max(S.lastOffset ?? 0, e.offset);
+  S.changes.push(e); if (S.changes.length > 500) S.changes.shift();
+  const page = (location.hash.replace(/^#\/?/, '') || 'dashboard').split('/')[0];
+  if (page === 'changelog') appendChangelogRow(e);
+  if (!changeBurst) changeBurst = { zones: new Set(), deleted: new Set() };
+  changeBurst.zones.add(e.zone);
+  if (e.entity === 'zone' && e.action === 'delete') changeBurst.deleted.add(e.zone);
+  if (e.actor !== S.user.username && e.txn && !toastedTxns.has(e.txn)) {
+    toastedTxns.add(e.txn); if (toastedTxns.size > 200) toastedTxns.delete(toastedTxns.values().next().value);
+    toast(`${e.actor}: ${(e.command || e.action).replace(/_/g, ' ')} in ${e.zone}`);
+  }
+  clearTimeout(onChange.timer);
+  onChange.timer = setTimeout(flushChanges, 250);
+}
+function flushChanges() {
+  const burst = changeBurst; changeBurst = null; if (!burst) return;
+  const page = (location.hash.replace(/^#\/?/, '') || 'dashboard').split('/')[0];
+  refreshZones().then(() => {
+    if (page === 'zones' && !S.zone) renderZonesTable();
+    if (page === 'zones' && S.zone && burst.zones.has(S.zone.name)) {
+      if (burst.deleted.has(S.zone.name)) { location.hash = '#/zones'; toast(`Zone ${S.zone.name} was deleted`); } else reloadZone();
+    }
+    if (page === 'dashboard') renderRecentChanges();
+  });
+}
+function onQuery(q) {
+  if (S.paused) return;
+  S.queries.unshift(q); if (S.queries.length > 400) S.queries.pop();
+  const page = (location.hash.replace(/^#\/?/, '') || 'dashboard').split('/')[0];
+  if (page === 'queries') prependQueryRow(q);
+}
+
+// ---------------------------------------------------------------------------
+// dashboard
+// ---------------------------------------------------------------------------
+let statusTimer = null;
+async function viewDashboard() {
+  clearInterval(statusTimer);
+  const st = S.status = await GET('/status');
+  const d = st.dns;
+  $('#main').innerHTML = `
+    <div class="topbar"><h1>Dashboard</h1><span class="hint">v${esc(st.version)} · up ${uptime(st.uptime_secs)}</span></div>
+    <div class="grid tiles" id="tiles"></div>
+    <div class="card panel" style="margin-top:14px" id="listeners">${listenersHtml(st)}</div>
+    <div class="grid two" style="margin-top:14px">
+      <div class="card panel"><h2>Server</h2><div class="kv">
+        <span class="k">Forwarding</span><span class="mono">${st.forwarding.upstreams.length ? esc(st.forwarding.upstreams.join(', ')) : '<i>off (foreign names are REFUSED)</i>'}</span>
+        <span class="k">Auto PTR</span><span>${st.auto_ptr ? 'on' : 'off'}</span>
+        <span class="k">Rate limit</span><span>${num(st.rate_limit.max_resolutions_per_second_per_address)} q/s per address · tracking ${num(st.rate_limit.tracked_addresses)} / ${num(st.rate_limit.max_tracked_addresses)}</span>
+        <span class="k">Changelog</span><span>offsets ${st.changelog.oldest_offset ?? '–'} … ${st.changelog.latest_offset ?? '–'} · ${st.changelog.retention_days} day retention</span>
+        <span class="k">Catalog built</span><span>${fmtTime(st.catalog_built_at)}</span>
+      </div></div>
+      <div class="card panel"><h2>Recent changes</h2><div id="recent" class="tw"></div></div>
+    </div>`;
+  renderTiles(); renderRecentChanges();
+  if (!S.changes.length) { const cl = await GET('/changelog?limit=20'); S.changes = cl.entries; renderRecentChanges(); }
+  statusTimer = setInterval(async () => { if (!location.hash.includes('dashboard') && location.hash) { clearInterval(statusTimer); return; } try { S.status = await GET('/status'); renderTiles(); } catch {} }, 5000);
+}
+// ---- how to reach the DNS server -------------------------------------------
+const WILDCARD_BINDS = ['0.0.0.0', '::', '[::]'];
+const isIpLiteral = h => /^\d{1,3}(\.\d{1,3}){3}$/.test(h) || h.includes(':');
+// The address sample commands should use: the host the console is reached at,
+// unless the DNS listeners are bound to specific addresses that exclude it.
+function dnsTarget(st) {
+  const L = (st && st.listeners) || {}; const binds = (L.bind || []).map(b => b.replace(/^\[|\]$/g, ''));
+  const port = L.port || 53;
+  let host = location.hostname.replace(/^\[|\]$/g, '');
+  let note = '';
+  const wild = binds.some(b => WILDCARD_BINDS.includes(b));
+  const loopHost = host === 'localhost' || host === '::1' || host.startsWith('127.');
+  const loopBind = binds.some(b => b === '::1' || b.startsWith('127.') || b === 'localhost');
+  if (!wild && binds.length) {
+    if (loopHost && !loopBind) { host = binds[0]; note = `DNS does not listen on loopback; the commands use ${host}.`; }
+    else if (!loopHost && isIpLiteral(host) && !binds.includes(host)) { note = `The console is reached at ${host}, but DNS listens only on ${binds.join(', ')}; the commands use ${binds[0]}.`; host = binds[0]; }
+    else if (loopHost && loopBind && binds.every(b => b === '::1' || b.startsWith('127.') || b === 'localhost')) note = 'DNS listens on loopback only: it is reachable from this machine, not from the network.';
+  }
+  return { host, port, note, tcp: L.tcp !== false, udp: L.udp !== false };
+}
+const digAt = t => `dig @${t.host}${t.port !== 53 ? ` -p ${t.port}` : ''}`;
+function listenersHtml(st) {
+  const L = st.listeners || {}; const t = dnsTarget(st);
+  const protos = `${L.udp ? '<span class="badge ok">UDP</span> ' : ''}${L.tcp ? '<span class="badge ok">TCP</span>' : ''}${!L.udp && !L.tcp ? '<span class="badge bad">no protocol enabled</span>' : ''}`;
+  const addrRow = b => {
+    const bare = b.replace(/^\[|\]$/g, ''); const shown = (bare.includes(':') ? `[${bare}]` : bare) + ':' + L.port;
+    const what = bare === '0.0.0.0' ? 'all IPv4 addresses of this host' : bare === '::' ? 'all IPv6 addresses of this host (often IPv4 too)' : bare === '::1' || bare.startsWith('127.') ? 'loopback: this machine only' : 'this address only';
+    return `<tr><td>${copyVal(shown)}</td><td>${protos}</td><td class="hint">${what}</td></tr>`;
+  };
+  const zone = (S.zones.find(z => !isReverseZone(z.name) && z.name !== '.') || { name: 'example.com' }).name;
+  const ptrZone = S.zones.find(z => /\.in-addr\.arpa$/.test(z.name));
+  const revIp = ptrZone ? ptrZone.name.replace(/\.in-addr\.arpa$/, '').split('.').reverse().concat(['1', '1', '1', '1']).slice(0, 4).join('.') : '192.0.2.10';
+  const cmds = [];
+  if (L.udp) cmds.push([`${digAt(t)} ${zone} SOA`, 'Ask for the SOA record of a zone over UDP (the normal way).']);
+  if (L.tcp) cmds.push([`${digAt(t)} +tcp ${zone} SOA`, 'The same question over TCP.']);
+  cmds.push([`${digAt(t)} www.${zone} A`, 'Look up an address record (use a name that exists in your zone).']);
+  cmds.push([`${digAt(t)} -x ${revIp}`, 'Reverse lookup: the name for an IP address (PTR).']);
+  const xfr = st.transfer && (st.transfer.allow || []).length;
+  if (xfr && L.tcp) cmds.push([`${digAt(t)} ${zone} AXFR`, `Zone transfer (full copy), allowed only from ${st.transfer.allow.join(', ')}.`]);
+  return `<div class="row between"><h2 style="margin:0">DNS listeners</h2><span class="hint">port ${L.port}${L.port !== 53 ? ' (not the standard 53: clients must be told the port)' : ''}</span></div>
+    <div class="tw" style="margin-top:8px"><table><thead><tr><th>Address</th><th>Protocols</th><th>Meaning</th></tr></thead><tbody>${(L.bind || []).map(addrRow).join('') || '<tr><td colspan="3" class="empty">No listeners</td></tr>'}</tbody></table></div>
+    <p class="hint" style="margin:10px 0 0"><span class="mono">0.0.0.0</span> and <span class="mono">::</span> mean every address of this host; a specific address means clients must use exactly that address.</p>
+    ${t.note ? `<div class="note info">${ico('info', 's')}<span>${esc(t.note)}</span></div>` : ''}
+    <h3 style="margin-top:16px">Try it</h3>
+    ${cmds.map(([c, why]) => `<div style="margin-top:8px"><div class="hint">${esc(why)}</div>${cmdBlock(c)}</div>`).join('')}`;
+}
+function renderTiles() {
+  const st = S.status, d = st.dns;
+  const tiles = [['Queries', d.queries], ['Authoritative', d.authoritative], ['Forwarded', d.forwarded], ['NXDOMAIN', d.nxdomain], ['Refused', d.refused], ['Rate limited', d.rate_limited], ['Truncated', d.truncated], ['Errors', d.errors], ['Zones', st.zones], ['Records', st.records]];
+  $('#tiles').innerHTML = tiles.map(([k, v]) => `<div class="card tile"><div class="k">${k}</div><div class="v">${num(v)}</div></div>`).join('');
+}
+function renderRecentChanges() {
+  const el = $('#recent'); if (!el) return;
+  const rows = S.changes.slice(-12).reverse();
+  el.innerHTML = rows.length ? `<table><tbody>${rows.map(e => `<tr><td class="hint" style="white-space:nowrap">${ago(e.ts)}</td><td><b>${esc(e.actor)}</b> ${esc(e.action)} ${esc(e.entity)}</td><td><a href="#/zones/${encodeURIComponent(e.zone)}" class="mono">${esc(e.zone)}</a></td></tr>`).join('')}</tbody></table>` : '<div class="empty">No changes yet</div>';
+}
+
+// ---------------------------------------------------------------------------
+// zones list
+// ---------------------------------------------------------------------------
+async function viewZones() {
+  S.zone = null;
+  $('#main').innerHTML = `
+    <div class="topbar"><h1>Zones</h1><div class="actions">
+      <button class="btn" id="z-io">Import / Export</button>
+      ${S.user.is_admin ? '<button class="btn primary" id="z-new">New zone</button>' : ''}
+    </div></div>
+    <div class="row toolbar"><input type="text" id="z-filter" placeholder="Filter zones…"></div>
+    <div class="card" id="z-table"></div>`;
+  $('#z-filter').oninput = renderZonesTable;
+  if ($('#z-new')) $('#z-new').onclick = newZoneModal;
+  $('#z-io').onclick = () => ioModal(null);
+  renderZonesTable();
+}
+function renderZonesTable() {
+  const f = ($('#z-filter')?.value || '').toLowerCase();
+  const zs = S.zones.filter(z => z.name.includes(f));
+  $('#z-table').innerHTML = zs.length ? `<table><thead><tr><th>Zone</th><th>Records</th><th>Serial</th><th>Owner</th><th>Your role</th><th>Updated</th></tr></thead><tbody>
+    ${zs.map(z => `<tr class="clickable" onclick="location.hash='#/zones/${encodeURIComponent(z.name)}'"><td><b class="mono">${esc(z.name)}</b></td><td>${num(z.record_count)}</td><td class="mono">${z.serial}</td><td>${esc(z.owner || '–')}</td><td><span class="badge">${esc(z.role)}</span></td><td class="hint">${ago(z.updated_at)}</td></tr>`).join('')}
+  </tbody></table>` : `<div class="empty">${S.zones.length ? 'No zones match' : (S.user.is_admin ? 'No zones yet. Create one to get started.' : 'No zones have been shared with you.')}</div>`;
+}
+function zoneForm(z = {}) {
+  return `<div class="cols">
+    <div class="field"><label>SOA primary NS (MNAME)</label><input type="text" name="soa_mname" value="${esc(z.soa_mname || '')}" placeholder="ns1.example.com"></div>
+    <div class="field"><label>Hostmaster (RNAME)</label><input type="text" name="soa_rname" value="${esc(z.soa_rname || '')}" placeholder="hostmaster@example.com"></div>
+    <div class="field"><label>Default TTL (seconds)</label><input type="number" name="default_ttl" value="${z.default_ttl ?? 300}" min="1"></div>
+    <div class="field"><label>Negative TTL (seconds, SOA MINIMUM)</label><input type="number" name="minimum" value="${z.minimum ?? 300}" min="0"></div>
+    <div class="field"><label>Refresh (seconds)</label><input type="number" name="refresh" value="${z.refresh ?? 3600}" min="0"></div>
+    <div class="field"><label>Retry (seconds)</label><input type="number" name="retry" value="${z.retry ?? 600}" min="0"></div>
+    <div class="field"><label>Expire (seconds)</label><input type="number" name="expire" value="${z.expire ?? 1209600}" min="0"></div>
+    ${S.user.is_admin ? `<div class="field"><label>Owner (username)</label><input type="text" name="owner" value="${esc(z.owner || '')}" placeholder="${esc(S.user.username)}"></div>` : ''}
+  </div>`;
+}
+function readForm(m) { const o = {}; m.querySelectorAll('[name]').forEach(i => { const v = i.type === 'number' ? (i.value === '' ? null : Number(i.value)) : i.value.trim(); if (v !== null && v !== '') o[i.name] = v; }); return o; }
+function newZoneModal() {
+  openModal(`<h2>New zone</h2>
+    <div class="field"><label>Zone name</label><input type="text" name="name" placeholder="example.com  ·  0.0.10.in-addr.arpa  ·  ."></div>
+    <p class="hint">Leave the SOA fields empty to use the server defaults.</p>
+    ${zoneForm({ soa_mname: '', soa_rname: '' })}
+    <div class="error" id="m-err"></div>
+    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="m-ok">Create</button></div>`, m => {
+    m.querySelectorAll('[name=default_ttl],[name=minimum],[name=refresh],[name=retry],[name=expire]').forEach(i => i.value = '');
+    $('#m-ok').onclick = async () => { try { const z = await POST('/zones', readForm(m)); closeModal(); await refreshZones(); location.hash = '#/zones/' + encodeURIComponent(z.name); toast(`Zone ${z.name} created`, 'ok'); } catch (e) { $('#m-err').textContent = e.message; } };
+  });
+}
+// ---------------------------------------------------------------------------
+// zone detail
+// ---------------------------------------------------------------------------
+async function viewZone(name) {
+  S.zone = await GET('/zones/' + encodeURIComponent(name));
+  renderZone();
+}
+async function reloadZone() { if (!S.zone) return; try { S.zone = await GET('/zones/' + encodeURIComponent(S.zone.name)); renderZone(true); } catch {} }
+const isReverseZone = n => /(^|\.)(in-addr|ip6)\.arpa$/.test(n);
+function renderZone(keepFilter) {
+  const z = S.zone; const canEdit = z.role === 'editor' || z.role === 'owner'; const isOwner = z.role === 'owner';
+  const filter = keepFilter ? ($('#r-filter')?.value || '') : '';
+  const dl = delegationInfo(z);
+  const delegWarn = !dl.reverse && (dl.ns.some(n => n.inZone && !n.glue.length) || dl.fromSoa);
+  $('#main').innerHTML = `
+    <div class="zhead">
+      <a href="#/zones" class="back">${ico('back', 's')} Zones</a>
+      <div class="topbar">
+        <h1 class="mono zname">${esc(z.fqdn)}</h1>
+        <div class="actions">
+          <button class="btn" id="z-io">Import / Export</button>
+          ${isOwner ? '<button class="btn" id="z-edit">Settings</button><button class="btn danger" id="z-del">Delete zone</button>' : ''}
+        </div>
+      </div>
+      <div class="chips">
+        <button class="chip-btn" data-panel="soa" title="Start of authority: serial, timers, contacts">${ico('info', 's')} SOA <span class="sub mono">serial ${z.serial}</span></button>
+        <button class="chip-btn${delegWarn ? ' warn' : ''}" data-panel="deleg" title="${dl.reverse ? 'How reverse delegation works' : 'Nameservers and glue for your registrar'}">${ico(delegWarn ? 'warn' : 'deleg', 's')} ${dl.reverse ? 'Reverse delegation' : 'Delegation'} <span class="sub">${dl.ns.length} NS</span></button>
+        <button class="chip-btn" data-panel="dig" title="Commands to query this zone">${ico('term', 's')} Test with dig</button>
+        ${isOwner ? `<button class="chip-btn" data-panel="access" title="Who can see and edit this zone">${ico('lock', 's')} Access <span class="sub">${z.members.length}</span></button>` : ''}
+        <span class="meta">owner <b>${esc(z.owner || '–')}</b> · you are <span class="badge">${esc(z.role)}</span> · default TTL ${z.default_ttl}s</span>
+      </div>
+    </div>
+    <div class="card">
+      <div class="rtool">
+        <h2>Records <span class="badge muted" id="r-count">${z.record_total ?? z.records.length}</span></h2>
+        <div class="search">${ico('search', 's')}<input type="search" id="r-filter" placeholder="Filter by name, type or value…" value="${esc(filter)}" aria-label="Filter records"></div>
+        ${canEdit ? `<button class="btn primary" id="r-add">${ico('plus', 's')} Add record</button>` : ''}
+      </div>
+      <div id="r-table"></div>
+    </div>`;
+  const large = (z.record_total ?? 0) > (z.record_page || 500);
+  let searchTimer = null;
+  $('#r-filter').oninput = () => { if (!large) return renderRecords(); clearTimeout(searchTimer); searchTimer = setTimeout(serverSearch, 250); };
+  if ($('#r-add')) $('#r-add').onclick = () => recordModal(null);
+  $('#z-io').onclick = () => ioModal(z.name);
+  if ($('#z-edit')) $('#z-edit').onclick = zoneSettingsModal;
+  if ($('#z-del')) $('#z-del').onclick = async () => { if (await confirmModal('Delete zone', `Delete ${z.name} and all ${z.records.length} records? This cannot be undone.`)) { try { await DEL('/zones/' + encodeURIComponent(z.name)); toast('Zone deleted', 'ok'); closeDrawer(); await refreshZones(); location.hash = '#/zones'; } catch (e) { toast(e.message, 'err'); } } };
+  $$('[data-panel]').forEach(b => b.onclick = () => openZonePanel(b.dataset.panel));
+  renderRecords();
+  if (S.panel && S.panel.zone === z.name) {
+    if (S.panel.tab === 'access' && $('#members')) { renderMembers(); markPanelChip(); }
+    else openZonePanel(S.panel.tab);
+  }
+}
+function renderMembers() {
+  const z = S.zone; const el = $('#members'); if (!el) return;
+  el.innerHTML = z.members.length ? `<table><tbody>${z.members.map(m => `<tr><td>${esc(m.username)}</td><td><span class="badge">${esc(m.role)}</span></td><td class="actions"><button class="btn sm ghost danger" data-rm="${esc(m.username)}">Revoke</button></td></tr>`).join('')}</tbody></table>` : '<div class="hint">Only the owner and administrators have access.</div>';
+  el.querySelectorAll('[data-rm]').forEach(b => b.onclick = async () => { try { await DEL(`/zones/${encodeURIComponent(z.name)}/members/${encodeURIComponent(b.dataset.rm)}`); toast(`Revoked ${b.dataset.rm}`, 'ok'); reloadZone(); } catch (e) { toast(e.message, 'err'); } });
+}
+async function serverSearch() {
+  const z = S.zone; const q = $('#r-filter')?.value || '';
+  const r = await GET(`/zones/${encodeURIComponent(z.name)}/records?q=${encodeURIComponent(q)}&limit=${z.record_page || 500}`);
+  z.records = r.records; z.search_total = r.total; z.search_q = q; renderRecords();
+}
+async function loadMore() {
+  const z = S.zone; const q = z.search_q || '';
+  const r = await GET(`/zones/${encodeURIComponent(z.name)}/records?q=${encodeURIComponent(q)}&offset=${z.records.length}&limit=${z.record_page || 500}`);
+  z.records = z.records.concat(r.records); renderRecords();
+}
+function renderRecords() {
+  const z = S.zone; const canEdit = z.role === 'editor' || z.role === 'owner';
+  const large = (z.record_total ?? 0) > (z.record_page || 500);
+  const total = large ? (z.search_q ? z.search_total : z.record_total) : z.records.length;
+  const f = large ? '' : ($('#r-filter')?.value || '').toLowerCase();
+  const order = n => n === '@' ? '' : n.startsWith('*') ? '~' + n : n;
+  const recs = z.records.filter(r => !f || r.name.includes(f) || r.type.toLowerCase().includes(f) || r.value.toLowerCase().includes(f))
+    .sort((a, b) => order(a.name).localeCompare(order(b.name)) || RTYPES.indexOf(a.type) - RTYPES.indexOf(b.type) || a.value.localeCompare(b.value));
+  $('#r-count').textContent = f ? `${num(recs.length)} of ${num(total)}` : num(large ? total : z.records.length);
+  $('#r-table').innerHTML = `<table class="records" id="records"><thead><tr><th style="width:20%">Name</th><th style="width:8%">Type</th><th>Value</th><th style="width:9%" title="How long resolvers may cache this record">TTL (s)</th><th style="width:15%" title="When the record stops answering: a duration from now (1m, 1h, 1d, 6d12h14s) or a date-time">Expires</th>${canEdit ? '<th style="width:1%"></th>' : ''}</tr></thead><tbody>
+    ${recs.length ? recs.map(r => recordRow(r, canEdit)).join('') : `<tr><td colspan="6" class="empty">${z.records.length ? 'No records match' : 'No records yet'}</td></tr>`}
+  </tbody></table>${large && total > z.records.length ? `<div style="padding:10px;text-align:center"><button class="btn sm" id="r-more">Load more (${num(z.records.length)} of ${num(total)})</button></div>` : ''}`;
+  if ($('#r-more')) $('#r-more').onclick = loadMore;
+
+  if (canEdit) $('#records').querySelectorAll('[data-edit]').forEach(b => b.onclick = () => recordModal(Number(b.dataset.edit)));
+  if (canEdit) $('#records').querySelectorAll('[data-del]').forEach(b => b.onclick = async () => { const r = z.records.find(x => x.id === Number(b.dataset.del)); if (await confirmModal('Delete record', `Delete ${r.name} ${r.type} ${r.value}?`)) { try { await DEL(`/zones/${encodeURIComponent(z.name)}/records/${r.id}`); toast('Record deleted', 'ok'); reloadZone(); } catch (e) { toast(e.message, 'err'); } } });
+}
+function recordRow(r, canEdit) {
+  const expired = r.expires_at && new Date(r.expires_at) <= new Date();
+  return `<tr data-id="${r.id}"${expired ? ' style="opacity:.5" title="Expired: no longer served; deleted after the retention period"' : ''}><td class="mono c-name">${esc(r.name)}</td><td class="c-type"><span class="badge">${esc(r.type)}</span></td><td class="c-val"><div class="mono clamp" style="word-break:break-all" onclick="this.classList.toggle('open')" title="${r.value.length > 80 ? 'Click to expand' : ''}">${esc(r.value)}</div></td><td class="hint c-ttl">${r.ttl ?? '<i>default</i>'}</td><td class="c-exp">${expiryCell(r)}</td>${canEdit ? `<td class="actions c-act"><button class="btn sm ghost" data-edit="${r.id}">Edit</button><button class="btn sm ghost danger" data-del="${r.id}">Delete</button></td>` : ''}</tr>`;
+}
+// Expiry: shown relative, edited as "30m", "24h", "7d", a date-time, or blank for never.
+// ---- durations: "1m", "1h", "1d", "6d12h14s" ---------------------------------
+// Tokens are <number><unit>, units d, h, m, s only, largest to smallest, each unit
+// at most once; the values are added together. Used for record expiry.
+/*DURATION-BEGIN*/
+const DURATION_UNITS = { d: 86400, h: 3600, m: 60, s: 1 };
+const DURATION_ORDER = ['d', 'h', 'm', 's'];
+function parseDuration(text) {
+  const s = String(text).trim().toLowerCase();
+  if (!s) throw new Error('empty duration');
+  if (/\s/.test(s)) throw new Error(`no spaces: write it as ${s.replace(/\s+/g, '')}`);
+  const re = /(\d+)([a-z]*)/y;
+  let pos = 0, total = 0, last = -1;
+  while (pos < s.length) {
+    re.lastIndex = pos;
+    const m = re.exec(s);
+    if (!m) throw new Error(`unexpected "${s.slice(pos)}": use numbers with d, h, m or s, e.g. 6d12h14s`);
+    const [, num, unit] = m;
+    if (!unit) throw new Error(`"${num}" needs a unit: d, h, m or s`);
+    if (!(unit in DURATION_UNITS)) throw new Error(`unknown unit "${unit}": only d, h, m and s are supported`);
+    const idx = DURATION_ORDER.indexOf(unit);
+    if (idx === last) throw new Error(`"${unit}" appears more than once`);
+    if (idx < last) throw new Error(`units must go from largest to smallest (d, h, m, s): "${unit}" cannot come after "${DURATION_ORDER[last]}"`);
+    last = idx;
+    total += Number(num) * DURATION_UNITS[unit];
+    pos = re.lastIndex;
+  }
+  if (total <= 0) throw new Error('must be longer than 0s');
+  if (total > 100 * 365 * 86400) throw new Error('must be at most 100 years');
+  return total;
+}
+// `parts` is the precision: how many units, starting at the largest non-zero one,
+// are considered (zero units inside that window are omitted from the text).
+function formatDuration(secs, parts = 2) {
+  secs = Math.max(0, Math.round(secs));
+  if (secs === 0) return '0s';
+  const first = DURATION_ORDER.findIndex(u => secs >= DURATION_UNITS[u]);
+  const out = [];
+  for (const u of DURATION_ORDER.slice(first, first + parts)) {
+    const n = Math.floor(secs / DURATION_UNITS[u]);
+    secs -= n * DURATION_UNITS[u];
+    if (n > 0) out.push(`${n}${u}`);
+  }
+  return out.join('');
+}
+/*DURATION-END*/
+
+function expiryCell(r) {
+  if (!r.expires_at) return '<span class="hint">never</span>';
+  const t = new Date(r.expires_at), secs = (t - new Date()) / 1000;
+  return secs > 0
+    ? `<span title="${esc(t.toLocaleString())}">in ${formatDuration(secs)}</span>`
+    : `<span class="badge muted" title="Expired ${esc(t.toLocaleString())}; not served, deleted after the retention period">expired ${formatDuration(-secs)} ago</span>`;
+}
+// Blank or "never": no expiry. A duration such as 6d12h14s: from now. A date-time: absolute.
+function parseExpiry(text) {
+  const v = text.trim();
+  if (v === '' || v.toLowerCase() === 'never') return { expires_at: null };
+  if (/^\d+[a-z]/i.test(v) && !/^\d{4}-/.test(v)) return { expires_in: parseDuration(v) };
+  if (/^\d{4}-\d{2}-\d{2}/.test(v)) {
+    const d = new Date(v);
+    if (isNaN(d)) throw new Error(`"${v}" is not a valid date-time`);
+    if (d <= new Date()) throw new Error('the date-time is in the past');
+    return { expires_at: d.toISOString() };
+  }
+  return { expires_in: parseDuration(v) }; // produces the specific error message
+}
+function expiryPreview(text) {
+  try {
+    const p = parseExpiry(text);
+    if (p.expires_at === null) return { ok: true, msg: 'never expires' };
+    const at = p.expires_in != null ? new Date(Date.now() + p.expires_in * 1000) : new Date(p.expires_at);
+    return { ok: true, msg: `expires ${at.toLocaleString()}${p.expires_in != null ? ` (in ${formatDuration(p.expires_in, 4)})` : ''}` };
+  } catch (e) { return { ok: false, msg: e.message }; }
+}
+// ---- add / edit record dialog ---------------------------------------------
+const TYPE_INFO = { A: 'IPv4 address', AAAA: 'IPv6 address', CNAME: 'alias: this name is another name (nothing else may share the name)', DNAME: 'redirects every name below this one to another domain', PTR: 'reverse lookup: the host name for an address', NS: 'nameserver for this name (at @: this zone; below @: delegates a subdomain)', MX: 'mail server: priority, then host name', TXT: 'free text, e.g. SPF, DKIM or a site-verification token', SRV: 'service location: priority weight port target', CAA: 'which certificate authorities may issue certificates: flags tag "value"', HTTPS: 'HTTPS service binding: priority target parameters', SVCB: 'service binding: priority target parameters', TLSA: 'DANE certificate association: usage selector matching-type hash', SSHFP: 'SSH host key fingerprint: algorithm type hash', NAPTR: 'naming authority pointer: order preference "flags" "service" "regexp" replacement', HINFO: 'host information: "cpu" "os"' };
+// Full owner name for what is typed in the Name field (mirrors the server's rules).
+function ownerName(name, zone) {
+  const raw = String(name).trim().toLowerCase();
+  const apex = zone === '.' ? '.' : zone + '.';
+  if (!raw || raw === '@') return { fqdn: apex, apex: true };
+  const stripped = raw.replace(/\.+$/, '');
+  if (zone === '.') return { fqdn: stripped + '.' };
+  if (stripped === zone) return { fqdn: apex, apex: true };
+  if (stripped.endsWith('.' + zone)) return { fqdn: stripped + '.' };
+  if (raw.endsWith('.')) return { error: `"${String(name).trim()}" ends with a dot but is not inside ${apex}` };
+  return { fqdn: stripped + '.' + apex };
+}
+function recordModal(id) {
+  const z = S.zone; const isNew = id == null;
+  const r = isNew ? { name: '', type: 'A', value: '', ttl: null, expires_at: null } : z.records.find(x => x.id === id);
+  if (!r) return;
+  const orig = r.expires_at || '';
+  openModal(`<h2>${isNew ? 'Add record' : 'Edit record'} <span class="hint mono" style="font-weight:400">· ${esc(z.fqdn)}</span></h2>
+    <div class="rec-top">
+      <div class="field" style="margin-top:0"><label for="rf-name">Name</label><input type="text" id="rf-name" name="name" value="${esc(r.name)}" placeholder="@, www, *.apps" autocomplete="off" spellcheck="false" autocapitalize="off"></div>
+      <div class="field" style="margin-top:0"><label for="rf-type">Type</label><select id="rf-type" name="type">${RTYPES.map(t => `<option ${t === r.type ? 'selected' : ''}>${t}</option>`).join('')}</select></div>
+    </div>
+    <div class="owner-prev" id="rf-owner"></div>
+    <div class="field"><label for="rf-value">Value <span class="hint" id="rf-tinfo" style="font-weight:400"></span></label><div id="rf-vwrap"></div><div class="hint" id="rf-vhint"></div></div>
+    <div class="cols">
+      <div class="field"><label for="rf-ttl">TTL (seconds)</label><input type="text" id="rf-ttl" name="ttl" inputmode="numeric" value="${r.ttl ?? ''}" placeholder="zone default (${z.default_ttl})" autocomplete="off"><div class="hint" id="rf-ttlhint"></div></div>
+      <div class="field"><label for="rf-exp">Expires</label><input type="text" id="rf-exp" name="expires" value="${esc(orig)}" data-orig="${esc(orig)}" placeholder="never, 1h, 1d, 6d12h14s" autocomplete="off" spellcheck="false" autocapitalize="off">
+        <div class="quick" id="rf-quick">${['never', '1h', '1d', '7d', '30d'].map(q => `<button type="button" data-q="${q}">${q}</button>`).join('')}</div>
+        <div class="hint" id="rf-exphint"></div></div>
+    </div>
+    <p class="hint" style="margin:12px 0 0">Expires: blank = never. A duration from now uses d, h, m, s, largest first, each once (1m, 1h, 1d, 6d12h14s), or give a date-time (2026-10-01T00:00:00Z). Expired records stop answering and are deleted after the retention period.</p>
+    <div class="error" id="rf-err"></div>
+    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="rf-save">${isNew ? 'Add record' : 'Save changes'}</button></div>`, m => {
+    const nameIn = $('#rf-name'), typeSel = $('#rf-type'), wrap = $('#rf-vwrap'), ttlIn = $('#rf-ttl'), ex = $('#rf-exp');
+    const useArea = (type, v) => type === 'TXT' || v.length > 60 || v.includes('\n');
+    const renderValue = (type, v) => {
+      const area = useArea(type, v), cur = $('#rf-value');
+      if (cur && (cur.tagName === 'TEXTAREA') === area) { cur.placeholder = VALUE_HINT[type]; return; }
+      wrap.innerHTML = area
+        ? `<textarea id="rf-value" name="value" rows="${v.length > 200 ? 6 : 3}" spellcheck="false" placeholder="${esc(VALUE_HINT[type])}">${esc(v)}</textarea>`
+        : `<input type="text" id="rf-value" name="value" value="${esc(v)}" placeholder="${esc(VALUE_HINT[type])}" autocomplete="off" spellcheck="false" autocapitalize="off">`;
+    };
+    const showType = () => {
+      const t = typeSel.value; renderValue(t, $('#rf-value') ? $('#rf-value').value : r.value);
+      $('#rf-tinfo').textContent = '· ' + (TYPE_INFO[t] || '');
+      $('#rf-vhint').innerHTML = `Example: <span class="mono">${esc(VALUE_HINT[t])}</span>${t === 'TXT' ? ' · Ctrl/⌘+Enter saves' : ''}`;
+    };
+    const showOwner = () => {
+      const o = ownerName(nameIn.value, z.name);
+      nameIn.classList.toggle('bad', !!o.error);
+      $('#rf-owner').innerHTML = o.error ? `<span style="color:var(--danger)">${esc(o.error)}</span>`
+        : `Full name: <b>${esc(o.fqdn)}</b>${o.apex ? ' (the zone apex, @)' : o.fqdn.startsWith('*.') ? ` · wildcard: answers any name under ${esc(o.fqdn.slice(2))} that has no records of its own` : ''}`;
+    };
+    const showTtl = () => {
+      const v = ttlIn.value.trim(), h = $('#rf-ttlhint');
+      const ok = v === '' || /^[1-9][0-9]*$/.test(v);
+      ttlIn.classList.toggle('bad', !ok); h.classList.toggle('bad', !ok);
+      h.textContent = !ok ? 'a whole number of seconds, or blank' : v === '' ? `blank: zone default, ${z.default_ttl}s${z.default_ttl >= 60 ? ` (${formatDuration(z.default_ttl)})` : ''}` : Number(v) >= 60 ? `= ${formatDuration(Number(v), 3)}` : 'how long resolvers may cache it';
+    };
+    const showExpiry = () => {
+      const h = $('#rf-exphint');
+      if (ex.value === ex.dataset.orig && ex.value) {
+        const t = new Date(ex.value), secs = (t - new Date()) / 1000;
+        h.textContent = `unchanged: ${secs > 0 ? `expires ${t.toLocaleString()} (in ${formatDuration(secs, 2)})` : `expired ${t.toLocaleString()}`}`;
+        h.classList.remove('bad'); ex.classList.remove('bad'); return;
+      }
+      const p = expiryPreview(ex.value);
+      h.textContent = p.msg; h.classList.toggle('bad', !p.ok); ex.classList.toggle('bad', !p.ok);
+    };
+    nameIn.addEventListener('input', showOwner); typeSel.onchange = showType;
+    ttlIn.addEventListener('input', showTtl); ex.addEventListener('input', showExpiry);
+    $('#rf-quick').onclick = e => { const b = e.target.closest('[data-q]'); if (!b) return; ex.value = b.dataset.q === 'never' ? '' : b.dataset.q; showExpiry(); ex.focus(); };
+    showType(); showOwner(); showTtl(); showExpiry();
+    $('#rf-save').onclick = () => saveEdit(m, id);
+    $('.m-body', m).addEventListener('keydown', e => {
+      if (e.key !== 'Enter' || e.isComposing) return;
+      if (e.target.matches('input[type=text]') || (e.target.tagName === 'TEXTAREA' && (e.metaKey || e.ctrlKey))) { e.preventDefault(); saveEdit(m, id); }
+    });
+    setTimeout(() => (isNew ? nameIn : $('#rf-value')).focus(), 40);
+  }, { size: 'md' });
+}
+async function saveEdit(f, id) {
+  const z = S.zone; const err = $('#rf-err', f), btn = $('#rf-save', f);
+  if (!btn || btn.disabled) return;
+  err.textContent = '';
+  const nameIn = f.querySelector('[name=name]');
+  const o = ownerName(nameIn.value, z.name);
+  if (o.error) { err.textContent = `Name: ${o.error}`; nameIn.focus(); return; }
+  const body = { name: nameIn.value.trim(), type: f.querySelector('[name=type]').value, value: f.querySelector('[name=value]').value };
+  const ttl = f.querySelector('[name=ttl]').value.trim();
+  if (ttl !== '' && !/^[1-9][0-9]*$/.test(ttl)) { err.textContent = 'TTL (seconds): a whole number of seconds, or blank for the zone default'; f.querySelector('[name=ttl]').focus(); return; }
+  body.ttl = ttl === '' ? null : Number(ttl);
+  const ex = f.querySelector('[name=expires]');
+  // Create: blank means "no expiry" (omit, so a duplicate still reports a conflict).
+  // Edit: only send when the field changed (blank then clears the expiry).
+  if (id == null ? ex.value.trim() !== '' : ex.value !== ex.dataset.orig) {
+    try { Object.assign(body, parseExpiry(ex.value)); } catch (e2) { err.textContent = `Expires: ${e2.message}`; ex.focus(); return; }
+  }
+  btn.disabled = true;
+  try {
+    if (id == null) {
+      const res = await api('POST', `/zones/${encodeURIComponent(z.name)}/records`, body, { full: true });
+      toast(res.status === 200 ? 'Renewed: an identical record already existed, its expiry was updated' : 'Record added', 'ok');
+    } else { await PUT(`/zones/${encodeURIComponent(z.name)}/records/${id}`, body); toast('Saved', 'ok'); }
+    closeModal(); reloadZone();
+  } catch (e) { err.textContent = e.message; btn.disabled = false; }
+}
+
+// ---- zone slide-over: SOA, delegation, dig, access --------------------------
+const absName = v => { v = String(v || '').trim().toLowerCase(); return !v ? '' : v.endsWith('.') ? v : v + '.'; };
+const noDot = n => n === '.' ? '.' : n.replace(/\.$/, '');
+const liveRecords = z => { const now = new Date(); return z.records.filter(r => !(r.expires_at && new Date(r.expires_at) <= now)); };
+function delegationInfo(z) {
+  const apex = z.fqdn.toLowerCase(), reverse = isReverseZone(z.name), live = liveRecords(z);
+  let names = [...new Set(live.filter(r => r.type === 'NS' && r.name === '@').map(r => absName(r.value)))];
+  const fromSoa = !names.length;
+  if (fromSoa && z.soa_mname) names = [absName(z.soa_mname)];
+  const rel = n => n === apex ? '@' : apex === '.' ? n.slice(0, -1) : n.slice(0, -(apex.length + 1));
+  const ns = names.map(n => {
+    const inZone = apex === '.' || n === apex || n.endsWith('.' + apex);
+    const glue = inZone ? live.filter(r => (r.type === 'A' || r.type === 'AAAA') && r.name === rel(n)) : [];
+    return { name: n, inZone, rel: inZone ? rel(n) : null, glue };
+  });
+  const partial = (z.record_total ?? 0) > z.records.length || !!z.search_q;
+  const parent = S.zones.filter(p => p.name !== z.name && (p.name === '.' || z.name.endsWith('.' + p.name))).sort((a, b) => b.name.length - a.name.length)[0];
+  return { apex, reverse, ns, fromSoa, partial, parent };
+}
+// "hostmaster.example.com." -> "hostmaster@example.com" (first unescaped dot is the @)
+function rnameToEmail(r) {
+  const s = String(r || '').replace(/\.$/, '');
+  for (let k = 0; k < s.length; k++) {
+    if (s[k] === '\\') { k++; continue; }
+    if (s[k] === '.') return s.slice(0, k).replace(/\\\./g, '.') + '@' + s.slice(k + 1);
+  }
+  return s;
+}
+// Reverse zone name -> network ("0.0.10.in-addr.arpa" -> "10.0.0.0/24")
+function reverseNetwork(name) {
+  let m = name.match(/^(.*?)\.?in-addr\.arpa$/);
+  if (m) { const o = m[1] ? m[1].split('.').reverse() : []; if (o.length > 4 || o.some(x => !/^\d+$/.test(x))) return null; return `${o.concat(['0', '0', '0', '0']).slice(0, 4).join('.')}/${o.length * 8}`; }
+  m = name.match(/^(.*?)\.?ip6\.arpa$/);
+  if (m) { const n = m[1] ? m[1].split('.').reverse() : []; if (n.length > 32 || n.some(x => !/^[0-9a-f]$/i.test(x))) return null; const full = n.concat(Array(32).fill('0')).slice(0, 32).join(''); return `${full.match(/.{4}/g).map(g => g.replace(/^0{1,3}/, '')).join(':')}/${n.length * 4}`; }
+  return null;
+}
+// PTR owner name -> IP address, when the name has all the labels of an address
+function ptrAddress(fqdn) {
+  let m = fqdn.match(/^(.*)\.in-addr\.arpa\.$/);
+  if (m) { const o = m[1].split('.'); return o.length === 4 && o.every(x => /^\d+$/.test(x)) ? o.reverse().join('.') : null; }
+  m = fqdn.match(/^(.*)\.ip6\.arpa\.$/);
+  if (m) { const n = m[1].split('.'); return n.length === 32 && n.every(x => /^[0-9a-f]$/i.test(x)) ? n.reverse().join('').match(/.{4}/g).map(g => g.replace(/^0{1,3}/, '')).join(':') : null; }
+  return null;
+}
+const ownerFqdn = (r, z) => r.name === '@' ? z.fqdn : `${r.name}.${z.fqdn === '.' ? '' : z.fqdn}`;
+function markPanelChip() { $$('.chip-btn[data-panel]').forEach(c => c.classList.toggle('on', !!S.panel && c.dataset.panel === S.panel.tab)); }
+async function openZonePanel(tab) {
+  const z = S.zone; if (!z) return;
+  const isOwner = z.role === 'owner'; if (tab === 'access' && !isOwner) tab = 'soa';
+  const same = S.panel && S.panel.zone === z.name && S.panel.tab === tab;
+  const keep = same ? ($('#drawer .d-body') || {}).scrollTop || 0 : 0;
+  S.panel = { zone: z.name, tab };
+  const dl = delegationInfo(z);
+  const tabs = [['soa', 'SOA'], ['deleg', dl.reverse ? 'Reverse delegation' : 'Delegation'], ['dig', 'Test with dig']].concat(isOwner ? [['access', 'Access']] : []);
+  const body = tab === 'soa' ? soaHtml(z) : tab === 'deleg' ? delegHtml(z, dl) : tab === 'dig' ? digHtml(z) : accessHtml(z);
+  openDrawer(`<div class="d-head"><div class="d-title"><h2 class="mono">${esc(z.fqdn)}</h2><button type="button" class="icon-btn" data-dclose title="Close (Esc)" aria-label="Close">${ico('close')}</button></div>
+    <div class="tabs" role="tablist">${tabs.map(([k, l]) => `<button type="button" role="tab" data-dtab="${k}" class="${k === tab ? 'on' : ''}">${l}</button>`).join('')}</div></div>
+    <div class="d-body">${body}</div>`);
+  const d = $('#drawer'); $('.d-body', d).scrollTop = keep;
+  $('[data-dclose]', d).onclick = closeDrawer;
+  $$('[data-dtab]', d).forEach(b => b.onclick = () => openZonePanel(b.dataset.dtab));
+  if ($('#soa-edit', d)) $('#soa-edit', d).onclick = zoneSettingsModal;
+  if (tab === 'access') {
+    renderMembers();
+    const grant = async () => { const u = $('#m-user').value.trim(); if (!u) { $('#m-user').focus(); return; } try { await PUT(`/zones/${encodeURIComponent(z.name)}/members/${encodeURIComponent(u)}`, { role: $('#m-role').value }); $('#m-user').value = ''; toast(`Granted ${u}`, 'ok'); reloadZone(); } catch (e) { toast(e.message, 'err'); } };
+    $('#m-add').onclick = grant;
+    $('#m-user').addEventListener('keydown', e => { if (e.key === 'Enter') grant(); });
+    if (!same) setTimeout(() => $('#m-user') && $('#m-user').focus(), 40);
+  }
+  markPanelChip();
+  if ((tab === 'dig' || tab === 'deleg') && !S.status) {
+    try { S.status = await GET('/status'); } catch { return; }
+    if (S.panel && S.panel.zone === z.name && S.panel.tab === tab) openZonePanel(tab);
+  }
+}
+const fact = (k, code, v, d) => `<div class="fact"><div class="fk">${k}${code ? `<small>${code}</small>` : ''}</div><div class="fv">${v}</div>${d ? `<div class="fd">${d}</div>` : ''}</div>`;
+const secsHtml = n => `${num(n)} s${n >= 60 ? ` <span class="hint">(${formatDuration(n, 2)})</span>` : ''}`;
+function soaHtml(z) {
+  const email = rnameToEmail(z.soa_rname);
+  return `<p class="hint">The SOA (start of authority) record describes the zone as a whole. This server writes it for you from these settings.</p>
+    <div class="facts">
+      ${fact('Primary NS', 'MNAME', copyVal(noDot(z.soa_mname)), 'The name of the primary nameserver for the zone: the server holding the master copy. It is normally one of the zone\'s NS names.')}
+      ${fact('Hostmaster', 'RNAME', `${copyVal(email)}<div class="hint mono" style="margin-top:2px">stored as ${esc(z.soa_rname)}</div>`, 'Email address of the person responsible for the zone. DNS writes it with a dot instead of the @ (hostmaster.example.com. means hostmaster@example.com); a dot inside the part before the @ is escaped as \\.')}
+      ${fact('Serial', 'SERIAL', `<span class="mono">${z.serial}</span>`, 'Version number of the zone. It increases automatically on every change made here; secondary servers compare it with their copy to decide whether to transfer the zone again.')}
+      ${fact('Refresh', 'REFRESH', secsHtml(z.refresh), 'Secondary server timer: how often a secondary checks the serial for changes (this server can also send NOTIFY so they check at once).')}
+      ${fact('Retry', 'RETRY', secsHtml(z.retry), 'Secondary server timer: how long a secondary waits before trying again after a failed refresh.')}
+      ${fact('Expire', 'EXPIRE', secsHtml(z.expire), 'Secondary server timer: how long a secondary keeps answering for the zone while it cannot reach the primary. After that it stops answering.')}
+      ${fact('Negative TTL', 'MINIMUM', secsHtml(z.minimum), 'How long resolvers cache "does not exist" answers (NXDOMAIN, or no record of the asked type). Keep it short if you often add new names.')}
+      ${fact('Default TTL', '', secsHtml(z.default_ttl), 'Cache time for records that do not set their own TTL.')}
+      ${fact('Owner', '', esc(z.owner || '–'), '')}
+      ${fact('Your role', '', `<span class="badge">${esc(z.role)}</span>`, '')}
+    </div>
+    ${z.role === 'owner' ? '<div class="row" style="margin-top:14px"><button class="btn" id="soa-edit">Edit SOA settings</button></div>' : ''}`;
+}
+function delegHtml(z, dl) {
+  const t = dnsTarget(S.status), zn = noDot(z.fqdn);
+  const nsHtml = `<div class="nslist">${dl.ns.map(n => `<div class="ns-item"><div class="row between">${copyVal(noDot(n.name))}<span class="badge ${n.inZone ? '' : 'muted'}">${n.inZone ? 'inside this zone' : 'outside this zone'}</span></div>
+      ${!n.inZone ? '<div class="hint" style="margin-top:6px">No glue needed: this name is resolved through its own zone and must point to this server.</div>'
+        : n.glue.length ? `<div class="glue"><span class="hint">Glue addresses (from the ${esc(n.rel)} A/AAAA records):</span>${n.glue.map(g => `<div class="row" style="gap:6px"><span class="badge muted">${g.type}</span>${copyVal(g.value)}</div>`).join('')}</div>`
+        : `<div class="note warn">${ico('warn', 's')}<span>No A or AAAA record for <b class="mono">${esc(n.rel)}</b> in this zone. Add one with this nameserver's IP address: the registrar needs it as glue, and resolvers cannot reach the nameserver without it.</span></div>`}</div>`).join('') || '<div class="hint">No nameservers found.</div>'}</div>`;
+  const srcNote = dl.fromSoa
+    ? `<div class="note warn">${ico('warn', 's')}<span>This zone has no NS records at the apex (@), so the SOA primary NS is shown. Add an NS record (name <b>@</b>, type NS) for each nameserver so the zone lists them itself.</span></div>`
+    : '<p class="hint">From the NS records at the apex (@) of this zone.</p>';
+  const partial = dl.partial ? '<p class="hint">Only the records currently loaded were checked; in a large or filtered zone some glue records may not be shown.</p>' : '';
+  const portNote = t.port !== 53 ? `<div class="note warn">${ico('warn', 's')}<span>This server listens on port ${t.port}. Nameservers used on the internet must answer on port 53 (UDP and TCP).</span></div>` : '';
+  if (dl.reverse) {
+    const net = reverseNetwork(z.name);
+    return `<p>Reverse zones (<span class="mono">in-addr.arpa</span>, <span class="mono">ip6.arpa</span>) are not bought from a domain registrar. They are delegated by whoever holds the IP address block: your ISP or hosting provider, or, for your own allocation, the regional internet registry (RIPE NCC, ARIN, APNIC, LACNIC, AFRINIC).</p>
+      ${net ? `<p>This zone covers <b class="mono">${esc(net)}</b>.</p>` : ''}
+      <h3>Nameservers to give them</h3>${srcNote}${nsHtml}${partial}
+      <h3>Steps</h3><ol class="steps">
+        <li>Ask the holder of the address block to delegate <span class="mono">${esc(zn)}</span> to the nameservers above (for blocks smaller than /24 they may use a classless, RFC 2317 style delegation with CNAMEs).</li>
+        <li>Private ranges (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, fc00::/7) are never delegated publicly: they work only for clients that ask this server directly, or through a resolver that forwards the zone here.</li>
+        <li>Check the delegation with ${cmdBlock(`dig NS ${zn} +trace`)} and this server's answer with ${cmdBlock(`${digAt(t)} ${zn} SOA`)}</li>
+      </ol>${portNote}`;
+  }
+  const inZone = dl.ns.filter(n => n.inZone);
+  const allNames = dl.ns.map(n => noDot(n.name)).join('\n');
+  return `<p>For <b class="mono">${esc(zn)}</b> to be found on the internet, the parent zone must point to your nameservers. For a registered domain you set this at the registrar.</p>
+    ${dl.parent ? `<div class="note info">${ico('info', 's')}<span>The parent zone <a class="mono" href="#/zones/${encodeURIComponent(dl.parent.name)}">${esc(dl.parent.name)}</a> is also on this server, so no registrar is involved: add NS records for <b class="mono">${esc(z.name.slice(0, -(dl.parent.name.length + 1)) || '@')}</b> in ${esc(dl.parent.name)}, plus A/AAAA glue records there for nameserver names inside ${esc(z.name)}.</span></div>` : ''}
+    <h3>Nameservers</h3>${srcNote}${nsHtml}${partial}
+    <h3>Registrar setup</h3>
+    <ol class="steps">
+      <li>At the registrar, set the domain's <b>nameservers</b> to these names (most registrars want them without the trailing dot):
+        <div class="row" style="margin-top:6px;gap:6px">${dl.ns.map(n => `<code>${esc(noDot(n.name))}</code>`).join(' ')}${dl.ns.length ? copyBtn(allNames, 'Copy all names') : ''}</div></li>
+      ${inZone.length ? `<li>Because ${inZone.map(n => `<span class="mono">${esc(noDot(n.name))}</span>`).join(', ')} ${inZone.length === 1 ? 'is' : 'are'} inside <span class="mono">${esc(zn)}</span>, also register <b>glue records</b> (the registrar may call them "host records", "child nameservers" or "register a nameserver") with these addresses:
+        <div class="tw" style="margin-top:6px"><table><tbody>${inZone.map(n => `<tr><td>${copyVal(noDot(n.name))}</td><td>${n.glue.length ? n.glue.map(g => `<div>${copyVal(g.value)}</div>`).join('') : '<span class="badge warn">no A/AAAA record</span>'}</td></tr>`).join('')}</tbody></table></div></li>` : ''}
+      <li>Most registrars require <b>at least two nameservers</b>${dl.ns.length < 2 ? ` and you have ${dl.ns.length}` : ''}. Run a secondary DNS server that copies this zone by zone transfer (AXFR, which this server supports: allow the secondary's address in the transfer settings of the server configuration${S.status && S.status.transfer && (S.status.transfer.allow || []).length ? `; currently allowed: ${esc(S.status.transfer.allow.join(', '))}` : ''}), add an NS record for it here, and list it at the registrar too.</li>
+      <li><b>DNSSEC is not supported</b> by this server: remove any DS record for the domain at the registrar, otherwise validating resolvers treat the domain as broken.</li>
+      <li>After the change (the parent's cache time can make it take up to a day or two), check the delegation from the root down:${cmdBlock(`dig NS ${zn} +trace`)}<span class="hint">The last step should list your nameservers.</span> And check that this server answers for the zone:${cmdBlock(`${digAt(t)} ${zn} SOA`)}<span class="hint">Look for status NOERROR and the <b>aa</b> (authoritative) flag.</span></li>
+    </ol>${portNote}`;
+}
+function digHtml(z) {
+  if (!S.status) return '<p class="hint">Loading the server\'s listener addresses…</p>';
+  const t = dnsTarget(S.status), L = S.status.listeners || {}, zn = noDot(z.fqdn), at = digAt(t);
+  const live = liveRecords(z).filter(r => !r.name.startsWith('*'));
+  const cmds = [[`${at} ${zn} SOA`, 'The zone\'s SOA record: proves this server is authoritative (look for the aa flag).'], [`${at} ${zn} NS`, 'The zone\'s nameservers.']];
+  const rec = ['A', 'AAAA', 'CNAME'].map(t => live.find(r => r.type === t)).find(Boolean);
+  if (rec) cmds.push([`${at} ${noDot(ownerFqdn(rec, z))} ${rec.type}`, `A record from this zone (${rec.name} ${rec.type}).`]);
+  const ptr = live.find(r => r.type === 'PTR' && ptrAddress(ownerFqdn(r, z)));
+  if (ptr) cmds.push([`${at} -x ${ptrAddress(ownerFqdn(ptr, z))}`, `Reverse lookup of ${ptrAddress(ownerFqdn(ptr, z))} (answers ${noDot(ptr.value)}).`]);
+  else if (isReverseZone(z.name)) { const p2 = live.find(r => r.type === 'PTR'); if (p2) cmds.push([`${at} ${noDot(ownerFqdn(p2, z))} PTR`, 'A PTR record from this zone.']); }
+  if (L.tcp) cmds.push([`${at} +tcp ${zn} SOA`, 'The same SOA question over TCP.']);
+  const xfr = S.status.transfer && (S.status.transfer.allow || []).length;
+  if (xfr && L.tcp) cmds.push([`${at} ${zn} AXFR`, `Full zone transfer; allowed only from ${S.status.transfer.allow.join(', ')}.`]);
+  return `<p class="hint">Run these from a terminal. They ask this server directly (<span class="mono">${esc(t.host)}</span>, port ${t.port}${t.udp && t.tcp ? ', UDP and TCP' : t.tcp ? ', TCP only' : ', UDP only'}).</p>
+    ${t.note ? `<div class="note info">${ico('info', 's')}<span>${esc(t.note)}</span></div>` : ''}
+    ${cmds.map(([c, why]) => `<div style="margin-top:12px"><div class="hint">${esc(why)}</div>${cmdBlock(c)}</div>`).join('')}
+    <p class="hint" style="margin-top:14px">In the reply, <b>status: NOERROR</b> means the name exists, <b>NXDOMAIN</b> that it does not; the <b>aa</b> flag marks an authoritative answer.</p>`;
+}
+function accessHtml(z) {
+  return `<p class="hint">Editors can change records. Viewers can only read. Ownership is set in Settings by an administrator.</p>
+    <h3>Members</h3><div id="members"></div>
+    <h3>Grant access</h3>
+    <div class="row"><input type="text" id="m-user" placeholder="username" style="flex:1 1 160px;width:auto" autocomplete="off"><select id="m-role" style="width:auto"><option value="editor">editor</option><option value="viewer">viewer</option></select><button class="btn" id="m-add">Grant</button></div>`;
+}
+// ---------------------------------------------------------------------------
+// Import / Export (one dialog; zone page: that zone, zones list: all zones)
+// ---------------------------------------------------------------------------
+function ioModal(zoneName) {
+  const zoneRole = n => (S.zones.find(z => z.name === n) || {}).role;
+  const ownedZones = S.zones.filter(z => z.role === 'owner').map(z => z.name);
+  const canImport = zoneName ? zoneRole(zoneName) === 'owner' : (S.user.is_admin || ownedZones.length > 0);
+  const scopeOptions = zoneName
+    ? `<option value="${esc(zoneName)}">${esc(zoneName)}</option>`
+    : `<option value="">All zones (${S.zones.length})</option>` + S.zones.map(z => `<option value="${esc(z.name)}">${esc(z.name)}</option>`).join('');
+  openModal(`<h2>Import / Export${zoneName ? ` · <span class="mono">${esc(zoneName)}</span>` : ''}</h2>
+    <div class="tabs"><button data-tab="export" class="on">Export</button>${canImport ? '<button data-tab="import">Import</button>' : ''}</div>
+    <section data-pane="export">
+      <div class="field"><label>Zone</label><select id="ex-scope">${scopeOptions}</select></div>
+      <div class="field"><label>Format</label><div class="seg">
+        <label><input type="radio" name="ex-fmt" value="json" checked>JSON</label><label><input type="radio" name="ex-fmt" value="bind">BIND zone file</label></div></div>
+      <p class="hint" id="ex-hint"></p>
+      <div class="foot"><button class="btn" data-close>Close</button><button class="btn primary" id="ex-go">Download</button></div>
+    </section>
+    ${canImport ? `<section data-pane="import" class="hidden">
+      <div class="field"><label>Format</label><div class="seg">
+        <label><input type="radio" name="im-fmt" value="json" checked>JSON</label><label><input type="radio" name="im-fmt" value="bind">BIND zone file</label></div></div>
+      <div class="field"><label>File</label><input type="file" id="im-file" accept=".json,.zone,.db,.txt,application/json,text/plain"></div>
+      <div class="field"><label>Or paste</label><textarea id="im-text" rows="7" spellcheck="false" placeholder=""></textarea></div>
+      <div class="field" id="im-target-row"><label id="im-target-label">Into zone</label><select id="im-target"></select></div>
+      <div class="field"><label>Mode</label><div class="seg">
+        <label><input type="radio" name="im-mode" value="merge" checked>Merge</label><label><input type="radio" name="im-mode" value="replace">Replace</label></div>
+        <span class="hint" id="im-mode-hint"></span></div>
+      <div class="io-summary" id="im-preview">Choose a file or paste its contents.</div>
+      <div class="foot"><button class="btn" data-close>Close</button><button class="btn primary" id="im-go" disabled>Import</button></div>
+    </section>` : ''}`, m => {
+    const val = name => (m.querySelector(`[name=${name}]:checked`) || {}).value;
+    // tabs
+    m.querySelectorAll('[data-tab]').forEach(t => t.onclick = () => {
+      m.querySelectorAll('[data-tab]').forEach(x => x.classList.toggle('on', x === t));
+      m.querySelectorAll('[data-pane]').forEach(p => p.classList.toggle('hidden', p.dataset.pane !== t.dataset.tab));
+    });
+
+    // ---- export
+    const exUpdate = () => {
+      const zone = $('#ex-scope').value, bindBox = m.querySelector('[name=ex-fmt][value=bind]');
+      bindBox.disabled = !zone; if (!zone && bindBox.checked) m.querySelector('[name=ex-fmt][value=json]').checked = true;
+      bindBox.parentElement.style.opacity = zone ? '' : '.45';
+      $('#ex-hint').textContent = !zone ? 'Every zone you can see, with SOA settings and records, as one JSON file (re-importable here). BIND zone files are per zone.'
+        : val('ex-fmt') === 'bind' ? 'Standard zone file (SOA, NS and records) for BIND, NSD, Knot or any other DNS server. Expired records are left out.'
+        : 'SOA settings and records, including TTLs and expiry times, as JSON (re-importable here).';
+    };
+    $('#ex-scope').onchange = exUpdate; m.querySelectorAll('[name=ex-fmt]').forEach(r => r.onchange = exUpdate); exUpdate();
+    $('#ex-go').onclick = () => {
+      const zone = $('#ex-scope').value;
+      const a = document.createElement('a');
+      a.href = zone ? `/api/zones/${encodeURIComponent(zone)}/export?format=${val('ex-fmt')}` : '/api/export';
+      a.download = ''; document.body.appendChild(a); a.click(); a.remove();
+      toast('Download started', 'ok');
+    };
+    if (!canImport) return;
+
+    // ---- import
+    const text = $('#im-text'), preview = $('#im-preview'), go = $('#im-go'), target = $('#im-target');
+    let plan = null; // what Import will send
+    const setPreview = (cls, html) => { preview.className = 'io-summary' + (cls ? ' ' + cls : ''); preview.innerHTML = html; };
+    const analyse = () => {
+      plan = null; go.disabled = true;
+      delete go.dataset.armed; go.classList.remove('danger'); go.classList.add('primary'); go.textContent = 'Import';
+      const fmt = val('im-fmt'), body = text.value, mode = val('im-mode');
+      text.placeholder = fmt === 'json' ? 'Paste a JSON export here' : `$ORIGIN ${zoneName || 'example.com'}.\nwww  300  IN  A  192.0.2.10`;
+      $('#im-mode-hint').textContent = mode === 'merge'
+        ? 'Adds records that are missing; existing records are kept. Identical records are skipped.'
+        : 'Deletes all existing records of the target zone first, then imports. Every deletion is in the change log.';
+      if (!body.trim()) { target.parentElement.classList.toggle('hidden', !!zoneName && fmt === 'bind' || true); setPreview('', 'Choose a file or paste its contents.'); return; }
+      if (fmt === 'json') {
+        let doc;
+        try { doc = JSON.parse(body); } catch (e) { setPreview('bad', `Not valid JSON: ${esc(e.message)}. For a zone file, choose BIND.`); return; }
+        const zones = Array.isArray(doc.zones) ? doc.zones : null;
+        if (!zones || !zones.length) { setPreview('bad', 'This JSON has no <code>zones</code>. Use a file produced by Export.'); return; }
+        const count = z => (z.records || []).length;
+        if (zoneName) {
+          // Zone page: records of one zone from the file go into this zone.
+          $('#im-target-label').textContent = 'Take records from';
+          const prev = target.value;
+          target.innerHTML = zones.map((z, i) => `<option value="${i}">${esc(z.name)} (${count(z)} records)</option>`).join('');
+          const same = zones.findIndex(z => (z.name || '').replace(/\.$/, '') === zoneName);
+          target.value = prev !== '' && zones[prev] ? prev : String(same >= 0 ? same : 0);
+          target.parentElement.classList.toggle('hidden', zones.length === 1);
+          const src = zones[Number(target.value)];
+          plan = { kind: 'json', path: `/import?mode=${mode}`, body: { version: doc.version || 1, exported_at: doc.exported_at || '', zones: [{ ...src, name: zoneName }] } };
+          const renamed = (src.name || '').replace(/\.$/, '') !== zoneName;
+          setPreview(mode === 'replace' ? 'warn' : '', `Imports <b>${count(src)}</b> record${count(src) === 1 ? '' : 's'} into <span class="mono">${esc(zoneName)}</span>${renamed ? ` (from <span class="mono">${esc(src.name)}</span> in the file)` : ''}.`
+            + ` The zone's SOA settings are also taken from the file.${mode === 'replace' ? ` <b>All ${S.zone ? S.zone.record_total : ''} existing records are deleted first.</b>` : ''}`);
+        } else {
+          target.parentElement.classList.add('hidden');
+          const known = new Set(S.zones.map(z => z.name));
+          const created = zones.filter(z => !known.has((z.name || '').replace(/\.$/, '')));
+          const denied = S.user.is_admin ? [] : zones.filter(z => zoneRole((z.name || '').replace(/\.$/, '')) !== 'owner');
+          if (denied.length) { setPreview('bad', `You can only import into zones you own. Not allowed: ${denied.map(z => `<span class="mono">${esc(z.name)}</span>`).join(', ')}.`); return; }
+          plan = { kind: 'json', path: `/import?mode=${mode}`, body: doc };
+          setPreview(mode === 'replace' ? 'warn' : '', `<b>${zones.length}</b> zone${zones.length === 1 ? '' : 's'}, <b>${zones.reduce((n, z) => n + count(z), 0)}</b> record${zones.reduce((n, z) => n + count(z), 0) === 1 ? '' : 's'}: `
+            + zones.map(z => `<span class="mono">${esc(z.name)}</span> (${count(z)}${known.has((z.name || '').replace(/\.$/, '')) ? '' : ', new zone'})`).join(', ')
+            + `.${mode === 'replace' ? ' <b>Existing records of these zones are deleted first.</b>' : ''}`);
+        }
+      } else {
+        if (body.trim().startsWith('{')) { setPreview('bad', 'This looks like JSON. Choose the JSON format.'); return; }
+        const lines = body.split('\n').filter(l => l.trim() && !/^[;$]/.test(l.trim())).length;
+        let into = zoneName;
+        if (!zoneName) {
+          $('#im-target-label').textContent = 'Into zone';
+          const prev = target.value;
+          target.innerHTML = (S.user.is_admin ? S.zones.map(z => z.name) : ownedZones).map(n => `<option>${esc(n)}</option>`).join('');
+          if (prev && [...target.options].some(o => o.value === prev)) target.value = prev;
+          target.parentElement.classList.remove('hidden');
+          into = target.value;
+          if (!into) { setPreview('bad', 'Create the zone first, then import its zone file.'); return; }
+        } else target.parentElement.classList.add('hidden');
+        plan = { kind: 'bind', path: `/zones/${encodeURIComponent(into)}/import-bind?mode=${mode}`, body };
+        setPreview(mode === 'replace' ? 'warn' : '', `Zone file with <b>${lines}</b> record lines, into <span class="mono">${esc(into)}</span>. SOA lines are ignored; `
+          + `names are relative to <span class="mono">$ORIGIN</span> or the zone.${mode === 'replace' ? ' <b>All existing records are deleted first.</b>' : ''}`);
+      }
+      go.disabled = false;
+    };
+    const detect = () => {
+      const t = text.value.trimStart();
+      if (t) m.querySelector(`[name=im-fmt][value=${t.startsWith('{') ? 'json' : 'bind'}]`).checked = true;
+    };
+    $('#im-file').onchange = async e => {
+      const f = e.target.files[0]; if (!f) return;
+      if (f.size > 16 * 1024 * 1024) { setPreview('bad', 'File is larger than 16 MB.'); return; }
+      text.value = await f.text(); detect(); analyse();
+    };
+    text.oninput = () => { detect(); analyse(); };
+    m.querySelectorAll('[name=im-fmt],[name=im-mode]').forEach(r => r.onchange = analyse);
+    target.onchange = analyse;
+    analyse();
+    go.onclick = async () => {
+      if (!plan) return;
+      // Replace deletes existing records: ask for a second, explicit click.
+      if (val('im-mode') === 'replace' && go.dataset.armed !== '1') {
+        go.dataset.armed = '1'; go.classList.remove('primary'); go.classList.add('danger'); go.textContent = 'Delete existing records and import';
+        return;
+      }
+      go.disabled = true; go.textContent = 'Importing…';
+      try {
+        let r;
+        if (plan.kind === 'json') r = await POST(plan.path, plan.body);
+        else {
+          const res = await fetch('/api' + plan.path, { method: 'POST', headers: { 'content-type': 'text/plain', 'x-requested-with': 'rust-dns' }, body: plan.body });
+          r = await res.json(); if (!res.ok) throw new Error(r.error || res.statusText);
+        }
+        const rejected = r.skipped && r.skipped.length ? r.skipped : [];
+        setPreview(rejected.length ? 'warn' : '', `<b>Imported.</b> ${r.zones_created ? `${r.zones_created} zone(s) created, ` : ''}${r.records_added} record(s) added`
+          + `${r.records_removed ? `, ${r.records_removed} removed (replace)` : ''}${r.records_skipped ? `, ${r.records_skipped} already present or not allowed (skipped)` : ''}.`
+          + (rejected.length ? `<div style="margin-top:6px"><b>${rejected.length} line(s) rejected:</b><pre style="margin-top:4px;max-height:160px;overflow:auto">${esc(rejected.join('\n'))}</pre></div>` : ''));
+        await refreshZones();
+        if (S.zone && zoneName) reloadZone(); else if (!zoneName) renderZonesTable();
+        delete go.dataset.armed; go.classList.remove('danger'); go.classList.add('primary'); go.textContent = 'Import';
+      } catch (e) {
+        setPreview('bad', `Import failed, nothing was changed: ${esc(e.message)}`);
+        delete go.dataset.armed; go.classList.remove('danger'); go.classList.add('primary'); go.textContent = 'Import'; go.disabled = false;
+      }
+    };
+  }, { size: 'md' });
+}
+
+function zoneSettingsModal() {
+  const z = S.zone;
+  openModal(`<h2>Zone settings · <span class="mono">${esc(z.name)}</span></h2>${zoneForm(z)}<div class="error" id="m-err"></div>
+    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="m-ok">Save</button></div>`, m => {
+    $('#m-ok').onclick = async () => { try { const b = readForm(m); if (S.user.is_admin && !b.owner) b.owner = ''; await PUT('/zones/' + encodeURIComponent(z.name), b); closeModal(); toast('Zone updated', 'ok'); reloadZone(); } catch (e) { $('#m-err').textContent = e.message; } };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// live queries
+// ---------------------------------------------------------------------------
+function viewQueries() {
+  $('#main').innerHTML = `
+    <div class="topbar"><h1>Live queries</h1><div class="actions"><input type="text" id="q-filter" placeholder="Filter by name, client, type…" value="${esc(S.filter)}"><button class="btn" id="q-pause">${S.paused ? 'Resume' : 'Pause'}</button><button class="btn" id="q-clear">Clear</button></div></div>
+    <div class="card"><table id="queries"><thead><tr><th>Time</th><th>Client</th><th>Proto</th><th>Name</th><th>Type</th><th>Status</th><th>Result</th><th>Source</th><th>Latency</th></tr></thead><tbody></tbody></table></div>
+    <p class="hint" style="margin-top:8px">Type is what the client asked for: A = IPv4 address, AAAA = IPv6 address, HTTPS = browser capability lookup (HTTP/3, encrypted hello), PTR = reverse lookup. Result shows the records returned. Streams every query the server answers, newest first. Only zone owners and administrators receive this feed. Nothing is stored.</p>`;
+  $('#q-filter').oninput = e => { S.filter = e.target.value; renderQueries(); };
+  $('#q-pause').onclick = () => { S.paused = !S.paused; $('#q-pause').textContent = S.paused ? 'Resume' : 'Pause'; };
+  $('#q-clear').onclick = () => { S.queries = []; renderQueries(); };
+  renderQueries();
+}
+const rcodeBadge = rc => `<span class="badge ${rc === 'No Error' || rc === 'NoError' ? 'ok' : rc === 'NXDomain' || rc === 'Non-Existent Domain' ? 'warn' : 'bad'}">${esc(rc)}</span>`;
+function queryRow(q) { return `<tr><td class="hint">${new Date(q.ts).toLocaleTimeString()}</td><td class="mono">${esc(q.client)}</td><td>${q.proto}</td><td class="mono">${esc(q.name)}</td><td><span class="badge muted">${esc(q.qtype)}</span></td><td>${rcodeBadge(q.rcode)}</td><td class="mono" style="font-size:12px;max-width:420px">${resultCell(q)}</td><td>${esc(q.source)}</td><td class="hint">${q.duration_us < 1000 ? q.duration_us + 'µs' : (q.duration_us/1000).toFixed(1) + 'ms'}</td></tr>`; }
+function resultCell(q) {
+  const r = q.result || [];
+  if (!r.length) return `<span class="hint">${q.rcode === 'No Error' || q.rcode === 'NoError' ? 'no records (NODATA)' : '–'}</span>`;
+  return r.map(line => `<div style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${esc(line)}">${esc(line)}</div>`).join('');
+}
+function matchQ(q) { const f = S.filter.toLowerCase(); return !f || q.name.toLowerCase().includes(f) || q.client.includes(f) || q.qtype.toLowerCase() === f || q.rcode.toLowerCase().includes(f) || q.source.includes(f) || (q.result || []).some(l => l.toLowerCase().includes(f)); }
+function renderQueries() { const tb = $('#queries tbody'); if (!tb) return; const rows = S.queries.filter(matchQ).slice(0, 200); tb.innerHTML = rows.length ? rows.map(queryRow).join('') : '<tr><td colspan="9" class="empty">Waiting for queries…</td></tr>'; }
+function prependQueryRow(q) { const tb = $('#queries tbody'); if (!tb || !matchQ(q)) return; if (tb.querySelector('.empty')) tb.innerHTML = ''; tb.insertAdjacentHTML('afterbegin', queryRow(q)); while (tb.rows.length > 200) tb.deleteRow(-1); }
+
+// ---------------------------------------------------------------------------
+// changelog
+// ---------------------------------------------------------------------------
+let clOldest = null;
+const clEntries = new Map(); // offset -> entry, for the details view
+async function viewChangelog() {
+  $('#main').innerHTML = `<div class="topbar"><h1>Changelog</h1><span class="hint" id="cl-info"></span></div>
+    <p class="hint" style="margin:-8px 0 12px">Every change to zones and records. Click a row to see the full entry.</p>
+    <div class="card"><div class="tw"><table id="cl"><thead><tr><th>Offset</th><th>Time</th><th>Actor</th><th>From</th><th>Operation</th><th>Action</th><th>Entity</th><th>Zone</th><th>Details</th></tr></thead><tbody></tbody></table></div>
+    <div style="padding:10px;text-align:center"><button class="btn sm" id="cl-more">Load older</button></div></div>`;
+  const cl = await GET('/changelog?limit=100');
+  $('#cl-info').textContent = `retained offsets ${cl.oldest_offset ?? '–'} … ${cl.latest_offset ?? '–'}`;
+  const tb = $('#cl tbody'); tb.innerHTML = cl.entries.slice().reverse().map(changeRow).join('') || '<tr><td colspan="9" class="empty">No changes recorded</td></tr>';
+  clOldest = cl.entries.length ? cl.entries[0].offset : null;
+  bindDetails(tb);
+  $('#cl-more').onclick = async () => { if (clOldest == null) return; const older = await GET(`/changelog?after=${Math.max(0, clOldest - 101)}&limit=100`); const rows = older.entries.filter(e => e.offset < clOldest); if (!rows.length) { toast('No older entries retained'); return; } tb.insertAdjacentHTML('beforeend', rows.slice().reverse().map(changeRow).join('')); clOldest = rows[0].offset; bindDetails(tb); };
+}
+function changeRow(e) { clEntries.set(e.offset, e); return `<tr class="clickable" data-off="${e.offset}"><td class="mono">${e.offset}</td><td class="hint" style="white-space:nowrap">${fmtTime(e.ts)}</td><td><b>${esc(e.actor)}</b></td><td class="mono hint">${esc(e.actor_ip)}</td><td class="hint" title="transaction ${esc(e.txn || '')}">${esc((e.command || '').replace(/_/g, ' '))}</td><td><span class="badge ${e.action === 'delete' ? 'bad' : e.action === 'create' ? 'ok' : ''}">${esc(e.action)}</span></td><td>${esc(e.entity)}</td><td><a class="mono" href="#/zones/${encodeURIComponent(e.zone)}">${esc(e.zone)}</a></td><td><button class="btn sm ghost" data-view>view</button></td></tr>`; }
+// One delegated handler per table body: a click anywhere on a row (except a link) opens it.
+function bindDetails(tb) {
+  if (tb.dataset.bound) return; tb.dataset.bound = '1';
+  tb.addEventListener('click', ev => {
+    if (ev.target.closest('a')) return;
+    const tr = ev.target.closest('tr[data-off]'); if (!tr) return;
+    const e = clEntries.get(Number(tr.dataset.off)); if (!e) return;
+    entryModal('Change details', [
+      ['Time', `${esc(fmtTime(e.ts))} <span class="hint">(${esc(ago(e.ts))})</span>`],
+      ['Offset', `<span class="mono">${e.offset}</span>`],
+      ['Operation', esc((e.command || '').replace(/_/g, ' '))],
+      ['Action', `<span class="badge ${e.action === 'delete' ? 'bad' : e.action === 'create' ? 'ok' : ''}">${esc(e.action)}</span> ${esc(e.entity)}${e.entity_id != null ? ` <span class="hint">#${esc(e.entity_id)}</span>` : ''}`],
+      ['Zone', `<a class="mono" href="#/zones/${encodeURIComponent(e.zone)}" data-close>${esc(e.zone)}</a>`],
+      ['Actor', `<b>${esc(e.actor)}</b>`],
+      ['From', `<span class="mono">${esc(e.actor_ip)}</span>`],
+      ['Transaction', e.txn ? copyVal(e.txn) : ''],
+    ], e.payload, 'Payload');
+  });
+}
+function appendChangelogRow(e) { const tb = $('#cl tbody'); if (!tb) return; if (tb.querySelector('.empty')) tb.innerHTML = ''; tb.insertAdjacentHTML('afterbegin', changeRow(e)); bindDetails(tb); }
+
+// Pretty-printed, highlighted JSON (escaped piece by piece).
+function jsonHtml(v) {
+  const s = JSON.stringify(v === undefined ? null : v, null, 2);
+  const re = /("(?:\\.|[^"\\])*")(\s*:)?|\b(true|false|null)\b|(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)/g;
+  let out = '', last = 0, m;
+  while ((m = re.exec(s))) {
+    out += esc(s.slice(last, m.index));
+    if (m[1]) out += `<span class="${m[2] ? 'j-k' : 'j-s'}">${esc(m[1])}</span>${m[2] ? esc(m[2]) : ''}`;
+    else if (m[3]) out += `<span class="j-b">${m[3]}</span>`;
+    else out += `<span class="j-n">${m[4]}</span>`;
+    last = re.lastIndex;
+  }
+  return out + esc(s.slice(last));
+}
+// Readable view of a changelog / audit entry. `rows`: [label, html] (empty html is skipped).
+function entryModal(title, rows, detail, detailLabel = 'Details') {
+  const json = JSON.stringify(detail === undefined ? null : detail, null, 2);
+  openModal(`<h2>${esc(title)}</h2>
+    <div class="kv">${rows.filter(([, v]) => v !== '' && v != null).map(([k, v]) => `<span class="k">${esc(k)}</span><span>${v}</span>`).join('')}</div>
+    <div class="row between" style="margin-top:18px"><h3>${esc(detailLabel)}</h3>${copyBtn(json, 'Copy JSON')}</div>
+    <pre class="json" style="margin-top:6px">${jsonHtml(detail)}</pre>
+    <div class="foot"><button class="btn primary" data-close>Close</button></div>`, null, { size: 'md' });
+}
+
+// ---------------------------------------------------------------------------
+// effective rights (from the same permission table the API enforces)
+// ---------------------------------------------------------------------------
+async function rightsModal(userId, via, tokenName) {
+  let r;
+  try { r = await GET(`/users/${userId}/rights?via=${via}`); } catch (e) { toast(e.message, 'err'); return; }
+  const permLabel = Object.fromEntries(r.zone_permissions.map(p => [p.perm, p.label]));
+  const title = via === 'token'
+    ? `API token ${tokenName ? `<span class="mono">${esc(tokenName)}</span>` : ''} · owner <b>${esc(r.user.username)}</b>`
+    : `<b>${esc(r.user.username)}</b> (signed in)`;
+  const yes = '<span class="badge ok">allowed</span>', no = why => `<span class="badge muted" title="${esc(why || '')}">not allowed</span>`;
+  openModal(`<h2>Effective rights</h2>
+    <p style="margin:0">${title} ${r.user.is_admin ? '<span class="badge">administrator</span>' : ''} ${r.user.disabled_at ? '<span class="badge bad">disabled</span>' : ''}</p>
+    ${r.notes.map(n => `<p class="hint" style="margin:4px 0">${esc(n)}</p>`).join('')}
+    <h3 style="margin-top:14px">Zones (${r.zones.length})</h3>
+    ${r.zones.length ? `<div class="rz-list">${r.zones.map(z => `<div class="rz">
+      <div class="rz-h"><span class="mono rz-n">${esc(z.zone)}</span><span class="badge">${esc(z.role)}</span><span class="hint">via ${esc(z.source)}</span></div>
+      <div class="rz-p">${z.permissions.map(p => `<span class="perm">✓ ${esc(permLabel[p])}</span>`).join('')}</div></div>`).join('')}</div>` : '<div class="empty">No zones. This user has no access to any zone.</div>'}
+    <h3 style="margin-top:14px">Account</h3>
+    <div class="tw"><table><tbody>${r.global.map(g => `<tr><td>${esc(g.label)}${g.allowed ? '' : `<div class="hint" style="font-size:12px">${esc(g.reason)}</div>`}</td><td style="white-space:nowrap;text-align:right">${g.allowed ? yes : no(g.reason)}</td></tr>`).join('')}</tbody></table></div>
+    <details style="margin-top:12px"><summary class="hint">What each role allows</summary>
+      <div class="tw"><table style="margin-top:6px"><tbody>${r.zone_permissions.map(p => `<tr><td>${esc(p.label)}</td><td><span class="badge muted">${esc(p.min_role)}+</span></td></tr>`).join('')}</tbody></table></div>
+    </details>
+    <div class="foot"><button class="btn primary" data-close>Close</button></div>`, null, { size: 'lg' });
+}
+
+// ---------------------------------------------------------------------------
+// API explorer (Swagger UI, same origin, uses the signed-in session)
+// ---------------------------------------------------------------------------
+function viewApi() {
+  $('#main').innerHTML = `<div class="topbar"><h1>API explorer</h1><div class="actions">
+      <a class="btn" href="/api/openapi.json" target="_blank">openapi.json</a>
+      <a class="btn" href="/docs" target="_blank">Open in new tab</a></div></div>
+    <p class="hint" style="margin:-8px 0 12px">Every endpoint, with "Try it out". Requests run as <b>${esc(S.user.username)}</b> against this server and really change data.</p>
+    <div class="card" style="overflow:hidden"><iframe src="/docs" title="API explorer" style="display:block;width:100%;height:calc(100vh - 150px);border:0;background:#fff"></iframe></div>`;
+}
+
+// ---------------------------------------------------------------------------
+// server settings (admin): forwarding upstreams
+// ---------------------------------------------------------------------------
+async function viewServer() {
+  if (!S.user.is_admin) { location.hash = '#/dashboard'; return; }
+  let f;
+  try { f = await GET('/settings/forwarding'); }
+  catch (e) {
+    if (e.code === 'login_required') throw e;
+    if (!S.status) { try { S.status = await GET('/status'); } catch {} }
+    $('#main').innerHTML = `<div class="topbar"><h1>Server settings</h1></div>
+      <div class="card panel" style="max-width:820px"><h2>Forwarding</h2>
+        <div class="note warn">${ico('warn', 's')}<span>Could not load the forwarding settings: <b>${esc(e.message)}</b>.${e.status === 404 ? ' This server version does not offer console-managed forwarding yet; forwarding is configured in the configuration file.' : ''}</span></div>
+        ${S.status ? `<p class="hint" style="margin-top:12px">Current upstreams: <span class="mono">${S.status.forwarding.upstreams.length ? esc(S.status.forwarding.upstreams.join(', ')) : 'none (foreign names are refused)'}</span></p>` : ''}
+        <div class="row" style="margin-top:12px"><button class="btn" id="fw-retry">Retry</button></div></div>`;
+    $('#fw-retry').onclick = viewServer;
+    return;
+  }
+  const lines = a => (a || []).join('\n');
+  const src = f.source === 'console'
+    ? `<span class="badge">set in the console</span> <span class="hint">by ${esc(f.updated_by || '?')} ${f.updated_at ? ago(f.updated_at) : ''}; overrides the config file</span>`
+    : '<span class="badge muted">from the config file</span>';
+  $('#main').innerHTML = `<div class="topbar"><h1>Server settings</h1></div>
+    <div class="card panel" style="max-width:820px"><div class="row between"><h2>Forwarding</h2><div>${src}</div></div>
+      <p class="hint">Names this server is not authoritative for are sent to these upstream resolvers, for clients in the allowed networks only.
+        With no upstreams, such queries are refused. Changes apply immediately, with no restart, and are recorded in the audit log.</p>
+      <div class="grid two" style="gap:0 16px">
+        <div class="field"><label>Upstream DNS servers (one per line)</label>
+          <textarea id="fw-up" rows="6" spellcheck="false" placeholder="1.1.1.1\n8.8.8.8:53\n2606:4700:4700::1111\n[2001:4860:4860::8888]:53">${esc(lines(f.upstreams))}</textarea>
+          <span class="hint">IP address, optionally with a port; port 53 when omitted. Tried in order.</span></div>
+        <div class="field"><label>Clients allowed to use forwarding (one network per line)</label>
+          <textarea id="fw-acl" rows="6" spellcheck="false" placeholder="192.168.0.0/16\nfd00::/8">${esc(lines(f.allowed_clients))}</textarea>
+          <span class="hint">CIDR or single address. Never 0.0.0.0/0: that makes an open resolver.</span></div>
+      </div>
+      <div class="field" style="max-width:220px"><label>Timeout per upstream (milliseconds)</label><input type="text" inputmode="numeric" id="fw-timeout" value="${f.timeout_ms}"></div>
+      <div class="error" id="fw-err"></div>
+      <div id="fw-test" class="io-summary hidden"></div>
+      <div class="row" style="margin-top:12px">
+        <button class="btn" id="fw-testbtn">Test upstreams</button>
+        <button class="btn primary" id="fw-save">Save and apply</button>
+        ${f.source === 'console' ? '<button class="btn" id="fw-reset">Reset to config file</button>' : ''}
+      </div>
+      ${f.source === 'console' ? `<p class="hint" style="margin-top:12px">Config file values: upstreams ${f.config.upstreams.length ? f.config.upstreams.map(esc).join(', ') : '<i>none</i>'}; timeout ${f.config.timeout_ms} ms.</p>` : ''}
+    </div>`;
+  const body = () => ({
+    upstreams: $('#fw-up').value.split('\n').map(x => x.trim()).filter(Boolean),
+    allowed_clients: $('#fw-acl').value.split('\n').map(x => x.trim()).filter(Boolean),
+    timeout_ms: Number($('#fw-timeout').value.trim()),
+  });
+  $('#fw-testbtn').onclick = async () => {
+    const box = $('#fw-test'); box.classList.remove('hidden', 'bad', 'warn'); box.textContent = 'Testing…'; $('#fw-err').textContent = '';
+    try {
+      const r = await POST('/settings/forwarding/test', body());
+      const bad = r.results.filter(x => !x.ok).length;
+      box.classList.toggle('warn', bad > 0);
+      box.innerHTML = r.results.map(x => `<div>${x.ok ? '✓' : '✗'} <span class="mono">${esc(x.upstream)}</span> ${x.ok ? `answered in ${x.ms} ms` : `<span style="color:var(--danger)">${esc(x.error)}</span>`}</div>`).join('') || 'No upstreams to test.';
+    } catch (e) { box.classList.add('bad'); box.textContent = e.message; }
+  };
+  $('#fw-save').onclick = async () => {
+    $('#fw-err').textContent = '';
+    try { await PUT('/settings/forwarding', body()); toast('Forwarding settings applied', 'ok'); viewServer(); }
+    catch (e) { $('#fw-err').textContent = e.message; }
+  };
+  if ($('#fw-reset')) $('#fw-reset').onclick = async () => {
+    try { await DEL('/settings/forwarding'); toast('Using the config file again', 'ok'); viewServer(); }
+    catch (e) { $('#fw-err').textContent = e.message; }
+  };
+}
+
+// ---------------------------------------------------------------------------
+// audit log (admin)
+// ---------------------------------------------------------------------------
+async function viewAudit() {
+  if (!S.user.is_admin) { location.hash = '#/dashboard'; return; }
+  const { entries } = await GET('/audit?limit=300');
+  const rows = entries.slice().reverse();
+  $('#main').innerHTML = `<div class="topbar"><h1>Audit log</h1><span class="hint">Sign-ins, users, MFA, sessions and API tokens. Written in the same transaction as the change.</span></div>
+    <div class="row toolbar"><input type="search" id="au-filter" placeholder="Filter by user, action, address…"><span class="hint">Click a row to see the full entry.</span></div>
+    <div class="card"><div class="tw"><table><thead><tr><th>Time</th><th>Actor</th><th>From</th><th>Operation</th><th>Action</th><th>Target</th><th>Details</th></tr></thead><tbody id="au-body"></tbody></table></div></div>`;
+  const summary = d => d && typeof d === 'object' ? Object.entries(d).map(([k, v]) => `${k}: ${typeof v === 'object' && v !== null ? JSON.stringify(v) : v}`).join(' · ') : JSON.stringify(d);
+  let list = [];
+  const render = () => {
+    const f = $('#au-filter').value.toLowerCase();
+    const match = e => !f || [e.actor, e.actor_ip, e.action, e.operation, e.target, JSON.stringify(e.detail)].some(v => String(v).toLowerCase().includes(f));
+    list = rows.filter(match);
+    $('#au-body').innerHTML = list.length ? list.map((e, i) => `<tr class="clickable" data-i="${i}"><td class="hint" style="white-space:nowrap">${fmtTime(e.ts)}</td><td><b>${esc(e.actor)}</b></td><td class="mono hint">${esc(e.actor_ip)}</td><td class="hint">${esc(e.operation.replace(/_/g, ' '))}</td><td><span class="badge ${/delete|revoke|disable/.test(e.action) ? 'bad' : /create/.test(e.action) ? 'ok' : ''}">${esc(e.action)}</span></td><td>${esc(e.target)}</td><td class="hint" style="font-size:12px;max-width:340px"><div class="ellip">${esc(summary(e.detail))}</div></td></tr>`).join('') : '<tr><td colspan="7" class="empty">No entries</td></tr>';
+  };
+  $('#au-body').onclick = ev => {
+    const tr = ev.target.closest('tr[data-i]'); if (!tr) return;
+    const e = list[Number(tr.dataset.i)]; if (!e) return;
+    entryModal('Audit entry', [
+      ['Time', `${esc(fmtTime(e.ts))} <span class="hint">(${esc(ago(e.ts))})</span>`],
+      ['Operation', esc(e.operation.replace(/_/g, ' '))],
+      ['Action', `<span class="badge ${/delete|revoke|disable/.test(e.action) ? 'bad' : /create/.test(e.action) ? 'ok' : ''}">${esc(e.action)}</span>`],
+      ['Actor', `<b>${esc(e.actor)}</b>`],
+      ['From (IP)', `<span class="mono">${esc(e.actor_ip)}</span>`],
+      ['Target', `${esc(e.target)}${e.target_user_id != null ? ` <span class="hint">user #${esc(e.target_user_id)}</span>` : ''}`],
+      ['Transaction', e.txn ? copyVal(e.txn) : ''],
+      ['Entry', e.id != null ? `<span class="mono">#${esc(e.id)}</span>` : ''],
+    ], e.detail, 'Details');
+  };
+  $('#au-filter').oninput = render; render();
+}
+
+// ---------------------------------------------------------------------------
+// users (admin)
+// ---------------------------------------------------------------------------
+async function viewUsers() {
+  if (!S.user.is_admin) { location.hash = '#/dashboard'; return; }
+  const { users } = await GET('/users');
+  $('#main').innerHTML = `<div class="topbar"><h1>Users</h1><button class="btn primary" id="u-new">New user</button></div>
+    <div class="card"><table><thead><tr><th>Username</th><th>Name</th><th>Role</th><th>MFA</th><th>Status</th><th>Created</th><th></th></tr></thead><tbody>
+    ${users.map(u => `<tr><td><b>${esc(u.username)}</b>${u.is_root ? ' <span class="badge muted">root</span>' : ''}</td><td>${esc(u.display_name)}</td><td>${u.is_admin ? '<span class="badge">admin</span>' : 'user'}</td><td>${u.mfa_enrolled ? '<span class="badge ok">enrolled</span>' : u.mfa_required ? '<span class="badge warn">pending</span>' : '<span class="badge muted">off</span>'}</td><td>${u.disabled_at ? '<span class="badge bad">disabled</span>' : '<span class="badge ok">active</span>'}</td><td class="hint">${ago(u.created_at)}</td><td class="actions"><button class="btn sm ghost" data-rights="${u.id}">Rights</button><button class="btn sm ghost" data-edit="${u.id}">Edit</button>${u.is_root ? '' : `<button class="btn sm ghost danger" data-del="${u.id}">Delete</button>`}</td></tr>`).join('')}
+    </tbody></table></div>`;
+  $('#u-new').onclick = () => userModal(null);
+  $$('[data-rights]').forEach(b => b.onclick = () => rightsModal(Number(b.dataset.rights), 'session'));
+  $$('[data-edit]').forEach(b => b.onclick = () => userModal(users.find(u => u.id === Number(b.dataset.edit))));
+  $$('[data-del]').forEach(b => b.onclick = async () => { const u = users.find(x => x.id === Number(b.dataset.del)); if (await confirmModal('Delete user', `Delete ${u.username}? Their zones keep existing without an owner.`)) { try { await DEL('/users/' + u.id); toast('User deleted', 'ok'); viewUsers(); } catch (e) { toast(e.message, 'err'); } } });
+}
+function userModal(u) {
+  const isNew = !u; u = u || {};
+  openModal(`<h2>${isNew ? 'New user' : 'Edit ' + esc(u.username)}</h2>
+    ${isNew ? '<div class="field"><label>Username</label><input type="text" name="username"></div>' : ''}
+    <div class="field"><label>Display name</label><input type="text" name="display_name" value="${esc(u.display_name || '')}"></div>
+    ${u.is_root ? '<p class="hint">The root password is managed in the configuration file.</p>' : `<div class="field"><label>${isNew ? 'Password' : 'New password (leave empty to keep)'}</label><input type="password" name="password" autocomplete="new-password"></div>`}
+    <div class="row" style="margin-top:14px;gap:18px">
+      <label><input type="checkbox" name="is_admin" ${u.is_admin ? 'checked' : ''} ${u.is_root ? 'disabled' : ''}> Administrator</label>
+      <label><input type="checkbox" name="mfa_required" ${u.mfa_required ? 'checked' : ''}> Require MFA</label>
+      ${isNew || u.is_root ? '' : `<label><input type="checkbox" name="disabled" ${u.disabled_at ? 'checked' : ''}> Disabled</label>`}
+    </div>
+    ${!isNew && u.mfa_enrolled ? '<p class="hint" style="margin-top:12px">MFA is enrolled. <a href="#" id="u-reset-mfa">Reset MFA</a> to force re-enrollment (all sessions are signed out).</p>' : ''}
+    ${!isNew ? '<p class="hint" style="margin-top:6px"><a href="#" id="u-signout">Sign this user out everywhere</a></p>' : ''}
+    <p class="hint" style="margin-top:10px">When MFA is required, the user must enroll an authenticator on their next sign-in.</p>
+    <div class="error" id="m-err"></div>
+    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="m-ok">${isNew ? 'Create' : 'Save'}</button></div>`, m => {
+    if ($('#u-signout')) $('#u-signout').onclick = async e => { e.preventDefault(); try { const r = await POST(`/users/${u.id}/sessions/revoke`); toast(`Revoked ${r.revoked} session(s)`, 'ok'); } catch (e) { $('#m-err').textContent = e.message; } };
+    if ($('#u-reset-mfa')) $('#u-reset-mfa').onclick = async e => { e.preventDefault(); try { await POST(`/users/${u.id}/reset-mfa`); closeModal(); toast('MFA reset', 'ok'); viewUsers(); } catch (e) { $('#m-err').textContent = e.message; } };
+    $('#m-ok').onclick = async () => {
+      const b = {}; m.querySelectorAll('[name]').forEach(i => { if (i.type === 'checkbox') { if (!i.disabled) b[i.name] = i.checked; } else if (i.value !== '') b[i.name] = i.value; });
+      try { if (isNew) await POST('/users', b); else await PUT('/users/' + u.id, b); closeModal(); toast(isNew ? 'User created' : 'User updated', 'ok'); viewUsers(); } catch (e) { $('#m-err').textContent = e.message; }
+    };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// API tokens
+// ---------------------------------------------------------------------------
+const TAG_RE = /^[A-Za-z0-9_-]{1,256}$/, MAX_TAGS = 16;
+const tagChip = (t, attrs = '') => `<span class="tag" ${attrs}>${esc(t)}</span>`;
+// Chip input: Enter, comma or blur adds a tag, × or Backspace removes one.
+function tagInput(host, initial) {
+  const tags = [...initial];
+  host.innerHTML = `<div class="tag-input"><span class="tag-list"></span><input type="text" placeholder="add tag…" autocomplete="off" spellcheck="false"></div><div class="hint tag-msg">Letters, digits, <code>_</code> and <code>-</code> (case matters); up to ${MAX_TAGS} tags of 256 characters.</div>`;
+  const list = host.querySelector('.tag-list'), inp = host.querySelector('input'), msg = host.querySelector('.tag-msg');
+  const draw = () => { list.innerHTML = tags.map((t, i) => `<span class="tag">${esc(t)}<button type="button" data-rm="${i}" aria-label="Remove ${esc(t)}">×</button></span>`).join(''); };
+  const say = (text, bad) => { msg.textContent = text; msg.classList.toggle('error', !!bad); };
+  const add = () => {
+    const v = inp.value.trim().replace(/,$/, '');
+    if (!v) return true;
+    if (!TAG_RE.test(v)) { say(`"${v.length > 40 ? v.slice(0, 40) + '…' : v}": use 1-256 characters of A-Z a-z 0-9 _ -`, true); return false; }
+    if (!tags.includes(v)) { if (tags.length >= MAX_TAGS) { say(`At most ${MAX_TAGS} tags`, true); return false; } tags.push(v); tags.sort(); }
+    inp.value = ''; say(`${tags.length} of ${MAX_TAGS} tags`); draw(); return true;
+  };
+  inp.addEventListener('keydown', e => {
+    if (e.key === 'Enter' || e.key === ',') { e.preventDefault(); e.stopPropagation(); add(); }
+    else if (e.key === 'Backspace' && !inp.value && tags.length) { tags.pop(); draw(); }
+  });
+  inp.addEventListener('blur', add);
+  list.addEventListener('click', e => { const b = e.target.closest('[data-rm]'); if (b) { tags.splice(Number(b.dataset.rm), 1); draw(); inp.focus(); } });
+  host.querySelector('.tag-input').addEventListener('click', e => { if (e.target === e.currentTarget) inp.focus(); });
+  draw();
+  // Returns the tags, or null when the text still typed is not a valid tag.
+  return () => add() ? [...tags] : null;
+}
+
+async function viewTokens() {
+  const tag = S.tokenTag || '';
+  const q = new URLSearchParams(); if (S.user.is_admin) q.set('all', 'true'); if (tag) q.set('tag', tag);
+  const { tokens } = await GET('/tokens?' + q);
+  const showOwner = S.user.is_admin;
+  // Every token listed is editable: non-admins only see their own, admins may manage anyone's.
+  const known = [...new Set(tokens.flatMap(t => t.tags))].sort();
+  const row = t => `<tr data-tok="${t.id}">
+      <td><b>${esc(t.name)}</b><div class="tags">${t.tags.map(g => tagChip(g, `data-filter="${esc(g)}" title="Show only tokens tagged ${esc(g)}"`)).join('')}</div></td>
+      ${showOwner ? `<td><a href="#" data-rights="${t.user_id}" data-token="${esc(t.name)}" title="Show what this token can do">${esc(t.username || '?')}</a></td>` : ''}
+      <td class="hint">${fmtTime(t.created_at)}</td>
+      <td>${t.last_used_at ? `<span title="${esc(t.last_used_at)} (updated at most once a minute per address)">${ago(t.last_used_at)}</span>` : '<span class="hint">never</span>'}<div class="mono hint">${esc(t.last_used_ip || '—')}</div></td>
+      <td class="actions"><button class="btn sm ghost" data-edit="${t.id}">Edit tags</button><button class="btn sm ghost danger" data-rev="${t.id}">Revoke</button></td></tr>`;
+  const cols = showOwner ? 5 : 4;
+  $('#main').innerHTML = `<div class="topbar"><h1>API tokens</h1><button class="btn primary" id="t-new">New token</button></div>
+    <div class="card"><div class="toolbar row" style="padding:12px 14px 0">
+      <label class="hint" for="t-tag">Tag</label>
+      <select id="t-tag" style="width:auto;max-width:240px"><option value="">all tokens</option>${[...new Set([...known, ...(tag ? [tag] : [])])].sort().map(g => `<option ${g === tag ? 'selected' : ''}>${esc(g)}</option>`).join('')}</select>
+      ${tag ? `<span class="tag on">${esc(tag)}<button type="button" id="t-clear" aria-label="Clear filter">×</button></span>` : ''}
+      <span class="hint" style="margin-left:auto">${tokens.length} token${tokens.length === 1 ? '' : 's'}${tag ? ' tagged ' + esc(tag) : ''}</span>
+    </div>
+    <div class="tw"><table><thead><tr><th>Name / tags</th>${showOwner ? '<th>Owner</th>' : ''}<th>Created</th><th title="Updated at most once a minute, immediately when the address changes">Last used</th><th></th></tr></thead><tbody>
+    ${tokens.length ? tokens.map(row).join('') : `<tr><td colspan="${cols}" class="empty">${tag ? 'No tokens with this tag' : 'No tokens'}</td></tr>`}
+    </tbody></table></div></div>
+    <div class="card panel" style="margin-top:14px"><h2>Using the API</h2><p class="hint">Tokens carry the permissions of the user who created them.${showOwner ? ' Click an owner to see exactly what a token can do.' : ''} Send them as a bearer header. Tags are labels for your own bookkeeping (<code>GET /api/tokens?tag=ci</code>); they do not change permissions. The full reference is in the API explorer and at <a href="/api/openapi.json" target="_blank">/api/openapi.json</a>.</p>
+    <pre>curl -H "Authorization: Bearer rdns_…" ${esc(location.origin)}/api/zones
+curl -H "Authorization: Bearer rdns_…" -H "content-type: application/json" \\
+     -d '{"name":"www","type":"A","value":"10.0.0.1"}' ${esc(location.origin)}/api/zones/example.com/records</pre></div>`;
+  const setTag = t => { S.tokenTag = t; viewTokens(); };
+  $('#t-tag').onchange = e => setTag(e.target.value);
+  if ($('#t-clear')) $('#t-clear').onclick = () => setTag('');
+  $$('[data-filter]').forEach(c => c.onclick = () => setTag(c.dataset.filter));
+  $('#t-new').onclick = () => openModal(`<h2>New API token</h2><div class="field"><label>Name</label><input type="text" name="name" placeholder="ci, ansible, home-assistant…"></div>
+    <div class="field"><label>Tags <span class="hint">(optional)</span></label><div id="m-tags"></div></div><div class="error" id="m-err"></div>
+    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="m-ok">Create</button></div>`, m => {
+    const getTags = tagInput($('#m-tags'), tag ? [tag] : []);
+    m.querySelector('[name=name]').focus();
+    $('#m-ok').onclick = async () => {
+      const tags = getTags(); if (!tags) return;
+      try { const r = await POST('/tokens', { name: m.querySelector('[name=name]').value, tags }); openModal(`<h2>Token created</h2><p class="hint">Copy it now. It will not be shown again.</p>${cmdBlock(r.token)}<div class="foot"><button class="btn primary" data-close>Done</button></div>`); $$('[data-close]').forEach(b => b.addEventListener('click', viewTokens, { once: true })); }
+      catch (e) { $('#m-err').textContent = e.message; }
+    };
+  });
+  $$('[data-edit]').forEach(b => b.onclick = () => {
+    const t = tokens.find(x => String(x.id) === b.dataset.edit);
+    openModal(`<h2>Tags for <span class="mono">${esc(t.name)}</span></h2><div class="field"><div id="m-tags"></div></div><div class="error" id="m-err"></div>
+      <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="m-ok">Save</button></div>`, () => {
+      const getTags = tagInput($('#m-tags'), t.tags);
+      $('#m-tags input').focus();
+      $('#m-ok').onclick = async () => {
+        const tags = getTags(); if (!tags) return;
+        try { await PUT('/tokens/' + t.id, { tags }); closeModal(); toast('Tags saved', 'ok'); viewTokens(); }
+        catch (e) { $('#m-err').textContent = e.status === 403 ? 'Not your token: only its owner or an administrator can change it.' : e.message; }
+      };
+    });
+  });
+  $$('[data-rights]').forEach(a => a.onclick = e => { e.preventDefault(); rightsModal(Number(a.dataset.rights), 'token', a.dataset.token); });
+  $$('[data-rev]').forEach(b => b.onclick = async () => { if (await confirmModal('Revoke token', 'Anything using this token will stop working.', 'Revoke')) { try { await DEL('/tokens/' + b.dataset.rev); toast('Token revoked', 'ok'); viewTokens(); } catch (e) { toast(e.message, 'err'); } } });
+}
+
+// ---------------------------------------------------------------------------
+// account
+// ---------------------------------------------------------------------------
+async function viewAccount() {
+  const me = (await GET('/me')); const u = S.user = me.user;
+  $('#main').innerHTML = `<div class="topbar"><h1>Account</h1></div>
+    <div class="grid two" style="align-items:start">
+      <div class="card panel"><h2>Profile</h2><div class="kv">
+        <span class="k">Username</span><span><b>${esc(u.username)}</b>${u.is_root ? ' <span class="badge muted">root</span>' : ''}</span>
+        <span class="k">Role</span><span>${u.is_admin ? 'administrator' : 'user'}</span>
+        <span class="k">Signed in from</span><span class="mono">${esc(me.ip)}</span>
+        <span class="k">Zones</span><span>${S.zones.length} visible · <a href="#" id="my-rights">effective rights</a></span>
+      </div>
+      ${u.is_root ? '<p class="hint" style="margin-top:12px">The root password lives in the configuration file.</p>' : `<h3 style="margin-top:18px">Change password</h3>
+        <div class="field"><label>Current password</label><input type="password" id="pw-cur" autocomplete="current-password"></div>
+        <div class="field"><label>New password</label><input type="password" id="pw-new" autocomplete="new-password"></div>
+        <div class="error" id="pw-err"></div><button class="btn" id="pw-btn">Update password</button>`}
+      </div>
+      <div class="grid">
+      <div class="card panel"><h2>Two-factor authentication</h2>
+        <p class="hint">${u.mfa_enrolled ? `Enrolled ${ago(u.totp_enrolled_at)}. Codes are required at every sign-in. ${me.recovery_codes_left} recovery code${me.recovery_codes_left === 1 ? '' : 's'} left.` : 'Not enrolled. Add an authenticator app to protect this account.'}${u.mfa_required ? ' MFA is required for this account.' : ''}</p>
+        <div id="mfa-box" class="row">${u.mfa_enrolled ? `<button class="btn" id="mfa-regen">New recovery codes</button>${u.mfa_required ? '' : '<button class="btn danger" id="mfa-off">Disable MFA</button>'}` : '<button class="btn primary" id="mfa-on">Enable MFA</button>'}</div>
+      </div>
+      <div class="card panel"><div class="row between"><h2>Sessions</h2><button class="btn sm danger" id="sess-others">Sign out other sessions</button></div><div id="sessions" class="tw"></div></div>
+      </div>
+    </div>`;
+  $('#my-rights').onclick = e => { e.preventDefault(); rightsModal(u.id, me.via === 'token' ? 'token' : 'session'); };
+  const renderSessions = async () => {
+    const { sessions } = await GET('/me/sessions');
+    $('#sessions').innerHTML = `<table><thead><tr><th>Where</th><th>Client</th><th>Last seen</th><th></th></tr></thead><tbody>${sessions.map(x => `<tr><td class="mono">${esc(x.ip)}${x.current ? ' <span class="badge ok">this session</span>' : ''}</td><td class="hint" style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(x.user_agent)}">${esc(x.user_agent || '–')}</td><td class="hint">${ago(x.last_seen_at)}</td><td class="actions">${x.current ? '' : `<button class="btn sm ghost danger" data-sess="${x.id}">Revoke</button>`}</td></tr>`).join('')}</tbody></table>`;
+    $$('[data-sess]').forEach(b => b.onclick = async () => { await DEL('/me/sessions/' + b.dataset.sess); toast('Session revoked', 'ok'); renderSessions(); });
+  };
+  renderSessions();
+  $('#sess-others').onclick = async () => { const r = await POST('/me/sessions/revoke-others'); toast(`Revoked ${r.revoked} session${r.revoked === 1 ? '' : 's'}`, 'ok'); renderSessions(); };
+  if ($('#mfa-regen')) $('#mfa-regen').onclick = () => openModal(`<h2>New recovery codes</h2><p class="hint">This replaces all existing recovery codes. Enter a current authenticator code to confirm.</p><div class="field"><label>Code</label><input type="text" name="code" inputmode="numeric" maxlength="6"></div><div class="error" id="m-err"></div>
+    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="m-ok">Generate</button></div>`, m => {
+    $('#m-ok').onclick = async () => { try { const r = await POST('/me/mfa/recovery', { code: m.querySelector('[name=code]').value }); recoveryModal(r.recovery_codes, viewAccount); } catch (e) { $('#m-err').textContent = e.message; } };
+  });
+  if ($('#pw-btn')) $('#pw-btn').onclick = async () => { $('#pw-err').textContent = ''; try { await PUT('/me/password', { current_password: $('#pw-cur').value, new_password: $('#pw-new').value }); toast('Password updated', 'ok'); $('#pw-cur').value = $('#pw-new').value = ''; } catch (e) { $('#pw-err').textContent = e.message; } };
+  if ($('#mfa-on')) $('#mfa-on').onclick = async () => {
+    const e = await POST('/me/mfa/start');
+    openModal(`<h2>Enable two-factor authentication</h2><p class="hint">Scan with your authenticator app, then enter the code it shows.</p><div class="qr">${e.qr_svg}</div><div class="hint">Manual entry: <code>${esc(e.secret)}</code></div>
+      <div class="field"><label>Code</label><input type="text" name="code" inputmode="numeric" maxlength="6"></div><div class="error" id="m-err"></div>
+      <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="m-ok">Activate</button></div>`, m => {
+      $('#m-ok').onclick = async () => { try { const r = await POST('/me/mfa/confirm', { code: m.querySelector('[name=code]').value }); toast('MFA enabled', 'ok'); recoveryModal(r.recovery_codes, viewAccount); } catch (e) { $('#m-err').textContent = e.message; } };
+    });
+  };
+  if ($('#mfa-off')) $('#mfa-off').onclick = () => openModal(`<h2>Disable MFA</h2><p class="hint">Enter a current code to confirm.</p><div class="field"><label>Code</label><input type="text" name="code" inputmode="numeric" maxlength="6"></div><div class="error" id="m-err"></div>
+    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn danger" id="m-ok">Disable</button></div>`, m => {
+    $('#m-ok').onclick = async () => { try { await POST('/me/mfa/disable', { code: m.querySelector('[name=code]').value }); closeModal(); toast('MFA disabled', 'ok'); viewAccount(); } catch (e) { $('#m-err').textContent = e.message; } };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// boot
+// ---------------------------------------------------------------------------
+(async () => {
+  try {
+    const s = await GET('/auth/session');
+    if (s.status === 'ok') { S.user = s.user; await enterApp(); }
+    else if (s.status === 'mfa_required') showLogin('mfa');
+    else if (s.status === 'enroll_required') showEnroll(s.enroll);
+    else showLogin();
+  } catch { showLogin(); }
+})();
+</script>
+</body>
+</html>

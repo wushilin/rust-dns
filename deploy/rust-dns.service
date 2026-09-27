@@ -1,0 +1,24 @@
+[Unit]
+Description=rust-dns authoritative DNS server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=rust-dns
+Group=rust-dns
+WorkingDirectory=/var/lib/rust-dns
+ExecStart=/usr/local/bin/rust-dns --config /etc/rust-dns/rust-dns.toml
+Restart=on-failure
+RestartSec=2
+# Bind port 53 without running as root.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/rust-dns /etc/rust-dns
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

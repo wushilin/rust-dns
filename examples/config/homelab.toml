@@ -1,0 +1,52 @@
+# Home / office LAN: authoritative for your internal zones, forwarding
+# everything else to public resolvers for LAN clients only.
+#
+# Point your router's DHCP "DNS server" option at this host.
+
+[server]
+bind = ["0.0.0.0", "::"]
+port = 53
+auto_ptr = true                          # reverse lookups work without maintaining PTR records
+default_primary_ns = "ns.home.arpa"
+default_hostmaster = "admin@home.arpa"
+
+[forwarding]
+upstreams = ["1.1.1.1:53", "9.9.9.9:53", "[2606:4700:4700::1111]:53"]
+timeout_ms = 1500
+# Only LAN clients may use forwarding. Never add 0.0.0.0/0 here.
+allowed_clients = ["127.0.0.0/8", "::1/128", "192.168.0.0/16", "10.0.0.0/8", "fd00::/8", "fe80::/10"]
+cache_entries = 20000
+
+[rate_limit]
+max_resolutions_per_second_per_address = 500
+max_tracked_addresses = 5000
+
+[database]
+path = "/var/lib/rust-dns/rust-dns.db"
+
+[backup]
+dir = "/var/lib/rust-dns/backups"
+interval_hours = 24
+keep = 14
+
+[web_console]
+bind = "192.168.1.2:8053"                # LAN address of this host
+session_ttl_hours = 24
+
+[root]
+username = "root"
+password = "change-me-please"
+mfa_required = false
+
+[changelog]
+retention_days = 90
+
+[logging]
+format = "text"
+level = "info"
+log_queries = true                       # every query to its own rotated file
+file = "/var/log/rust-dns/rust-dns.log"
+query_log_file = "/var/log/rust-dns/queries.log"
+max_size_mb = 20
+max_files = 10
+compress = true

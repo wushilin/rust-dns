@@ -1,0 +1,33 @@
+# rust-dns behind HAProxy (or a cloud load balancer) that speaks the PROXY
+# protocol, so the server logs and rate-limits the real client address.
+# See examples/proxy/haproxy.cfg for the matching proxy side.
+#
+# UDP has no PROXY protocol: UDP DNS should reach rust-dns directly
+# (or through a UDP load balancer that preserves the source address).
+
+[server]
+bind = ["0.0.0.0"]
+port = 53
+
+[tcp_dns]
+proxy_on = true
+proxy_version = 2                        # must match "send-proxy-v2" in HAProxy
+proxy_trust = "10.0.0.10/32"             # only the proxy may send PROXY headers
+
+[database]
+path = "/var/lib/rust-dns/rust-dns.db"
+
+[backup]
+dir = "/var/lib/rust-dns/backups"
+
+[web_console]
+bind = "0.0.0.0:8053"
+proxy_on = true
+proxy_version = 2
+proxy_trust = "10.0.0.10/32"             # also the only source trusted for X-Forwarded-For
+secure_cookies = true
+
+[root]
+username = "root"
+password = "change-me-please"
+mfa_required = true
