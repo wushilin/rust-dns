@@ -422,6 +422,46 @@ a router-sized footprint (a design property, not a feature).
   check; K3/L1 recorded; stale "not committed" / "in flight" headings and
   the status line brought up to date.
 
+## Phase M: pre-deploy checks, then the next features (owner, 2026-10-04)
+
+Pre-deploy (must pass before the next deploy):
+- [ ] M0a. Mixed-version against the DEPLOYED binary: dns1/dns2 run d32d67f,
+  not 3884ba8. Build d32d67f, run the mixed-version follow tests with
+  `RUST_DNS_PREV_BIN=<d32d67f binary>` (both directions: new standby/old
+  primary and old standby/new primary), plus the equivalence script between
+  d32d67f and HEAD (answers unchanged except documented changes). Keep the
+  3884ba8 run too.
+- [ ] M0b. Review the diff d32d67f..HEAD (K1/K2, K3, L1, L2, L3, AGENT.md)
+  as a principal engineer: correctness, AGENT.md changelog rules, standby
+  never writes replicated data, secrets, permissions, compatibility. Fix
+  real findings with tests; record the rest.
+
+Features (in this order; each with console UI where it applies, API with
+contract tests, typed changes that replicate, tests, AGENT.md rules):
+- [ ] M1. Per-token scopes: a token can be limited to a set of zones, a
+  maximum role (viewer/editor/owner) and an expiry time. Effective rights =
+  min(owner's rights, token scope). Shown in the rights view and on the
+  tokens page; old tokens keep full owner rights (no scope = unchanged).
+- [ ] M2. Zone-level record expiry policy: default expiry for new records
+  and a maximum expiry (records created without an expiry get the default;
+  longer ones are clamped or refused — choose and document). For
+  self-registration zones. Console on the zone settings dialog.
+- [ ] M3. TSIG replay protection (RFC 8945 §5.2.3): remember the last Time
+  Signed per key, refuse an older-or-equal one within the fudge window
+  (BADTIME), in memory per server. Interop with BIND still passes.
+- [ ] M4. Automated console flows: a headless browser test (Playwright or
+  similar via node, or Chrome headless with a small driver) for the main
+  flows: sign in, create zone, add/edit/delete record, standby read-only
+  page, viewer cannot edit. Runs in CI on Linux; skips locally when the
+  browser is missing unless REQUIRE_BROWSER_TEST=1.
+- [ ] M5. Soak/load script for dns-test (LXD home:dns-test): a release build
+  run for N hours under a mixed query load with periodic record changes and
+  a standby, reporting memory, latency percentiles, errors. A script plus
+  instructions; running it on dns-test needs the owner's go-ahead.
+
+Not in this phase: automated DNSSEC key rollover (CDS/CDNSKEY) — it changes
+what the registrar's DS must match on the live zone; plan it separately.
+
 ## Rollout (after everything above passes)
 
 - Build on GitHub; upgrade baba2 first, then gate (new change kinds / columns).
@@ -1040,3 +1080,7 @@ a router-sized footprint (a design property, not a feature).
   an additive `recovery_codes_left` in `GET /me`. Either upgrade order;
   standby (baba2) first as usual. After the upgrade baba2's changelog page
   fills from gate at its next follow session start.
+- 2026-10-04: Phase L verified (gate on 72c4d39: 282 tests, conformance 127).
+  Phase M added: M0a/M0b pre-deploy checks (mixed-version vs the deployed
+  d32d67f; review of d32d67f..HEAD), then M1-M5. Deploy waits for M0 and the
+  owner's go-ahead.
