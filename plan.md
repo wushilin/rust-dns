@@ -333,6 +333,29 @@ validate), `ipset`/`nftset` (Linux-only, needs CAP_NET_ADMIN, conflicts with
 the unprivileged hardening; only for domain-based routing on VPN gateways),
 a router-sized footprint (a design property, not a feature).
 
+## Phase L: queued follow-ups (owner, 2026-10-03)
+
+- [ ] K3. (found in K1's walk-through) The changelog page on a standby is
+  empty: `GET /api/changelog` returns 0 entries there although the standby
+  holds the replicated DNS changelog rows. Find out why (row class, the
+  visible-zones filter, offsets copied with the primary's ids, or the
+  query), fix, test on a local pair (the standby must show the same DNS
+  history as the primary; account rows still never shown), browser check.
+- [ ] L1 (= J2). Watch interface address changes through netlink on Linux
+  instead of polling every `interface_poll_secs`; keep polling as the
+  fallback elsewhere. Tests: address diffing unit tests; Linux integration
+  where possible (CI runs on Linux).
+- [ ] L2. Test debt from pending.md, made repeatable where possible:
+  recovery-code dialog after MFA enrollment, "New recovery codes", users ->
+  "Sign this user out everywhere", the MFA enable/disable/regenerate dialogs
+  and the "Promoted" result dialog (not covered in K2), live updates through
+  a reverse proxy (local nginx in front of the websocket, if nginx is
+  available; otherwise document how to check it).
+- [ ] L3. pending.md cleanup: tick entries that are done (TSIG for
+  AXFR/NOTIFY, git repository, static musl build in the release workflow,
+  deployment notes, per-zone forwarding via override zones) with a pointer
+  to where; keep the rest accurate.
+
 ## Rollout (after everything above passes)
 
 - Build on GitHub; upgrade baba2 first, then gate (new change kinds / columns).
@@ -904,3 +927,8 @@ a router-sized footprint (a design property, not a feature).
   refuses (sampled 403/400/409). One mismatch found and fixed during the
   walk: the SOA "Edit" button's zone was in a quoted string (`'${...}'`),
   so it was denied for owners; a test now rejects `${` in quoted strings.
+- 2026-10-03: K1/K2 verified by the coordinating session (gate on 1ba0933:
+  279 tests, both UI unit tests, conformance 127, smoke, audit only `paste`).
+  Not deployed (console change; needs a deploy to reach dns1/dns2). Phase L
+  queued: K3 (standby changelog empty), L1 (= J2 netlink), L2 (test debt),
+  L3 (pending.md cleanup).
