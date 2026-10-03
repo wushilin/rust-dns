@@ -148,6 +148,106 @@ OpenAPI snapshot + validator, conformance (123), smoke-release, cargo-audit.
   the network, so a plain `cargo test` then depends on dns.google), make
   it `#[ignore]`d / opt-in, or drop it.
 
+## Phase I: dnsmasq-style resolver features (owner, 2026-10-03)
+
+Goal: close the useful gaps to dnsmasq (DHCP excluded), configured from the
+web console wherever possible. Every setting follows the forwarding-settings
+model: console page + API (`#[utoipa::path]`, strict contract tests), stored
+as an audited typed change (`setting_set` / new kinds via `SecretChange` or
+`DnsChange` as appropriate), replicated to standbys, applied without a
+restart, shown in `/api/status` and `/metrics`. Per-server facts (listener
+interfaces) do not replicate. No native alert/confirm/prompt in the UI.
+Defaults must not change answers for existing deployments except where noted.
+
+Order: I1-I4 first (core, ~2 days), then I5-I6, then I7, then the rest.
+
+- [ ] I1. Override zones (covers conditional forwarding). A zone of type
+  `override` (default type stays `authoritative`) with its own upstream list
+  and a mode: `transparent` (default: a name+type defined locally is
+  answered from the local records, anything else under the zone is forwarded
+  to the zone's upstreams) or `static` (missing names answer NXDOMAIN
+  locally, for blocking). An override zone with no records = conditional
+  forwarding (`server=/abc.com/10.8.0.1`). Rules: never authoritative (no AA),
+  never in AXFR/NOTIFY, never DNSSEC-signed, answers never carry AD; served
+  only to clients allowed to forward (others REFUSED, like forwarding today);
+  longest match wins between own zones and override zones (an override
+  `vpn.wushilin.net` under the signed `wushilin.net` must not break the
+  parent's NSEC chain: exclude it from signing and document how that looks to
+  validators). Wildcards and CNAMEs work; a local CNAME to a forwarded name is
+  chased through the zone's upstreams. Per-zone forward cache keys include the
+  upstream set. Console: zone type chosen at creation, upstream editor and
+  mode on the zone page, a clear "not authoritative" badge. Replicates (zone
+  row fields; check mixed-version compatibility with the 3884ba8 binary and
+  the current one; bump nothing unless unavoidable). Tests: local answer,
+  per-type fallback, static NXDOMAIN, CNAME local→forwarded, per-zone
+  upstreams with a fake resolver, REFUSED for disallowed clients, no AA, not
+  in AXFR, no AD, longest-match vs a signed parent (delv still validates the
+  parent), replication to a standby.
+- [ ] I2. `domain-needed`: never forward single-label names (no dot except the
+  root). Answer NXDOMAIN locally unless an own/override zone has the name.
+  Default ON. Console: toggle in Server settings → Forwarding with a short
+  explanation (privacy, `wpad` risk). Counter for refused-locally queries.
+- [ ] I3. `bogus-priv`: never forward reverse lookups for private/special
+  ranges (RFC 6303 zones: 10/8, 172.16/12, 192.168/16, 100.64/10 CGNAT,
+  127/8, 169.254/16, 0/8, fc00::/7, fe80::/10, ::1, unspecified). Answer
+  NXDOMAIN locally unless an own zone or auto-PTR covers the address (own
+  reverse zones always win). Default ON. Console toggle + counter.
+- [ ] I4. Rebinding protection (`stop-dns-rebind`). Default OFF. When on:
+  forwarded answers containing private, loopback, link-local, CGNAT, ULA,
+  `0.0.0.0` or `::` addresses are refused (REFUSED), counted and logged with
+  the name. Never applied to own or override zones. Allowlist of domain
+  suffixes (`rebind-domain-ok`, e.g. `amazonaws.com`, `internal`). Console:
+  toggle, allowlist editor, "recently blocked" list with counts. Tests:
+  blocked answer, allowlisted answer, own zone with a private address
+  unaffected, override zone unaffected, CNAME chain ending in a private
+  address blocked.
+- [ ] I5. Serve stale (RFC 8767). Default OFF. When on and every upstream fails
+  or times out, answer from an expired cache entry (TTL 30 s, per RFC 8767)
+  up to `max_stale_age` (default 1 day). Console toggle + max age + counter
+  of stale answers. Tests with a fake upstream that goes away.
+- [ ] I6. Upstream strategy and health. Strategies: `in_order` (current),
+  `fastest` (track latency, prefer the fastest healthy one), `parallel`
+  (send to all, first valid answer wins; respect the in-flight cap from C1).
+  Health: per upstream latency (EWMA), success/failure counts, last error,
+  marked down after N consecutive failures and probed back. Console:
+  dropdown + live health table on Server settings. Applies per override zone
+  too. Tests with fake upstreams of different speeds and one dead.
+- [ ] I7. Blocklists. Console page "Blocklists": list URLs (formats: hosts
+  file, plain domains, Adblock `||domain^`), refresh interval, on/off per
+  list, allowlist, block action (NXDOMAIN or 0.0.0.0/::), per-list counts and
+  last refresh status, "test a name" box. Only the list configuration
+  replicates; each server downloads and parses the lists itself (outbound
+  HTTPS via the existing reqwest/rustls client) and keeps them in memory in
+  a compact structure (suffix set), separate from the zone catalog, swapped
+  atomically on refresh. Applies to forwarded queries only (own/override
+  zones win). Size limits and failure handling (keep the last good copy).
+  Tests: each format, allowlist, action, refresh with a local HTTP server,
+  memory for 1M entries measured.
+- [ ] I8. Hosts-file import. "Import hosts file" in the Import/Export dialog:
+  paste or upload `/etc/hosts`-format text, choose the target zone (names
+  outside it are listed and skipped), preview, import in one transaction
+  (same merge/replace modes as JSON import). Tests: parsing (comments,
+  multiple names per line, IPv6), preview, transaction rollback on error.
+- [ ] I9. Filter record types from forwarded answers (`filter-AAAA`,
+  `filter-rr`). Console multi-select of types; answer NODATA for a filtered
+  type. Default empty. Tests.
+- [ ] I10. EDNS Client Subnet on forwarded queries (`add-subnet`). Default OFF;
+  console toggle + prefix lengths (IPv4 /24, IPv6 /56 defaults); never for
+  clients in private ranges unless chosen; cache key includes the subnet
+  scope returned. `add-mac` is out of scope (MACs are only known on the same
+  LAN segment). Tests with a fake upstream that echoes the option.
+- [ ] I11. Follow interfaces (`bind-dynamic` / `interface=`). Listener choice
+  by interface name (per server; does not replicate), console shows current
+  addresses per interface; sockets re-bound when addresses appear/disappear
+  (poll or netlink on Linux; poll elsewhere). Replaces the `run.sh` ens5/eth0
+  rewrite. Tests: unit for the address diffing; integration where possible.
+
+Considered and NOT planned (owner may revisit): validating DNSSEC on
+forwarded answers ourselves (several days, subtle; upstreams already
+validate), `ipset`/`nftset` (Linux-only, needs CAP_NET_ADMIN, conflicts with
+the unprivileged hardening; only for domain-based routing on VPN gateways),
+a router-sized footprint (a design property, not a feature).
+
 ## Rollout (after everything above passes)
 
 - Build on GitHub; upgrade baba2 first, then gate (new change kinds / columns).
@@ -502,3 +602,11 @@ OpenAPI snapshot + validator, conformance (123), smoke-release, cargo-audit.
   conformance 123, smoke, cargo-audit only `paste`. Open: H4 (owner's
   decision), H5 (owner to look at compat/ after one rustfmt pass).
   Nothing pushed, tagged or deployed.
+- 2026-10-03: Phases E, G2, H1-H3 verified by the coordinating session: full
+  gate on 6d7e5a2 in the clean worktree passes (192 unit + all integration
+  suites incl. mixed-version vs 3884ba8 with REQUIRE_BIND_TOOLS/REQUIRE_PREV_BIN,
+  conformance 123, smoke, audit only `paste`). Not deployed.
+- 2026-10-03: Phase I added at the owner's request: dnsmasq-style resolver
+  features (DHCP excluded), configured from the web console where possible.
+  Order: I1-I4, I5-I6, I7, then I8-I11. Not started. H4/H5 still await the
+  owner; deployment of the finished work is a separate decision.
