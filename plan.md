@@ -1162,3 +1162,22 @@ what the registrar's DS must match on the live zone; plan it separately.
   binary has, plus `a_new_standby_follows_an_old_primary_and_copies_its_
   changelog`; 4/4 pass with d32d67f and with 3884ba8; equivalence
   d32d67f vs HEAD 0 differences.
+- 2026-10-04 (phase M): **M0 RESULT — pre-deploy checks PASSED (c24387a).**
+  M0a: mixed-version follow tests against the deployed d32d67f binary pass
+  in both directions (new standby / old primary incl. the K3 changelog
+  copy from an old primary, DNSSEC-signed zone validated with
+  dnssec-verify and delv, new `/status` and `/me` fields; old standby /
+  new primary incl. bootstrap of an old standby from an upgraded
+  primary); the same 4 tests pass against 3884ba8. Equivalence d32d67f vs
+  HEAD: 20,743 cases, 0 differences. M0b: review of d32d67f..HEAD found no
+  high or medium issue (minor m1-m5 recorded under M0b; none affects the
+  deploy). Full gate on c24387a in the clean worktree: fmt, clippy
+  `-D warnings`, all tests with `REQUIRE_BIND_TOOLS=1 REQUIRE_PREV_BIN=1`
+  against d32d67f AND against 3884ba8 (219 unit + suites api_contract 5,
+  dnssec 3, dnssec_changes 1, e2e 6, follow 9, forwarding 8, hardening 10,
+  netlink 0 (Linux only), openapi_spec 8, resolver 8, tsig 7), UI tests,
+  OpenAPI snapshot + validator, conformance 127/127, smoke, cargo-audit
+  (only `paste`). Deploy of HEAD-as-of-M0 (d32d67f..c24387a: K1-K3, L1-L3)
+  is safe in either order (protocol 2, no new change kind, no payload
+  change; standby baba2 first as usual). Not deployed; owner's go-ahead.
+  Continuing with M1.
