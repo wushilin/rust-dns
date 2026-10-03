@@ -262,7 +262,7 @@ fn status(s: &AppState, z: &Zone) -> ApiResult<DnssecStatus> {
             inception: sec::ts_rfc3339(sz.inception as i64),
             expiration: sec::ts_rfc3339(sz.expiration as i64),
             next_resign: (!standby)
-                .then(|| sec::resign_due_at(&zd.zone.updated_at, &cfg).map(sec::ts_rfc3339))
+                .then(|| sec::resign_due_at(zd.zone.signing_epoch(), &cfg).map(sec::ts_rfc3339))
                 .flatten(),
             signed_rrsets: sz.signed_rrsets,
             nsec_names: sz.chain_len(),

@@ -61,6 +61,7 @@ fn zone() -> Zone {
         updated_at: String::new(),
         owner_id: None,
         dnssec: false,
+        signed_at: None,
     }
 }
 

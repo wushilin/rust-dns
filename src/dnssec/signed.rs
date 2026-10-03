@@ -14,15 +14,27 @@
 //! descendant of the empty non-terminal, proves it exists without data.
 //! Names below a cut or a DNAME are not in the chain.
 //!
-//! Every record is converted with the same function the query path uses
-//! (`zones::to_rr`), so what is signed is exactly what is served.
+//! Every record is the wire record the catalog prepared (`cache::Rec`), the
+//! same one the query path serves, so what is signed is exactly what is
+//! served.
+//!
+//! Signatures are reused across builds, per RRset: a signature is kept
+//! under the SHA-256 of the public key and of the exact octets it signs
+//! (RFC 4034 §3.1.8.1: the RRSIG fields with the key tag, signer name,
+//! inception and expiration, and the RRset in canonical form with its
+//! owner, type and TTL). A build looks every RRset up in the previous
+//! signed view of the zone and signs only what is not there, so a change
+//! signs the changed RRsets, the SOA, and the NSECs whose next name or
+//! type list changed. Anything that alters the signed octets (a record, a
+//! TTL, the key, the window) misses the lookup and is signed afresh; an
+//! entry can never be used for other octets or another key.
 
 use super::wire::{self, CanonKey, RrsigFields, T_DNSKEY, T_DS, T_NSEC, T_RRSIG};
 use super::{Window, ZoneKey, ALGORITHM};
 use crate::cache::ZoneData;
 use crate::model::RecordType as Rt;
 use crate::replication::types::ReplDnssecKey;
-use crate::zones::{apex_ns, soa_record, to_rr};
+use crate::zones::{apex_ns, soa_record};
 use anyhow::{anyhow, Result};
 use hickory_proto::rr::{Name, Record, RecordType};
 use sha2::{Digest, Sha256};
@@ -49,6 +61,13 @@ pub struct SignedZone {
     pub dnskey: Record,
     /// RRsets signed, NSEC RRsets included.
     pub signed_rrsets: usize,
+    /// Of those, signatures computed by this build ...
+    pub fresh_signatures: usize,
+    /// ... and signatures taken from the previous build of the zone.
+    pub reused_signatures: usize,
+    /// Signature per digest of (public key, signed octets): what the next
+    /// build reuses.
+    sig_cache: HashMap<[u8; 32], Vec<u8>>,
     /// RRSIG per (owner, covered type); the owner as stored (lower case).
     sigs: HashMap<(String, u16), Record>,
     chain: Vec<NsecEntry>,
@@ -113,7 +132,8 @@ pub fn position(z: &ZoneData, owner: &str) -> Position {
 
 /// Cache key: everything the signed view depends on.
 pub fn fingerprint(z: &ZoneData, key: &ReplDnssecKey, w: &Window) -> String {
-    let mut records: Vec<&crate::model::Record> = z.names.values().flatten().collect();
+    let mut records: Vec<&crate::model::Record> =
+        z.names.values().flatten().map(|r| &**r).collect();
     records.sort_by_key(|r| r.id);
     let recs: Vec<(i64, &str, &str, &str, Option<u32>)> = records
         .iter()
@@ -149,7 +169,15 @@ fn code(r: &Record) -> u16 {
 }
 
 impl SignedZone {
-    pub fn build(z: &ZoneData, key: &ZoneKey, w: Window, fingerprint: String) -> Result<Self> {
+    /// Sign `z`. `prev`: the zone's previous signed view, whose signatures
+    /// are reused for RRsets that are signed over the same octets.
+    pub fn build(
+        z: &ZoneData,
+        key: &ZoneKey,
+        w: Window,
+        fingerprint: String,
+        prev: Option<&SignedZone>,
+    ) -> Result<Self> {
         let zone = &z.zone;
         let apex = Name::from_ascii(&z.apex).map_err(|e| anyhow!("apex: {e}"))?;
         // NSEC TTL: as the SOA of negative answers (RFC 9077).
@@ -201,7 +229,7 @@ impl SignedZone {
                 if pos == Position::Cut && !matches!(r.rtype, Rt::NS | Rt::DS) {
                     continue; // glue at the cut is not authoritative
                 }
-                if let Some(rr) = to_rr(zone, r, &name) {
+                if let Some(rr) = r.rr(&name) {
                     let set = entry.rrsets.entry(code(&rr)).or_default();
                     if !set.contains(&rr) {
                         set.push(rr);
@@ -214,6 +242,9 @@ impl SignedZone {
         let expiration = w.expiration as u32;
         let mut sigs = HashMap::new();
         let mut signed_rrsets = 0usize;
+        let (mut fresh, mut reused) = (0usize, 0usize);
+        let mut sig_cache: HashMap<[u8; 32], Vec<u8>> = HashMap::new();
+        let key_digest = Sha256::digest(key.dnskey_rdata());
         let mut sign = |owner: &str, name: &Name, t: u16, set: &[Record]| -> Result<Record> {
             let original_ttl = set.iter().map(|r| r.ttl).min().unwrap_or(0);
             let fields = RrsigFields {
@@ -232,7 +263,21 @@ impl SignedZone {
                 .collect::<Option<Vec<_>>>()
                 .ok_or_else(|| anyhow!("{owner} {}: RDATA does not encode", RecordType::from(t)))?;
             let data = wire::signed_data(&fields, name, &rdatas);
-            let sig = key.sign(&data)?;
+            let mut h = Sha256::new();
+            h.update(key_digest);
+            h.update(&data);
+            let digest: [u8; 32] = h.finalize().into();
+            let sig = match prev.and_then(|p| p.sig_cache.get(&digest)) {
+                Some(sig) => {
+                    reused += 1;
+                    sig.clone()
+                }
+                None => {
+                    fresh += 1;
+                    key.sign(&data)?
+                }
+            };
+            sig_cache.insert(digest, sig.clone());
             signed_rrsets += 1;
             Ok(wire::raw_record(
                 name.clone(),
@@ -286,6 +331,9 @@ impl SignedZone {
             expiration,
             dnskey,
             signed_rrsets,
+            fresh_signatures: fresh,
+            reused_signatures: reused,
+            sig_cache,
             sigs,
             chain,
             index,
@@ -362,6 +410,108 @@ impl SignedZone {
     }
 }
 
+/// Test support (used by the cache, mutation and replica tests).
+#[cfg(test)]
+impl SignedZone {
+    /// Verify every RRSIG of the zone against the RRset it covers, with the
+    /// zone's DNSKEY: the signed octets are derived again from `z` (not
+    /// from what `build` kept), and checked with ring. ECDSA signatures
+    /// are randomised, so signatures are validated, never compared.
+    /// Also checks that every authoritative RRset has a signature with
+    /// this view's window and key tag. Returns the number verified.
+    pub(crate) fn verify_all(&self, z: &ZoneData) -> usize {
+        let key = wire::raw_rdata(&self.dnskey).expect("DNSKEY rdata");
+        let mut pk = vec![4u8];
+        pk.extend(&key[4..]);
+        let verifier =
+            ring::signature::UnparsedPublicKey::new(&ring::signature::ECDSA_P256_SHA256_FIXED, pk);
+        let apex = Name::from_ascii(&z.apex).unwrap();
+        let mut verified = 0;
+        for ((owner, t), sig) in &self.sigs {
+            let name = Name::from_ascii(owner).unwrap();
+            let (f, sigbytes) = wire::parse_rrsig(wire::raw_rdata(sig).unwrap()).unwrap();
+            let set: Vec<Record> = if *t == T_NSEC {
+                vec![self
+                    .nsec_at(owner)
+                    .expect("NSEC for the RRSIG")
+                    .record
+                    .clone()]
+            } else if *t == T_DNSKEY {
+                vec![self.dnskey.clone()]
+            } else if owner == &z.apex && *t == 6 {
+                vec![soa_record(z, z.zone.default_ttl).unwrap()]
+            } else if owner == &z.apex && *t == 2 {
+                apex_ns(z)
+            } else {
+                z.names[owner]
+                    .iter()
+                    .filter_map(|r| r.rr(&name))
+                    .filter(|rr| code(rr) == *t)
+                    .collect()
+            };
+            assert!(!set.is_empty(), "{owner} type {t}: RRSIG without an RRset");
+            assert_eq!(f.type_covered, *t);
+            assert_eq!(
+                (f.inception, f.expiration, f.key_tag),
+                (self.inception, self.expiration, self.key_tag),
+                "{owner} type {t}"
+            );
+            assert_eq!(f.signer, apex);
+            assert_eq!(f.original_ttl, set.iter().map(|r| r.ttl).min().unwrap());
+            let rdatas: Vec<Vec<u8>> = set
+                .iter()
+                .map(|r| wire::canonical_rdata(&r.data).unwrap())
+                .collect();
+            let data = wire::signed_data(&f, &name, &rdatas);
+            verifier
+                .verify(&data, &sigbytes)
+                .unwrap_or_else(|_| panic!("{owner} type {t}: signature does not verify"));
+            verified += 1;
+        }
+        // Completeness: every owner of the chain has its NSEC signed, and
+        // every type in its bitmap except RRSIG (and the NS of a cut).
+        for e in &self.chain {
+            let cut = position(z, &e.owner) == Position::Cut;
+            for t in &e.types {
+                if *t == T_RRSIG || (cut && *t != T_DS && *t != T_NSEC) {
+                    continue;
+                }
+                assert!(
+                    self.sigs.contains_key(&(e.owner.clone(), *t)),
+                    "{} type {t} is not signed",
+                    e.owner
+                );
+            }
+        }
+        assert_eq!(verified, self.signed_rrsets);
+        verified
+    }
+
+    /// The signed view without the signature bytes (they are randomised):
+    /// window, key, chain and which RRsets are signed with which fields.
+    pub(crate) fn describe(&self) -> serde_json::Value {
+        let mut sigs: Vec<(String, u16, u8, u32)> = self
+            .sigs
+            .iter()
+            .map(|((o, t), r)| {
+                let (f, _) = wire::parse_rrsig(wire::raw_rdata(r).unwrap()).unwrap();
+                (o.clone(), *t, f.labels, f.original_ttl)
+            })
+            .collect();
+        sigs.sort();
+        serde_json::json!({
+            "key_tag": self.key_tag,
+            "inception": self.inception,
+            "expiration": self.expiration,
+            "dnskey": hex::encode(wire::raw_rdata(&self.dnskey).unwrap()),
+            "chain": self.chain.iter().map(|e| serde_json::json!([
+                e.owner, e.types, e.record.ttl, hex::encode(wire::raw_rdata(&e.record).unwrap())
+            ])).collect::<Vec<_>>(),
+            "sigs": sigs,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,6 +534,7 @@ mod tests {
             updated_at: "2026-09-01T00:00:00.000Z".into(),
             owner_id: None,
             dnssec: true,
+            signed_at: None,
         }
     }
 
@@ -451,7 +602,7 @@ mod tests {
             inception: 1000,
             expiration: 2000,
         };
-        let s = SignedZone::build(z, &key, w, String::new()).unwrap();
+        let s = SignedZone::build(z, &key, w, String::new(), None).unwrap();
         let owners: Vec<&str> = s.chain.iter().map(|e| e.owner.as_str()).collect();
         assert_eq!(
             owners,
@@ -508,6 +659,134 @@ mod tests {
         assert!(s.nsec_covering("gate.example.net.").is_none());
     }
 
+    /// D2: signatures are reused per RRset; the lookup key is the public
+    /// key plus the exact signed octets, so anything that changes them
+    /// (record data, a TTL, the window, the key) is signed afresh.
+    #[test]
+    fn signatures_are_reused_only_for_identical_signed_octets() {
+        let (_, key) = test_key();
+        let w = Window {
+            inception: 1000,
+            expiration: 2000,
+        };
+        let records = |extra: Option<StoredRecord>| {
+            let mut v = vec![
+                rec(1, "@", Rt::NS, "ns1.example.net."),
+                rec(2, "ns1", Rt::A, "192.0.2.53"),
+                rec(3, "www", Rt::A, "192.0.2.1"),
+                rec(4, "www", Rt::A, "192.0.2.2"),
+                rec(5, "mail", Rt::MX, "10 mx.example.net."),
+            ];
+            v.extend(extra);
+            v
+        };
+        let build = |z: Zone,
+                     recs: Vec<StoredRecord>,
+                     key: &ZoneKey,
+                     w: Window,
+                     prev: Option<&SignedZone>| {
+            let c = Catalog::build(vec![z], recs);
+            let zd = c.zones.get("example.net.").unwrap().clone();
+            let s = SignedZone::build(&zd, key, w, String::new(), prev).unwrap();
+            s.verify_all(&zd);
+            s
+        };
+        let first = build(zone(1, "example.net"), records(None), &key, w, None);
+        assert_eq!(first.reused_signatures, 0);
+        // 4 owners (apex, mail, ns1, www): apex SOA NS DNSKEY, 3 RRsets, 4 NSEC.
+        assert_eq!((first.fresh_signatures, first.signed_rrsets), (10, 10));
+        // Nothing changed: nothing is signed.
+        let same = build(zone(1, "example.net"), records(None), &key, w, Some(&first));
+        assert_eq!((same.fresh_signatures, same.reused_signatures), (0, 10));
+        // A serial bump (every ordinary change): only the SOA.
+        let mut z2 = zone(1, "example.net");
+        z2.serial += 1;
+        let bumped = build(z2.clone(), records(None), &key, w, Some(&first));
+        assert_eq!((bumped.fresh_signatures, bumped.reused_signatures), (1, 9));
+        // A record added to an existing RRset: that RRset (and the SOA).
+        let more = build(
+            z2.clone(),
+            records(Some(rec(6, "www", Rt::A, "192.0.2.3"))),
+            &key,
+            w,
+            Some(&first),
+        );
+        assert_eq!((more.fresh_signatures, more.reused_signatures), (2, 8));
+        // A new type at an existing name: the RRset and that name's NSEC.
+        let typed = build(
+            z2.clone(),
+            records(Some(rec(6, "www", Rt::TXT, "hello"))),
+            &key,
+            w,
+            Some(&first),
+        );
+        assert_eq!((typed.fresh_signatures, typed.reused_signatures), (3, 8));
+        // A new name: its RRset, its NSEC, the NSEC before it (next name
+        // changed), the SOA. O(1), whatever the size of the zone.
+        let named = build(
+            z2.clone(),
+            records(Some(rec(6, "new", Rt::A, "192.0.2.9"))),
+            &key,
+            w,
+            Some(&first),
+        );
+        assert_eq!((named.fresh_signatures, named.reused_signatures), (4, 8));
+        // A TTL change alone re-signs the RRset (the TTL is signed).
+        let mut ttl = records(None);
+        ttl[4].ttl = Some(77);
+        let t = build(zone(1, "example.net"), ttl, &key, w, Some(&first));
+        assert_eq!((t.fresh_signatures, t.reused_signatures), (1, 9));
+        // The zone's default TTL: every RRset that takes it. The 4 NSECs
+        // keep theirs (min(SOA minimum, default TTL) = 300 as before).
+        let mut z3 = zone(1, "example.net");
+        z3.default_ttl = 1234;
+        let d = build(z3, records(None), &key, w, Some(&first));
+        assert_eq!((d.fresh_signatures, d.reused_signatures), (6, 4));
+        // Another window: nothing is reused.
+        let w2 = Window {
+            inception: 1001,
+            expiration: 2000,
+        };
+        let moved = build(
+            zone(1, "example.net"),
+            records(None),
+            &key,
+            w2,
+            Some(&first),
+        );
+        assert_eq!((moved.fresh_signatures, moved.reused_signatures), (10, 0));
+        let w3 = Window {
+            inception: 1000,
+            expiration: 2001,
+        };
+        let moved = build(
+            zone(1, "example.net"),
+            records(None),
+            &key,
+            w3,
+            Some(&first),
+        );
+        assert_eq!(moved.reused_signatures, 0);
+        // Another key: nothing is reused (also if the key tag were the same:
+        // the public key is part of the lookup).
+        let (_, other) = test_key();
+        let rekeyed = build(
+            zone(1, "example.net"),
+            records(None),
+            &other,
+            w,
+            Some(&first),
+        );
+        assert_eq!(
+            (rekeyed.fresh_signatures, rekeyed.reused_signatures),
+            (10, 0)
+        );
+        // Reuse is per build chain: entries no longer used are dropped.
+        let back = build(zone(1, "example.net"), records(None), &key, w, Some(&more));
+        assert_eq!(back.fresh_signatures, 2, "SOA (serial) and the www RRset");
+        assert_eq!(back.sig_cache.len(), back.signed_rrsets);
+    }
+
     #[test]
     fn signatures_verify_with_the_public_key() {
         let c = sample();
@@ -517,7 +796,7 @@ mod tests {
             inception: 1000,
             expiration: 2000,
         };
-        let s = SignedZone::build(z, &key, w, String::new()).unwrap();
+        let s = SignedZone::build(z, &key, w, String::new(), None).unwrap();
         let mut pk = vec![4u8];
         pk.extend(&key.public_key);
         let verifier =

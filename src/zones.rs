@@ -86,7 +86,9 @@ fn name_of(s: &str) -> Option<Name> {
     Name::from_ascii(s).ok()
 }
 
-/// Convert a stored record to a wire record with the given owner.
+/// Convert a stored record to a wire record with the given owner. Text is
+/// parsed here: the catalog does it once per record when it is built
+/// ([`crate::cache::Rec`]); the query path uses the prepared record.
 pub fn to_rr(zone: &Zone, r: &StoredRecord, owner: &Name) -> Option<Record> {
     let ttl = r.ttl.unwrap_or(zone.default_ttl);
     let rdata = match r.rtype {
@@ -129,14 +131,22 @@ pub fn to_rr(zone: &Zone, r: &StoredRecord, owner: &Name) -> Option<Record> {
     Some(Record::from_rdata(owner.clone(), ttl, rdata))
 }
 
+/// The zone's SOA record with TTL `ttl` (prepared when the catalog is built).
 pub fn soa_record(z: &ZoneData, ttl: u32) -> Option<Record> {
+    let mut r = z.soa.clone()?;
+    r.ttl = ttl;
+    Some(r)
+}
+
+/// Build the SOA record (TTL = the zone default) for the catalog.
+pub fn build_soa(z: &ZoneData) -> Option<Record> {
     let zone = &z.zone;
     let apex = name_of(&z.apex)?;
     let mname = name_of(&zone.soa_mname)?;
     let rname = name_of(&zone.soa_rname)?;
     Some(Record::from_rdata(
         apex,
-        ttl,
+        zone.default_ttl,
         RData::SOA(SOA::new(
             mname,
             rname,
@@ -149,8 +159,14 @@ pub fn soa_record(z: &ZoneData, ttl: u32) -> Option<Record> {
     ))
 }
 
-/// NS records at the apex: explicit ones, else a single synthesized one from the SOA MNAME.
+/// NS records at the apex: explicit ones, else a single synthesized one
+/// from the SOA MNAME (prepared when the catalog is built).
 pub fn apex_ns(z: &ZoneData) -> Vec<Record> {
+    z.apex_ns.clone()
+}
+
+/// Build the apex NS RRset for the catalog.
+pub fn build_apex_ns(z: &ZoneData) -> Vec<Record> {
     let apex = match name_of(&z.apex) {
         Some(a) => a,
         None => return vec![],
@@ -160,7 +176,7 @@ pub fn apex_ns(z: &ZoneData) -> Vec<Record> {
         .map(|rs| {
             rs.iter()
                 .filter(|r| r.rtype == Rt::NS)
-                .filter_map(|r| to_rr(&z.zone, r, &apex))
+                .filter_map(|r| r.rr(&apex))
                 .collect()
         })
         .unwrap_or_default();
@@ -187,9 +203,9 @@ fn add_glue(catalog: &Catalog, records: &[Record], out: &mut Vec<Record>) {
             _ => continue,
         };
         let key = key_of(target);
-        if let Some((z, recs)) = catalog.records_anywhere(&key) {
+        if let Some((_, recs)) = catalog.records_anywhere(&key) {
             for sr in recs.iter().filter(|x| matches!(x.rtype, Rt::A | Rt::AAAA)) {
-                if let Some(rr) = to_rr(&z.zone, sr, target) {
+                if let Some(rr) = sr.rr(target) {
                     if !out.iter().any(|o| o == &rr) {
                         out.push(rr);
                     }
@@ -217,7 +233,7 @@ fn wants(qtype: RecordType, rt: Rt) -> bool {
 fn find_rrset<'a>(
     z: &'a ZoneData,
     owner: &str,
-) -> (Option<&'a Vec<StoredRecord>>, bool, Option<String>) {
+) -> (Option<&'a Vec<crate::cache::Rec>>, bool, Option<String>) {
     if let Some(rs) = z.records_at(owner) {
         return (Some(rs), true, None);
     }
@@ -442,7 +458,7 @@ fn resolve_into(
                     .map(|rs| {
                         rs.iter()
                             .filter(|r| r.rtype == Rt::DS)
-                            .filter_map(|r| to_rr(zone, r, n))
+                            .filter_map(|r| r.rr(n))
                             .collect()
                     })
                     .unwrap_or_default()
@@ -475,7 +491,7 @@ fn resolve_into(
                 .map(|rs| {
                     rs.iter()
                         .filter(|r| r.rtype == Rt::NS)
-                        .filter_map(|r| to_rr(zone, r, &owner))
+                        .filter_map(|r| r.rr(&owner))
                         .collect()
                 })
                 .unwrap_or_default();
@@ -503,7 +519,7 @@ fn resolve_into(
             if let Some(dr) = z
                 .records_at(&owner)
                 .and_then(|rs| rs.iter().find(|r| r.rtype == Rt::DNAME))
-                .and_then(|r| to_rr(zone, r, &owner_n))
+                .and_then(|r| r.rr(&owner_n))
             {
                 let from = ans.answers.len();
                 ans.answers.push(dr);
@@ -598,7 +614,7 @@ fn resolve_into(
         // If a CNAME lives here and the query is not for CNAME/ANY, follow it.
         if let Some(c) = rs.iter().find(|r| r.rtype == Rt::CNAME) {
             if qtype != RecordType::CNAME && qtype != RecordType::ANY {
-                if let Some(rr) = to_rr(zone, c, qname) {
+                if let Some(rr) = c.rr(qname) {
                     if let RData::CNAME(t) = &rr.data {
                         cname_target = Some(t.0.clone());
                     }
@@ -613,7 +629,7 @@ fn resolve_into(
                 if is_apex && r.rtype == Rt::NS {
                     continue;
                 }
-                if let Some(rr) = to_rr(zone, r, qname) {
+                if let Some(rr) = r.rr(qname) {
                     if !ans.answers.contains(&rr) {
                         ans.answers.push(rr);
                     }
@@ -755,6 +771,7 @@ mod tests {
             updated_at: String::new(),
             owner_id: None,
             dnssec: false,
+            signed_at: None,
         }
     }
     fn rec(id: i64, zone_id: i64, name: &str, t: Rt, v: &str) -> StoredRecord {

@@ -38,8 +38,9 @@ pub(super) fn apply(c: &Connection, change: &Change, ctx: &Ctx) -> Result<()> {
             zone_id,
             serial,
             updated_at,
+            signed_at,
             ..
-        } => sql::set_serial(c, *zone_id, *serial, updated_at)?,
+        } => sql::set_serial(c, *zone_id, *serial, updated_at, signed_at.as_deref())?,
         Change::MemberSet {
             zone_id,
             user_id,

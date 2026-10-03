@@ -99,6 +99,13 @@ pub enum Change {
         zone_id: i64,
         serial: u32,
         updated_at: String,
+        /// The zone's DNSSEC signing epoch from this serial on (the whole
+        /// new value of `zones.signed_at`). Present for every bump of a
+        /// signed zone, so a standby that missed it converges at the next
+        /// change; absent for unsigned zones and in rows written before it
+        /// existed (the epoch is then `updated_at`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signed_at: Option<String>,
     },
     MemberSet {
         zone: String,
@@ -272,6 +279,43 @@ impl Change {
         }
     }
 
+    /// The zone whose catalog entry this change can alter (its row, its
+    /// served records, its signing key): after a commit exactly these zones
+    /// are rebuilt. `None`: nothing the DNS server answers from changed.
+    /// Exhaustive, so a new kind of change must decide.
+    pub fn catalog_zone(&self) -> Option<i64> {
+        match self {
+            Change::ZoneCreated { zone } | Change::ZoneDeleted { zone } => Some(zone.id),
+            Change::ZoneUpdated { after, .. } => Some(after.id),
+            Change::RecordCreated { record, .. }
+            | Change::RecordDeleted { record, .. }
+            | Change::RecordExpired { record, .. }
+            | Change::RecordReaped { record, .. } => Some(record.zone_id),
+            // An update keeps the record in its zone.
+            Change::RecordUpdated { after, .. } => Some(after.zone_id),
+            Change::SerialBumped { zone_id, .. } | Change::ZoneResigned { zone_id, .. } => {
+                Some(*zone_id)
+            }
+            Change::DnssecKeySet { key } => Some(key.zone_id),
+            Change::DnssecKeyDeleted { zone_id, .. } => Some(*zone_id),
+            Change::MemberSet { .. }
+            | Change::MemberRemoved { .. }
+            | Change::UserCreated { .. }
+            | Change::UserUpdated { .. }
+            | Change::UserDeleted { .. }
+            | Change::TotpStepAccepted { .. }
+            | Change::RecoveryCodesReplaced { .. }
+            | Change::RecoveryCodeUsed { .. }
+            | Change::TokenCreated { .. }
+            | Change::TokenTagsSet { .. }
+            | Change::TokenRevoked { .. }
+            | Change::TsigKeySet { .. }
+            | Change::TsigKeyDeleted { .. }
+            | Change::SettingSet { .. }
+            | Change::SettingCleared { .. } => None,
+        }
+    }
+
     /// Settings or TSIG keys changed: the DNS server must reload them.
     pub fn affects_dns_runtime(&self) -> bool {
         matches!(
@@ -290,6 +334,8 @@ pub struct Tx<'a> {
     changes: Vec<Change>,
     /// Zones whose DNS content changed: serial is bumped once at commit.
     touched: BTreeMap<i64, String>,
+    /// Zones being re-signed: their signing epoch moves to the commit time.
+    resigned: std::collections::BTreeSet<i64>,
 }
 
 impl<'a> Tx<'a> {
@@ -298,6 +344,7 @@ impl<'a> Tx<'a> {
             conn,
             changes: Vec::new(),
             touched: BTreeMap::new(),
+            resigned: Default::default(),
         }
     }
 
@@ -352,6 +399,10 @@ impl<'a> Tx<'a> {
         after.name = before.name.clone();
         after.serial = before.serial;
         after.updated_at = now_rfc3339();
+        if !after.dnssec {
+            // No signing, no epoch: turning it on again starts a new one.
+            after.signed_at = None;
+        }
         let zone = sql::update_zone(self.conn, &after)?;
         self.touched.insert(zone.id, zone.name.clone());
         self.changes.push(Change::ZoneUpdated {
@@ -640,9 +691,11 @@ impl<'a> Tx<'a> {
         Ok(())
     }
 
-    /// Re-sign: record why and bump the serial at commit.
+    /// Re-sign: record why; at commit the serial is bumped and the signing
+    /// epoch moves to the commit time (a new signature window).
     pub fn resign_zone(&mut self, zone: &Zone, key_tag: u16) -> MResult<()> {
         self.touched.insert(zone.id, zone.name.clone());
+        self.resigned.insert(zone.id);
         self.changes.push(Change::ZoneResigned {
             zone: zone.name.clone(),
             zone_id: zone.id,
@@ -651,20 +704,43 @@ impl<'a> Tx<'a> {
         Ok(())
     }
 
-    /// Bump serials of changed zones, then write every change to the changelog.
-    fn finish(mut self, actor: &Actor, command: &str) -> MResult<Vec<ChangeEvent>> {
+    /// Bump serials of changed zones, then write every change to the
+    /// changelog. Returns the events to publish and the zones whose catalog
+    /// entries must be rebuilt (derived from the changes themselves).
+    fn finish(mut self, actor: &Actor, command: &str) -> MResult<(Vec<ChangeEvent>, Vec<i64>)> {
         for (zone_id, name) in std::mem::take(&mut self.touched) {
             let Some(z) = db::get_zone_by_id(self.conn, zone_id)? else {
                 continue;
             };
             let serial = z.serial.wrapping_add(1).max(1);
             let updated_at = now_rfc3339();
-            sql::set_serial(self.conn, zone_id, serial, &updated_at)?;
+            // The signing epoch of a signed zone: a re-sign moves it to now;
+            // otherwise it stays, so an ordinary change keeps the signature
+            // window and only the changed RRsets need new signatures. A
+            // zone without one yet is pinned to the change time its window
+            // is derived from at this moment: signing just turned on (this
+            // transaction set `updated_at`), or a zone signed by an older
+            // version (its window does not move at the upgrade).
+            let signed_at = if !z.dnssec {
+                None
+            } else if self.resigned.contains(&zone_id) {
+                Some(updated_at.clone())
+            } else {
+                Some(z.signing_epoch().to_string())
+            };
+            sql::set_serial(
+                self.conn,
+                zone_id,
+                serial,
+                &updated_at,
+                signed_at.as_deref(),
+            )?;
             self.changes.push(Change::SerialBumped {
                 zone: name,
                 zone_id,
                 serial,
                 updated_at,
+                signed_at,
             });
         }
         let txn = crate::auth::random_token(9);
@@ -677,8 +753,25 @@ impl<'a> Tx<'a> {
                 events.push(ev);
             }
         }
-        Ok(events)
+        Ok((events, catalog_zones(&self.changes)))
     }
+}
+
+/// The zones a list of changes touches, for the incremental catalog build.
+pub(crate) fn catalog_zones<'a>(changes: impl IntoIterator<Item = &'a Change>) -> Vec<i64> {
+    let ids: std::collections::BTreeSet<i64> = changes
+        .into_iter()
+        .filter_map(Change::catalog_zone)
+        .collect();
+    ids.into_iter().collect()
+}
+
+/// How much of the catalog a committed write may have changed.
+pub(crate) enum Rebuild {
+    /// These zones (possibly none).
+    Zones(Vec<i64>),
+    /// Anything (snapshot load, history change): build it all again.
+    Full,
 }
 
 /// Whether this server accepts writes. Closed on a standby (and on a fenced
@@ -787,6 +880,28 @@ fn rebuild_catalog(storage: &Storage, signer: &crate::dnssec::Signer, cache: &Ca
     let (zones, records, keys) = storage.catalog_inputs()?;
     let catalog = Catalog::build_signed(zones, records, &keys, signer, chrono::Utc::now());
     cache.store_built(ticket, catalog);
+    Ok(())
+}
+
+/// Rebuild only the zones `ids` (read again from storage, converted and
+/// signed) and keep every other zone of the current catalog. Must be
+/// called with the mutator lock held, after the commit: see
+/// [`Cache::apply`] for why no committed change can be lost.
+fn update_catalog(
+    storage: &Storage,
+    signer: &crate::dnssec::Signer,
+    cache: &Cache,
+    ids: &[i64],
+) -> Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let ticket = cache.ticket();
+    let updates = storage.catalog_zone_inputs(ids)?;
+    let now = chrono::Utc::now();
+    cache.apply(ticket, |base| {
+        Catalog::with_zones(base, &updates, signer, now)
+    });
     Ok(())
 }
 
@@ -991,6 +1106,7 @@ fn default_zone(name: &str, owner_id: Option<i64>) -> Zone {
         updated_at: now,
         owner_id,
         dnssec: false,
+        signed_at: None,
     }
 }
 
@@ -1105,15 +1221,15 @@ impl Mutator {
         let storage = self.storage.clone();
         let tx_actor = actor.clone();
         let joined = tokio::task::spawn_blocking(move || {
-            storage.write(&TOKEN, |conn| -> MResult<(T, Vec<ChangeEvent>)> {
+            storage.write(&TOKEN, |conn| -> MResult<(T, Vec<ChangeEvent>, Vec<i64>)> {
                 let mut t = Tx::new(conn);
                 let out = f(&mut t)?;
-                let events = t.finish(&tx_actor, command)?;
-                Ok((out, events))
+                let (events, zones) = t.finish(&tx_actor, command)?;
+                Ok((out, events, zones))
             })
         })
         .await;
-        let (out, events) = match joined {
+        let (out, events, zones) = match joined {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => {
                 match &e {
@@ -1134,8 +1250,9 @@ impl Mutator {
             }
         };
         // Committed. From here on nothing may turn the result into an error:
-        // the caller must learn that the change happened.
-        self.refresh_catalog().await;
+        // the caller must learn that the change happened. Still under the
+        // lock: only the zones this transaction touched are rebuilt.
+        self.refresh_catalog(Rebuild::Zones(zones)).await;
         self.expiry_wake.notify_one();
         for ev in events {
             tracing::info!(offset = ev.offset, txn = %ev.txn, command, actor = %ev.actor, ip = %ev.actor_ip, action = %ev.action, entity = %ev.entity, zone = %ev.zone, "change committed");
@@ -1144,9 +1261,13 @@ impl Mutator {
         Ok(out)
     }
 
-    /// Rebuild the in-memory catalog after a commit. A failure is logged and
-    /// retried in the background; it never un-commits the change.
-    async fn refresh_catalog(&self) {
+    /// Bring the in-memory catalog up to date after a commit:
+    /// [`Rebuild::Zones`] rebuilds just those zones (the caller holds the
+    /// mutator lock), [`Rebuild::Full`] everything. A failure is logged
+    /// and retried in the background with full builds (which cover
+    /// whatever an incremental build missed); it never un-commits the
+    /// change.
+    pub(crate) async fn refresh_catalog(&self, what: Rebuild) {
         let build =
             |storage: Arc<Storage>, signer: Arc<crate::dnssec::Signer>, cache: Arc<Cache>| {
                 tokio::task::spawn_blocking(move || rebuild_catalog(&storage, &signer, &cache))
@@ -1156,7 +1277,14 @@ impl Mutator {
             self.signer.clone(),
             self.cache.clone(),
         );
-        let err = match build(storage.clone(), signer.clone(), cache.clone()).await {
+        let first = match what {
+            Rebuild::Zones(ids) => {
+                let (s, g, c) = (storage.clone(), signer.clone(), cache.clone());
+                tokio::task::spawn_blocking(move || update_catalog(&s, &g, &c, &ids)).await
+            }
+            Rebuild::Full => build(storage.clone(), signer.clone(), cache.clone()).await,
+        };
+        let err = match first {
             Ok(Ok(())) => return,
             Ok(Err(e)) => e.to_string(),
             Err(e) => e.to_string(),
@@ -1428,7 +1556,7 @@ impl Mutator {
             .values()
             .filter(|z| z.zone.dnssec)
             .filter(|z| {
-                crate::dnssec::resign_due_at(&z.zone.updated_at, &cfg)
+                crate::dnssec::resign_due_at(z.zone.signing_epoch(), &cfg)
                     .is_some_and(|due| now.timestamp() >= due)
             })
             .map(|z| z.zone.name.clone())
@@ -1458,7 +1586,7 @@ impl Mutator {
                     if !z.dnssec {
                         continue;
                     }
-                    let Some(due) = crate::dnssec::resign_due_at(&z.updated_at, &cfg) else {
+                    let Some(due) = crate::dnssec::resign_due_at(z.signing_epoch(), &cfg) else {
                         continue;
                     };
                     if ts < due {
@@ -1497,7 +1625,7 @@ impl Mutator {
                 }
                 if m.signer.window_stale(&m.cache.load(), now.timestamp()) {
                     tracing::info!("DNSSEC: signature window moved without a serial change; re-signing in memory");
-                    m.refresh_catalog().await;
+                    m.refresh_catalog(Rebuild::Full).await;
                 }
                 // Next check: the earliest due re-sign, within 1 min .. 1 h.
                 let cfg = m.signer.config();
@@ -1507,7 +1635,7 @@ impl Mutator {
                     .zones
                     .values()
                     .filter(|z| z.zone.dnssec)
-                    .filter_map(|z| crate::dnssec::resign_due_at(&z.zone.updated_at, &cfg))
+                    .filter_map(|z| crate::dnssec::resign_due_at(z.zone.signing_epoch(), &cfg))
                     .min()
                     .map(|due| (due - chrono::Utc::now().timestamp()).clamp(60, 3600))
                     .unwrap_or(3600);
@@ -2402,6 +2530,560 @@ mod tests {
         let d = m.cache.load().zones["w.test."].signed.clone().unwrap();
         assert!(!Arc::ptr_eq(&a, &d));
         assert!(d.nsec_at("x.w.test.").is_some());
+    }
+
+    /// A full build of what `s` holds now, with a signer of its own (no
+    /// shared cache), configured like `m`'s.
+    pub(crate) fn full_build(s: &Storage, m: &Mutator) -> Catalog {
+        let signer = crate::dnssec::Signer::default();
+        signer.set_config(m.signer().config());
+        let (zones, records, keys) = s.catalog_inputs().unwrap();
+        Catalog::build_signed(zones, records, &keys, &signer, chrono::Utc::now())
+    }
+
+    /// The served catalog must equal a full build of the database, and
+    /// every signature in it must verify.
+    pub(crate) fn assert_catalog_is_current(s: &Storage, m: &Mutator, what: &str) {
+        let served = m.cache.load();
+        let full = full_build(s, m);
+        let (a, b) = (served.describe(), full.describe());
+        if a != b {
+            for (k, v) in a["zones"].as_object().unwrap() {
+                if b["zones"].get(k) != Some(v) {
+                    panic!(
+                        "{what}: zone {k} differs\nincremental: {v:#}\nfull: {:#}",
+                        b["zones"][k]
+                    );
+                }
+            }
+            panic!("{what}: catalogs differ\nincremental: {a:#}\nfull: {b:#}");
+        }
+        served.verify_signatures();
+        full.verify_signatures();
+    }
+
+    /// One random DNS operation (zones incl. a parent/child pair, records
+    /// incl. delegations, DS, wildcards, DNAME, addresses shared between
+    /// zones for the reverse index, expiry, import, DNSSEC on/off/new
+    /// key/re-sign). Used by the catalog equality tests here and in
+    /// `replica`.
+    pub(crate) async fn random_dns_op(
+        rng: &mut StdRng,
+        s: &Storage,
+        m: &Mutator,
+        step: usize,
+    ) -> MResult<()> {
+        let zones = ["eq.test", "sub.eq.test", "other.test", "10.in-addr.arpa"];
+        let z = zones[rng.random_range(0..zones.len())];
+        let names = [
+            "@", "www", "a.b", "*.w", "x.w", "deleg", "ns.deleg", "old", "y.old", "sub",
+        ];
+        let pick = |rng: &mut StdRng| names[rng.random_range(0..names.len())];
+        match rng.random_range(0..100) {
+            0..=7 => m
+                .create_zone(actor(), zone_input(z), None)
+                .await
+                .map(|_| ()),
+            8..=9 => m.delete_zone(actor(), z).await.map(|_| ()),
+            10..=14 => m
+                .update_zone(
+                    actor(),
+                    z,
+                    ZoneInput {
+                        refresh: Some(rng.random_range(60..9000)),
+                        default_ttl: Some(rng.random_range(30..600)),
+                        minimum: Some(rng.random_range(30..600)),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await
+                .map(|_| ()),
+            15..=54 => {
+                let name = pick(rng);
+                // Few addresses: several zones share them (reverse index).
+                let n = rng.random_range(1..6);
+                let (t, v) = match rng.random_range(0..12) {
+                    0..=3 => (RecordType::A, format!("10.0.0.{n}")),
+                    4 => (RecordType::AAAA, format!("2001:db8::{n}")),
+                    5 => (RecordType::TXT, format!("text {n}")),
+                    6 => (RecordType::CNAME, format!("host{n}.example.com.")),
+                    7 => (RecordType::NS, format!("ns{n}.example.org.")),
+                    8 => (RecordType::MX, format!("10 mx{n}.eq.test.")),
+                    9 => (RecordType::DS, format!("{n} 13 2 {}", "ab".repeat(32))),
+                    10 => (RecordType::DNAME, format!("target{n}.example.net.")),
+                    _ => (RecordType::PTR, format!("host{n}.eq.test.")),
+                };
+                let mut input = rec(name, t, &v);
+                match rng.random_range(0..10) {
+                    0 => input.ttl = Some(Some(rng.random_range(10..900))),
+                    1 => input.expires_in = Some(rng.random_range(3600..7200)),
+                    _ => {}
+                }
+                m.create_record(actor(), z, input).await.map(|_| ())
+            }
+            55..=69 => match s
+                .get_zone(z)
+                .unwrap()
+                .map(|zz| s.list_records(zz.id).unwrap())
+            {
+                Some(rs) if !rs.is_empty() => {
+                    let r = &rs[rng.random_range(0..rs.len())];
+                    let input = if r.rtype == RecordType::A {
+                        RecordInput {
+                            value: Some(format!("10.0.0.{}", rng.random_range(1..6))),
+                            ..Default::default()
+                        }
+                    } else {
+                        RecordInput {
+                            ttl: Some(Some(rng.random_range(10..900))),
+                            ..Default::default()
+                        }
+                    };
+                    m.update_record(actor(), z, r.id, input).await.map(|_| ())
+                }
+                _ => Ok(()),
+            },
+            70..=79 => match s
+                .get_zone(z)
+                .unwrap()
+                .map(|zz| s.list_records(zz.id).unwrap())
+            {
+                Some(rs) if !rs.is_empty() => {
+                    let r = &rs[rng.random_range(0..rs.len())];
+                    m.delete_record(actor(), z, r.id).await.map(|_| ())
+                }
+                _ => Ok(()),
+            },
+            80..=85 => m
+                .set_dnssec(actor(), z, true, step.is_multiple_of(5))
+                .await
+                .map(|_| ()),
+            86..=88 => m.set_dnssec(actor(), z, false, false).await.map(|_| ()),
+            89..=90 => m
+                .resign_due(chrono::Utc::now() + chrono::Duration::days(8))
+                .await
+                .map(|_| ()),
+            // Marks the records with an expiry as expired (they stay in
+            // the catalog until their time really passes) / reaps nothing.
+            91..=92 => m
+                .expire_due(chrono::Utc::now() + chrono::Duration::hours(3))
+                .await
+                .map(|_| ()),
+            93 => m
+                .reap_due(chrono::Utc::now() - chrono::Duration::days(30))
+                .await
+                .map(|_| ()),
+            _ => {
+                let recs = (0..rng.random_range(0..5))
+                    .map(|i| ExportRecord {
+                        name: format!("imp{i}"),
+                        rtype: RecordType::A,
+                        value: format!("10.0.1.{}", rng.random_range(1..4)),
+                        ttl: None,
+                        expires_at: None,
+                    })
+                    .collect();
+                let doc = ExportDoc {
+                    version: 1,
+                    exported_at: String::new(),
+                    zones: vec![ExportZone {
+                        name: z.into(),
+                        serial: None,
+                        soa_mname: None,
+                        soa_rname: None,
+                        refresh: None,
+                        retry: None,
+                        expire: None,
+                        minimum: None,
+                        default_ttl: None,
+                        owner: None,
+                        records: recs,
+                    }],
+                };
+                let mode = if rng.random_bool(0.4) {
+                    ImportMode::Replace
+                } else {
+                    ImportMode::Merge
+                };
+                m.import(actor(), doc, mode, None, None).await.map(|_| ())
+            }
+        }
+    }
+
+    /// D3: after every committed operation the incrementally maintained
+    /// catalog equals a full build of the database (zone rows, records and
+    /// their wire form, existing names, delegations, the reverse index
+    /// across zones, the signed view), and all signatures verify.
+    #[tokio::test]
+    async fn incremental_catalog_builds_equal_full_builds() {
+        for seed in [1u64, 20261003, 77] {
+            let (s, m, _) = setup();
+            let mut rng = StdRng::seed_from_u64(seed);
+            let (mut ok, mut failed) = (0, 0);
+            let mut kinds = std::collections::BTreeSet::new();
+            let mut signed_steps = 0;
+            for step in 0..260 {
+                let before = s.changelog_head().unwrap();
+                match random_dns_op(&mut rng, &s, &m, step).await {
+                    Ok(()) => ok += 1,
+                    Err(_) => failed += 1,
+                }
+                for e in s.changelog_after(before, 10_000).unwrap() {
+                    kinds.insert(e.payload["kind"].as_str().unwrap().to_string());
+                }
+                assert_catalog_is_current(&s, &m, &format!("seed {seed} step {step}"));
+                if m.cache.load().zones.values().any(|z| z.signed.is_some()) {
+                    signed_steps += 1;
+                }
+            }
+            assert!(
+                ok > 120 && failed > 10,
+                "seed {seed}: {ok} ok, {failed} rejected"
+            );
+            for k in [
+                "zone_created",
+                "zone_updated",
+                "zone_deleted",
+                "record_created",
+                "record_updated",
+                "record_deleted",
+                "record_expired",
+                "serial_bumped",
+                "zone_resigned",
+            ] {
+                assert!(kinds.contains(k), "seed {seed}: no {k} in the sequence");
+            }
+            assert!(
+                signed_steps > 20,
+                "seed {seed}: signed zones in {signed_steps} steps"
+            );
+
+            // Real expiry: records whose time passes are dropped by the
+            // sweep (as a full build at that moment drops them), then reaped.
+            for z in ["eq.test", "other.test"] {
+                let _ = m.create_zone(actor(), zone_input(z), None).await;
+                m.create_record(
+                    actor(),
+                    z,
+                    RecordInput {
+                        expires_in: Some(1),
+                        ..rec("soon", RecordType::A, "10.0.0.250")
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            assert_catalog_is_current(&s, &m, "expiring records added");
+            assert!(m
+                .cache
+                .load()
+                .reverse
+                .contains_key("250.0.0.10.in-addr.arpa."));
+            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+            assert_eq!(m.expire_due(chrono::Utc::now()).await.unwrap(), 2);
+            assert_catalog_is_current(&s, &m, "after expiry");
+            assert!(!m
+                .cache
+                .load()
+                .reverse
+                .contains_key("250.0.0.10.in-addr.arpa."));
+            m.reap_due(chrono::Utc::now()).await.unwrap();
+            assert_catalog_is_current(&s, &m, "after reaping");
+            // A zone replaced by a new one of the same name in one step.
+            m.delete_zone(actor(), "eq.test").await.unwrap();
+            m.create_zone(actor(), zone_input("eq.test"), None)
+                .await
+                .unwrap();
+            assert_catalog_is_current(&s, &m, "zone recreated");
+            // An empty zone deleted: `zone_deleted` is the only change.
+            m.create_zone(actor(), zone_input("empty.test"), None)
+                .await
+                .unwrap();
+            assert!(m.cache.load().zones.contains_key("empty.test."));
+            m.delete_zone(actor(), "empty.test").await.unwrap();
+            assert!(!m.cache.load().zones.contains_key("empty.test."));
+            assert_catalog_is_current(&s, &m, "empty zone deleted");
+        }
+    }
+
+    /// D2/D3 at size: one record change in a signed zone of 5,000 records
+    /// signs a handful of RRsets, and does not touch the other zone.
+    #[tokio::test]
+    async fn one_change_in_a_large_signed_zone_signs_a_few_rrsets() {
+        let (s, m, _) = setup();
+        for z in ["big.test", "bystander.test"] {
+            m.create_zone(actor(), zone_input(z), None).await.unwrap();
+            let id = s.get_zone(z).unwrap().unwrap().id;
+            let mut sql = String::from("BEGIN;");
+            for i in 0..5000 {
+                sql.push_str(&format!(
+                    "INSERT INTO records (zone_id, name, rtype, value, created_at, updated_at) VALUES ({id}, 'h{i}', 'A', '10.{}.{}.{}', 't', 't');",
+                    id, i / 250, i % 250 + 1
+                ));
+            }
+            sql.push_str("COMMIT;");
+            s.exec_raw(&sql).unwrap();
+        }
+        m.rebuild().unwrap();
+        let t = std::time::Instant::now();
+        m.set_dnssec(actor(), "big.test", true, false)
+            .await
+            .unwrap();
+        m.set_dnssec(actor(), "bystander.test", true, false)
+            .await
+            .unwrap();
+        let enable = t.elapsed();
+        let signer = m.signer();
+        let big = || m.cache.load().zones["big.test."].clone();
+        let bystander = m.cache.load().zones["bystander.test."].clone();
+        let all = big().signed.as_ref().unwrap().signed_rrsets;
+        assert_eq!(all, 5000 + 5001 + 3, "RRsets + NSECs + apex SOA/NS/DNSKEY");
+
+        // What a change cost before D1-D3: every zone read, every signed
+        // zone signed again (the window moved with each change).
+        let t = std::time::Instant::now();
+        let full = full_build(&s, &m);
+        let full_took = t.elapsed();
+        let full_sigs: usize = full
+            .zones
+            .values()
+            .map(|z| z.signed.as_ref().unwrap().fresh_signatures)
+            .sum();
+
+        let mut cases = Vec::new();
+        let mut measure = |what: &'static str, made_before: u64, took: std::time::Duration| {
+            let made = signer.signatures_made() - made_before;
+            let z = big();
+            let sz = z.signed.as_ref().unwrap();
+            assert_eq!(sz.fresh_signatures as u64, made);
+            assert_eq!(sz.fresh_signatures + sz.reused_signatures, sz.signed_rrsets);
+            assert!(
+                Arc::ptr_eq(&m.cache.load().zones["bystander.test."], &bystander),
+                "{what}: the other zone was rebuilt"
+            );
+            cases.push((what, made, took));
+            made
+        };
+        // A new name: its RRset, its NSEC, the previous NSEC, the SOA.
+        let (b, t) = (signer.signatures_made(), std::time::Instant::now());
+        let (r, _) = m
+            .create_record(actor(), "big.test", rec("new", RecordType::A, "192.0.2.1"))
+            .await
+            .unwrap();
+        assert_eq!(measure("add a name", b, t.elapsed()), 4);
+        // A changed record: its RRset and the SOA.
+        let (b, t) = (signer.signatures_made(), std::time::Instant::now());
+        m.update_record(
+            actor(),
+            "big.test",
+            r.id,
+            RecordInput {
+                value: Some("192.0.2.2".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(measure("change a record", b, t.elapsed()), 2);
+        // A removed name: the previous NSEC and the SOA.
+        let (b, t) = (signer.signatures_made(), std::time::Instant::now());
+        m.delete_record(actor(), "big.test", r.id).await.unwrap();
+        assert_eq!(measure("remove a name", b, t.elapsed()), 2);
+        assert_catalog_is_current(&s, &m, "large zone");
+        assert_eq!(big().signed.as_ref().unwrap().verify_all(&big()), all);
+        eprintln!(
+            "D2/D3 measure (2 signed zones x 5,000 records; enabling signing on both took {enable:?}): \
+             before: a full build reads 10,000 record rows and computes {full_sigs} signatures in {full_took:?}; \
+             after: a change reads the 5,000 rows of its zone and computes: {}",
+            cases
+                .iter()
+                .map(|(w, n, d)| format!("{w}: {n} signatures, {d:?} (whole operation)"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+    }
+
+    /// The window formula of the version before `signed_at` (frozen copy
+    /// of `dnssec::window` at 3884ba8), for the upgrade test.
+    fn legacy_window(updated_at: &str, now: i64, cfg: &crate::config::DnssecConfig) -> (i64, i64) {
+        let validity = cfg.signature_validity_days as i64 * 86400;
+        let resign_before = cfg.resign_before_days as i64 * 86400;
+        if let Ok(changed) = chrono::DateTime::parse_from_rfc3339(updated_at) {
+            let inception = changed.timestamp() - 3600;
+            let expiration = inception + validity;
+            if expiration - now > resign_before / 2 && inception <= now - 300 {
+                return (inception, expiration);
+            }
+        }
+        let inception = now - now.rem_euclid(3600) - 3600;
+        (inception, inception + validity)
+    }
+
+    /// D1: an upgrade must not move the signature window of a zone that is
+    /// already signed, and afterwards ordinary changes must not move it
+    /// either; only a re-sign does.
+    #[tokio::test]
+    async fn the_signature_window_survives_the_upgrade_and_ordinary_changes() {
+        let (s, m, _) = setup();
+        let cfg = m.signer().config();
+        m.create_zone(actor(), zone_input("up.test"), None)
+            .await
+            .unwrap();
+        m.create_record(actor(), "up.test", rec("www", RecordType::A, "192.0.2.1"))
+            .await
+            .unwrap();
+        m.set_dnssec(actor(), "up.test", true, false).await.unwrap();
+        // A zone signed by the previous version: no signing epoch, last
+        // changed two days ago (the window served before the upgrade).
+        let two_days_ago = (chrono::Utc::now() - chrono::Duration::days(2))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        s.exec_raw(&format!(
+            "UPDATE zones SET signed_at = NULL, updated_at = '{two_days_ago}' WHERE name = 'up.test'"
+        ))
+        .unwrap();
+        let z0 = s.get_zone("up.test").unwrap().unwrap();
+        assert!(z0.dnssec && z0.signed_at.is_none());
+        // Old formula and new formula on the same row, at several times:
+        // inside the window, near the re-sign time, and past the fallback.
+        let now = chrono::Utc::now().timestamp();
+        for dt in [
+            0,
+            3600,
+            3 * 86400,
+            5 * 86400,
+            86400 * 9,
+            86400 * 12,
+            86400 * 20,
+        ] {
+            let old = legacy_window(&z0.updated_at, now + dt, &cfg);
+            let new = crate::dnssec::window(z0.signing_epoch(), now + dt, &cfg);
+            assert_eq!((new.inception, new.expiration), old, "at now + {dt}s");
+            assert_eq!(
+                crate::dnssec::resign_due_at(z0.signing_epoch(), &cfg),
+                Some(old_due(&z0.updated_at, &cfg))
+            );
+        }
+        // The upgraded server signs with exactly that window.
+        m.rebuild().unwrap();
+        let before = m.cache.load().zones["up.test."].signed.clone().unwrap();
+        let old = legacy_window(&z0.updated_at, now, &cfg);
+        assert_eq!((before.inception as i64, before.expiration as i64), old);
+
+        // First change after the upgrade: the epoch is pinned to the old
+        // change time (a typed, replicated fact) and the window stays.
+        m.create_record(actor(), "up.test", rec("new", RecordType::A, "192.0.2.2"))
+            .await
+            .unwrap();
+        let z1 = s.get_zone("up.test").unwrap().unwrap();
+        assert_ne!(z1.updated_at, z0.updated_at);
+        assert_eq!(z1.signed_at.as_deref(), Some(z0.updated_at.as_str()));
+        let l = log(&s);
+        let bump = l.last().unwrap();
+        assert_eq!(bump.payload["kind"], "serial_bumped");
+        assert_eq!(bump.payload["signed_at"], z0.updated_at.as_str());
+        let after = m.cache.load().zones["up.test."].signed.clone().unwrap();
+        assert_eq!(
+            (after.inception, after.expiration),
+            (before.inception, before.expiration),
+            "an ordinary change does not move the window"
+        );
+        assert!(after.nsec_at("new.up.test.").is_some());
+        // Nor do later changes (zone settings, record update, delete).
+        m.update_zone(
+            actor(),
+            "up.test",
+            ZoneInput {
+                refresh: Some(7200),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let z2 = s.get_zone("up.test").unwrap().unwrap();
+        assert_eq!(z2.signed_at, z1.signed_at);
+        let again = m.cache.load().zones["up.test."].signed.clone().unwrap();
+        assert_eq!(again.inception, before.inception);
+
+        // An unsigned zone never gets an epoch.
+        m.create_zone(actor(), zone_input("plain.test"), None)
+            .await
+            .unwrap();
+        m.create_record(actor(), "plain.test", rec("a", RecordType::A, "192.0.2.3"))
+            .await
+            .unwrap();
+        assert!(s
+            .get_zone("plain.test")
+            .unwrap()
+            .unwrap()
+            .signed_at
+            .is_none());
+        assert!(log(&s).last().unwrap().payload.get("signed_at").is_none());
+
+        // The re-sign (due 7 days after the epoch) moves it, with the serial.
+        let due = chrono::Utc::now() + chrono::Duration::days(5) + chrono::Duration::hours(2);
+        assert_eq!(
+            m.resign_due(due).await.unwrap(),
+            vec!["up.test".to_string()]
+        );
+        let z3 = s.get_zone("up.test").unwrap().unwrap();
+        assert_eq!(z3.serial, z2.serial + 1);
+        assert_eq!(z3.signed_at.as_deref(), Some(z3.updated_at.as_str()));
+        let l = log(&s);
+        assert_eq!(l[l.len() - 2].payload["kind"], "zone_resigned");
+        assert_eq!(l[l.len() - 1].payload["signed_at"], z3.updated_at.as_str());
+        let resigned = m.cache.load().zones["up.test."].signed.clone().unwrap();
+        assert!(resigned.inception > before.inception && resigned.expiration > before.expiration);
+
+        // Off clears the epoch; on starts a new one at that moment.
+        m.set_dnssec(actor(), "up.test", false, false)
+            .await
+            .unwrap();
+        assert!(s.get_zone("up.test").unwrap().unwrap().signed_at.is_none());
+        m.set_dnssec(actor(), "up.test", true, false).await.unwrap();
+        let z4 = s.get_zone("up.test").unwrap().unwrap();
+        assert!(z4.signed_at.as_deref() > z3.signed_at.as_deref());
+
+        // A standby replaying this history has the same epochs.
+        let target = Storage::open_memory().unwrap();
+        let events = s
+            .read_tx(|c| crate::replication::data::changelog_tail(c, 0))
+            .unwrap();
+        // (The raw UPDATE above is not in the changelog: replay it too.)
+        let cut = events
+            .iter()
+            .position(|e| {
+                e.payload["kind"] == "record_created" && e.payload["record"]["name"] == "new"
+            })
+            .unwrap();
+        replay::replay(&target, &events[..cut]).unwrap();
+        target
+            .exec_raw(&format!(
+                "UPDATE zones SET signed_at = NULL, updated_at = '{two_days_ago}' WHERE name = 'up.test'"
+            ))
+            .unwrap();
+        target
+            .exec_raw(&format!(
+                "UPDATE sqlite_sequence SET seq = {} WHERE name = 'changelog'",
+                events[cut - 1].offset
+            ))
+            .ok();
+        replay::replay(&target, &events[cut..]).unwrap();
+        assert_eq!(
+            target.get_zone("up.test").unwrap().unwrap().signed_at,
+            z4.signed_at
+        );
+        assert_eq!(dump(&target)["zones"], dump(&s)["zones"]);
+    }
+
+    fn old_due(updated_at: &str, cfg: &crate::config::DnssecConfig) -> i64 {
+        chrono::DateTime::parse_from_rfc3339(updated_at)
+            .unwrap()
+            .timestamp()
+            - 3600
+            + cfg.signature_validity_days as i64 * 86400
+            - cfg.resign_before_days as i64 * 86400
     }
 
     fn fixture_path() -> std::path::PathBuf {

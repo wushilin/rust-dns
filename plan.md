@@ -59,19 +59,19 @@ OpenAPI snapshot + validator, conformance (123), smoke-release, cargo-audit.
 
 ## Phase D: cost per change
 
-- [ ] D1. Signature window independent of `updated_at`: a per-zone signing
+- [x] D1. Signature window independent of `updated_at`: a per-zone signing
   epoch (`zones.signed_at`, set when signing is enabled and by
   `zone_resigned`), replicated. Inception = epoch - 1h. Existing signed zones
   migrate with epoch = current `updated_at` so the live window does not move.
-- [ ] D2. Per-RRset signature cache keyed by (zone, canonical RRset bytes,
+- [x] D2. Per-RRset signature cache keyed by (zone, canonical RRset bytes,
   window): a change re-signs only the changed RRsets and the two neighbouring
   NSECs. Test: one record change in a 5,000-record signed zone signs O(1)
   RRsets; dnssec-verify / delv still pass.
-- [ ] D3. Catalog rebuild per touched zone: `execute` knows the touched zones;
+- [x] D3. Catalog rebuild per touched zone: `execute` knows the touched zones;
   only those are re-read and rebuilt, the rest of the catalog is shared
   (`Arc<ZoneData>`). Full rebuild stays for startup, bootstrap and fallback.
   Test: equality between incremental and full rebuild (randomized).
-- [ ] D4. Pre-parse record data at catalog build (no text parsing per query);
+- [x] D4. Pre-parse record data at catalog build (no text parsing per query);
   skip query-event formatting when nobody subscribes and query logging is off.
 
 ## Phase E: shape of the code
@@ -111,9 +111,43 @@ OpenAPI snapshot + validator, conformance (123), smoke-release, cargo-audit.
   wait, other writes still do). Fix: validate against an in-memory index
   kept for the transaction.
 
+- [ ] H2. (found in D3) Deleting a user clears `zones.owner_id` through the
+  foreign key (`ON DELETE SET NULL`) with no zone change, on the primary
+  and, by the same cascade, on a standby replaying `user_deleted`. The
+  catalog's copy of the zone row keeps the old `owner_id` until that zone
+  changes (already so before D3: account writes never rebuilt the
+  catalog). Nothing reads `owner_id` from the catalog (permissions read
+  storage), so no behaviour depends on it; make it a typed zone change or
+  drop the field from the catalog's zone row.
+- [ ] H3. (found in D3) A record whose expiry time has passed stays in the
+  catalog until the expiry sweeper processes it (primary) or the
+  `record_expired` change arrives (standby). Before D3 any commit in any
+  zone also dropped it as a side effect of the full rebuild. The sweeper
+  wakes at the next expiry, so the window is milliseconds on a primary; a
+  standby cut off from its primary keeps serving such records (it already
+  did while no change arrived). Decide whether a standby should drop them
+  by its own clock in memory.
+- [ ] H4. Another session edited `tests/dnssec.rs` and added
+  `tests/dnssec/wushilin_net.rs` (a live `delv wushilin.net DNSKEY` check)
+  in the working tree while this plan ran. Left untouched and NOT in these
+  commits; the D2/D3 BIND cases went to a new file,
+  `tests/dnssec_changes.rs`, to stay out of its way.
+
 ## Rollout (after everything above passes)
 
 - Build on GitHub; upgrade baba2 first, then gate (new change kinds / columns).
+- After phase D (see the Log): replication protocol stays 2, no new change
+  kind. New: nullable column `zones.signed_at` (added empty by the
+  migration; no data is rewritten) and an optional `signed_at` field in
+  `serial_bumped` and in zone rows. Either upgrade order works and was
+  tested against the 3884ba8 binary (`a_signed_zone_survives_a_mixed_
+  version_pair_and_the_upgrade`); standby first is still preferred: with
+  the primary first, the old standby signs by the old rule (its window
+  moves with each change, signatures valid) until it is upgraded and the
+  zone changes once more. Do NOT downgrade a server after it ran this
+  version against a peer that did not: the old binary would include the
+  unknown `signed_at` column in its `zones` table checksum, the reconcile
+  would differ and the standby would halt.
 - After each host: config check must pass (script aborts otherwise), DNSSEC
   delv validation of all records against that host, replica `up_to_date`.
 
@@ -221,3 +255,92 @@ OpenAPI snapshot + validator, conformance (123), smoke-release, cargo-audit.
   (tests/forwarding.rs: stalled upstream, cap 4, 12 queries: 4 in flight,
   8 dropped, TCP SERVFAIL at once, 20 authoritative answers each under
   500 ms, slots freed after the timeout). OpenAPI snapshot refreshed.
+- 2026-10-03: gate after phase C (commit af48568): all steps pass; 177 unit
+  tests, forwarding suite 8, conformance 123, cargo-audit only `paste`.
+- 2026-10-03: D1 done. `zones.signed_at` (nullable, last column) is the
+  signing epoch; `Zone::signing_epoch()` = `signed_at` or, when empty,
+  `updated_at` (the old rule). The migration only adds the column: an
+  already signed zone keeps exactly the window it was served with (not
+  "epoch = updated_at written at migration" as planned: writing it would
+  change the per-zone JSON and a standby must not write replicated data by
+  itself; leaving it empty gives the same window with no write). The
+  primary pins it at the zone's next serial bump (to the old change time),
+  sets it to the commit time on a re-sign and when signing is turned on,
+  clears it when signing is turned off. It replicates in zone rows and in
+  `serial_bumped.signed_at` (the whole new value, present in every bump of
+  a signed zone, so a standby that missed it converges at the next
+  change); `zone_resigned` is unchanged. No protocol bump. `signed_at` is
+  in NO checksum (table: `compat_columns`; zone: stripped): a mismatch
+  halts a standby, and in a mixed pair the values legitimately differ.
+  Consequence, stated plainly: a wrong `signed_at` on a standby is not
+  detected by reconcile; it would only give that standby another (valid)
+  signature window, and the hour-based fallback still protects against
+  expiry. Tests: `the_signature_window_survives_the_upgrade_and_ordinary_
+  changes` (frozen copy of the old formula vs the new one on the same
+  row; pin; re-sign; off/on; replay), `migrate_adds_the_signing_epoch_
+  empty`, `checksums_do_not_cover_the_signing_epoch`, and with the real
+  previous binary (3884ba8, `RUST_DNS_PREV_BIN`; skipped without it unless
+  `REQUIRE_PREV_BIN`): `a_signed_zone_survives_a_mixed_version_pair_and_
+  the_upgrade` (both upgrade orders, in place on the old databases,
+  changes while mixed, reconcile ok at every step, never halted,
+  `dnssec-verify` on both servers, window unchanged at each upgrade).
+- 2026-10-03: D2 done. Signatures are kept per RRset under SHA-256(public
+  key, exact signed octets: RRSIG fields with key tag, signer, inception,
+  expiration; owner, type, TTL and canonical RDATA of the RRset); a build
+  takes them from the zone's previous signed view and signs only what is
+  missing. Counter `rustdns_dnssec_signatures_total`. Tests:
+  `signatures_are_reused_only_for_identical_signed_octets` (TTL, window,
+  key, default TTL all miss), `one_change_in_a_large_signed_zone_signs_a_
+  few_rrsets`, `tests/dnssec_changes.rs` (BIND: dnssec-verify of the AXFR
+  and delv for a changed record, an unchanged one, a wildcard, NXDOMAIN
+  and NODATA after each change; exact signature counts). All signature
+  checks validate with ring / BIND, none compares bytes.
+- 2026-10-03: D3 done. The zones to rebuild derive from the committed
+  changes (`Change::catalog_zone`, exhaustive); `Catalog::with_zones`
+  replaces those zones in the current catalog and shares the rest; the
+  reverse index is shared when the touched zones contribute the same
+  entries, else derived again from all zones by the same function a full
+  build uses. Incremental builds run only under the mutator lock
+  (`execute` and the standby's `replica_write`); full builds keep using
+  tickets; `Cache::apply` documents why no delta can be lost. Snapshot
+  loads, promotion, the re-sign timer, startup and any failed incremental
+  build do a full build. Behaviour changes: automatic PTR answers list
+  owners in zone/record-id order; a transaction without DNS changes
+  (members) no longer rebuilds anything; see H2, H3. Tests:
+  `incremental_catalog_builds_equal_full_builds` (3 seeds x 260 random
+  operations: zones incl. parent/child and a reverse zone, delegations,
+  DS, wildcards, DNAME, shared addresses, import, expiry, DNSSEC
+  on/off/new key/re-sign; compared with a full build after every step,
+  every signature verified; then real expiry, reaping, delete+recreate,
+  empty zone delete), `a_standby_keeps_its_catalog_current_per_zone`
+  (same on the apply path, also equal to the primary's catalog),
+  `incremental_builds_apply_to_the_current_catalog`. Sensitivity checked
+  by hand: dropping the deltas of `serial_bumped` and `record_updated`
+  makes the equality test fail at step 22.
+- 2026-10-03: D4 done. Records are converted to wire form once at catalog
+  build (`cache::Rec`, also the SOA and the apex NS set); a query clones
+  the prepared record and sets the owner name. Query events (answer
+  summary and strings) are not built when nobody subscribes to the query
+  feed (`Bus::has_query_subscribers`; the query log is a subscriber).
+  Tests: `records_are_converted_once_at_build`,
+  `query_subscribers_are_counted`.
+- 2026-10-03: measured (debug build, this Mac, 2 signed zones x 5,000
+  records, test `one_change_in_a_large_signed_zone_signs_a_few_rrsets`):
+  before, every change did a full build: 10,000 record rows read, 20,008
+  signatures, 1.17 s. After: a change reads the 5,000 rows of its own
+  zone (not O(1): the touched zone is still read and converted whole) and
+  signs 4 (new name), 2 (changed record) or 2 (removed name) RRsets;
+  whole operation 0.27-0.30 s; the other zone is not read or rebuilt.
+  Not measured in a release build.
+- 2026-10-03: STOPPED HERE at the owner's request, after phase D. Done and
+  committed: F1, F2, G1, B1-B3, C1, D1-D4 (A1-A3, C2 earlier). Next
+  unchecked item: E1 (split `mutation/mod.rs`), then E2; also open: G2,
+  H1-H4. Context for whoever continues: (1) E1/E2 must keep
+  `tests/fixtures/changelog_payloads.jsonl` passing unchanged (never run
+  `UPDATE_FIXTURES`); payloads written since D1 may also carry
+  `signed_at` in `serial_bumped` and zone rows (optional, skipped when
+  empty). (2) After B2 the natural E2 split is: `acct_sql::write` takes
+  the secret half. (3) The gate was run on a scratch `git worktree` of
+  each commit; the mixed-version test needs the 3884ba8 binary in
+  `RUST_DNS_PREV_BIN`. (4) See H4: another session has uncommitted edits
+  in tests/dnssec.rs; stage files by name, not `git add -A`.

@@ -383,6 +383,11 @@ pub async fn metrics(State(s): St, _caller: Caller) -> ApiResult<Response> {
         d.open_resolver_rate_limited.load(Relaxed),
     );
     m(
+        "rustdns_dnssec_signatures_total",
+        "DNSSEC signatures computed (signatures reused from the previous build of a zone are not counted)",
+        s.mutator.signer().signatures_made(),
+    );
+    m(
         "rustdns_forward_overflow_total",
         "Queries not forwarded because [forwarding].max_inflight was reached",
         d.forward_overflow.load(Relaxed),

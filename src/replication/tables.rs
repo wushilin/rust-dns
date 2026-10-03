@@ -72,7 +72,12 @@ pub const TABLES: &[Table] = &[
     Table {
         // `dnssec` (added with DNSSEC signing) is covered by the per-zone
         // checksum (the zone row as JSON, where it appears only when on).
-        compat_columns: &["dnssec"],
+        // `signed_at` (the signing epoch) is in no checksum: it only picks
+        // the signature window, every server signs for itself, and a
+        // standby whose value lags (changes applied by a version without
+        // the column) converges at the zone's next serial bump. Comparing
+        // it would halt such a standby in a mixed-version pair.
+        compat_columns: &["dnssec", "signed_at"],
         ..replicated("zones", "id", ("zone", "zones"))
     },
     replicated("records", "id", ("record", "records")),

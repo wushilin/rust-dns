@@ -12,16 +12,21 @@
 //! Queries with DO=1 and zone transfers serve that signed view; queries
 //! without DO are answered exactly as for an unsigned zone.
 //!
-//! Signature window: inception = one hour before the zone's last change
-//! (`zones.updated_at`, replicated), expiration = inception + validity. So
-//! every rebuild at the same serial, on the primary or a standby, uses the
-//! same window. The primary re-signs (bumps the serial through a `Tx`) once
-//! the signatures expire within `resign_before_days`; a standby never
-//! writes, and signs in memory with its own copy of the key (ECDSA
-//! signatures are randomised, so its RRSIGs differ from the primary's but
-//! verify with the same DNSKEY). If a window gets close to expiry without a
-//! serial bump (a stopped primary, a disconnected standby), the node signs
-//! from the current hour instead.
+//! Signature window: inception = one hour before the zone's signing epoch,
+//! expiration = inception + validity. The epoch is `zones.signed_at`
+//! (replicated: set when signing is turned on and by every re-sign), so the
+//! window does not move when the zone's data changes and only the changed
+//! RRsets need new signatures ([`signed`] reuses the others); every
+//! rebuild, on the primary or a standby, uses the same window. A zone
+//! signed before `signed_at` existed has none: its epoch is `updated_at`
+//! (the old rule) until its next serial bump, which pins it to that value,
+//! so the window served at an upgrade stays. The primary re-signs (a new
+//! epoch and a serial bump through a `Tx`) once the signatures expire
+//! within `resign_before_days`; a standby never writes, and signs in memory
+//! with its own copy of the key (ECDSA signatures are randomised, so its
+//! RRSIGs differ from the primary's but verify with the same DNSKEY). If a
+//! window gets close to expiry without a re-sign (a stopped primary, a
+//! disconnected standby), the node signs from the current hour instead.
 
 pub mod check;
 pub mod signed;
@@ -44,7 +49,7 @@ pub use signed::SignedZone;
 pub const ALGORITHM: u8 = 13;
 /// Zone Key + Secure Entry Point: one key signs everything (CSK).
 pub const CSK_FLAGS: u16 = 257;
-/// Signatures start this long before the zone's last change (clock skew).
+/// Signatures start this long before the zone's signing epoch (clock skew).
 pub const INCEPTION_MARGIN_SECS: i64 = 3600;
 /// DS digest types offered: SHA-256 (use this) and SHA-384.
 pub const DS_DIGEST_TYPES: [u8; 2] = [2, 4];
@@ -209,13 +214,15 @@ fn resign_before_secs(cfg: &DnssecConfig) -> i64 {
     cfg.resign_before_days as i64 * 86400
 }
 
-/// The window for a zone last changed at `updated_at`, signed at `now`.
-pub fn window(updated_at: &str, now: i64, cfg: &DnssecConfig) -> Window {
+/// The window for a zone with signing epoch `epoch`
+/// ([`Zone::signing_epoch`](crate::model::Zone::signing_epoch)), signed at
+/// `now`.
+pub fn window(epoch: &str, now: i64, cfg: &DnssecConfig) -> Window {
     let validity = validity_secs(cfg);
-    if let Some(changed) = parse_ts(updated_at) {
+    if let Some(changed) = parse_ts(epoch) {
         let inception = changed - INCEPTION_MARGIN_SECS;
         let expiration = inception + validity;
-        // Deterministic per serial while it has plenty of time left and is
+        // Deterministic per epoch while it has plenty of time left and is
         // not in the future (clock skew between servers).
         if expiration - now > resign_before_secs(cfg) / 2 && inception <= now - 300 {
             return Window {
@@ -232,9 +239,9 @@ pub fn window(updated_at: &str, now: i64, cfg: &DnssecConfig) -> Window {
     }
 }
 
-/// When the primary must re-sign a zone last changed at `updated_at`.
-pub fn resign_due_at(updated_at: &str, cfg: &DnssecConfig) -> Option<i64> {
-    let changed = parse_ts(updated_at)?;
+/// When the primary must re-sign a zone with signing epoch `epoch`.
+pub fn resign_due_at(epoch: &str, cfg: &DnssecConfig) -> Option<i64> {
+    let changed = parse_ts(epoch)?;
     Some(changed - INCEPTION_MARGIN_SECS + validity_secs(cfg) - resign_before_secs(cfg))
 }
 
@@ -251,6 +258,8 @@ pub struct Signer {
     cfg: RwLock<DnssecConfig>,
     cache: Mutex<HashMap<i64, Arc<SignedZone>>>,
     errors: Mutex<HashMap<i64, String>>,
+    /// Signatures computed since start (not the reused ones).
+    signatures_made: std::sync::atomic::AtomicU64,
 }
 
 impl Default for Signer {
@@ -259,6 +268,7 @@ impl Default for Signer {
             cfg: RwLock::new(DnssecConfig::default()),
             cache: Mutex::new(HashMap::new()),
             errors: Mutex::new(HashMap::new()),
+            signatures_made: Default::default(),
         }
     }
 }
@@ -272,8 +282,16 @@ impl Signer {
         self.cfg.read().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
-    /// The signed view of a zone: reused when the fingerprint (zone row,
-    /// served records, key, window) is unchanged, else signed afresh.
+    /// Signatures computed since start.
+    pub fn signatures_made(&self) -> u64 {
+        self.signatures_made
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The signed view of a zone: the previous one when the fingerprint
+    /// (zone row, served records, key, window) is unchanged; else built
+    /// again, signing only the RRsets the previous one has no signature
+    /// for (see [`signed`]).
     pub fn sign(
         &self,
         z: &crate::cache::ZoneData,
@@ -281,21 +299,27 @@ impl Signer {
         now: i64,
     ) -> Option<Arc<SignedZone>> {
         let cfg = self.config();
-        let w = window(&z.zone.updated_at, now, &cfg);
+        let w = window(z.zone.signing_epoch(), now, &cfg);
         let fp = signed::fingerprint(z, key, &w);
-        {
+        let prev = {
             let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(s) = cache.get(&z.zone.id) {
-                if s.fingerprint == fp {
-                    return Some(s.clone());
-                }
+            cache.get(&z.zone.id).cloned()
+        };
+        if let Some(s) = &prev {
+            if s.fingerprint == fp {
+                return Some(s.clone());
             }
         }
-        let result = ZoneKey::load(key).and_then(|k| SignedZone::build(z, &k, w, fp));
+        let result =
+            ZoneKey::load(key).and_then(|k| SignedZone::build(z, &k, w, fp, prev.as_deref()));
         match result {
             Ok(s) => {
                 let s = Arc::new(s);
-                tracing::info!(zone = %z.zone.name, serial = z.zone.serial, key_tag = s.key_tag, rrsets = s.signed_rrsets, names = s.chain_len(), inception = %ts_rfc3339(s.inception as i64), expiration = %ts_rfc3339(s.expiration as i64), "zone signed");
+                self.signatures_made.fetch_add(
+                    s.fresh_signatures as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                tracing::info!(zone = %z.zone.name, serial = z.zone.serial, key_tag = s.key_tag, rrsets = s.signed_rrsets, signed_now = s.fresh_signatures, reused = s.reused_signatures, names = s.chain_len(), inception = %ts_rfc3339(s.inception as i64), expiration = %ts_rfc3339(s.expiration as i64), "zone signed");
                 self.cache
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
@@ -315,6 +339,18 @@ impl Signer {
                 None
             }
         }
+    }
+
+    /// Forget one zone (deleted, or signing turned off).
+    pub fn forget(&self, zone_id: i64) {
+        self.cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&zone_id);
+        self.errors
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&zone_id);
     }
 
     /// Forget zones that are no longer signed.
@@ -341,7 +377,7 @@ impl Signer {
         let cfg = self.config();
         catalog.zones.values().any(|z| match &z.signed {
             Some(s) => {
-                let w = window(&z.zone.updated_at, now, &cfg);
+                let w = window(z.zone.signing_epoch(), now, &cfg);
                 w.inception != s.inception as i64
                     || s.expiration as i64 - now <= resign_before_secs(&cfg) / 2
             }

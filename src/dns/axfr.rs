@@ -1,7 +1,7 @@
 //! Outbound zone transfer (AXFR, RFC 5936) for secondaries.
 
 use crate::cache::ZoneData;
-use crate::zones::{apex_ns, soa_record, to_rr};
+use crate::zones::{apex_ns, soa_record};
 use hickory_proto::op::{Message, MessageType, OpCode, Query};
 use hickory_proto::rr::{Name, Record, RecordType};
 
@@ -32,7 +32,7 @@ pub fn build(z: &ZoneData, id: u16, query: &Query) -> Vec<Vec<u8>> {
             if owner == &z.apex && r.rtype == crate::model::RecordType::NS {
                 continue; // already emitted with apex_ns
             }
-            if let Some(rr) = to_rr(zone, r, &owner_name) {
+            if let Some(rr) = r.rr(&owner_name) {
                 records.push(rr);
             }
         }

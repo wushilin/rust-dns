@@ -76,6 +76,10 @@ struct Ctx {
     open_cap_from: Option<usize>,
     /// The query had the DO bit (RFC 3225).
     dnssec_ok: bool,
+    /// Someone listens to the query feed (live view, query log), decided
+    /// when the request arrived. Without a listener no query event is
+    /// built: no answer summary, no name / type / rcode strings.
+    listening: bool,
 }
 
 /// A request whose TSIG signature verified.
@@ -221,6 +225,7 @@ impl DnsServer {
                 reserve: 0,
                 open_cap_from: None,
                 dnssec_ok: false,
+                listening: self.bus.has_query_subscribers(),
             };
             return Reply::One(self.tsig_error_reply(
                 req,
@@ -358,6 +363,7 @@ impl DnsServer {
                 .unwrap_or(0),
             open_cap_from: None,
             dnssec_ok,
+            listening: self.bus.has_query_subscribers(),
         };
 
         let mut resp = Message::response(id, request.metadata.op_code);
@@ -644,7 +650,11 @@ impl DnsServer {
                                 (
                                     m.metadata.response_code,
                                     m.answers.len(),
-                                    summarize(m, &qname),
+                                    if ctx.listening {
+                                        summarize(m, &qname)
+                                    } else {
+                                        Vec::new()
+                                    },
                                 )
                             }
                             Err(_) => (
@@ -697,7 +707,11 @@ impl DnsServer {
                 header_only(resp.metadata.id, ResponseCode::ServFail)
             }
         };
-        let mut result = summarize(&resp, &qname);
+        let mut result = if ctx.listening {
+            summarize(&resp, &qname)
+        } else {
+            Vec::new()
+        };
         let limit = ctx.udp_limit.saturating_sub(ctx.reserve);
         // A DO answer (RRSIGs make it larger) first loses its additional
         // section, which needs no TC (RFC 2181 §9); only if the answer and
@@ -813,6 +827,9 @@ impl DnsServer {
     ) {
         let us = ctx.started.elapsed().as_micros() as u64;
         self.stats.observe_latency(us);
+        if !ctx.listening {
+            return;
+        }
         self.bus.publish_query(QueryEvent {
             ts: crate::model::now_rfc3339(),
             client: ctx.client.ip().to_string(),

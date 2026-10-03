@@ -24,7 +24,7 @@
 use super::accounts::AuditTx;
 use super::replay;
 use super::sql;
-use super::{Change, MResult, MutationError, Mutator, TOKEN};
+use super::{Change, MResult, MutationError, Mutator, Rebuild, TOKEN};
 use crate::model::{Actor, ChangeEvent};
 use crate::replication::data;
 use crate::replication::types::*;
@@ -350,13 +350,18 @@ impl Mutator {
     /// Run a replication write under the write lock: `f` gets the raw
     /// connection (this module is the replication writer: history,
     /// changelog rows with the primary's offsets, snapshot loads) and an
-    /// [`AuditTx`] whose rows commit with it. Committed: the catalog is
-    /// rebuilt and `events` (if any) published.
+    /// [`AuditTx`] whose rows commit with it, and says how much of the
+    /// catalog the write may have changed. Committed: the catalog is
+    /// brought up to date (the same per-zone mechanism as a primary's
+    /// commit, under the same lock) and `events` (if any) published.
     async fn replica_write<T: Send + 'static>(
         &self,
         operation: &'static str,
         actor: Actor,
-        f: impl for<'t> FnOnce(&'t Connection, &mut AuditTx<'t>) -> Result<(T, Vec<ChangeEvent>)>
+        f: impl for<'t> FnOnce(
+                &'t Connection,
+                &mut AuditTx<'t>,
+            ) -> Result<(T, Vec<ChangeEvent>, Rebuild)>
             + Send
             + 'static,
     ) -> MResult<T> {
@@ -372,7 +377,7 @@ impl Mutator {
             })
         })
         .await;
-        let ((out, events), audit) = match joined {
+        let ((out, events, rebuild), audit) = match joined {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => {
                 tracing::warn!(operation, error = %format!("{e:#}"), "replication transaction rolled back; nothing committed");
@@ -387,7 +392,7 @@ impl Mutator {
         for r in &audit {
             tracing::info!(audit_id = r.id, txn = %r.txn, operation, actor = %r.actor, action = %r.action, target = %r.target, "audit");
         }
-        self.refresh_catalog().await;
+        self.refresh_catalog(rebuild).await;
         self.expiry_wake.notify_one();
         for ev in events {
             self.bus.publish_change(ev);
@@ -412,14 +417,22 @@ impl Mutator {
         }
         self.replica_write("replication_apply", system("apply"), move |c, _t| {
             let out = apply_changes(c, &primary_history, &events, &root.username)?;
-            let dns = events
+            // The zones to rebuild and the events to publish both derive
+            // from the changes just applied.
+            let changes: Vec<(ChangeEvent, Change)> = events
                 .into_iter()
-                .filter(|e| {
-                    serde_json::from_value::<Change>(e.payload.clone())
-                        .is_ok_and(|c| c.class() == super::CLASS_DNS)
+                .filter_map(|e| {
+                    let c = serde_json::from_value::<Change>(e.payload.clone()).ok()?;
+                    Some((e, c))
                 })
                 .collect();
-            Ok((out, dns))
+            let zones = super::catalog_zones(changes.iter().map(|(_, c)| c));
+            let dns = changes
+                .into_iter()
+                .filter(|(_, c)| c.class() == super::CLASS_DNS)
+                .map(|(e, _)| e)
+                .collect();
+            Ok((out, dns, Rebuild::Zones(zones)))
         })
         .await
     }
@@ -444,7 +457,7 @@ impl Mutator {
                 &source,
                 serde_json::json!({ "summary": sum, "history_id": snap.history.history_id }),
             );
-            Ok((sum, Vec::new()))
+            Ok((sum, Vec::new(), Rebuild::Full))
         })
         .await
     }
@@ -460,7 +473,7 @@ impl Mutator {
                 &info.reason,
                 serde_json::json!({ "reason": info.reason, "detail": info.detail, "offset": info.offset, "report_file": info.report_file }),
             );
-            Ok(((), Vec::new()))
+            Ok(((), Vec::new(), Rebuild::Full))
         })
         .await
     }
@@ -478,7 +491,7 @@ impl Mutator {
                 &source,
                 serde_json::json!({ "from": old.history_id, "to": h.history_id, "fork_offset": h.fork_offset }),
             );
-            Ok(((), Vec::new()))
+            Ok(((), Vec::new(), Rebuild::Full))
         })
         .await
     }
@@ -510,7 +523,7 @@ impl Mutator {
                 &from,
                 serde_json::json!({ "old_history_id": old.history_id, "new_history_id": h.history_id, "fork_offset": head, "how": how }),
             );
-            Ok((h, Vec::new()))
+            Ok((h, Vec::new(), Rebuild::Full))
         })
         .await
     }
@@ -702,6 +715,49 @@ mod tests {
             .await
             .unwrap()
             .1
+    }
+
+    /// D3 on the standby: the apply path maintains the catalog per zone
+    /// with the same mechanism; after every batch the standby's catalog
+    /// equals a full build of its database, equals the primary's (same
+    /// windows from the replicated signing epoch), and every signature
+    /// (made with the standby's copy of the key) verifies.
+    #[tokio::test]
+    async fn a_standby_keeps_its_catalog_current_per_zone() {
+        use super::super::tests::{assert_catalog_is_current, random_dns_op};
+        use rand::SeedableRng;
+        let (ps, pm, _pa) = node();
+        let (ss, sm, _sa) = standby_node();
+        sm.replica_bootstrap(snapshot(&ps), standby_root(), "https://p".into())
+            .await
+            .unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(424242);
+        let mut applied = 0;
+        for step in 0..220 {
+            let _ = random_dns_op(&mut rng, &ps, &pm, step).await;
+            // Mostly one transaction per batch, sometimes several.
+            if step % 7 == 3 {
+                continue;
+            }
+            let before = ss.changelog_head().unwrap();
+            tail(&ps, &ss, &sm).await;
+            applied += ss.changelog_head().unwrap() - before;
+            assert_catalog_is_current(&ss, &sm, &format!("standby step {step}"));
+            assert_eq!(
+                sm.cache.load().describe(),
+                pm.cache.load().describe(),
+                "standby and primary serve the same at step {step}"
+            );
+        }
+        tail(&ps, &ss, &sm).await;
+        assert!(applied > 300, "{applied}");
+        assert_eq!(replicated(&ss), replicated(&ps));
+        assert!(sm.cache.load().verify_signatures() > 0);
+        // A snapshot load rebuilds everything.
+        sm.replica_bootstrap(snapshot(&ps), standby_root(), "https://p".into())
+            .await
+            .unwrap();
+        assert_catalog_is_current(&ss, &sm, "after a snapshot");
     }
 
     #[tokio::test]

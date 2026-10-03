@@ -433,6 +433,7 @@ mod tests {
             zone_id: 1,
             serial: 2,
             updated_at: "t".into(),
+            signed_at: None,
         };
         let r = s.write(&crate::mutation::TOKEN, |c| -> Result<()> {
             assert!(write(c, &Ctx::verbatim(), &dns).is_err());

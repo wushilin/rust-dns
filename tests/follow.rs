@@ -36,6 +36,9 @@ struct Node {
     web: u16,
     password: &'static str,
     child: Option<Child>,
+    /// The binary this node runs (the one under test unless changed: the
+    /// mixed-version test runs a node with the previous release).
+    bin: PathBuf,
 }
 
 impl Node {
@@ -49,6 +52,7 @@ impl Node {
             web: free_port(),
             password,
             child: None,
+            bin: PathBuf::from(env!("CARGO_BIN_EXE_rust-dns")),
         }
     }
 
@@ -98,7 +102,7 @@ dir = ""
 
     fn start(&mut self) {
         assert!(self.child.is_none());
-        let child = Command::new(env!("CARGO_BIN_EXE_rust-dns"))
+        let child = Command::new(&self.bin)
             .arg("--config")
             .arg(self.config_path())
             .stdout(Stdio::null())
@@ -1882,4 +1886,293 @@ fn dnssec_signing_on_the_primary_is_served_by_the_standby() {
     );
     assert!(!s.log().contains("re-signed"), "the standby never re-signs");
     let _ = std::fs::remove_dir_all(&root_dir);
+}
+
+/// The previous release's binary (`RUST_DNS_PREV_BIN`: built from the
+/// commit that is deployed), for the mixed-version tests. Without it they
+/// are skipped (loudly), unless `REQUIRE_PREV_BIN` is set.
+fn prev_bin() -> Option<PathBuf> {
+    match std::env::var_os("RUST_DNS_PREV_BIN").map(PathBuf::from) {
+        Some(p) if p.is_file() => Some(p),
+        _ => {
+            assert!(
+                std::env::var("REQUIRE_PREV_BIN").is_err(),
+                "RUST_DNS_PREV_BIN is not set to the previous release's binary"
+            );
+            eprintln!("follow: RUST_DNS_PREV_BIN not set; skipping the mixed-version test");
+            None
+        }
+    }
+}
+
+fn dnssec_status(n: &Node, a: &ureq::Agent, zone: &str) -> Value {
+    ok(
+        call(
+            &Auth::Session(a),
+            "GET",
+            &n.api(&format!("/zones/{zone}/dnssec")),
+            None,
+        ),
+        "dnssec status",
+    )
+}
+
+/// AXFR from `port` and `dnssec-verify` it (skipped without BIND tools).
+fn verify_zone(dir: &Path, port: u16, zone: &str, what: &str) {
+    let (Some(dig), Some(verify)) = (bind_tool("dig"), bind_tool("dnssec-verify")) else {
+        return;
+    };
+    let out = Command::new(&dig)
+        .args([
+            "@127.0.0.1",
+            "-p",
+            &port.to_string(),
+            zone,
+            "AXFR",
+            "+nocmd",
+            "+nocomments",
+            "+nostats",
+        ])
+        .output()
+        .unwrap();
+    let zf = dir.join(format!("{}-axfr.zone", what.replace(' ', "-")));
+    std::fs::write(&zf, &out.stdout).unwrap();
+    let v = Command::new(&verify)
+        .args(["-z", "-o", zone, zf.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&v.stdout).to_string() + &String::from_utf8_lossy(&v.stderr);
+    assert!(
+        v.status.success() && text.contains("Zone fully signed"),
+        "{what}: {text}"
+    );
+}
+
+fn wait_reconciled(p: &Node, pr: &ureq::Agent, s: &Node, sr: &ureq::Agent, what: &str) {
+    let head = status(p, pr)["head"].clone();
+    wait_for(
+        &format!("{what}: reconcile ok at the primary's head"),
+        30,
+        || {
+            let st = status(s, sr);
+            assert!(st["follow"]["halted"].is_null(), "{what}: halted: {st}");
+            st["head"] == head
+                && st["follow"]["last_reconcile_result"]
+                    .as_str()
+                    .is_some_and(|r| r.starts_with("ok") && r.ends_with(&format!("offset {head}")))
+        },
+    );
+}
+
+/// D1, mixed versions: a signed zone followed across an upgrade in either
+/// order. Nothing halts, the signatures of both servers validate at every
+/// step, the window served before the upgrade is the window served after
+/// it, and once both run this version an ordinary change no longer moves
+/// the window and the standby has the primary's signing epoch.
+#[test]
+fn a_signed_zone_survives_a_mixed_version_pair_and_the_upgrade() {
+    let Some(prev) = prev_bin() else { return };
+    for primary_first in [false, true] {
+        let tag = if primary_first {
+            "primary-first"
+        } else {
+            "standby-first"
+        };
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root_dir = std::env::temp_dir().join(format!(
+            "rust-dns-follow-mixed-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root_dir).unwrap();
+        let mut p = Node::new(&root_dir, "primary", "rootpass-primary");
+        let mut s = Node::new(&root_dir, "standby", "rootpass-standby");
+        let new_bin = p.bin.clone();
+        // Both start on the previous release, as deployed.
+        p.bin = prev.clone();
+        s.bin = prev.clone();
+        let transfer = "[transfer]\nallow = [\"127.0.0.0/8\"]\n";
+        p.configure(transfer);
+        p.start();
+        let pr = p.root();
+        let token = ok(
+            call(
+                &Auth::Session(&pr),
+                "POST",
+                &p.api("/tokens"),
+                Some(json!({ "name": "repl" })),
+            ),
+            "token",
+        )["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        ok(
+            call(
+                &Auth::Session(&pr),
+                "POST",
+                &p.api("/zones"),
+                Some(json!({ "name": "mix.test" })),
+            ),
+            "zone",
+        );
+        let add = |a: &ureq::Agent, n: &Node, name: &str, v: &str| {
+            ok(
+                call(
+                    &Auth::Session(a),
+                    "POST",
+                    &n.api("/zones/mix.test/records"),
+                    Some(json!({ "name": name, "type": "A", "value": v })),
+                ),
+                "record",
+            );
+        };
+        add(&pr, &p, "www", "192.0.2.1");
+        add(&pr, &p, "*.w", "192.0.2.2");
+        ok(
+            call(
+                &Auth::Session(&pr),
+                "PUT",
+                &p.api("/zones/mix.test/dnssec"),
+                Some(json!({ "enabled": true })),
+            ),
+            "enable DNSSEC",
+        );
+        s.configure(&format!("{transfer}{}", follow_cfg(&p, "dns2", &token)));
+        s.start();
+        let sr = s.root();
+        wait_reconciled(&p, &pr, &s, &sr, &format!("{tag}: both previous"));
+        let inception0 = dnssec_status(&p, &pr, "mix.test")["signatures"]["inception"].clone();
+        assert!(inception0.is_string());
+        assert_eq!(
+            dnssec_status(&s, &sr, "mix.test")["signatures"]["inception"],
+            inception0
+        );
+
+        // Upgrade one server in place (same database), then change data
+        // while the pair is mixed.
+        let (first, first_is_primary) = if primary_first {
+            (&mut p, true)
+        } else {
+            (&mut s, false)
+        };
+        first.stop();
+        first.bin = new_bin.clone();
+        first.start();
+        let (pr, sr) = (p.root(), s.root());
+        assert_eq!(
+            dnssec_status(&p, &pr, "mix.test")["signatures"]["inception"],
+            inception0,
+            "{tag}: the window did not move at the upgrade (primary)"
+        );
+        assert_eq!(
+            dnssec_status(&s, &sr, "mix.test")["signatures"]["inception"],
+            inception0,
+            "{tag}: the window did not move at the upgrade (standby)"
+        );
+        wait_reconciled(&p, &pr, &s, &sr, &format!("{tag}: mixed, before a change"));
+        std::thread::sleep(Duration::from_millis(1100));
+        add(&pr, &p, "mixed", "192.0.2.3");
+        wait_for("the change reaches the standby", 20, || {
+            soa_serial(s.dns, "mix.test.") == soa_serial(p.dns, "mix.test.")
+        });
+        wait_reconciled(&p, &pr, &s, &sr, &format!("{tag}: mixed, after a change"));
+        let p_inc = dnssec_status(&p, &pr, "mix.test")["signatures"]["inception"].clone();
+        let s_inc = dnssec_status(&s, &sr, "mix.test")["signatures"]["inception"].clone();
+        if first_is_primary {
+            // The upgraded primary keeps its window; the old standby signs
+            // by the old rule (from the change time). Both validate.
+            assert_eq!(p_inc, inception0, "{tag}");
+            assert_ne!(s_inc, inception0, "{tag}");
+        } else {
+            // The old primary moves its window with every change, and the
+            // upgraded standby follows it (no epoch from that primary).
+            assert_ne!(p_inc, inception0, "{tag}");
+            assert_eq!(s_inc, p_inc, "{tag}");
+        }
+        verify_zone(
+            &root_dir,
+            p.dns,
+            "mix.test",
+            &format!("{tag} mixed primary"),
+        );
+        verify_zone(
+            &root_dir,
+            s.dns,
+            "mix.test",
+            &format!("{tag} mixed standby"),
+        );
+
+        // Upgrade the other one too.
+        let second = if primary_first { &mut s } else { &mut p };
+        second.stop();
+        second.bin = new_bin.clone();
+        second.start();
+        let (pr, sr) = (p.root(), s.root());
+        wait_reconciled(&p, &pr, &s, &sr, &format!("{tag}: both upgraded"));
+        assert_eq!(
+            dnssec_status(&p, &pr, "mix.test")["signatures"]["inception"],
+            p_inc,
+            "{tag}: the primary's window did not move at its upgrade"
+        );
+        // From now on a change keeps the window, and the standby has the
+        // primary's signing epoch (carried by every serial bump).
+        std::thread::sleep(Duration::from_millis(1100));
+        add(&pr, &p, "after", "192.0.2.4");
+        wait_for("the change reaches the standby", 20, || {
+            soa_serial(s.dns, "mix.test.") == soa_serial(p.dns, "mix.test.")
+        });
+        wait_reconciled(
+            &p,
+            &pr,
+            &s,
+            &sr,
+            &format!("{tag}: both upgraded, after a change"),
+        );
+        let zone_of = |n: &Node, a: &ureq::Agent| {
+            ok(
+                call(&Auth::Session(a), "GET", &n.api("/zones/mix.test"), None),
+                "zone",
+            )
+        };
+        let (pz, sz) = (zone_of(&p, &pr), zone_of(&s, &sr));
+        assert!(pz["signed_at"].is_string(), "{tag}: {pz}");
+        assert_eq!(pz["signed_at"], sz["signed_at"], "{tag}");
+        let p2 = dnssec_status(&p, &pr, "mix.test")["signatures"]["inception"].clone();
+        assert_eq!(p2, p_inc, "{tag}: an ordinary change keeps the window");
+        assert_eq!(
+            dnssec_status(&s, &sr, "mix.test")["signatures"]["inception"],
+            p2,
+            "{tag}: same window on both"
+        );
+        std::thread::sleep(Duration::from_millis(1100));
+        add(&pr, &p, "again", "192.0.2.5");
+        wait_for("the change reaches the standby", 20, || {
+            soa_serial(s.dns, "mix.test.") == soa_serial(p.dns, "mix.test.")
+        });
+        assert_eq!(
+            dnssec_status(&p, &pr, "mix.test")["signatures"]["inception"],
+            p2
+        );
+        verify_zone(
+            &root_dir,
+            p.dns,
+            "mix.test",
+            &format!("{tag} final primary"),
+        );
+        verify_zone(
+            &root_dir,
+            s.dns,
+            "mix.test",
+            &format!("{tag} final standby"),
+        );
+        wait_reconciled(&p, &pr, &s, &sr, &format!("{tag}: final"));
+        let st = status(&s, &sr);
+        assert_eq!(st["follow"]["state"], "following", "{tag}: {st}");
+        drop(p);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&root_dir);
+    }
 }

@@ -151,6 +151,14 @@ pub struct Zone {
     /// DNSSEC signing is on (see `/zones/{zone}/dnssec`); absent when off.
     #[serde(default, skip_serializing_if = "is_false")]
     pub dnssec: bool,
+    /// DNSSEC signing epoch: the signature window starts one hour before
+    /// it and does not move when the zone changes; the primary sets it when
+    /// signing is turned on and when it re-signs. Absent: signing is off,
+    /// or the zone was signed by a version without it (the window then
+    /// follows `updated_at` until the zone's next change).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(format = DateTime)]
+    pub signed_at: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -158,6 +166,12 @@ fn is_false(b: &bool) -> bool {
 }
 
 impl Zone {
+    /// The time the DNSSEC signature window is derived from: `signed_at`,
+    /// or (zones signed before `signed_at` existed) `updated_at`.
+    pub fn signing_epoch(&self) -> &str {
+        self.signed_at.as_deref().unwrap_or(&self.updated_at)
+    }
+
     /// Fully qualified apex, e.g. `example.com.`
     pub fn fqdn(&self) -> String {
         zone_fqdn(&self.name)

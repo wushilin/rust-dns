@@ -91,7 +91,10 @@ CREATE TABLE IF NOT EXISTS zones (
     updated_at  TEXT NOT NULL,
     -- DNSSEC signing on (1) or off (0); last so that migrated and new
     -- databases have the same column order (replication checksums).
-    dnssec      INTEGER NOT NULL DEFAULT 0
+    dnssec      INTEGER NOT NULL DEFAULT 0,
+    -- DNSSEC signing epoch (see model::Zone::signed_at). NULL: unsigned, or
+    -- signed by a version without it (the epoch is then updated_at).
+    signed_at   TEXT
 );
 CREATE TABLE IF NOT EXISTS records (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -342,6 +345,12 @@ fn migrate(conn: &Connection) -> Result<()> {
         .collect::<Result<_, _>>()?;
     if !zcols.is_empty() && !zcols.iter().any(|c| c == "dnssec") {
         conn.execute_batch("ALTER TABLE zones ADD COLUMN dnssec INTEGER NOT NULL DEFAULT 0")?;
+    }
+    // Added NULL on purpose: for a zone that is already signed the epoch
+    // stays `updated_at`, so its signature window is exactly the one served
+    // before the upgrade; the primary pins it at the zone's next change.
+    if !zcols.is_empty() && !zcols.iter().any(|c| c == "signed_at") {
+        conn.execute_batch("ALTER TABLE zones ADD COLUMN signed_at TEXT")?;
     }
     let rcols: Vec<String> = conn
         .prepare("SELECT name FROM pragma_table_info('records')")?
@@ -790,6 +799,28 @@ impl Storage {
         self.read_tx(|c| Ok((list_zones(c)?, all_records(c)?, list_dnssec_keys(c)?)))
     }
 
+    /// What the catalog needs to rebuild the zones `ids` (zone row, its
+    /// records in id order, its DNSSEC key), read in one transaction;
+    /// `None` for a zone that no longer exists.
+    pub fn catalog_zone_inputs(&self, ids: &[i64]) -> Result<Vec<(i64, crate::cache::ZoneInput)>> {
+        self.read_tx(|c| {
+            ids.iter()
+                .map(|id| {
+                    let Some(zone) = get_zone_by_id(c, *id)? else {
+                        return Ok((*id, None));
+                    };
+                    let mut stmt = c.prepare(&format!(
+                        "SELECT {RECORD_COLS} FROM records WHERE zone_id = ?1 ORDER BY id"
+                    ))?;
+                    let records = stmt
+                        .query_map(params![id], row_to_record)?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok((*id, Some((zone, records, get_dnssec_key(c, *id)?))))
+                })
+                .collect()
+        })
+    }
+
     pub fn get_setting(&self, key: &str) -> Result<Option<(String, String, String)>> {
         self.with_read(|c| {
             Ok(c.query_row(
@@ -1010,11 +1041,12 @@ fn row_to_zone(r: &Row<'_>) -> rusqlite::Result<Zone> {
         updated_at: r.get(11)?,
         owner_id: r.get(12)?,
         dnssec: r.get::<_, i64>(13)? != 0,
+        signed_at: r.get(14)?,
     })
 }
 
 const ZONE_COLS: &str =
-    "id, name, serial, soa_mname, soa_rname, refresh, retry, expire, minimum, default_ttl, created_at, updated_at, owner_id, dnssec";
+    "id, name, serial, soa_mname, soa_rname, refresh, retry, expire, minimum, default_ttl, created_at, updated_at, owner_id, dnssec, signed_at";
 
 pub(crate) const USER_COLS: &str =
     "id, username, password_hash, display_name, is_admin, is_root, mfa_required, totp_secret, totp_enrolled_at, disabled_at, created_at, updated_at";
@@ -1198,8 +1230,9 @@ pub fn list_records(c: &Connection, zone_id: i64) -> Result<Vec<Record>> {
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
+/// Every record, in id order (the order the catalog keeps them in).
 pub fn all_records(c: &Connection) -> Result<Vec<Record>> {
-    let mut stmt = c.prepare(&format!("SELECT {RECORD_COLS} FROM records"))?;
+    let mut stmt = c.prepare(&format!("SELECT {RECORD_COLS} FROM records ORDER BY id"))?;
     let rows = stmt.query_map([], row_to_record)?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
@@ -1388,6 +1421,47 @@ mod tests {
             ("", 1),
             "old rows are marked schema 1"
         );
+    }
+
+    /// D1: a database of the version before `signed_at` gains the column,
+    /// empty: nothing about an already signed zone changes at the upgrade.
+    #[test]
+    fn migrate_adds_the_signing_epoch_empty() {
+        // The zones table as the previous version (3884ba8) created it.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE changelog (offset INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, actor TEXT NOT NULL,
+             actor_ip TEXT NOT NULL, action TEXT NOT NULL, entity TEXT NOT NULL, zone TEXT NOT NULL,
+             entity_id INTEGER, payload TEXT NOT NULL);
+             CREATE TABLE zones (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, owner_id INTEGER,
+                serial INTEGER NOT NULL DEFAULT 1, soa_mname TEXT NOT NULL, soa_rname TEXT NOT NULL,
+                refresh INTEGER NOT NULL DEFAULT 3600, retry INTEGER NOT NULL DEFAULT 600,
+                expire INTEGER NOT NULL DEFAULT 1209600, minimum INTEGER NOT NULL DEFAULT 300,
+                default_ttl INTEGER NOT NULL DEFAULT 300, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                -- DNSSEC signing on (1) or off (0)
+                dnssec INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO zones (name, soa_mname, soa_rname, created_at, updated_at, dnssec)
+             VALUES ('old.test', 'n.', 'h.', 't', '2026-09-20T10:00:00.000Z', 1);",
+        )
+        .unwrap();
+        let cols = |c: &Connection| -> Vec<String> {
+            c.prepare("SELECT name FROM pragma_table_info('zones')")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert!(!cols(&conn).contains(&"signed_at".to_string()));
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap(); // idempotent
+        assert_eq!(cols(&conn).last().map(String::as_str), Some("signed_at"));
+        let z = get_zone(&conn, "old.test").unwrap().unwrap();
+        assert!(z.dnssec);
+        assert_eq!(z.signed_at, None);
+        assert_eq!(z.signing_epoch(), "2026-09-20T10:00:00.000Z");
     }
 
     #[test]

@@ -8066,6 +8066,14 @@
           "dnssec": {
             "type": "boolean",
             "description": "DNSSEC signing is on (see `/zones/{zone}/dnssec`); absent when off."
+          },
+          "signed_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "DNSSEC signing epoch: the signature window starts one hour before\nit and does not move when the zone changes; the primary sets it when\nsigning is turned on and when it re-signs. Absent: signing is off,\nor the zone was signed by a version without it (the window then\nfollows `updated_at` until the zone's next change)."
           }
         }
       },

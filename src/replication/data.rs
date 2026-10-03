@@ -355,8 +355,15 @@ pub fn snapshot(c: &Connection) -> Result<Snapshot> {
 }
 
 /// Checksum of one zone: its row, its records (with expiry state) and members.
+///
+/// Without `signed_at` (see `tables::TABLES`): the checksum is the same as
+/// the one a version without that column computes.
 pub fn zone_checksum(c: &Connection, z: &Zone) -> Result<String> {
-    sha256_json(&(z, records(c, Some(z.id))?, members(c, Some(z.id))?))
+    let row = Zone {
+        signed_at: None,
+        ..z.clone()
+    };
+    sha256_json(&(&row, records(c, Some(z.id))?, members(c, Some(z.id))?))
 }
 
 pub fn zone_checksums(c: &Connection) -> Result<Vec<ZoneChecksum>> {
@@ -398,6 +405,49 @@ mod tests {
 
     fn exec(s: &Storage, sql: &str) {
         s.exec_raw(sql).unwrap();
+    }
+
+    /// D1: `signed_at` is in no checksum, so a pair of servers of which
+    /// only one knows the column keeps matching (a mismatch halts a
+    /// standby). The value below is what a version without the column
+    /// computes for the same zone.
+    #[test]
+    fn checksums_do_not_cover_the_signing_epoch() {
+        let s = Storage::open_memory().unwrap();
+        exec(
+            &s,
+            "INSERT INTO zones (id, name, soa_mname, soa_rname, created_at, updated_at, dnssec)
+             VALUES (1, 'a.test', 'n.', 'h.', 't', 'u', 1);
+             INSERT INTO records (zone_id, name, rtype, value, created_at, updated_at) VALUES (1,'www','A','192.0.2.1','t','t');",
+        );
+        let sums = |s: &Storage| {
+            s.read_tx(|c| {
+                Ok((
+                    zone_checksums(c)?[0].checksum.clone(),
+                    crate::replication::tables::checksums(c, "root")?
+                        .into_iter()
+                        .find(|t| t.table == "zones")
+                        .unwrap()
+                        .checksum,
+                ))
+            })
+            .unwrap()
+        };
+        let before = sums(&s);
+        // The zone row exactly as the previous version serialized it.
+        let legacy_zone = serde_json::json!({
+            "id": 1, "name": "a.test", "serial": 1, "soa_mname": "n.", "soa_rname": "h.",
+            "refresh": 3600, "retry": 600, "expire": 1209600, "minimum": 300, "default_ttl": 300,
+            "created_at": "t", "updated_at": "u", "owner_id": null, "dnssec": true
+        });
+        let z = s.get_zone("a.test").unwrap().unwrap();
+        assert_eq!(serde_json::to_value(&z).unwrap(), legacy_zone);
+        exec(
+            &s,
+            "UPDATE zones SET signed_at = '2026-10-01T00:00:00.000Z'",
+        );
+        assert!(s.get_zone("a.test").unwrap().unwrap().signed_at.is_some());
+        assert_eq!(sums(&s), before);
     }
 
     #[test]

@@ -12,16 +12,17 @@ use rusqlite::{params, Connection};
 /// (idempotent: a standby may re-apply changes from an earlier offset).
 pub(super) fn insert_zone(c: &Connection, z: &Zone) -> Result<Zone> {
     c.execute(
-        "INSERT INTO zones (id, name, serial, soa_mname, soa_rname, refresh, retry, expire, minimum, default_ttl, created_at, updated_at, owner_id, dnssec)
-         VALUES (NULLIF(?1, 0), ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+        "INSERT INTO zones (id, name, serial, soa_mname, soa_rname, refresh, retry, expire, minimum, default_ttl, created_at, updated_at, owner_id, dnssec, signed_at)
+         VALUES (NULLIF(?1, 0), ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
          ON CONFLICT(id) DO UPDATE SET name = excluded.name, serial = excluded.serial, soa_mname = excluded.soa_mname,
             soa_rname = excluded.soa_rname, refresh = excluded.refresh, retry = excluded.retry, expire = excluded.expire,
             minimum = excluded.minimum, default_ttl = excluded.default_ttl, created_at = excluded.created_at,
-            updated_at = excluded.updated_at, owner_id = excluded.owner_id, dnssec = excluded.dnssec",
+            updated_at = excluded.updated_at, owner_id = excluded.owner_id, dnssec = excluded.dnssec,
+            signed_at = excluded.signed_at",
         params![
             z.id, z.name, z.serial as i64, z.soa_mname, z.soa_rname, z.refresh as i64, z.retry as i64,
             z.expire as i64, z.minimum as i64, z.default_ttl as i64, z.created_at, z.updated_at, z.owner_id,
-            z.dnssec as i64
+            z.dnssec as i64, z.signed_at
         ],
     )?;
     let id = if z.id != 0 {
@@ -35,11 +36,11 @@ pub(super) fn insert_zone(c: &Connection, z: &Zone) -> Result<Zone> {
 pub(super) fn update_zone(c: &Connection, z: &Zone) -> Result<Zone> {
     c.execute(
         "UPDATE zones SET serial=?2, soa_mname=?3, soa_rname=?4, refresh=?5, retry=?6, expire=?7, minimum=?8,
-         default_ttl=?9, updated_at=?10, owner_id=?11, dnssec=?12 WHERE id = ?1",
+         default_ttl=?9, updated_at=?10, owner_id=?11, dnssec=?12, signed_at=?13 WHERE id = ?1",
         params![
             z.id, z.serial as i64, z.soa_mname, z.soa_rname, z.refresh as i64, z.retry as i64,
             z.expire as i64, z.minimum as i64, z.default_ttl as i64, z.updated_at, z.owner_id,
-            z.dnssec as i64
+            z.dnssec as i64, z.signed_at
         ],
     )?;
     Ok(db::get_zone_by_id(c, z.id)?.expect("zone exists"))
@@ -50,15 +51,19 @@ pub(super) fn delete_zone(c: &Connection, id: i64) -> Result<()> {
     Ok(())
 }
 
+/// A serial bump: the new serial, change time and DNSSEC signing epoch
+/// (`signed_at` is the whole new value: `None` clears it, which is what a
+/// bump written by a version without it means: the epoch is `updated_at`).
 pub(super) fn set_serial(
     c: &Connection,
     zone_id: i64,
     serial: u32,
     updated_at: &str,
+    signed_at: Option<&str>,
 ) -> Result<()> {
     c.execute(
-        "UPDATE zones SET serial = ?2, updated_at = ?3 WHERE id = ?1",
-        params![zone_id, serial as i64, updated_at],
+        "UPDATE zones SET serial = ?2, updated_at = ?3, signed_at = ?4 WHERE id = ?1",
+        params![zone_id, serial as i64, updated_at, signed_at],
     )?;
     Ok(())
 }
