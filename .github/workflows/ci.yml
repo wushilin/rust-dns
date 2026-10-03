@@ -25,6 +25,8 @@ jobs:
       - run: cargo test -- --test-threads=1
         env:
           REQUIRE_BIND_TOOLS: "1"
+          # tests/netlink.rs: a network namespace through `sudo -n unshare -n`.
+          REQUIRE_NETLINK_TEST: "1"
       - run: node tests/ui/duration.test.js
       - run: node tests/ui/access.test.js
       - run: cargo build

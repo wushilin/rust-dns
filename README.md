@@ -283,7 +283,8 @@ replicated to standbys, applied without a restart.
 - **Hosts-file import**: Import / Export -> Hosts file, or
   `POST /api/zones/{zone}/import/hosts` (preview, then one transaction).
 - **Following interfaces**: `[server] interfaces = ["eth0"]` listens on that
-  interface's addresses and follows them as they change (polled every
+  interface's addresses and follows them as they change (on Linux at once,
+  through netlink; elsewhere, or if netlink is unavailable, polled every
   `interface_poll_secs`); per server, not replicated.
 
 ## Running an open resolver

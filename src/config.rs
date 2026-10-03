@@ -248,7 +248,8 @@ pub struct ServerConfig {
     /// `bind`, following them as addresses appear and disappear (I11,
     /// dnsmasq `interface=` / `bind-dynamic`). Empty = use `bind`.
     pub interfaces: Vec<String>,
-    /// How often the interfaces' addresses are checked, seconds.
+    /// How often the interfaces' addresses are checked, seconds, where
+    /// netlink is not used (not Linux, or the socket cannot be opened).
     pub interface_poll_secs: u64,
 }
 
@@ -694,7 +695,7 @@ nsid = ""                # EDNS NSID reply (RFC 5001), e.g. the host name; empty
 cookies = true           # issue/verify DNS server cookies (RFC 7873)
 cookies_required = false # strict mode: UDP queries without a valid cookie get BADCOOKIE
 interfaces = []          # e.g. ["eth0"]: listen on these interfaces' addresses (followed) instead of bind
-interface_poll_secs = 5
+interface_poll_secs = 5   # without netlink (not Linux): how often addresses are re-read
 
 [forwarding]
 upstreams = []           # e.g. ["1.1.1.1:53", "[2606:4700:4700::1111]:53"]; empty = REFUSED for foreign names

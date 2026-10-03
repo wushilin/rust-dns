@@ -355,10 +355,30 @@ a router-sized footprint (a design property, not a feature).
   were, so a promoted standby still sends a snapshot to a standby behind
   its own first row). Cleared by a snapshot load and `--prepare-standby`;
   pruned with the changelog retention.
-- [ ] L1 (= J2). Watch interface address changes through netlink on Linux
+- [x] L1 (= J2). Watch interface address changes through netlink on Linux
   instead of polling every `interface_poll_secs`; keep polling as the
   fallback elsewhere. Tests: address diffing unit tests; Linux integration
   where possible (CI runs on Linux).
+  Done with `libc` only (no new crate): a `NETLINK_ROUTE` socket bound to
+  `RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR` under tokio's `AsyncFd`; any
+  `RTM_NEWADDR` / `RTM_DELADDR` (or an error, overrun, `ENOBUFS`, malformed
+  buffer) wakes the follower, which re-reads with `getifaddrs` and diffs as
+  before (one code path for the truth); a full re-read every 300 s anyway.
+  Socket open failure -> polling (logged); a later socket error -> polling
+  from then on. Non-Linux: polling as before. Found on the way: the shipped
+  systemd units (`deploy/rust-dns.service`, `deploy/install.sh`) had
+  `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`; glibc/musl
+  `getifaddrs` itself uses netlink, so `[server] interfaces` could not have
+  read any address under those units. `AF_NETLINK` added (gate and baba2
+  run under processmaster, not these units: not affected).
+  Tests: unit `dns::ifaces::tests::netlink_address_messages_wake_the_
+  follower` (message parsing incl. padding, errors, truncation), Linux-only
+  `the_netlink_socket_opens`, integration `tests/netlink.rs`
+  `interface_addresses_are_followed_through_netlink` (server in a private
+  network namespace via `unshare -rn` / `unshare -n` as root / `sudo -n
+  unshare -n`; `interface_poll_secs = 3600`; an address added to and
+  removed from `lo` must be bound and released within 3 s). CI sets
+  `REQUIRE_NETLINK_TEST=1` so a skip fails there.
 - [ ] L2. Test debt from pending.md, made repeatable where possible:
   recovery-code dialog after MFA enrollment, "New recovery codes", users ->
   "Sign this user out everywhere", the MFA enable/disable/regenerate dialogs
@@ -957,3 +977,13 @@ a router-sized footprint (a design property, not a feature).
   protocol or wire change; new local table created at startup (an older
   binary ignores it); works against a 3884ba8 primary (its
   `/api/changelog` is the same).
+- 2026-10-03 (phase L): L1 done (see L1). macOS cannot run the Linux
+  parts; compiled and run in LXD container `home:alma8-rust` (x86_64, cargo
+  1.92, sources + `cargo vendor` pushed, offline build; `home:dns-test` had
+  no toolchain, so it was started, found without cargo, and stopped
+  again): ifaces unit tests 6/6, `tests/netlink.rs` passed 5 runs (as root,
+  `unshare -n`). Negative control in the container (netlink open forced to
+  fail -> polling): the integration test fails as intended (address never
+  bound within 3 s). Not run: the `unshare -rn` (unprivileged) and `sudo
+  -n` paths, and clippy with the CI toolchain on Linux (the container's
+  clippy 1.92 flags 3 pre-existing lints elsewhere; none in the new code).

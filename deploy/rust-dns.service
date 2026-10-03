@@ -30,7 +30,8 @@ ProtectHostname=true
 RestrictSUIDSGID=true
 RestrictNamespaces=true
 RestrictRealtime=true
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# AF_NETLINK: reading and following interface addresses ([server] interfaces).
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 LockPersonality=true
 MemoryDenyWriteExecute=true
 SystemCallArchitectures=native
