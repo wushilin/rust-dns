@@ -843,3 +843,16 @@ a router-sized footprint (a design property, not a feature).
   Throughput (release, `scripts/bench-tcp-local.sh`, alternating):
   7f7e547 338.8k/339.4k/340.5k/316.3k q/s (the last one while a cargo
   build ran), phase I tree 341.5k/338.2k/351.2k/345.6k: no regression.
+- 2026-10-03 (phase P session): full gate on 715aa33 (P1 + phase I;
+  clean worktree, `REQUIRE_BIND_TOOLS=1 REQUIRE_PREV_BIN=1`, 3884ba8
+  binary): all steps pass. fmt, clippy, 211 unit tests, suites
+  api_contract 5, dnssec 3, dnssec_changes 1, e2e 5, follow 7 (both new
+  mixed-version tests), forwarding 8, hardening 10, openapi_spec 8,
+  resolver 8, tsig 7; UI, OpenAPI snapshot, validator, conformance
+  127/127, smoke, cargo-audit only `paste`. This one gate stands for the
+  planned checkpoints after I1-I4 and I5-I7 (the items landed in one
+  commit, see above). Nothing pushed, tagged or deployed. Still open: J2
+  (netlink), H4/H5 (owner). Next step: the owner reviews and deploys
+  (baba2 first, see Rollout; create override zones only after both run
+  this version).
+
