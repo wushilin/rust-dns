@@ -155,7 +155,7 @@ can answer, abort (drop/refuse, with logging) or pass to the next one, and can
 inspect or rewrite the response on the way back. Phase I features become
 filters instead of branches in `dns/handler.rs`.
 
-- [ ] P1. Design and build the pipeline; move today's behaviour into filters
+- [x] P1. Design and build the pipeline; move today's behaviour into filters
   with NO change in answers.
   - Two stages, because admission must stay before decoding (C2):
     - Raw stage (bytes only, synchronous, no allocation on the reject path):
@@ -662,3 +662,41 @@ a router-sized footprint (a design property, not a feature).
   only then deploy (expects compatibility; still verify mixed-version with the
   3884ba8 and 6d7e5a2 binaries before deploying). Phase P (query pipeline,
   servlet-filter style) added before phase I.
+- 2026-10-03 (phase P session): P1 done (commit 93ddd9d). `src/dns/
+  pipeline.rs` (stages, `QueryCtx`, `Filter` enum, runner, finish stage,
+  the chain order table in the module docs) and `src/dns/filters.rs` (one
+  method per filter, code moved verbatim from `handler::answer`). Raw
+  stage unchanged in `handler.rs`: `admit` (C2) then TSIG verify/strip,
+  query stage, TSIG signing of the reply. Chain: edns, request, special,
+  transfer, authoritative, recursion, [open_resolver], forward. Static
+  dispatch (enum + `Vec<Filter>` in `Runtime`, so it is rebuilt and
+  swapped with the runtime on reload / console changes; a switched-off
+  filter is absent); post-processing is a second pass over the filters
+  that passed, innermost first (no recursion, no boxed futures);
+  `catch_unwind` around the chain: a panicking filter answers SERVFAIL
+  (id + question echoed), is logged with the filter name and counted.
+  Per-filter counters `rustdns_filter_queries_total{filter,outcome}`,
+  `/api/status` `pipeline` (chain in effect with counters), query events
+  carry `filter` (console shows it under Source). Tests:
+  `filters_answer_pass_and_post_process_in_order`,
+  `a_dropping_filter_sends_nothing`, `a_panicking_filter_answers_
+  servfail_and_the_server_goes_on`, `the_default_chain_and_its_counters`;
+  C2 test unchanged and passing; all suites pass.
+  Equivalence: new `scripts/equivalence.py` / `equivalence-local.sh`
+  (BASE NEW): one seeded database copied for both servers, deterministic
+  fake upstream per server, 20,743 query pairs (110 names x 19 types x
+  EDNS/DO x UDP/TCP, EDNS/cookie/NSID shapes, flags, classes, opcodes,
+  malformed and garbage packets, forwarding incl. TC/fail/timeout,
+  AXFR/IXFR of 7 zones, TSIG good/bad/badtime/truncated, a rate-limit
+  burst sequence, cookies_required). Normalised only: RRSIG signature
+  bytes, server cookie bytes, TSIG time/MAC (248 MACs verified). Result
+  7f7e547 vs 93ddd9d (release): 0 differences, 16,633 byte-identical.
+  Self-test (`--self-test`) proves it reports perturbed cases. Seen by the
+  script: 3884ba8's rate-limit replied/dropped sequence varies run to run
+  (C2 made it deterministic); the forward cache keeps the letter case of
+  the query that filled it (unchanged behaviour, noted).
+  Throughput (release, `scripts/bench-tcp-local.sh`, dnsperf -m tcp, 16
+  clients, 8 s, alternating runs): 7f7e547 334.5k/341.8k/335.6k/326.4k
+  q/s (mean 334.6k), 93ddd9d 338.1k/342.5k/326.3k/324.0k (mean 332.7k):
+  no measurable difference (-0.6%, within run-to-run noise of +-2%).
+
