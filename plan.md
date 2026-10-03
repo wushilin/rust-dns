@@ -453,10 +453,61 @@ Pre-deploy (must pass before the next deploy):
   (normalised: RRSIG signatures 1984, server cookies 2313, TSIG 18,
   forwarded TTL +-1 1) — nothing between d32d67f and HEAD changes an
   answer, as expected (K/L are console, changelog display, netlink).
-- [ ] M0b. Review the diff d32d67f..HEAD (K1/K2, K3, L1, L2, L3, AGENT.md)
+- [x] M0b. Review the diff d32d67f..HEAD (K1/K2, K3, L1, L2, L3, AGENT.md)
   as a principal engineer: correctness, AGENT.md changelog rules, standby
   never writes replicated data, secrets, permissions, compatibility. Fix
   real findings with tests; record the rest.
+  Done. No high or medium finding; nothing needed a code fix. Checked:
+  - K3 `changelog_history` is display only: classified `Local` in
+    `tables.rs` (so in no table checksum, no snapshot, not deleted by
+    `delete_replicated`); read only by `Storage::changelog_after/_recent/
+    _bounds`, whose callers are the user-facing changelog API, the
+    websocket catch-up and `GET /status` — never `/api/replication/*`
+    (changes, gap check, snapshot, checksum use `changelog` /
+    `changelog_head` only). Written only by `replica_store_history`
+    (the standby's replication writer; no changelog row, no audit row,
+    no rebuild) with DNS kinds only (parsed as `Change`, `Change::Dns`
+    kept), only below the first own row. Cleared by a snapshot load and
+    `--prepare-standby`, pruned by age with `changelog`. Viewers: the
+    rows go through the same `View::change` filter as `changelog` (own
+    zones only, member rows only for owners, others' IPs blanked); the
+    copy is made with the replication token, which must be an admin's
+    (so complete), and the primary's changelog API never returns account
+    rows (and they are dropped again here). No new write path on a
+    standby beyond this local table.
+  - K1/K2: `standby_writable` is generated from `STANDBY_WRITABLE`; the two
+    added routes (`POST /blocklists/refresh`, `/blocklists/test`) only
+    touch the in-memory blocklist state (`blocklist.rs` has no storage
+    access). The console's rights come from `GET /users/{me}/rights` (own
+    rights only; others' need `manage_users`, unchanged); client-side
+    denial is UX, the server still enforces. Dynamic attributes go through
+    `esc()`; no native dialogs.
+  - L1 netlink: two `unsafe` blocks (socket/bind with an owned fd and a
+    zeroed, correctly sized `sockaddr_nl`; `recv` bounded by the buffer
+    length). The parser reads headers with `get(at..at+16)`, rejects
+    `len < 16` and `at + len > buf.len()` (both mean "re-read"), so no
+    out-of-bounds read and no infinite loop (`len >= 16` advances). Any
+    error falls back to polling. Systemd units gained `AF_NETLINK` (needed
+    by `getifaddrs` itself); gate/baba2 run under processmaster.
+  - L2 `GET /me` `recovery_codes_left`: additive field, own data.
+  - Compatibility: protocol 2, no new change kind, no payload change,
+    fixture untouched; the new `/status` field has a serde default and is
+    never read cross-server (a standby reads only `/api/replication/*`
+    and, for K3, the primary's `/api/changelog`, same in 3884ba8/d32d67f).
+  Minor (recorded, not fixed):
+  - m1. The K3 copy runs at every follow session start before the
+    long-poll loop, so following starts after the copy (gate's history is
+    ~120 rows: negligible; a primary with 100k rows: ~50 pages first).
+  - m2. When the rows between the newest copied row and the first own row
+    are all account rows, each session start still fetches one page (up
+    to 2000 rows above the floor, discarded). Session starts are rare.
+  - m3. If the history copy is pruned entirely and the primary keeps rows
+    longer, the next session start copies them again and the next prune
+    removes them (display-only churn).
+  - m4. A local process can send netlink messages to the socket; the only
+    effect is an extra `getifaddrs` re-read.
+  - m5. With netlink, `interface_poll_secs` only matters above 300 s
+    (resync = max(300 s, poll)); documented in the config comment.
 
 Features (in this order; each with console UI where it applies, API with
 contract tests, typed changes that replicate, tests, AGENT.md rules):
