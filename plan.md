@@ -1027,3 +1027,16 @@ a router-sized footprint (a design property, not a feature).
   browser walk-through of the five dialogs, proxy check documented (no
   nginx here).
 - 2026-10-03 (phase L): L3 done (pending.md).
+- 2026-10-03 (phase L): full gate on d8360ba (clean worktree,
+  `REQUIRE_BIND_TOOLS=1 REQUIRE_PREV_BIN=1`, 3884ba8 binary): all steps
+  pass. fmt, clippy, 218 unit tests, suites api_contract 5, dnssec 3,
+  dnssec_changes 1, e2e 6, follow 8, forwarding 8, hardening 10, netlink 0
+  (Linux only; run in a container, see L1), openapi_spec 8, resolver 8,
+  tsig 7; UI tests, OpenAPI snapshot, validator, conformance 127/127,
+  smoke, cargo-audit only `paste`. The K3 checkpoint gate on 993c104 also
+  passed (280 tests). Nothing pushed, tagged or deployed. Rollout: still
+  protocol 2, no new change kind, no payload change; new local table
+  `changelog_history` (created at startup; an older binary ignores it) and
+  an additive `recovery_codes_left` in `GET /me`. Either upgrade order;
+  standby (baba2) first as usual. After the upgrade baba2's changelog page
+  fills from gate at its next follow session start.
