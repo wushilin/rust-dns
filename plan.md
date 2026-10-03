@@ -344,3 +344,13 @@ OpenAPI snapshot + validator, conformance (123), smoke-release, cargo-audit.
   each commit; the mixed-version test needs the 3884ba8 binary in
   `RUST_DNS_PREV_BIN`. (4) See H4: another session has uncommitted edits
   in tests/dnssec.rs; stage files by name, not `git add -A`.
+- 2026-10-03: gate after phase D. First run (commit 3ca6060) failed one
+  existing test, `resign_bumps_the_serial_and_keeps_validating`
+  (tests/dnssec.rs): it made a re-sign due by backdating `updated_at`
+  only, and since D1 the window comes from `signed_at`. Test fixed to
+  backdate the epoch (commit 4501db8); no server code changed. Second run
+  on 4501db8: all steps pass; 187 unit tests, integration suites
+  5/3/1/4/4/8/10/8/7 (follow includes the mixed-version test with
+  `REQUIRE_PREV_BIN=1`), conformance 123, cargo-audit only `paste`.
+  An operator note follows from the same fact: backdating or editing
+  `updated_at` by hand no longer triggers a re-sign.
