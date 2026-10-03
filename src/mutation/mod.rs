@@ -43,7 +43,7 @@ pub use import_export::{
 };
 pub(crate) use tx::catalog_zones;
 #[allow(unused_imports)]
-pub use tx::{Change, Tx, CLASS_ACCOUNT, CLASS_DNS};
+pub use tx::{Change, DnsChange, DnsEvent, SecretChange, Tx, CLASS_ACCOUNT, CLASS_DNS};
 
 use crate::cache::{Cache, Catalog};
 use crate::events::Bus;
@@ -240,7 +240,7 @@ impl Mutator {
         let storage = self.storage.clone();
         let tx_actor = actor.clone();
         let joined = tokio::task::spawn_blocking(move || {
-            storage.write(&TOKEN, |conn| -> MResult<(T, Vec<ChangeEvent>, Vec<i64>)> {
+            storage.write(&TOKEN, |conn| -> MResult<(T, Vec<DnsEvent>, Vec<i64>)> {
                 let mut t = Tx::new(conn);
                 let out = f(&mut t)?;
                 let (events, zones) = t.finish(&tx_actor, command)?;
@@ -273,9 +273,10 @@ impl Mutator {
         // lock: only the zones this transaction touched are rebuilt.
         self.refresh_catalog(Rebuild::Zones(zones)).await;
         self.expiry_wake.notify_one();
-        for ev in events {
+        for dns in events {
+            let ev = dns.event();
             tracing::info!(offset = ev.offset, txn = %ev.txn, command, actor = %ev.actor, ip = %ev.actor_ip, action = %ev.action, entity = %ev.entity, zone = %ev.zone, "change committed");
-            self.bus.publish_change(ev);
+            self.bus.publish_change(dns);
         }
         Ok(out)
     }

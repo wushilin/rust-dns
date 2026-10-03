@@ -109,7 +109,7 @@ impl AuditTx<'_> {
             return Ok(None);
         }
         let now = now_rfc3339();
-        self.record(crate::mutation::Change::TsigKeySet {
+        self.record(crate::mutation::SecretChange::TsigKeySet {
             key: crate::replication::types::ReplTsigKey {
                 name: k.name.clone(),
                 algorithm: k.algorithm.name().to_string(),
@@ -137,7 +137,7 @@ impl AuditTx<'_> {
             let mut row = crate::replication::data::tsig_row(before.clone());
             row.zones = zones.to_vec();
             row.updated_at = now_rfc3339();
-            self.record(crate::mutation::Change::TsigKeySet { key: row })?;
+            self.record(crate::mutation::SecretChange::TsigKeySet { key: row })?;
         }
         let after = self.tsig_key(&before.name)?.expect("exists");
         if before.zones != after.zones {
@@ -154,7 +154,7 @@ impl AuditTx<'_> {
     pub fn delete_tsig_key(&mut self, k: &StoredTsigKey) -> Result<bool> {
         let n = usize::from(self.tsig_key(&k.name)?.is_some());
         if n > 0 {
-            self.record(crate::mutation::Change::TsigKeyDeleted {
+            self.record(crate::mutation::SecretChange::TsigKeyDeleted {
                 name: k.name.clone(),
             })?;
         }

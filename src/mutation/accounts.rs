@@ -14,7 +14,7 @@
 //! pruning of expired sessions and old log rows.
 
 use super::acct_sql::{self, Ctx};
-use super::{Change, TOKEN};
+use super::{Change, SecretChange, TOKEN};
 use crate::model::*;
 use crate::replication::data;
 use crate::replication::types::{Hidden, ReplToken, ReplUser};
@@ -132,7 +132,7 @@ impl<'a> AuditTx<'a> {
 
     /// Apply an account change and queue it for the changelog. The only
     /// way to write a replicated account table (see `acct_sql`).
-    pub(super) fn record(&mut self, change: Change) -> Result<()> {
+    pub(super) fn record(&mut self, change: SecretChange) -> Result<()> {
         acct_sql::write(self.conn, &Ctx::verbatim(), &change)?.log_into(change, &mut self.changes);
         Ok(())
     }
@@ -198,7 +198,7 @@ impl<'a> AuditTx<'a> {
             created_at: now.clone(),
             updated_at: now,
         };
-        self.record(Change::UserCreated { user: row.clone() })?;
+        self.record(SecretChange::UserCreated { user: row.clone() })?;
         let user = to_user(&row);
         self.push(
             "user.create",
@@ -273,7 +273,7 @@ impl<'a> AuditTx<'a> {
             return Ok(to_user(&after));
         }
         after.updated_at = now_rfc3339();
-        self.record(Change::UserUpdated {
+        self.record(SecretChange::UserUpdated {
             user: after.clone(),
         })?;
         let (b, a) = (to_user(&before), to_user(&after));
@@ -340,7 +340,7 @@ impl<'a> AuditTx<'a> {
         if row.totp_secret.is_none() || row.totp_last_step.is_some_and(|l| l >= step) {
             return Ok(false);
         }
-        self.record(Change::TotpStepAccepted {
+        self.record(SecretChange::TotpStepAccepted {
             user_id: user.id,
             step,
         })?;
@@ -356,7 +356,7 @@ impl<'a> AuditTx<'a> {
     pub fn delete_user(&mut self, u: &User) -> Result<bool> {
         match data::user_row(self.conn, u.id)? {
             Some(r) if !r.is_root => {
-                self.record(Change::UserDeleted {
+                self.record(SecretChange::UserDeleted {
                     user_id: r.id,
                     username: r.username.clone(),
                 })?;
@@ -410,7 +410,7 @@ impl<'a> AuditTx<'a> {
                     created_at: now.clone(),
                     updated_at: now,
                 };
-                self.record(Change::UserCreated { user: row })?;
+                self.record(SecretChange::UserCreated { user: row })?;
                 Some(serde_json::json!({ "created": true }))
             }
             Some(b) => {
@@ -435,7 +435,7 @@ impl<'a> AuditTx<'a> {
                 }
                 if after != *b {
                     after.updated_at = now_rfc3339();
-                    self.record(Change::UserUpdated { user: after })?;
+                    self.record(SecretChange::UserUpdated { user: after })?;
                 }
                 (!m.is_empty()).then_some(serde_json::Value::Object(m))
             }
@@ -465,7 +465,7 @@ impl<'a> AuditTx<'a> {
     // ---- recovery codes --------------------------------------------------
 
     pub fn set_recovery_codes(&mut self, user: &User, hashes: &[String]) -> Result<()> {
-        self.record(Change::RecoveryCodesReplaced {
+        self.record(SecretChange::RecoveryCodesReplaced {
             user_id: user.id,
             code_hashes: Hidden(hashes.to_vec()),
         })?;
@@ -488,7 +488,7 @@ impl<'a> AuditTx<'a> {
         if !unused {
             return Ok(false);
         }
-        self.record(Change::RecoveryCodeUsed {
+        self.record(SecretChange::RecoveryCodeUsed {
             user_id: user.id,
             code_hash: Hidden(hash.to_string()),
             used_at: now_rfc3339(),
@@ -616,7 +616,7 @@ impl<'a> AuditTx<'a> {
     ) -> Result<TokenInfo> {
         let tags = normalize_tags(tags)?;
         let id = acct_sql::next_id(self.conn, "api_tokens")?;
-        self.record(Change::TokenCreated {
+        self.record(SecretChange::TokenCreated {
             token: ReplToken {
                 id,
                 user_id: user.id,
@@ -647,7 +647,7 @@ impl<'a> AuditTx<'a> {
         let tags = normalize_tags(tags)?;
         let current = db::get_token(self.conn, t.id)?.context("token vanished")?;
         if current.tags != tags {
-            self.record(Change::TokenTagsSet {
+            self.record(SecretChange::TokenTagsSet {
                 token_id: t.id,
                 tags: tags.clone(),
             })?;
@@ -670,7 +670,7 @@ impl<'a> AuditTx<'a> {
         if !current.is_some_and(|c| c.revoked_at.is_none()) {
             return Ok(false);
         }
-        self.record(Change::TokenRevoked {
+        self.record(SecretChange::TokenRevoked {
             token_id: t.id,
             revoked_at: now_rfc3339(),
         })?;

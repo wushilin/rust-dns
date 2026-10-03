@@ -21,10 +21,10 @@
 //! these tables (the snapshot loader and `--prepare-standby` in
 //! `replica.rs` excepted).
 
-use super::Change;
+use super::{Change, SecretChange};
 use crate::replication::data;
 use crate::replication::types::{ReplSetting, ReplToken, ReplTsigKey, ReplUser};
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 
 /// How a change is applied.
@@ -48,8 +48,8 @@ pub(super) struct Written(());
 
 impl Written {
     /// Primary: queue the change for the changelog rows of this transaction.
-    pub(super) fn log_into(self, change: Change, changes: &mut Vec<Change>) {
-        changes.push(change);
+    pub(super) fn log_into(self, change: SecretChange, changes: &mut Vec<Change>) {
+        changes.push(Change::Secret(change));
     }
 
     /// The change comes from the primary's changelog (the caller copies its
@@ -58,46 +58,37 @@ impl Written {
 }
 
 /// Apply one account-class change to its table. The only entry to the SQL
-/// of this file. Exhaustive: a new kind of change does not compile until it
-/// is handled here or declared a DNS change.
-pub(super) fn write(c: &Connection, ctx: &Ctx, change: &Change) -> Result<Written> {
+/// of this file. It takes only the secret half of [`Change`], so a DNS
+/// change cannot reach it; exhaustive, so a new kind of secret change does
+/// not compile until it is handled here.
+pub(super) fn write(c: &Connection, ctx: &Ctx, change: &SecretChange) -> Result<Written> {
     match change {
-        Change::UserCreated { user } | Change::UserUpdated { user } => put_user(c, ctx, user)?,
-        Change::UserDeleted { user_id, username } => delete_user(c, ctx, *user_id, username)?,
-        Change::TotpStepAccepted { user_id, step } => totp_step(c, ctx, *user_id, *step)?,
-        Change::RecoveryCodesReplaced {
+        SecretChange::UserCreated { user } | SecretChange::UserUpdated { user } => {
+            put_user(c, ctx, user)?
+        }
+        SecretChange::UserDeleted { user_id, username } => delete_user(c, ctx, *user_id, username)?,
+        SecretChange::TotpStepAccepted { user_id, step } => totp_step(c, ctx, *user_id, *step)?,
+        SecretChange::RecoveryCodesReplaced {
             user_id,
             code_hashes,
         } => recovery_codes(c, ctx, *user_id, &code_hashes.0)?,
-        Change::RecoveryCodeUsed {
+        SecretChange::RecoveryCodeUsed {
             user_id,
             code_hash,
             used_at,
         } => recovery_code_used(c, ctx, *user_id, &code_hash.0, used_at)?,
-        Change::TokenCreated { token } => put_token(c, token)?,
-        Change::TokenTagsSet { token_id, tags } => token_tags(c, *token_id, tags)?,
-        Change::TokenRevoked {
+        SecretChange::TokenCreated { token } => put_token(c, token)?,
+        SecretChange::TokenTagsSet { token_id, tags } => token_tags(c, *token_id, tags)?,
+        SecretChange::TokenRevoked {
             token_id,
             revoked_at,
         } => token_revoked(c, *token_id, revoked_at)?,
-        Change::TsigKeySet { key } => put_tsig_key(c, key)?,
-        Change::TsigKeyDeleted { name } => delete_tsig_key(c, name)?,
-        Change::SettingSet { setting } => put_setting(c, setting)?,
-        Change::SettingCleared { key } => delete_setting(c, key)?,
-        Change::DnssecKeySet { key } => put_dnssec_key(c, key)?,
-        Change::DnssecKeyDeleted { zone_id, .. } => delete_dnssec_key(c, *zone_id)?,
-        Change::ZoneCreated { .. }
-        | Change::ZoneUpdated { .. }
-        | Change::ZoneDeleted { .. }
-        | Change::RecordCreated { .. }
-        | Change::RecordUpdated { .. }
-        | Change::RecordExpired { .. }
-        | Change::RecordReaped { .. }
-        | Change::RecordDeleted { .. }
-        | Change::SerialBumped { .. }
-        | Change::MemberSet { .. }
-        | Change::MemberRemoved { .. }
-        | Change::ZoneResigned { .. } => bail!("not an account change: {:?}", change.meta()),
+        SecretChange::TsigKeySet { key } => put_tsig_key(c, key)?,
+        SecretChange::TsigKeyDeleted { name } => delete_tsig_key(c, name)?,
+        SecretChange::SettingSet { setting } => put_setting(c, setting)?,
+        SecretChange::SettingCleared { key } => delete_setting(c, key)?,
+        SecretChange::DnssecKeySet { key } => put_dnssec_key(c, key)?,
+        SecretChange::DnssecKeyDeleted { zone_id, .. } => delete_dnssec_key(c, *zone_id)?,
     }
     Ok(Written(()))
 }
@@ -438,19 +429,12 @@ mod tests {
             accounts.contains("pub struct AuditTx<'a> {\n    conn: &'a Connection,"),
             "AuditTx.conn must stay private"
         );
-        // A DNS change is not written here.
+        // A DNS change cannot be written here: `write` takes a
+        // `SecretChange` (E2; was a runtime error before). An account
+        // change is, and the receipt must be turned in.
         let s = crate::storage::Storage::open_memory().unwrap();
-        let dns = Change::SerialBumped {
-            zone: "a.test".into(),
-            zone_id: 1,
-            serial: 2,
-            updated_at: "t".into(),
-            signed_at: None,
-        };
         let r = s.write(&crate::mutation::TOKEN, |c| -> Result<()> {
-            assert!(write(c, &Ctx::verbatim(), &dns).is_err());
-            // An account change is, and the receipt must be turned in.
-            let set = Change::SettingSet {
+            let set = SecretChange::SettingSet {
                 setting: ReplSetting {
                     key: "k".into(),
                     value: "{}".into(),

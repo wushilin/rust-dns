@@ -24,7 +24,9 @@
 use super::accounts::AuditTx;
 use super::replay;
 use super::sql;
-use super::{Change, MResult, MutationError, Mutator, Rebuild, TOKEN};
+use super::{
+    Change, DnsChange, DnsEvent, MResult, MutationError, Mutator, Rebuild, SecretChange, TOKEN,
+};
 use crate::model::{Actor, ChangeEvent};
 use crate::replication::data;
 use crate::replication::types::*;
@@ -168,19 +170,19 @@ fn load_snapshot(c: &Connection, snap: &Snapshot, root: &str) -> Result<Bootstra
     let mut ids = std::collections::HashSet::new();
     for e in &snap.entities {
         match e {
-            Change::UserCreated { user } => {
+            Change::Secret(SecretChange::UserCreated { user }) => {
                 sum.users += 1;
                 ids.insert(user.id);
                 if user.username == root {
                     sum.local_root = "merged";
                 }
             }
-            Change::ZoneCreated { .. } => sum.zones += 1,
-            Change::RecordCreated { .. } => sum.records += 1,
-            Change::MemberSet { .. } => sum.members += 1,
-            Change::TokenCreated { .. } => sum.tokens += 1,
-            Change::TsigKeySet { .. } => sum.tsig_keys += 1,
-            Change::SettingSet { .. } => sum.settings += 1,
+            Change::Dns(DnsChange::ZoneCreated { .. }) => sum.zones += 1,
+            Change::Dns(DnsChange::RecordCreated { .. }) => sum.records += 1,
+            Change::Dns(DnsChange::MemberSet { .. }) => sum.members += 1,
+            Change::Secret(SecretChange::TokenCreated { .. }) => sum.tokens += 1,
+            Change::Secret(SecretChange::TsigKeySet { .. }) => sum.tsig_keys += 1,
+            Change::Secret(SecretChange::SettingSet { .. }) => sum.settings += 1,
             _ => {}
         }
         replay::apply(c, e, &ctx).with_context(|| format!("snapshot entity {e:?}"))?;
@@ -190,10 +192,10 @@ fn load_snapshot(c: &Connection, snap: &Snapshot, root: &str) -> Result<Bootstra
         if !ids.contains(&u.id) && u.username != root {
             replay::apply(
                 c,
-                &Change::UserDeleted {
+                &Change::Secret(SecretChange::UserDeleted {
                     user_id: u.id,
                     username: u.username,
-                },
+                }),
                 &ctx,
             )?;
             sum.users_removed += 1;
@@ -202,11 +204,11 @@ fn load_snapshot(c: &Connection, snap: &Snapshot, root: &str) -> Result<Bootstra
     for (user_id, hash, used_at) in used_here {
         replay::apply(
             c,
-            &Change::RecoveryCodeUsed {
+            &Change::Secret(SecretChange::RecoveryCodeUsed {
                 user_id,
                 code_hash: crate::replication::types::Hidden(hash),
                 used_at,
-            },
+            }),
             &ctx,
         )?;
     }
@@ -358,10 +360,7 @@ impl Mutator {
         &self,
         operation: &'static str,
         actor: Actor,
-        f: impl for<'t> FnOnce(
-                &'t Connection,
-                &mut AuditTx<'t>,
-            ) -> Result<(T, Vec<ChangeEvent>, Rebuild)>
+        f: impl for<'t> FnOnce(&'t Connection, &mut AuditTx<'t>) -> Result<(T, Vec<DnsEvent>, Rebuild)>
             + Send
             + 'static,
     ) -> MResult<T> {
@@ -429,8 +428,10 @@ impl Mutator {
             let zones = super::catalog_zones(changes.iter().map(|(_, c)| c));
             let dns = changes
                 .into_iter()
-                .filter(|(_, c)| c.class() == super::CLASS_DNS)
-                .map(|(e, _)| e)
+                .filter_map(|(e, c)| match c {
+                    Change::Dns(d) => Some(DnsEvent::new(e, &d)),
+                    Change::Secret(_) => None,
+                })
                 .collect();
             Ok((out, dns, Rebuild::Zones(zones)))
         })

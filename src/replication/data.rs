@@ -264,10 +264,10 @@ pub(crate) fn sha256_json<T: serde::Serialize>(v: &T) -> Result<String> {
 
 /// Everything replicated as logical entities (see [`Snapshot`]).
 pub fn snapshot(c: &Connection) -> Result<Snapshot> {
-    use crate::mutation::Change;
+    use crate::mutation::{Change, DnsChange, SecretChange};
     let mut e = Vec::new();
     for u in users(c)? {
-        e.push(Change::UserCreated { user: u });
+        e.push(Change::Secret(SecretChange::UserCreated { user: u }));
     }
     let codes = recovery_codes(c)?;
     let mut by_user: std::collections::BTreeMap<i64, Vec<String>> = Default::default();
@@ -278,37 +278,37 @@ pub fn snapshot(c: &Connection) -> Result<Snapshot> {
             .push(rc.code_hash.clone());
     }
     for (user_id, hashes) in by_user {
-        e.push(Change::RecoveryCodesReplaced {
+        e.push(Change::Secret(SecretChange::RecoveryCodesReplaced {
             user_id,
             code_hashes: Hidden(hashes),
-        });
+        }));
     }
     for rc in codes {
         if let Some(used_at) = rc.used_at {
-            e.push(Change::RecoveryCodeUsed {
+            e.push(Change::Secret(SecretChange::RecoveryCodeUsed {
                 user_id: rc.user_id,
                 code_hash: Hidden(rc.code_hash),
                 used_at,
-            });
+            }));
         }
     }
     for t in tokens(c)? {
-        e.push(Change::TokenCreated { token: t });
+        e.push(Change::Secret(SecretChange::TokenCreated { token: t }));
     }
     for st in settings(c)? {
-        e.push(Change::SettingSet { setting: st });
+        e.push(Change::Secret(SecretChange::SettingSet { setting: st }));
     }
     for k in tsig_keys(c)? {
-        e.push(Change::TsigKeySet { key: k });
+        e.push(Change::Secret(SecretChange::TsigKeySet { key: k }));
     }
     let zones = db::list_zones(c)?;
     let names: std::collections::HashMap<i64, String> =
         zones.iter().map(|z| (z.id, z.name.clone())).collect();
     for z in zones {
-        e.push(Change::ZoneCreated { zone: z });
+        e.push(Change::Dns(DnsChange::ZoneCreated { zone: z }));
     }
     for k in db::list_dnssec_keys(c)? {
-        e.push(Change::DnssecKeySet { key: k });
+        e.push(Change::Secret(SecretChange::DnssecKeySet { key: k }));
     }
     for r in records(c, None)? {
         let zone = names.get(&r.zone_id).cloned().unwrap_or_default();
@@ -324,18 +324,18 @@ pub fn snapshot(c: &Connection) -> Result<Snapshot> {
             expires_at: r.expires_at,
         };
         let expired = r.expired_noted;
-        e.push(Change::RecordCreated {
+        e.push(Change::Dns(DnsChange::RecordCreated {
             zone: zone.clone(),
             record: record.clone(),
-        });
+        }));
         if expired {
-            e.push(Change::RecordExpired { zone, record });
+            e.push(Change::Dns(DnsChange::RecordExpired { zone, record }));
         }
     }
     let usernames: std::collections::HashMap<i64, String> =
         users(c)?.into_iter().map(|u| (u.id, u.username)).collect();
     for m in members(c, None)? {
-        e.push(Change::MemberSet {
+        e.push(Change::Dns(DnsChange::MemberSet {
             zone: names.get(&m.zone_id).cloned().unwrap_or_default(),
             zone_id: m.zone_id,
             user_id: m.user_id,
@@ -343,7 +343,7 @@ pub fn snapshot(c: &Connection) -> Result<Snapshot> {
             role: m.role,
             previous: None,
             created_at: m.created_at,
-        });
+        }));
     }
     Ok(Snapshot {
         format: REPLICATION_PROTOCOL,

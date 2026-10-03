@@ -79,7 +79,7 @@ OpenAPI snapshot + validator, conformance (123), smoke-release, cargo-audit.
 - [x] E1. Split `mutation/mod.rs` (2,850 lines): `tx.rs` (Tx, Change, finish),
   `gate.rs`, `ops.rs` (zone/record/member operations), `import_export.rs`,
   `expiry.rs`, `dnssec_ops.rs`; tests next to their module.
-- [ ] E2. `Change` split by class at the type level: `DnsChange` and
+- [x] E2. `Change` split by class at the type level: `DnsChange` and
   `SecretChange` inside one envelope, so only `DnsChange` can be published on
   the event bus or returned by the changelog API. Wire format unchanged
   (`kind` tags stay), verified against stored changelog rows and a
@@ -450,3 +450,27 @@ OpenAPI snapshot + validator, conformance (123), smoke-release, cargo-audit.
   files except for module/`use` lines, `impl Mutator {` openers, three
   `pub(super)`s on Tx (conn, new, finish), helper visibility and one
   `ops::` path; same 191 unit tests.
+- 2026-10-03: gate on abe2a71 (H2, H3, H1, G2; worktree of the commit,
+  `REQUIRE_BIND_TOOLS=1 REQUIRE_PREV_BIN=1`, 3884ba8 binary): all steps
+  pass; 191 unit tests, integration suites 5/3/1/5/5/8/10/8/7 (e2e and
+  follow one test more each), conformance 123, cargo-audit only `paste`.
+- 2026-10-03: E2 done. `Change` is an envelope `Change::Dns(DnsChange)` /
+  `Change::Secret(SecretChange)`, both inner enums keep `#[serde(tag =
+  "kind")]` and every variant as it was. Serialization is `untagged`
+  (the envelope adds nothing: byte-identical, fixture test unchanged and
+  passing; fixture file untouched); deserialization is by hand: try the
+  DNS family, then the secret one, and report the error of the family
+  the kind belongs to. What the types now enforce: `acct_sql::write` and
+  `AuditTx::record` take a `SecretChange` (the runtime "not an account
+  change" error is gone: a DNS change cannot be passed); the event bus
+  takes only a `DnsEvent`, constructible only in `mutation` and only
+  with a `&DnsChange` (`Tx::finish` and the standby's apply make them
+  with `if let Change::Dns(d)`); the changelog row's class column is the
+  envelope variant. Not type-level, stated plainly: the changelog API and
+  websocket history read stored rows filtered by that class column (the
+  rows are JSON; old rows may predate structured changes), as before.
+  Tests: `stored_changelog_payloads_round_trip_byte_for_byte` (unchanged),
+  new `stored_kinds_read_into_their_family` (every fixture kind lands in
+  the family whose class its stored rows carry; error messages for an
+  unknown kind and missing fields). No wire, storage or protocol change
+  (replication protocol stays 2).

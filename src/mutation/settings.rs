@@ -171,7 +171,7 @@ impl AuditTx<'_> {
         before: Option<&ForwardingSettings>,
         after: &ForwardingSettings,
     ) -> Result<()> {
-        self.record(crate::mutation::Change::SettingSet {
+        self.record(crate::mutation::SecretChange::SettingSet {
             setting: crate::replication::types::ReplSetting {
                 key: FORWARDING_KEY.into(),
                 value: serde_json::to_string(after)?,
@@ -202,7 +202,7 @@ impl AuditTx<'_> {
     pub fn clear_forwarding(&mut self, before: &ForwardingSettings) -> Result<bool> {
         let stored = self.has_setting(FORWARDING_KEY)?;
         if stored {
-            self.record(crate::mutation::Change::SettingCleared {
+            self.record(crate::mutation::SecretChange::SettingCleared {
                 key: FORWARDING_KEY.into(),
             })?;
             self.push(

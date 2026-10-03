@@ -7,18 +7,67 @@ use super::*;
 
 /// A committed fact. Serialized as the changelog payload.
 ///
-/// One enum for DNS data and for accounts, settings and TSIG keys, so there
-/// is one ordered changelog (one cursor for a standby, and a user always
-/// exists before a change that refers to it), one exhaustive replay, and one
-/// serialization. [`Change::class`] separates the two families: account
-/// changes carry password hashes, TOTP and TSIG secrets and never leave
-/// through the user-facing changelog API or websocket.
+/// One envelope for DNS data and for accounts, settings and TSIG keys, so
+/// there is one ordered changelog (one cursor for a standby, and a user
+/// always exists before a change that refers to it), one exhaustive
+/// replay, and one serialization. The two families are separate types:
+/// [`SecretChange`]s carry password hashes, TOTP and TSIG secrets and
+/// private keys and never leave through the user-facing changelog API or
+/// websocket: only a [`DnsChange`] can make a [`DnsEvent`], the one thing
+/// the event bus publishes, and the row's class column is the envelope's
+/// variant.
 ///
-/// Account facts are the resulting state (whole rows where a row changed),
-/// not intents, so replaying them reproduces identical rows.
+/// Wire format: the envelope adds nothing. A change serializes exactly as
+/// its inner enum (`{"kind": "zone_created", ...}`, the `kind` tags
+/// unchanged), so rows written before the split read the same and are
+/// written byte for byte the same (test
+/// `stored_changelog_payloads_round_trip_byte_for_byte`).
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum Change {
+    Dns(DnsChange),
+    Secret(SecretChange),
+}
+
+/// Reads a change by its `kind`: tried as a DNS change, then as a secret
+/// one (the kinds are disjoint); the error names what was wrong with the
+/// family the kind belongs to.
+impl<'de> Deserialize<'de> for Change {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        use serde::de::Error;
+        let v = serde_json::Value::deserialize(d)?;
+        match DnsChange::deserialize(&v) {
+            Ok(c) => Ok(Change::Dns(c)),
+            Err(dns_err) => match SecretChange::deserialize(&v) {
+                Ok(c) => Ok(Change::Secret(c)),
+                Err(secret_err) => Err(D::Error::custom(
+                    if dns_err.to_string().starts_with("unknown variant") {
+                        secret_err
+                    } else {
+                        dns_err
+                    },
+                )),
+            },
+        }
+    }
+}
+
+impl From<DnsChange> for Change {
+    fn from(c: DnsChange) -> Self {
+        Change::Dns(c)
+    }
+}
+
+impl From<SecretChange> for Change {
+    fn from(c: SecretChange) -> Self {
+        Change::Secret(c)
+    }
+}
+
+/// A fact about DNS data (class `dns`): zones, records, serials, members.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum Change {
+pub enum DnsChange {
     ZoneCreated {
         zone: Zone,
     },
@@ -92,7 +141,16 @@ pub enum Change {
         zone_id: i64,
         key_tag: u16,
     },
-    // ---- accounts, settings, TSIG (class "account") ----------------------
+}
+
+/// A fact about accounts, settings, TSIG and DNSSEC keys (class
+/// `account`): may carry secrets; only standbys receive it.
+///
+/// Account facts are the resulting state (whole rows where a row changed),
+/// not intents, so replaying them reproduces identical rows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SecretChange {
     /// A new user (every column).
     UserCreated {
         user: ReplUser,
@@ -165,77 +223,16 @@ impl Change {
     /// (action, entity, zone, entity id) columns of the changelog row.
     pub fn meta(&self) -> (&'static str, &'static str, &str, Option<i64>) {
         match self {
-            Change::ZoneCreated { zone } => ("create", "zone", &zone.name, Some(zone.id)),
-            Change::ZoneUpdated { after, .. } => ("update", "zone", &after.name, Some(after.id)),
-            Change::ZoneDeleted { zone } => ("delete", "zone", &zone.name, Some(zone.id)),
-            Change::RecordCreated { zone, record } => ("create", "record", zone, Some(record.id)),
-            Change::RecordUpdated { zone, after, .. } => ("update", "record", zone, Some(after.id)),
-            Change::RecordDeleted { zone, record } => ("delete", "record", zone, Some(record.id)),
-            Change::RecordExpired { zone, record } => ("expire", "record", zone, Some(record.id)),
-            Change::RecordReaped { zone, record } => ("reap", "record", zone, Some(record.id)),
-            Change::SerialBumped { zone, zone_id, .. } => {
-                ("update", "serial", zone, Some(*zone_id))
-            }
-            Change::MemberSet { zone, user_id, .. } => ("update", "member", zone, Some(*user_id)),
-            Change::MemberRemoved { zone, user_id, .. } => {
-                ("delete", "member", zone, Some(*user_id))
-            }
-            Change::ZoneResigned { zone, zone_id, .. } => ("resign", "zone", zone, Some(*zone_id)),
-            Change::UserCreated { user } => ("create", "user", "", Some(user.id)),
-            Change::UserUpdated { user } => ("update", "user", "", Some(user.id)),
-            Change::UserDeleted { user_id, .. } => ("delete", "user", "", Some(*user_id)),
-            Change::TotpStepAccepted { user_id, .. } => ("update", "totp_step", "", Some(*user_id)),
-            Change::RecoveryCodesReplaced { user_id, .. } => {
-                ("update", "recovery_codes", "", Some(*user_id))
-            }
-            Change::RecoveryCodeUsed { user_id, .. } => {
-                ("update", "recovery_code", "", Some(*user_id))
-            }
-            Change::TokenCreated { token } => ("create", "token", "", Some(token.id)),
-            Change::TokenTagsSet { token_id, .. } => ("update", "token", "", Some(*token_id)),
-            Change::TokenRevoked { token_id, .. } => ("revoke", "token", "", Some(*token_id)),
-            Change::TsigKeySet { .. } => ("update", "tsig_key", "", None),
-            Change::TsigKeyDeleted { .. } => ("delete", "tsig_key", "", None),
-            Change::SettingSet { .. } => ("update", "setting", "", None),
-            Change::SettingCleared { .. } => ("delete", "setting", "", None),
-            // No zone name: account rows never reach zone-scoped views.
-            Change::DnssecKeySet { key } => ("update", "dnssec_key", "", Some(key.zone_id)),
-            Change::DnssecKeyDeleted { zone_id, .. } => {
-                ("delete", "dnssec_key", "", Some(*zone_id))
-            }
+            Change::Dns(c) => c.meta(),
+            Change::Secret(c) => c.meta(),
         }
     }
 
-    /// [`CLASS_DNS`] or [`CLASS_ACCOUNT`].
+    /// [`CLASS_DNS`] or [`CLASS_ACCOUNT`]: the envelope's variant.
     pub fn class(&self) -> &'static str {
         match self {
-            Change::ZoneCreated { .. }
-            | Change::ZoneUpdated { .. }
-            | Change::ZoneDeleted { .. }
-            | Change::RecordCreated { .. }
-            | Change::RecordUpdated { .. }
-            | Change::RecordExpired { .. }
-            | Change::RecordReaped { .. }
-            | Change::RecordDeleted { .. }
-            | Change::SerialBumped { .. }
-            | Change::MemberSet { .. }
-            | Change::MemberRemoved { .. }
-            | Change::ZoneResigned { .. } => CLASS_DNS,
-            Change::UserCreated { .. }
-            | Change::UserUpdated { .. }
-            | Change::UserDeleted { .. }
-            | Change::TotpStepAccepted { .. }
-            | Change::RecoveryCodesReplaced { .. }
-            | Change::RecoveryCodeUsed { .. }
-            | Change::TokenCreated { .. }
-            | Change::TokenTagsSet { .. }
-            | Change::TokenRevoked { .. }
-            | Change::TsigKeySet { .. }
-            | Change::TsigKeyDeleted { .. }
-            | Change::SettingSet { .. }
-            | Change::SettingCleared { .. }
-            | Change::DnssecKeySet { .. }
-            | Change::DnssecKeyDeleted { .. } => CLASS_ACCOUNT,
+            Change::Dns(_) => CLASS_DNS,
+            Change::Secret(_) => CLASS_ACCOUNT,
         }
     }
 
@@ -245,34 +242,8 @@ impl Change {
     /// Exhaustive, so a new kind of change must decide.
     pub fn catalog_zone(&self) -> Option<i64> {
         match self {
-            Change::ZoneCreated { zone } | Change::ZoneDeleted { zone } => Some(zone.id),
-            Change::ZoneUpdated { after, .. } => Some(after.id),
-            Change::RecordCreated { record, .. }
-            | Change::RecordDeleted { record, .. }
-            | Change::RecordExpired { record, .. }
-            | Change::RecordReaped { record, .. } => Some(record.zone_id),
-            // An update keeps the record in its zone.
-            Change::RecordUpdated { after, .. } => Some(after.zone_id),
-            Change::SerialBumped { zone_id, .. } | Change::ZoneResigned { zone_id, .. } => {
-                Some(*zone_id)
-            }
-            Change::DnssecKeySet { key } => Some(key.zone_id),
-            Change::DnssecKeyDeleted { zone_id, .. } => Some(*zone_id),
-            Change::MemberSet { .. }
-            | Change::MemberRemoved { .. }
-            | Change::UserCreated { .. }
-            | Change::UserUpdated { .. }
-            | Change::UserDeleted { .. }
-            | Change::TotpStepAccepted { .. }
-            | Change::RecoveryCodesReplaced { .. }
-            | Change::RecoveryCodeUsed { .. }
-            | Change::TokenCreated { .. }
-            | Change::TokenTagsSet { .. }
-            | Change::TokenRevoked { .. }
-            | Change::TsigKeySet { .. }
-            | Change::TsigKeyDeleted { .. }
-            | Change::SettingSet { .. }
-            | Change::SettingCleared { .. } => None,
+            Change::Dns(c) => c.catalog_zone(),
+            Change::Secret(c) => c.catalog_zone(),
         }
     }
 
@@ -280,11 +251,139 @@ impl Change {
     pub fn affects_dns_runtime(&self) -> bool {
         matches!(
             self,
-            Change::TsigKeySet { .. }
-                | Change::TsigKeyDeleted { .. }
-                | Change::SettingSet { .. }
-                | Change::SettingCleared { .. }
+            Change::Secret(
+                SecretChange::TsigKeySet { .. }
+                    | SecretChange::TsigKeyDeleted { .. }
+                    | SecretChange::SettingSet { .. }
+                    | SecretChange::SettingCleared { .. }
+            )
         )
+    }
+}
+
+impl DnsChange {
+    fn meta(&self) -> (&'static str, &'static str, &str, Option<i64>) {
+        match self {
+            DnsChange::ZoneCreated { zone } => ("create", "zone", &zone.name, Some(zone.id)),
+            DnsChange::ZoneUpdated { after, .. } => ("update", "zone", &after.name, Some(after.id)),
+            DnsChange::ZoneDeleted { zone } => ("delete", "zone", &zone.name, Some(zone.id)),
+            DnsChange::RecordCreated { zone, record } => {
+                ("create", "record", zone, Some(record.id))
+            }
+            DnsChange::RecordUpdated { zone, after, .. } => {
+                ("update", "record", zone, Some(after.id))
+            }
+            DnsChange::RecordDeleted { zone, record } => {
+                ("delete", "record", zone, Some(record.id))
+            }
+            DnsChange::RecordExpired { zone, record } => {
+                ("expire", "record", zone, Some(record.id))
+            }
+            DnsChange::RecordReaped { zone, record } => ("reap", "record", zone, Some(record.id)),
+            DnsChange::SerialBumped { zone, zone_id, .. } => {
+                ("update", "serial", zone, Some(*zone_id))
+            }
+            DnsChange::MemberSet { zone, user_id, .. } => {
+                ("update", "member", zone, Some(*user_id))
+            }
+            DnsChange::MemberRemoved { zone, user_id, .. } => {
+                ("delete", "member", zone, Some(*user_id))
+            }
+            DnsChange::ZoneResigned { zone, zone_id, .. } => {
+                ("resign", "zone", zone, Some(*zone_id))
+            }
+        }
+    }
+
+    fn catalog_zone(&self) -> Option<i64> {
+        match self {
+            DnsChange::ZoneCreated { zone } | DnsChange::ZoneDeleted { zone } => Some(zone.id),
+            DnsChange::ZoneUpdated { after, .. } => Some(after.id),
+            DnsChange::RecordCreated { record, .. }
+            | DnsChange::RecordDeleted { record, .. }
+            | DnsChange::RecordExpired { record, .. }
+            | DnsChange::RecordReaped { record, .. } => Some(record.zone_id),
+            // An update keeps the record in its zone.
+            DnsChange::RecordUpdated { after, .. } => Some(after.zone_id),
+            DnsChange::SerialBumped { zone_id, .. } | DnsChange::ZoneResigned { zone_id, .. } => {
+                Some(*zone_id)
+            }
+            DnsChange::MemberSet { .. } | DnsChange::MemberRemoved { .. } => None,
+        }
+    }
+}
+
+impl SecretChange {
+    fn meta(&self) -> (&'static str, &'static str, &str, Option<i64>) {
+        match self {
+            SecretChange::UserCreated { user } => ("create", "user", "", Some(user.id)),
+            SecretChange::UserUpdated { user } => ("update", "user", "", Some(user.id)),
+            SecretChange::UserDeleted { user_id, .. } => ("delete", "user", "", Some(*user_id)),
+            SecretChange::TotpStepAccepted { user_id, .. } => {
+                ("update", "totp_step", "", Some(*user_id))
+            }
+            SecretChange::RecoveryCodesReplaced { user_id, .. } => {
+                ("update", "recovery_codes", "", Some(*user_id))
+            }
+            SecretChange::RecoveryCodeUsed { user_id, .. } => {
+                ("update", "recovery_code", "", Some(*user_id))
+            }
+            SecretChange::TokenCreated { token } => ("create", "token", "", Some(token.id)),
+            SecretChange::TokenTagsSet { token_id, .. } => ("update", "token", "", Some(*token_id)),
+            SecretChange::TokenRevoked { token_id, .. } => ("revoke", "token", "", Some(*token_id)),
+            SecretChange::TsigKeySet { .. } => ("update", "tsig_key", "", None),
+            SecretChange::TsigKeyDeleted { .. } => ("delete", "tsig_key", "", None),
+            SecretChange::SettingSet { .. } => ("update", "setting", "", None),
+            SecretChange::SettingCleared { .. } => ("delete", "setting", "", None),
+            // No zone name: account rows never reach zone-scoped views.
+            SecretChange::DnssecKeySet { key } => ("update", "dnssec_key", "", Some(key.zone_id)),
+            SecretChange::DnssecKeyDeleted { zone_id, .. } => {
+                ("delete", "dnssec_key", "", Some(*zone_id))
+            }
+        }
+    }
+
+    /// A zone's signing key is served (DNSKEY, signatures); nothing else
+    /// here is.
+    fn catalog_zone(&self) -> Option<i64> {
+        match self {
+            SecretChange::DnssecKeySet { key } => Some(key.zone_id),
+            SecretChange::DnssecKeyDeleted { zone_id, .. } => Some(*zone_id),
+            SecretChange::UserCreated { .. }
+            | SecretChange::UserUpdated { .. }
+            | SecretChange::UserDeleted { .. }
+            | SecretChange::TotpStepAccepted { .. }
+            | SecretChange::RecoveryCodesReplaced { .. }
+            | SecretChange::RecoveryCodeUsed { .. }
+            | SecretChange::TokenCreated { .. }
+            | SecretChange::TokenTagsSet { .. }
+            | SecretChange::TokenRevoked { .. }
+            | SecretChange::TsigKeySet { .. }
+            | SecretChange::TsigKeyDeleted { .. }
+            | SecretChange::SettingSet { .. }
+            | SecretChange::SettingCleared { .. } => None,
+        }
+    }
+}
+
+/// A committed change event that may be published (event bus, websocket,
+/// live feed): it can only be made from a [`DnsChange`], so a secret
+/// change has no way onto the bus.
+#[derive(Debug, Clone)]
+pub struct DnsEvent(ChangeEvent);
+
+impl DnsEvent {
+    /// The event of a DNS change (`_change`: the proof of its class).
+    pub(super) fn new(ev: ChangeEvent, _change: &DnsChange) -> Self {
+        DnsEvent(ev)
+    }
+
+    pub fn event(&self) -> &ChangeEvent {
+        &self.0
+    }
+
+    pub fn into_event(self) -> ChangeEvent {
+        self.0
     }
 }
 
@@ -360,7 +459,7 @@ impl<'a> Tx<'a> {
         }
         let zone = sql::insert_zone(self.conn, &z)?;
         self.changes
-            .push(Change::ZoneCreated { zone: zone.clone() });
+            .push(Change::Dns(DnsChange::ZoneCreated { zone: zone.clone() }));
         Ok(zone)
     }
 
@@ -375,10 +474,10 @@ impl<'a> Tx<'a> {
         }
         let zone = sql::update_zone(self.conn, &after)?;
         self.touched.insert(zone.id, zone.name.clone());
-        self.changes.push(Change::ZoneUpdated {
+        self.changes.push(Change::Dns(DnsChange::ZoneUpdated {
             before,
             after: zone.clone(),
-        });
+        }));
         Ok(zone)
     }
 
@@ -395,7 +494,7 @@ impl<'a> Tx<'a> {
         sql::delete_zone(self.conn, zone.id)?;
         self.touched.remove(&zone.id);
         self.changes
-            .push(Change::ZoneDeleted { zone: zone.clone() });
+            .push(Change::Dns(DnsChange::ZoneDeleted { zone: zone.clone() }));
         Ok(())
     }
 
@@ -508,10 +607,10 @@ impl<'a> Tx<'a> {
             },
         )?;
         self.touched.insert(zone.id, zone.name.clone());
-        self.changes.push(Change::RecordCreated {
+        self.changes.push(Change::Dns(DnsChange::RecordCreated {
             zone: zone.name.clone(),
             record: record.clone(),
-        });
+        }));
         Ok(record)
     }
 
@@ -548,11 +647,11 @@ impl<'a> Tx<'a> {
             },
         )?;
         self.touched.insert(zone.id, zone.name.clone());
-        self.changes.push(Change::RecordUpdated {
+        self.changes.push(Change::Dns(DnsChange::RecordUpdated {
             zone: zone.name.clone(),
             before: before.clone(),
             after: after.clone(),
-        });
+        }));
         Ok(after)
     }
 
@@ -560,10 +659,10 @@ impl<'a> Tx<'a> {
     pub fn expire_record(&mut self, zone: &Zone, record: &Record) -> MResult<()> {
         sql::mark_expired(self.conn, record.id)?;
         self.touched.insert(zone.id, zone.name.clone());
-        self.changes.push(Change::RecordExpired {
+        self.changes.push(Change::Dns(DnsChange::RecordExpired {
             zone: zone.name.clone(),
             record: record.clone(),
-        });
+        }));
         Ok(())
     }
 
@@ -571,10 +670,10 @@ impl<'a> Tx<'a> {
     /// served, so the serial does not change.
     pub fn reap_record(&mut self, zone: &Zone, record: &Record) -> MResult<()> {
         sql::delete_record(self.conn, record.id)?;
-        self.changes.push(Change::RecordReaped {
+        self.changes.push(Change::Dns(DnsChange::RecordReaped {
             zone: zone.name.clone(),
             record: record.clone(),
-        });
+        }));
         Ok(())
     }
 
@@ -585,10 +684,10 @@ impl<'a> Tx<'a> {
     pub fn delete_record(&mut self, zone: &Zone, record: &Record) -> MResult<()> {
         sql::delete_record(self.conn, record.id)?;
         self.touched.insert(zone.id, zone.name.clone());
-        self.changes.push(Change::RecordDeleted {
+        self.changes.push(Change::Dns(DnsChange::RecordDeleted {
             zone: zone.name.clone(),
             record: record.clone(),
-        });
+        }));
         Ok(())
     }
 
@@ -605,7 +704,7 @@ impl<'a> Tx<'a> {
             .map(|m| m.created_at.clone())
             .unwrap_or_else(now_rfc3339);
         sql::upsert_member(self.conn, zone.id, user.id, role, &created_at)?;
-        self.changes.push(Change::MemberSet {
+        self.changes.push(Change::Dns(DnsChange::MemberSet {
             zone: zone.name.clone(),
             zone_id: zone.id,
             user_id: user.id,
@@ -613,7 +712,7 @@ impl<'a> Tx<'a> {
             role: role.into(),
             previous: previous.map(|m| m.role),
             created_at,
-        });
+        }));
         Ok(())
     }
 
@@ -627,10 +726,10 @@ impl<'a> Tx<'a> {
             ..zone.clone()
         };
         let after = sql::update_zone(self.conn, &after)?;
-        self.changes.push(Change::ZoneUpdated {
+        self.changes.push(Change::Dns(DnsChange::ZoneUpdated {
             before: zone.clone(),
             after: after.clone(),
-        });
+        }));
         Ok(after)
     }
 
@@ -641,13 +740,13 @@ impl<'a> Tx<'a> {
             .find(|m| m.user_id == user_id)
             .ok_or_else(|| MutationError::NotFound("membership not found".into()))?;
         sql::delete_member(self.conn, zone.id, user_id)?;
-        self.changes.push(Change::MemberRemoved {
+        self.changes.push(Change::Dns(DnsChange::MemberRemoved {
             zone: zone.name.clone(),
             zone_id: zone.id,
             user_id,
             username: m.username,
             role: m.role,
-        });
+        }));
         Ok(())
     }
 
@@ -664,14 +763,14 @@ impl<'a> Tx<'a> {
     /// Store a zone's signing key. An account-class change: the private
     /// key reaches standbys but never the changelog API or websocket.
     pub fn set_dnssec_key(&mut self, key: crate::replication::types::ReplDnssecKey) -> MResult<()> {
-        let change = Change::DnssecKeySet { key };
+        let change = SecretChange::DnssecKeySet { key };
         acct_sql::write(self.conn, &acct_sql::Ctx::verbatim(), &change)?
             .log_into(change, &mut self.changes);
         Ok(())
     }
 
     pub fn delete_dnssec_key(&mut self, zone: &Zone) -> MResult<()> {
-        let change = Change::DnssecKeyDeleted {
+        let change = SecretChange::DnssecKeyDeleted {
             zone_id: zone.id,
             zone: zone.name.clone(),
         };
@@ -685,11 +784,11 @@ impl<'a> Tx<'a> {
     pub fn resign_zone(&mut self, zone: &Zone, key_tag: u16) -> MResult<()> {
         self.touched.insert(zone.id, zone.name.clone());
         self.resigned.insert(zone.id);
-        self.changes.push(Change::ZoneResigned {
+        self.changes.push(Change::Dns(DnsChange::ZoneResigned {
             zone: zone.name.clone(),
             zone_id: zone.id,
             key_tag,
-        });
+        }));
         Ok(())
     }
 
@@ -700,7 +799,7 @@ impl<'a> Tx<'a> {
         mut self,
         actor: &Actor,
         command: &str,
-    ) -> MResult<(Vec<ChangeEvent>, Vec<i64>)> {
+    ) -> MResult<(Vec<DnsEvent>, Vec<i64>)> {
         for (zone_id, name) in std::mem::take(&mut self.touched) {
             let Some(z) = db::get_zone_by_id(self.conn, zone_id)? else {
                 continue;
@@ -728,22 +827,22 @@ impl<'a> Tx<'a> {
                 &updated_at,
                 signed_at.as_deref(),
             )?;
-            self.changes.push(Change::SerialBumped {
+            self.changes.push(Change::Dns(DnsChange::SerialBumped {
                 zone: name,
                 zone_id,
                 serial,
                 updated_at,
                 signed_at,
-            });
+            }));
         }
         let txn = crate::auth::random_token(9);
         let mut events = Vec::with_capacity(self.changes.len());
         for c in &self.changes {
             let ev = sql::append_changelog(self.conn, actor, command, &txn, c)?;
             // Account-class rows (secrets) are for standbys only: never
-            // published to the websocket / live feed.
-            if c.class() == CLASS_DNS {
-                events.push(ev);
+            // published to the websocket / live feed (no DnsEvent).
+            if let Change::Dns(d) = c {
+                events.push(DnsEvent::new(ev, d));
             }
         }
         Ok((events, catalog_zones(&self.changes)))
@@ -1042,6 +1141,41 @@ mod tests {
             expected,
             "the fixture covers every kind"
         );
+    }
+
+    /// E2: every stored kind reads into its family (the class it had as
+    /// one enum: the changelog row's `class` column of rows already
+    /// stored), and a bad payload's error says what is wrong.
+    #[test]
+    fn stored_kinds_read_into_their_family() {
+        let dns_kinds = [
+            "zone_created",
+            "zone_updated",
+            "zone_deleted",
+            "record_created",
+            "record_updated",
+            "record_expired",
+            "record_reaped",
+            "record_deleted",
+            "serial_bumped",
+            "member_set",
+            "member_removed",
+            "zone_resigned",
+        ];
+        let text = std::fs::read_to_string(fixture_path()).unwrap();
+        for line in text.lines() {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            let kind = v["kind"].as_str().unwrap();
+            let change: Change = serde_json::from_value(v.clone()).unwrap();
+            let dns = dns_kinds.contains(&kind);
+            assert_eq!(matches!(change, Change::Dns(_)), dns, "{kind}");
+            assert_eq!(change.class(), if dns { CLASS_DNS } else { CLASS_ACCOUNT });
+        }
+        let err = |j: &str| serde_json::from_str::<Change>(j).unwrap_err().to_string();
+        assert!(err(r#"{"kind":"no_such_kind"}"#).contains("unknown variant `no_such_kind`"));
+        assert!(err(r#"{"kind":"user_deleted","user_id":1}"#).contains("missing field `username`"));
+        assert!(err(r#"{"kind":"zone_deleted"}"#).contains("missing field `zone`"));
+        assert!(err(r#"{"zone":1}"#).contains("missing field `kind`"));
     }
 
     #[tokio::test]

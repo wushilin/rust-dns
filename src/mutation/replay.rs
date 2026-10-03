@@ -8,7 +8,7 @@
 #![allow(dead_code)]
 
 use super::acct_sql::{self, Ctx};
-use super::{sql, Change, TOKEN};
+use super::{sql, Change, DnsChange, TOKEN};
 use crate::model::ChangeEvent;
 use crate::storage::Storage;
 use anyhow::{bail, Context, Result};
@@ -18,58 +18,51 @@ use rusqlite::Connection;
 /// does not compile until it can be replayed.
 pub(super) fn apply(c: &Connection, change: &Change, ctx: &Ctx) -> Result<()> {
     match change {
-        Change::ZoneCreated { zone } => {
+        Change::Dns(d) => apply_dns(c, d)?,
+        // Account class: one entry point, which hands back a receipt; this
+        // is a replay (the caller copies the primary's changelog row).
+        Change::Secret(s) => acct_sql::write(c, ctx, s)?.replayed(),
+    }
+    Ok(())
+}
+
+fn apply_dns(c: &Connection, change: &DnsChange) -> Result<()> {
+    match change {
+        DnsChange::ZoneCreated { zone } => {
             sql::insert_zone(c, zone)?;
         }
-        Change::ZoneUpdated { after, .. } => {
+        DnsChange::ZoneUpdated { after, .. } => {
             sql::update_zone(c, after)?;
         }
-        Change::ZoneDeleted { zone } => sql::delete_zone(c, zone.id)?,
-        Change::RecordCreated { record, .. } => {
+        DnsChange::ZoneDeleted { zone } => sql::delete_zone(c, zone.id)?,
+        DnsChange::RecordCreated { record, .. } => {
             sql::insert_record(c, record)?;
         }
-        Change::RecordUpdated { after, .. } => {
+        DnsChange::RecordUpdated { after, .. } => {
             sql::update_record(c, after)?;
         }
-        Change::RecordDeleted { record, .. } => sql::delete_record(c, record.id)?,
-        Change::RecordExpired { record, .. } => sql::mark_expired(c, record.id)?,
-        Change::RecordReaped { record, .. } => sql::delete_record(c, record.id)?,
-        Change::SerialBumped {
+        DnsChange::RecordDeleted { record, .. } => sql::delete_record(c, record.id)?,
+        DnsChange::RecordExpired { record, .. } => sql::mark_expired(c, record.id)?,
+        DnsChange::RecordReaped { record, .. } => sql::delete_record(c, record.id)?,
+        DnsChange::SerialBumped {
             zone_id,
             serial,
             updated_at,
             signed_at,
             ..
         } => sql::set_serial(c, *zone_id, *serial, updated_at, signed_at.as_deref())?,
-        Change::MemberSet {
+        DnsChange::MemberSet {
             zone_id,
             user_id,
             role,
             created_at,
             ..
         } => sql::upsert_member(c, *zone_id, *user_id, role, created_at)?,
-        Change::MemberRemoved {
+        DnsChange::MemberRemoved {
             zone_id, user_id, ..
         } => sql::delete_member(c, *zone_id, *user_id)?,
         // The serial bump that goes with it is its own change.
-        Change::ZoneResigned { .. } => {}
-        // Account class: one entry point, which hands back a receipt; this
-        // is a replay (the caller copies the primary's changelog row).
-        Change::UserCreated { .. }
-        | Change::UserUpdated { .. }
-        | Change::UserDeleted { .. }
-        | Change::TotpStepAccepted { .. }
-        | Change::RecoveryCodesReplaced { .. }
-        | Change::RecoveryCodeUsed { .. }
-        | Change::TokenCreated { .. }
-        | Change::TokenTagsSet { .. }
-        | Change::TokenRevoked { .. }
-        | Change::TsigKeySet { .. }
-        | Change::TsigKeyDeleted { .. }
-        | Change::SettingSet { .. }
-        | Change::SettingCleared { .. }
-        | Change::DnssecKeySet { .. }
-        | Change::DnssecKeyDeleted { .. } => acct_sql::write(c, ctx, change)?.replayed(),
+        DnsChange::ZoneResigned { .. } => {}
     }
     Ok(())
 }

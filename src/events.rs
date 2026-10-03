@@ -62,9 +62,11 @@ impl Bus {
         }
     }
 
-    pub fn publish_change(&self, ev: ChangeEvent) {
+    /// Publish a committed DNS change. Only a `DnsEvent` (made from a DNS
+    /// change, never from a secret one) can be published.
+    pub fn publish_change(&self, ev: crate::mutation::DnsEvent) {
         // Broadcast sends never block; an error only means shutdown.
-        let _ = self.changes.send(ev);
+        let _ = self.changes.send(ev.into_event());
     }
 
     pub fn publish_query(&self, ev: QueryEvent) {
