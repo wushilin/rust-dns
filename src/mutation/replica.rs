@@ -724,7 +724,7 @@ mod tests {
     /// (made with the standby's copy of the key) verifies.
     #[tokio::test]
     async fn a_standby_keeps_its_catalog_current_per_zone() {
-        use super::super::tests::{assert_catalog_is_current, random_dns_op};
+        use super::super::test_support::{assert_catalog_is_current, random_dns_op};
         use rand::SeedableRng;
         let (ps, pm, _pa) = node();
         let (ss, sm, _sa) = standby_node();

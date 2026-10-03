@@ -76,7 +76,7 @@ OpenAPI snapshot + validator, conformance (123), smoke-release, cargo-audit.
 
 ## Phase E: shape of the code
 
-- [ ] E1. Split `mutation/mod.rs` (2,850 lines): `tx.rs` (Tx, Change, finish),
+- [x] E1. Split `mutation/mod.rs` (2,850 lines): `tx.rs` (Tx, Change, finish),
   `gate.rs`, `ops.rs` (zone/record/member operations), `import_export.rs`,
   `expiry.rs`, `dnssec_ops.rs`; tests next to their module.
 - [ ] E2. `Change` split by class at the type level: `DnsChange` and
@@ -437,3 +437,16 @@ OpenAPI snapshot + validator, conformance (123), smoke-release, cargo-audit.
   refused` (400 pooled + 1,200 single-connection POSTs answered 401: none
   lost; fails in about half the runs without the middleware, 8/8 passes
   with it; 413 is JSON).
+- 2026-10-03: E1 done (pure move, no behaviour change). `mutation/mod.rs`
+  (3,866 lines) is now: `mod.rs` (WriteToken, Rebuild, MutationError,
+  Mutator with `execute` / `refresh_catalog` / catalog builds, 420
+  lines), `tx.rs` (Change, Tx, `finish`, catalog_zones), `gate.rs`
+  (WriteGate), `ops.rs` (zone/record/member operations and their
+  validation helpers), `dnssec_ops.rs`, `expiry.rs`, `import_export.rs`
+  (export types, import, export), each with its tests, and
+  `test_support.rs` (cfg(test): helpers shared with `replica`'s tests).
+  Public paths unchanged (`pub use` in mod.rs). Checked mechanically: the
+  multiset of non-blank lines of the old file equals that of the new
+  files except for module/`use` lines, `impl Mutator {` openers, three
+  `pub(super)`s on Tx (conn, new, finish), helper visibility and one
+  `ops::` path; same 191 unit tests.
