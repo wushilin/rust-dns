@@ -337,7 +337,7 @@ pub enum MemberRole {
 }
 
 /// What a caller may do with a zone.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 #[schema(example = "owner")]
 pub enum ZoneRole {
@@ -431,6 +431,71 @@ impl ZonePerm {
     }
 }
 
+/// M1: how far an API token is limited below its owner's rights. A token
+/// never has more than its owner: its effective role on a zone is the
+/// owner's role capped by `max_role`, and only on `zones` when given. No
+/// scope (or an empty one) = exactly the owner's rights, as before.
+/// Part of the token row (`api_tokens.scope`, JSON; NULL = unrestricted).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(example = json!({ "zones": ["example.com"], "max_role": "editor", "expires_at": "2099-12-31T00:00:00.000Z" }))]
+pub struct TokenScope {
+    /// Only these zones (lower-case names without the trailing dot).
+    /// Absent: every zone the owner has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_items = 256, example = json!(["example.com"]))]
+    pub zones: Option<Vec<String>>,
+    /// At most this role on any zone. Absent: the owner's role.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_role: Option<ZoneRole>,
+    /// The token stops working at this time (RFC 3339, UTC). Absent: never.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(format = DateTime, example = "2099-12-31T00:00:00.000Z")]
+    pub expires_at: Option<String>,
+}
+
+impl TokenScope {
+    /// No limit at all: the token has exactly its owner's rights.
+    pub fn is_unrestricted(&self) -> bool {
+        self.zones.is_none() && self.max_role.is_none() && self.expires_at.is_none()
+    }
+
+    /// Limited to some zones or a role: account-wide rights are withheld.
+    pub fn limits_zones(&self) -> bool {
+        self.zones.is_some() || self.max_role.is_some()
+    }
+
+    /// The token's role on `zone` given its owner's `role` (never higher).
+    pub fn cap(&self, zone: &str, role: ZoneRole) -> Option<ZoneRole> {
+        if let Some(zones) = &self.zones {
+            if !zones.iter().any(|z| z == zone) {
+                return None;
+            }
+        }
+        Some(match self.max_role {
+            Some(max) => role.min(max),
+            None => role,
+        })
+    }
+
+    /// Whether the token has expired at `now` (RFC 3339 UTC strings compare in order).
+    pub fn expired_at(&self, now: &str) -> bool {
+        self.expires_at.as_deref().is_some_and(|e| e <= now)
+    }
+}
+
+/// The role a caller holding `owner_role` on `zone` has through `scope`.
+pub fn scoped_role(
+    scope: Option<&TokenScope>,
+    zone: &str,
+    owner_role: Option<ZoneRole>,
+) -> Option<ZoneRole> {
+    let role = owner_role?;
+    match scope {
+        Some(s) => s.cap(zone, role),
+        None => Some(role),
+    }
+}
+
 /// Something a caller may do outside any one zone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -505,10 +570,25 @@ impl GlobalPerm {
     }
 
     /// Whether `user` holds this permission when authenticated `via`
-    /// ("session" or "token"); `Err` carries the reason when not.
-    pub fn check(self, user: &User, via: &str) -> Result<(), String> {
+    /// ("session" or "token") with the token's `scope` (M1; `None` for a
+    /// session or an unrestricted token); `Err` carries the reason when not.
+    /// A scope only ever removes rights.
+    pub fn check(self, user: &User, via: &str, scope: Option<&TokenScope>) -> Result<(), String> {
         if self.requires_admin() && !user.is_admin {
             return Err("administrators only".into());
+        }
+        if let Some(scope) = scope.filter(|s| !s.is_unrestricted()) {
+            if self == GlobalPerm::ManageOwnTokens {
+                return Err(
+                    "a scoped API token cannot create, change or revoke tokens (it could widen itself)"
+                        .into(),
+                );
+            }
+            if self.requires_admin() && scope.limits_zones() {
+                return Err(
+                    "an API token limited to zones or a role has no account-wide rights".into(),
+                );
+            }
         }
         if self.requires_session() && via != "session" {
             return Err("needs a signed-in browser session; API tokens cannot do this".into());
@@ -1199,7 +1279,7 @@ mod permission_tests {
         let allowed = |u: &User, via: &str| {
             GlobalPerm::ALL
                 .iter()
-                .filter(|p| p.check(u, via).is_ok())
+                .filter(|p| p.check(u, via, None).is_ok())
                 .copied()
                 .collect::<Vec<_>>()
         };
@@ -1230,5 +1310,88 @@ mod permission_tests {
             !allowed(&user(true, true), "session").contains(&ChangeOwnPassword),
             "root password lives in the config file"
         );
+        // M1: a scope only removes rights.
+        let scoped = |u: &User, scope: &TokenScope| {
+            GlobalPerm::ALL
+                .iter()
+                .filter(|p| p.check(u, "token", Some(scope)).is_ok())
+                .copied()
+                .collect::<Vec<_>>()
+        };
+        let admin = user(true, false);
+        let unrestricted = TokenScope::default();
+        assert_eq!(scoped(&admin, &unrestricted), allowed(&admin, "token"));
+        let expiring = TokenScope {
+            expires_at: Some("2999-01-01T00:00:00.000Z".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            scoped(&admin, &expiring),
+            vec![
+                CreateZones,
+                TransferOwnership,
+                ManageUsers,
+                ViewAudit,
+                ServerAdmin,
+                Replicate
+            ],
+            "no token management (a new token could outlive this one)"
+        );
+        for limit in [
+            TokenScope {
+                zones: Some(vec!["a.test".into()]),
+                ..Default::default()
+            },
+            TokenScope {
+                max_role: Some(ZoneRole::Owner),
+                ..Default::default()
+            },
+        ] {
+            assert!(scoped(&admin, &limit).is_empty(), "{limit:?}");
+            assert!(scoped(&user(false, false), &limit).is_empty());
+        }
+    }
+
+    /// M1: the effective role is min(owner's role, scope), only on the
+    /// scope's zones, and never more than the owner's.
+    #[test]
+    fn token_scope_caps_zone_roles() {
+        use ZoneRole::*;
+        let s = TokenScope {
+            zones: Some(vec!["a.test".into(), "b.test".into()]),
+            max_role: Some(Editor),
+            expires_at: None,
+        };
+        assert_eq!(scoped_role(Some(&s), "a.test", Some(Owner)), Some(Editor));
+        assert_eq!(scoped_role(Some(&s), "b.test", Some(Viewer)), Some(Viewer));
+        assert_eq!(scoped_role(Some(&s), "c.test", Some(Owner)), None);
+        assert_eq!(scoped_role(Some(&s), "a.test", None), None, "never widens");
+        assert_eq!(scoped_role(None, "c.test", Some(Owner)), Some(Owner));
+        let role_only = TokenScope {
+            max_role: Some(Viewer),
+            ..Default::default()
+        };
+        assert_eq!(
+            scoped_role(Some(&role_only), "z.test", Some(Owner)),
+            Some(Viewer)
+        );
+        for role in [Viewer, Editor, Owner] {
+            for max in [Viewer, Editor, Owner] {
+                let s = TokenScope {
+                    max_role: Some(max),
+                    ..Default::default()
+                };
+                let got = scoped_role(Some(&s), "x", Some(role)).unwrap();
+                assert!(got <= role && got <= max);
+            }
+        }
+        let exp = TokenScope {
+            expires_at: Some("2026-10-04T10:00:00.000Z".into()),
+            ..Default::default()
+        };
+        assert!(!exp.expired_at("2026-10-04T09:59:59.999Z"));
+        assert!(exp.expired_at("2026-10-04T10:00:00.000Z"));
+        assert!(TokenScope::default().is_unrestricted());
+        assert_eq!(serde_json::to_string(&TokenScope::default()).unwrap(), "{}");
     }
 }

@@ -211,7 +211,7 @@ fn tokens_where(
     p: &[&dyn rusqlite::ToSql],
 ) -> Result<Vec<ReplToken>> {
     let mut stmt = c.prepare(&format!(
-        "SELECT id, user_id, name, token_hash, created_at, revoked_at, tags FROM api_tokens {filter} ORDER BY id"
+        "SELECT id, user_id, name, token_hash, created_at, revoked_at, tags, scope FROM api_tokens {filter} ORDER BY id"
     ))?;
     let rows = stmt.query_map(p, |r| {
         let tags: String = r.get(6)?;
@@ -223,6 +223,7 @@ fn tokens_where(
             created_at: r.get(4)?,
             revoked_at: r.get(5)?,
             tags: serde_json::from_str(&tags).unwrap_or_default(),
+            scope: crate::storage::parse_scope_column(r.get(7)?, 7)?,
         })
     })?;
     Ok(rows.collect::<Result<_, _>>()?)

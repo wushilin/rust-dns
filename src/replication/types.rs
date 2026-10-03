@@ -136,6 +136,9 @@ pub struct ReplToken {
     #[schema(required = true)]
     pub revoked_at: Option<String>,
     pub tags: Vec<String>,
+    /// M1: absent = unrestricted (every token written before M1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<crate::model::TokenScope>,
 }
 
 impl std::fmt::Debug for ReplToken {

@@ -138,6 +138,7 @@ td.actions .btn { margin-left: 4px; }
 .tag[data-filter]:hover { outline: 1px solid var(--accent); }
 .tag button { border: 0; background: none; color: inherit; cursor: pointer; font-size: 14px; line-height: 1; padding: 0 0 0 2px; opacity: .7; }
 .tag button:hover { opacity: 1; }
+label.check { display: flex; gap: 8px; align-items: center; margin: 4px 0; font-weight: normal; }
 .tag-input { display: flex; flex-wrap: wrap; align-items: center; gap: 2px; min-height: 38px; padding: 3px 8px 6px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); cursor: text; }
 .tag-input:focus-within { border-color: var(--accent); }
 .tag-msg.error { color: var(--danger); }
@@ -1850,12 +1851,12 @@ function entryModal(title, rows, detail, detailLabel = 'Details') {
 // ---------------------------------------------------------------------------
 // effective rights (from the same permission table the API enforces)
 // ---------------------------------------------------------------------------
-async function rightsModal(userId, via, tokenName) {
+async function rightsModal(userId, via, tokenName, tokenId) {
   let r;
-  try { r = await GET(`/users/${userId}/rights?via=${via}`); } catch (e) { toast(e.message, 'err'); return; }
+  try { r = await GET(`/users/${userId}/rights?via=${via}${tokenId ? `&token_id=${Number(tokenId)}` : ''}`); } catch (e) { toast(e.message, 'err'); return; }
   const permLabel = Object.fromEntries(r.zone_permissions.map(p => [p.perm, p.label]));
   const title = via === 'token'
-    ? `API token ${tokenName ? `<span class="mono">${esc(tokenName)}</span>` : ''} · owner <b>${esc(r.user.username)}</b>`
+    ? `API token ${tokenName ? `<span class="mono">${esc(tokenName)}</span>` : ''} · owner <b>${esc(r.user.username)}</b>${r.token ? ` · scope ${scopeSummary(r.token.scope)}` : ''}`
     : `<b>${esc(r.user.username)}</b> (signed in)`;
   const yes = '<span class="badge ok">allowed</span>', no = why => `<span class="badge muted" title="${esc(why || '')}">not allowed</span>`;
   openModal(`<h2>Effective rights</h2>
@@ -2494,6 +2495,38 @@ function userModal(u) {
 // ---------------------------------------------------------------------------
 const TAG_RE = /^[A-Za-z0-9_-]{1,256}$/, MAX_TAGS = 16;
 const tagChip = (t, attrs = '') => `<span class="tag" ${attrs}>${esc(t)}</span>`;
+// M1: a token's scope, shown and edited. Absent / {} = its owner's rights.
+function scopeSummary(sc) {
+  if (!sc || (!sc.zones && !sc.max_role && !sc.expires_at)) return '<span class="hint">owner\'s rights</span>';
+  const expired = sc.expires_at && sc.expires_at <= new Date().toISOString();
+  return [sc.zones ? `<span class="badge muted" title="${esc(sc.zones.join(', '))}">${sc.zones.length === 1 ? esc(sc.zones[0]) : `${sc.zones.length} zones`}</span>` : '',
+    sc.max_role ? `<span class="badge muted">≤ ${esc(sc.max_role)}</span>` : '',
+    sc.expires_at ? `<span class="badge ${expired ? 'bad' : 'muted'}" title="${esc(sc.expires_at)}">${expired ? 'expired' : 'until ' + esc(fmtTime(sc.expires_at))}</span>` : ''].join(' ');
+}
+// Scope fields in `host`; returns a getter: the scope object, or null (and a message) when invalid.
+function scopeInput(host, sc) {
+  sc = sc || {};
+  const names = [...new Set([...S.zones.map(z => z.name), ...(sc.zones || [])])].sort();
+  const local = sc.expires_at ? (d => new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16))(new Date(sc.expires_at)) : '';
+  host.innerHTML = `<div class="field"><label>Zones</label>
+      <label class="check"><input type="radio" name="sc-all" value="all" ${sc.zones ? '' : 'checked'}> every zone of the owner</label>
+      <label class="check"><input type="radio" name="sc-all" value="some" ${sc.zones ? 'checked' : ''}> only these:</label>
+      <div class="sc-zones" style="max-height:160px;overflow:auto;padding-left:22px">${names.length ? names.map(n => `<label class="check"><input type="checkbox" name="sc-zone" value="${esc(n)}" ${(sc.zones || []).includes(n) ? 'checked' : ''}> <span class="mono">${esc(n)}</span></label>`).join('') : '<span class="hint">no zones</span>'}</div></div>
+    <div class="field"><label>Highest role</label><select name="sc-role"><option value="">the owner's role</option>${['viewer', 'editor', 'owner'].map(r => `<option ${sc.max_role === r ? 'selected' : ''}>${r}</option>`).join('')}</select></div>
+    <div class="field"><label>Expires <span class="hint">(optional, your local time)</span></label><input type="datetime-local" name="sc-exp" value="${local}"></div>
+    <p class="hint">A token never has more than its owner. A token with any limit cannot manage tokens; one limited to zones or a role has no account-wide rights.</p>`;
+  return () => {
+    const out = {};
+    if (host.querySelector('[name=sc-all]:checked').value === 'some') {
+      out.zones = [...host.querySelectorAll('[name=sc-zone]:checked')].map(c => c.value);
+      if (!out.zones.length) return { error: 'Pick at least one zone, or choose every zone' };
+    }
+    const role = host.querySelector('[name=sc-role]').value; if (role) out.max_role = role;
+    const exp = host.querySelector('[name=sc-exp]').value;
+    if (exp) { const d = new Date(exp); if (isNaN(d)) return { error: 'Invalid expiry time' }; out.expires_at = d.toISOString(); }
+    return { scope: out };
+  };
+}
 // Chip input: Enter, comma or blur adds a tag, × or Backspace removes one.
 function tagInput(host, initial) {
   const tags = [...initial];
@@ -2529,11 +2562,12 @@ async function viewTokens() {
   const known = [...new Set(tokens.flatMap(t => t.tags))].sort();
   const row = t => `<tr data-tok="${t.id}">
       <td><b>${esc(t.name)}</b><div class="tags">${t.tags.map(g => tagChip(g, `data-filter="${esc(g)}" title="Show only tokens tagged ${esc(g)}"`)).join('')}</div></td>
-      ${showOwner ? `<td><a href="#" data-rights="${t.user_id}" data-token="${esc(t.name)}" title="Show what this token can do">${esc(t.username || '?')}</a></td>` : ''}
+      <td>${scopeSummary(t.scope)}<div><a href="#" data-rights="${t.user_id}" data-token="${esc(t.name)}" data-token-id="${t.id}" title="Show what this token can do">effective rights</a></div></td>
+      ${showOwner ? `<td>${esc(t.username || '?')}</td>` : ''}
       <td class="hint">${fmtTime(t.created_at)}</td>
       <td>${t.last_used_at ? `<span title="${esc(t.last_used_at)} (updated at most once a minute per address)">${ago(t.last_used_at)}</span>` : '<span class="hint">never</span>'}<div class="mono hint">${esc(t.last_used_ip || '—')}</div></td>
-      <td class="actions"><button class="btn sm ghost" data-edit="${t.id}" data-perm="manage_own_tokens">Edit tags</button><button class="btn sm ghost danger" data-rev="${t.id}" data-perm="manage_own_tokens">Revoke</button></td></tr>`;
-  const cols = showOwner ? 5 : 4;
+      <td class="actions"><button class="btn sm ghost" data-edit="${t.id}" data-perm="manage_own_tokens">Edit</button><button class="btn sm ghost danger" data-rev="${t.id}" data-perm="manage_own_tokens">Revoke</button></td></tr>`;
+  const cols = showOwner ? 6 : 5;
   $('#main').innerHTML = `<div class="topbar"><h1>API tokens</h1><button class="btn primary" id="t-new" data-perm="manage_own_tokens">New token</button></div>
     <div class="card"><div class="toolbar row" style="padding:12px 14px 0">
       <label class="hint" for="t-tag">Tag</label>
@@ -2541,10 +2575,10 @@ async function viewTokens() {
       ${tag ? `<span class="tag on">${esc(tag)}<button type="button" id="t-clear" data-ro-ok aria-label="Clear filter">×</button></span>` : ''}
       <span class="hint" style="margin-left:auto">${tokens.length} token${tokens.length === 1 ? '' : 's'}${tag ? ' tagged ' + esc(tag) : ''}</span>
     </div>
-    <div class="tw"><table><thead><tr><th>Name / tags</th>${showOwner ? '<th>Owner</th>' : ''}<th>Created</th><th title="Updated at most once a minute, immediately when the address changes">Last used</th><th></th></tr></thead><tbody>
+    <div class="tw"><table><thead><tr><th>Name / tags</th><th>Scope</th>${showOwner ? '<th>Owner</th>' : ''}<th>Created</th><th title="Updated at most once a minute, immediately when the address changes">Last used</th><th></th></tr></thead><tbody>
     ${tokens.length ? tokens.map(row).join('') : `<tr><td colspan="${cols}" class="empty">${tag ? 'No tokens with this tag' : 'No tokens'}</td></tr>`}
     </tbody></table></div></div>
-    <div class="card panel" style="margin-top:14px"><h2>Using the API</h2><p class="hint">Tokens carry the permissions of the user who created them.${showOwner ? ' Click an owner to see exactly what a token can do.' : ''} Send them as a bearer header. Tags are labels for your own bookkeeping (<code>GET /api/tokens?tag=ci</code>); they do not change permissions. The full reference is in the API explorer and at <a href="/api/openapi.json" target="_blank">/api/openapi.json</a>.</p>
+    <div class="card panel" style="margin-top:14px"><h2>Using the API</h2><p class="hint">Tokens carry the permissions of the user who created them, limited by their scope (zones, highest role, expiry); "effective rights" shows exactly what a token can do. Send them as a bearer header. Tags are labels for your own bookkeeping (<code>GET /api/tokens?tag=ci</code>); they do not change permissions. The full reference is in the API explorer and at <a href="/api/openapi.json" target="_blank">/api/openapi.json</a>.</p>
     <pre>curl -H "Authorization: Bearer rdns_…" ${esc(location.origin)}/api/zones
 curl -H "Authorization: Bearer rdns_…" -H "content-type: application/json" \\
      -d '{"name":"www","type":"A","value":"10.0.0.1"}' ${esc(location.origin)}/api/zones/example.com/records</pre></div>`;
@@ -2553,30 +2587,36 @@ curl -H "Authorization: Bearer rdns_…" -H "content-type: application/json" \\
   if ($('#t-clear')) $('#t-clear').onclick = () => setTag('');
   $$('[data-filter]').forEach(c => c.onclick = () => setTag(c.dataset.filter));
   $('#t-new').onclick = () => openModal(`<h2>New API token</h2><div class="field"><label>Name</label><input type="text" name="name" placeholder="ci, ansible, home-assistant…"></div>
-    <div class="field"><label>Tags <span class="hint">(optional)</span></label><div id="m-tags"></div></div><div class="error" id="m-err"></div>
+    <div class="field"><label>Tags <span class="hint">(optional)</span></label><div id="m-tags"></div></div>
+    <details id="m-scope-d"><summary>Limit this token <span class="hint">(optional)</span></summary><div id="m-scope"></div></details><div class="error" id="m-err"></div>
     <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="m-ok" data-perm="manage_own_tokens">Create</button></div>`, m => {
     const getTags = tagInput($('#m-tags'), tag ? [tag] : []);
+    const getScope = scopeInput($('#m-scope'), null);
     m.querySelector('[name=name]').focus();
     $('#m-ok').onclick = async () => {
       const tags = getTags(); if (!tags) return;
-      try { const r = await POST('/tokens', { name: m.querySelector('[name=name]').value, tags }); openModal(`<h2>Token created</h2><p class="hint">Copy it now. It will not be shown again.</p>${cmdBlock(r.token)}<div class="foot"><button class="btn primary" data-close>Done</button></div>`); $$('[data-close]').forEach(b => b.addEventListener('click', viewTokens, { once: true })); }
+      const sc = getScope(); if (sc.error) { $('#m-err').textContent = sc.error; return; }
+      try { const r = await POST('/tokens', { name: m.querySelector('[name=name]').value, tags, scope: sc.scope }); openModal(`<h2>Token created</h2><p class="hint">Copy it now. It will not be shown again.</p>${cmdBlock(r.token)}<div class="foot"><button class="btn primary" data-close>Done</button></div>`); $$('[data-close]').forEach(b => b.addEventListener('click', viewTokens, { once: true })); }
       catch (e) { $('#m-err').textContent = e.message; }
     };
   });
   $$('[data-edit]').forEach(b => b.onclick = () => {
     const t = tokens.find(x => String(x.id) === b.dataset.edit);
-    openModal(`<h2>Tags for <span class="mono">${esc(t.name)}</span></h2><div class="field"><div id="m-tags"></div></div><div class="error" id="m-err"></div>
+    openModal(`<h2>Token <span class="mono">${esc(t.name)}</span></h2><div class="field"><label>Tags</label><div id="m-tags"></div></div>
+      <h3>Scope</h3><div id="m-scope"></div><div class="error" id="m-err"></div>
       <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="m-ok" data-perm="manage_own_tokens">Save</button></div>`, () => {
       const getTags = tagInput($('#m-tags'), t.tags);
+      const getScope = scopeInput($('#m-scope'), t.scope);
       $('#m-tags input').focus();
       $('#m-ok').onclick = async () => {
         const tags = getTags(); if (!tags) return;
-        try { await PUT('/tokens/' + t.id, { tags }); closeModal(); toast('Tags saved', 'ok'); viewTokens(); }
+        const sc = getScope(); if (sc.error) { $('#m-err').textContent = sc.error; return; }
+        try { await PUT('/tokens/' + t.id, { tags, scope: sc.scope }); closeModal(); toast('Token saved', 'ok'); viewTokens(); }
         catch (e) { $('#m-err').textContent = e.status === 403 ? 'Not your token: only its owner or an administrator can change it.' : e.message; }
       };
     });
   });
-  $$('[data-rights]').forEach(a => a.onclick = e => { e.preventDefault(); rightsModal(Number(a.dataset.rights), 'token', a.dataset.token); });
+  $$('[data-rights]').forEach(a => a.onclick = e => { e.preventDefault(); rightsModal(Number(a.dataset.rights), 'token', a.dataset.token, a.dataset.tokenId); });
   $$('[data-rev]').forEach(b => b.onclick = async () => { if (await confirmModal('Revoke token', 'Anything using this token will stop working.', 'Revoke', b)) { try { await DEL('/tokens/' + b.dataset.rev); toast('Token revoked', 'ok'); viewTokens(); } catch (e) { toast(e.message, 'err'); } } });
 }
 

@@ -24,6 +24,11 @@ pub struct Table {
     /// checksum covers them (the per-zone checksum) and older versions do
     /// not have them (a mixed-version primary/standby pair keeps matching).
     pub compat_columns: &'static [&'static str],
+    /// Replicated columns newer versions added, in the table checksum only
+    /// where not NULL: a version without the column computes the same
+    /// checksum while every value is NULL, and a row that uses it differs
+    /// there (an older peer cannot represent it: it halts, see plan.md).
+    pub optional_columns: &'static [&'static str],
     /// Rows a fresh database may still have (`?1` = the config root's name).
     pub fresh_keeps: Option<&'static str>,
     /// Rows of the server's own root account, which is local on a standby
@@ -48,6 +53,7 @@ const fn replicated(
         class: Class::Replicated,
         node_columns: &[],
         compat_columns: &[],
+        optional_columns: &[],
         fresh_keeps: None,
         own_root_rows: None,
         order,
@@ -61,6 +67,7 @@ const fn local(name: &'static str) -> Table {
         class: Class::Local,
         node_columns: &[],
         compat_columns: &[],
+        optional_columns: &[],
         fresh_keeps: None,
         own_root_rows: None,
         order: "rowid",
@@ -118,6 +125,8 @@ pub const TABLES: &[Table] = &[
     },
     Table {
         node_columns: &["last_used_at", "last_used_ip"],
+        // M1: `scope` NULL = unrestricted (every token before M1).
+        optional_columns: &["scope"],
         ..replicated("api_tokens", "id", ("API token", "API tokens"))
     },
     replicated(
@@ -182,10 +191,18 @@ pub fn dump(
     );
     let mut stmt = c.prepare(&sql)?;
     let n = cols.len();
+    let optional: Vec<bool> = cols
+        .iter()
+        .map(|c| t.optional_columns.contains(&c.as_str()))
+        .collect();
     let rows = stmt.query_map(params![skip_root], |r| {
         let mut v = Vec::with_capacity(n);
         for i in 0..n {
-            v.push(match r.get_ref(i)? {
+            let value = r.get_ref(i)?;
+            if optional[i] && value == rusqlite::types::ValueRef::Null {
+                continue;
+            }
+            v.push(match value {
                 rusqlite::types::ValueRef::Null => serde_json::Value::Null,
                 rusqlite::types::ValueRef::Integer(x) => x.into(),
                 rusqlite::types::ValueRef::Real(x) => x.into(),
@@ -300,7 +317,12 @@ mod tests {
                     t.name
                 );
                 let cols = columns(c, t.name)?;
-                for col in t.node_columns.iter().chain(t.compat_columns) {
+                for col in t
+                    .node_columns
+                    .iter()
+                    .chain(t.compat_columns)
+                    .chain(t.optional_columns)
+                {
                     assert!(
                         cols.iter().any(|x| x == col),
                         "{}.{col} does not exist",
@@ -311,5 +333,36 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    /// M1: `api_tokens.scope` is in the table checksum only where set, so
+    /// a version without the column (d32d67f, 3884ba8) computes the same
+    /// checksum while no token is scoped, and a scoped token differs (an
+    /// older standby cannot enforce it: it must halt, not serve it unscoped).
+    #[test]
+    fn a_scope_column_matches_older_versions_until_used() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE api_tokens (id INTEGER PRIMARY KEY, user_id INTEGER, name TEXT, token_hash TEXT,
+                created_at TEXT, last_used_at TEXT, revoked_at TEXT, last_used_ip TEXT, tags TEXT);
+             INSERT INTO api_tokens VALUES (1, 1, 'a', 'h1', 't', 'u', NULL, '1.2.3.4', '[]');
+             INSERT INTO api_tokens VALUES (2, 1, 'b', 'h2', 't', NULL, 't2', NULL, '[\"x\"]');",
+        )
+        .unwrap();
+        let t = TABLES.iter().find(|t| t.name == "api_tokens").unwrap();
+        let sum = |c: &Connection| {
+            let exclude: Vec<&str> = t.node_columns.to_vec();
+            super::super::data::sha256_json(&dump(c, t, &exclude, None).unwrap()).unwrap()
+        };
+        let old = sum(&c);
+        c.execute_batch("ALTER TABLE api_tokens ADD COLUMN scope TEXT")
+            .unwrap();
+        assert_eq!(sum(&c), old, "unscoped tokens: same as without the column");
+        c.execute(
+            "UPDATE api_tokens SET scope = ?1 WHERE id = 2",
+            params![r#"{"max_role":"viewer"}"#],
+        )
+        .unwrap();
+        assert_ne!(sum(&c), old, "a scoped token is compared");
     }
 }

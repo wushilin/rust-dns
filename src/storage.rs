@@ -227,7 +227,9 @@ CREATE TABLE IF NOT EXISTS api_tokens (
     last_used_at TEXT,
     revoked_at   TEXT,
     last_used_ip TEXT,
-    tags         TEXT NOT NULL DEFAULT '[]'
+    tags         TEXT NOT NULL DEFAULT '[]',
+    -- M1: the token's scope as JSON (`TokenScope`); NULL = unrestricted.
+    scope        TEXT
 );
 "#;
 
@@ -255,6 +257,10 @@ pub struct TokenInfo {
     pub last_used_ip: Option<String>,
     #[schema(required = true, format = DateTime)]
     pub revoked_at: Option<String>,
+    /// M1: how the token is limited below its owner's rights; absent =
+    /// exactly the owner's rights.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<crate::model::TokenScope>,
 }
 
 /// `last_used_at` is refreshed at most this often while the IP is unchanged.
@@ -310,6 +316,8 @@ fn migrate_api_tokens(conn: &Connection) -> Result<()> {
             "tags",
             "ALTER TABLE api_tokens ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'",
         ),
+        // M1: NULL for every existing token (unrestricted, as before).
+        ("scope", "ALTER TABLE api_tokens ADD COLUMN scope TEXT"),
     ] {
         if !cols.iter().any(|c| c == col) {
             conn.execute_batch(ddl)?;
@@ -1151,7 +1159,29 @@ fn row_to_session(r: &Row<'_>) -> rusqlite::Result<Session> {
 }
 
 const TOKEN_COLS: &str =
-    "id, user_id, name, created_at, last_used_at, revoked_at, last_used_ip, tags";
+    "id, user_id, name, created_at, last_used_at, revoked_at, last_used_ip, tags, scope";
+
+/// `api_tokens.scope` as stored: NULL for an unrestricted token.
+pub fn scope_column(scope: Option<&crate::model::TokenScope>) -> Option<String> {
+    scope
+        .filter(|s| !s.is_unrestricted())
+        .map(|s| serde_json::to_string(s).expect("a scope serializes"))
+}
+
+/// `api_tokens.scope` read back (an unreadable value never widens: it is
+/// an error, not "unrestricted").
+pub fn parse_scope_column(
+    v: Option<String>,
+    idx: usize,
+) -> rusqlite::Result<Option<crate::model::TokenScope>> {
+    v.map(|v| {
+        serde_json::from_str::<crate::model::TokenScope>(&v).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(idx, rusqlite::types::Type::Text, Box::new(e))
+        })
+    })
+    .transpose()
+    .map(|s| s.filter(|s| !s.is_unrestricted()))
+}
 
 fn row_to_token(r: &Row<'_>) -> rusqlite::Result<TokenInfo> {
     let tags: String = r.get(7)?;
@@ -1166,6 +1196,7 @@ fn row_to_token(r: &Row<'_>) -> rusqlite::Result<TokenInfo> {
         last_used_at: r.get(4)?,
         last_used_ip: r.get(6)?,
         revoked_at: r.get(5)?,
+        scope: parse_scope_column(r.get(8)?, 8)?,
     })
 }
 

@@ -89,7 +89,19 @@ divergence. Divergence halts the standby.
 - Only a fresh database, or one already in this primary's history, may start
   following. Discarding data is always an explicit operator action.
 
-## 5. Before a change is done
+## 5. Rights are checked in one place
+
+- Every permission comes from the table in `model.rs` (`ZonePerm`,
+  `GlobalPerm`), checked through the `Caller`: `require`, `has`,
+  `require_zone`, `visible_zones`, `ws::View::build`. These apply the API
+  token's scope (M1), which only ever removes rights. Never decide access
+  from `caller.user` directly (`is_admin`, `owner_id`, memberships): that
+  would ignore the scope.
+- A new column that older versions do not have and that changes what a row
+  means (a token's scope) goes in `optional_columns` (in the table checksum
+  only where set), so an older standby halts rather than serving it wrong.
+
+## 6. Before a change is done
 
 - Tests prove the change is logged and replays: a unit test on the change
   kind, the replay equality test, and for anything that crosses servers a

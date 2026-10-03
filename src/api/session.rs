@@ -33,9 +33,17 @@ pub struct Caller {
     /// The API token used, when `via` is `Token`.
     pub token_id: Option<i64>,
     pub via: AuthVia,
+    /// M1: the token's scope (`None` for a session or an unrestricted
+    /// token). Every rights check below goes through it; it only removes
+    /// rights.
+    pub scope: Option<TokenScope>,
 }
 
 impl Caller {
+    pub fn scope(&self) -> Option<&TokenScope> {
+        self.scope.as_ref()
+    }
+
     pub fn actor(&self) -> Actor {
         Actor {
             name: self.user.username.clone(),
@@ -173,12 +181,18 @@ impl FromRequestParts<Arc<AppState>> for Caller {
             if user.disabled_at.is_some() {
                 return Err(ApiError::unauthorized("account disabled"));
             }
+            let scope = info.scope.filter(|s| !s.is_unrestricted());
+            if scope.as_ref().is_some_and(|s| s.expired_at(&now_rfc3339())) {
+                tracing::warn!(%ip, token_id = info.id, "rejected expired API token");
+                return Err(ApiError::unauthorized("API token expired"));
+            }
             return Ok(Caller {
                 user,
                 ip,
                 session_id: None,
                 token_id: Some(info.id),
                 via: AuthVia::Token,
+                scope,
             });
         }
         match load_session(state, &parts.headers)? {
@@ -204,6 +218,7 @@ impl FromRequestParts<Arc<AppState>> for Caller {
                     session_id: Some(sess.id),
                     token_id: None,
                     via: AuthVia::Session,
+                    scope: None,
                 })
             }
             Some((sess, _)) => Err(ApiError::unauthorized("additional authentication required")
@@ -221,18 +236,23 @@ impl FromRequestParts<Arc<AppState>> for Caller {
 // ---- authorisation --------------------------------------------------------
 
 impl AppState {
-    /// The caller's role on a zone, if any.
-    pub fn zone_role(&self, user: &User, zone: &Zone) -> ApiResult<Option<ZoneRole>> {
-        if user.is_admin {
-            return Ok(Some(ZoneRole::Owner));
-        }
-        if zone.owner_id == Some(user.id) {
-            return Ok(Some(ZoneRole::Owner));
-        }
-        let m = self.storage.memberships_for_user(user.id)?;
-        Ok(m.into_iter()
-            .find(|(zid, _)| *zid == zone.id)
-            .and_then(|(_, r)| ZoneRole::parse(&r)))
+    /// The role `user` has on a zone through `scope` (M1: a token's scope
+    /// caps the user's role, see [`TokenScope::cap`]), if any.
+    pub fn zone_role(
+        &self,
+        user: &User,
+        scope: Option<&TokenScope>,
+        zone: &Zone,
+    ) -> ApiResult<Option<ZoneRole>> {
+        let own = if user.is_admin || zone.owner_id == Some(user.id) {
+            Some(ZoneRole::Owner)
+        } else {
+            let m = self.storage.memberships_for_user(user.id)?;
+            m.into_iter()
+                .find(|(zid, _)| *zid == zone.id)
+                .and_then(|(_, r)| ZoneRole::parse(&r))
+        };
+        Ok(scoped_role(scope, &zone.name, own))
     }
 
     /// Fetch a zone and check the caller holds at least `min`.
@@ -247,47 +267,65 @@ impl AppState {
             .storage
             .get_zone(&name)?
             .ok_or_else(|| ApiError::not_found(format!("zone '{name}' not found")))?;
-        match self.zone_role(&caller.user, &zone)? {
+        match self.zone_role(&caller.user, caller.scope(), &zone)? {
             Some(r) if perm.allowed(r) => Ok((zone, r)),
             Some(r) => Err(ApiError::forbidden(format!(
-                "not allowed: {} needs the {} role on this zone; you are {}",
+                "not allowed: {} needs the {} role on this zone; you are {}{}",
                 perm.label(),
                 perm.min_role().as_str(),
-                r.as_str()
+                r.as_str(),
+                if caller.scope().is_some_and(|s| s.max_role.is_some()) {
+                    " (limited by this API token's scope)"
+                } else {
+                    ""
+                }
             ))),
             None => Err(ApiError::not_found(format!("zone '{name}' not found"))),
         }
     }
 
-    /// Zones visible to the caller with their role.
-    pub fn visible_zones(&self, user: &User) -> ApiResult<Vec<(Zone, ZoneRole)>> {
+    /// Zones visible to the caller with their role (through its token's
+    /// scope, if any).
+    pub fn visible_zones(&self, caller: &Caller) -> ApiResult<Vec<(Zone, ZoneRole)>> {
+        self.zones_of(&caller.user, caller.scope())
+    }
+
+    /// Zones `user` sees through `scope` (`None`: the user's own rights).
+    pub fn zones_of(
+        &self,
+        user: &User,
+        scope: Option<&TokenScope>,
+    ) -> ApiResult<Vec<(Zone, ZoneRole)>> {
         let zones = self.storage.list_zones()?;
-        if user.is_admin {
-            return Ok(zones.into_iter().map(|z| (z, ZoneRole::Owner)).collect());
-        }
-        let m = self.storage.memberships_for_user(user.id)?;
+        let m = if user.is_admin {
+            Vec::new()
+        } else {
+            self.storage.memberships_for_user(user.id)?
+        };
         Ok(zones
             .into_iter()
             .filter_map(|z| {
-                if z.owner_id == Some(user.id) {
-                    return Some((z, ZoneRole::Owner));
-                }
-                m.iter()
-                    .find(|(zid, _)| *zid == z.id)
-                    .and_then(|(_, r)| ZoneRole::parse(r))
-                    .map(|r| (z, r))
+                let own = if user.is_admin || z.owner_id == Some(user.id) {
+                    Some(ZoneRole::Owner)
+                } else {
+                    m.iter()
+                        .find(|(zid, _)| *zid == z.id)
+                        .and_then(|(_, r)| ZoneRole::parse(r))
+                };
+                scoped_role(scope, &z.name, own).map(|r| (z, r))
             })
             .collect())
     }
 
     /// Check an account-level permission from the permission table.
     pub fn require(&self, caller: &Caller, perm: GlobalPerm) -> ApiResult<()> {
-        perm.check(&caller.user, caller.via.as_str())
+        perm.check(&caller.user, caller.via.as_str(), caller.scope())
             .map_err(|why| ApiError::forbidden(format!("not allowed: {} ({why})", perm.label())))
     }
 
     pub fn has(&self, caller: &Caller, perm: GlobalPerm) -> bool {
-        perm.check(&caller.user, caller.via.as_str()).is_ok()
+        perm.check(&caller.user, caller.via.as_str(), caller.scope())
+            .is_ok()
     }
 }
 

@@ -607,14 +607,18 @@ impl<'a> AuditTx<'a> {
 
     /// `tags` are normalized here too (callers should validate first to
     /// report a 400; an invalid list rolls the transaction back).
-    pub fn create_token(
+    /// A new API token with an optional scope (M1; validated by the caller,
+    /// see `api::routes::normalize_scope`; unrestricted = none).
+    pub fn create_token_scoped(
         &mut self,
         user: &User,
         name: &str,
         token_hash: &str,
         tags: &[String],
+        scope: Option<&crate::model::TokenScope>,
     ) -> Result<TokenInfo> {
         let tags = normalize_tags(tags)?;
+        let scope = scope.filter(|s| !s.is_unrestricted()).cloned();
         let id = acct_sql::next_id(self.conn, "api_tokens")?;
         self.record(SecretChange::TokenCreated {
             token: ReplToken {
@@ -625,42 +629,68 @@ impl<'a> AuditTx<'a> {
                 created_at: now_rfc3339(),
                 revoked_at: None,
                 tags: tags.clone(),
+                scope: scope.clone(),
             },
         })?;
-        self.push(
-            "token.create",
-            Some(user.id),
-            &user.username,
-            serde_json::json!({ "token_id": id, "name": name, "tags": tags }),
-        );
+        let mut detail = serde_json::json!({ "token_id": id, "name": name, "tags": tags });
+        if let Some(scope) = &scope {
+            detail["scope"] = serde_json::to_value(scope)?;
+        }
+        self.push("token.create", Some(user.id), &user.username, detail);
         Ok(db::get_token(self.conn, id)?.expect("just inserted"))
     }
 
     /// Replace a token's tags. Written and audited (`token.update`, before
     /// and after) only when the normalized list actually changed.
+    #[cfg(test)]
     pub fn update_token_tags(
         &mut self,
         owner: &User,
         t: &TokenInfo,
         tags: &[String],
     ) -> Result<TokenInfo> {
-        let tags = normalize_tags(tags)?;
+        self.update_token(owner, t, Some(tags), None)
+    }
+
+    /// Replace a token's tags and/or (M1) its scope (`Some(unrestricted)`
+    /// clears it). Written and audited (`token.update`, before and after)
+    /// only when something actually changed; the change carries the
+    /// resulting tags, and the resulting scope when the scope changed.
+    pub fn update_token(
+        &mut self,
+        owner: &User,
+        t: &TokenInfo,
+        tags: Option<&[String]>,
+        scope: Option<&crate::model::TokenScope>,
+    ) -> Result<TokenInfo> {
         let current = db::get_token(self.conn, t.id)?.context("token vanished")?;
-        if current.tags != tags {
+        let tags = match tags {
+            Some(tags) => normalize_tags(tags)?,
+            None => current.tags.clone(),
+        };
+        let new_scope = match scope {
+            Some(s) => s.clone(),
+            None => current.scope.clone().unwrap_or_default(),
+        };
+        let old_scope = current.scope.clone().unwrap_or_default();
+        let scope_changed = new_scope != old_scope;
+        if current.tags != tags || scope_changed {
             self.record(SecretChange::TokenTagsSet {
                 token_id: t.id,
                 tags: tags.clone(),
+                scope: scope_changed.then(|| new_scope.clone()),
             })?;
-            self.push(
-                "token.update",
-                Some(owner.id),
-                &owner.username,
-                serde_json::json!({
-                    "token_id": t.id,
-                    "name": t.name,
-                    "tags": { "before": current.tags, "after": tags },
-                }),
-            );
+            let mut detail = serde_json::json!({
+                "token_id": t.id,
+                "name": t.name,
+            });
+            if current.tags != tags {
+                detail["tags"] = serde_json::json!({ "before": current.tags, "after": tags });
+            }
+            if scope_changed {
+                detail["scope"] = serde_json::json!({ "before": old_scope, "after": new_scope });
+            }
+            self.push("token.update", Some(owner.id), &owner.username, detail);
         }
         db::get_token(self.conn, t.id)?.context("token vanished")
     }
@@ -832,6 +862,7 @@ impl Accounts {
         .context("syncing the root user from configuration")
     }
 
+    #[cfg(test)]
     pub fn create_token(
         &self,
         actor: &Actor,
@@ -840,8 +871,20 @@ impl Accounts {
         token_hash: &str,
         tags: &[String],
     ) -> Result<TokenInfo> {
+        self.create_token_scoped(actor, user, name, token_hash, tags, None)
+    }
+
+    pub fn create_token_scoped(
+        &self,
+        actor: &Actor,
+        user: &User,
+        name: &str,
+        token_hash: &str,
+        tags: &[String],
+        scope: Option<&crate::model::TokenScope>,
+    ) -> Result<TokenInfo> {
         self.run(actor, "create_token", |t| {
-            t.create_token(user, name, token_hash, tags)
+            t.create_token_scoped(user, name, token_hash, tags, scope)
         })
     }
 }

@@ -387,10 +387,25 @@ fn token_tags_and_last_use_are_documented() {
             .any(|r| r == "tags"),
         "tags are optional when creating a token"
     );
-    assert_eq!(
-        schemas["TokenUpdateBody"]["required"],
-        serde_json::json!(["tags"])
+    // M1: tags and scope are each optional on update (absent = unchanged).
+    assert!(
+        schemas["TokenUpdateBody"]["required"]
+            .as_array()
+            .is_none_or(|r| r.is_empty()),
+        "{}",
+        schemas["TokenUpdateBody"]
     );
+    for body in ["TokenBody", "TokenUpdateBody"] {
+        assert!(
+            schemas[body]["properties"]["scope"].is_object(),
+            "{body}.scope missing"
+        );
+    }
+    let scope = &schemas["TokenScope"]["properties"];
+    for f in ["zones", "max_role", "expires_at"] {
+        assert!(scope[f].is_object(), "TokenScope.{f} missing");
+    }
+    assert!(info["properties"]["scope"].is_object(), "TokenInfo.scope");
 
     let put = &spec["paths"]["/tokens/{id}"]["put"];
     assert_eq!(put["operationId"], "update_token");

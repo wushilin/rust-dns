@@ -1332,6 +1332,16 @@
                 "token"
               ]
             }
+          },
+          {
+            "name": "token_id",
+            "in": "query",
+            "description": "M1: what this one token of the user may do (its scope applied);\nimplies `via=token`. Without it, a call made with a scoped token\nabout its own user shows that token's rights.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           }
         ],
         "responses": {
@@ -2438,7 +2448,7 @@
           "Tokens"
         ],
         "summary": "Create an API token",
-        "description": "The token acts with exactly the caller's rights. Tokens do not expire; revoke them when no longer needed. Optional `tags` label the token (change them later with `PUT /tokens/{id}`).",
+        "description": "The token acts with the caller's rights, limited by an optional `scope` (only some zones, at most a role, until a time; it never has more than its owner). A token with any scope cannot create, change or revoke tokens; one limited to zones or a role has no account-wide rights. Without an expiry a token does not expire; revoke it when no longer needed. Optional `tags` label the token (change tags and scope later with `PUT /tokens/{id}`).",
         "operationId": "create_token",
         "requestBody": {
           "content": {
@@ -2488,8 +2498,8 @@
         "tags": [
           "Tokens"
         ],
-        "summary": "Update an API token's tags",
-        "description": "Replaces the tag list. Own tokens; administrators (`manage_users`) may update anyone's. Revoked tokens cannot be changed (404). A change is recorded in the audit log as `token.update` with the tags before and after.",
+        "summary": "Update an API token's tags and scope",
+        "description": "Replaces the tag list and/or the scope (`{}` removes every limit; absent fields are unchanged). Own tokens; administrators (`manage_users`) may update anyone's. Not with a scoped token. Revoked tokens cannot be changed (404). A change is recorded in the audit log as `token.update` with the tags and scope before and after.",
         "operationId": "update_token",
         "parameters": [
           {
@@ -7807,6 +7817,39 @@
             "items": {
               "type": "string"
             }
+          },
+          "token": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RightsToken",
+                "description": "M1: the API token these rights are for (asked with `token_id`, or\nthe calling token itself), whose scope limits them."
+              }
+            ]
+          }
+        }
+      },
+      "RightsToken": {
+        "type": "object",
+        "description": "The token a rights document is for.",
+        "required": [
+          "id",
+          "name",
+          "scope"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "name": {
+            "type": "string"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/TokenScope",
+            "description": "`{}` = unrestricted (exactly the owner's rights)."
           }
         }
       },
@@ -8203,10 +8246,28 @@
               "deploy"
             ],
             "maxItems": 16
+          },
+          "scope": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TokenScope",
+                "description": "Optional limits (M1): only these zones, at most this role, until\nthis time. The token never has more than its owner's rights."
+              }
+            ]
           }
         },
         "example": {
           "name": "ci-deploy",
+          "scope": {
+            "expires_at": "2099-12-31T00:00:00.000Z",
+            "max_role": "editor",
+            "zones": [
+              "example.com"
+            ]
+          },
           "tags": [
             "ci",
             "deploy"
@@ -8309,6 +8370,17 @@
               "null"
             ],
             "format": "date-time"
+          },
+          "scope": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TokenScope",
+                "description": "M1: how the token is limited below its owner's rights; absent =\nexactly the owner's rights."
+              }
+            ]
           }
         },
         "example": {
@@ -8379,24 +8451,82 @@
           }
         ]
       },
-      "TokenUpdateBody": {
+      "TokenScope": {
         "type": "object",
-        "required": [
-          "tags"
-        ],
+        "description": "M1: how far an API token is limited below its owner's rights. A token\nnever has more than its owner: its effective role on a zone is the\nowner's role capped by `max_role`, and only on `zones` when given. No\nscope (or an empty one) = exactly the owner's rights, as before.\nPart of the token row (`api_tokens.scope`, JSON; NULL = unrestricted).",
         "properties": {
-          "tags": {
-            "type": "array",
+          "zones": {
+            "type": [
+              "array",
+              "null"
+            ],
             "items": {
               "type": "string"
             },
-            "description": "The complete new tag list (replaces the old one; `[]` clears it).\nAt most 16, each 1-256 characters of `[A-Za-z0-9_-]` after trimming\n(case is kept); duplicates are dropped.",
+            "description": "Only these zones (lower-case names without the trailing dot).\nAbsent: every zone the owner has.",
+            "example": [
+              "example.com"
+            ],
+            "maxItems": 256
+          },
+          "max_role": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ZoneRole",
+                "description": "At most this role on any zone. Absent: the owner's role."
+              }
+            ]
+          },
+          "expires_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "The token stops working at this time (RFC 3339, UTC). Absent: never.",
+            "example": "2099-12-31T00:00:00.000Z"
+          }
+        },
+        "example": {
+          "expires_at": "2099-12-31T00:00:00.000Z",
+          "max_role": "editor",
+          "zones": [
+            "example.com"
+          ]
+        }
+      },
+      "TokenUpdateBody": {
+        "type": "object",
+        "properties": {
+          "tags": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The complete new tag list (replaces the old one; `[]` clears it).\nAt most 16, each 1-256 characters of `[A-Za-z0-9_-]` after trimming\n(case is kept); duplicates are dropped. Absent: unchanged.",
             "example": [
               "ci",
               "deploy",
               "prod"
             ],
             "maxItems": 16
+          },
+          "scope": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TokenScope",
+                "description": "The complete new scope (replaces the old one; `{}` removes every\nlimit). Absent: unchanged."
+              }
+            ]
           }
         },
         "example": {

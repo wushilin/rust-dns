@@ -182,9 +182,14 @@ pub enum SecretChange {
     TokenCreated {
         token: ReplToken,
     },
+    /// A token's tags and, when `scope` is present (M1), its resulting
+    /// scope (`{}` = unrestricted). Absent (every change written before
+    /// M1, and tag-only edits) = the scope is unchanged.
     TokenTagsSet {
         token_id: i64,
         tags: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<crate::model::TokenScope>,
     },
     TokenRevoked {
         token_id: i64,
@@ -1411,7 +1416,13 @@ mod tests {
                             }
                             109..=111 => {
                                 let u = t.change_user(uid, &accounts::UserChanges::default())?;
-                                t.create_token(&u, &format!("t{step}"), &format!("th{step}"), &["a".into()])?;
+                                // M1: some tokens scoped (the scope is part of the row).
+                                let scope = (step % 3 == 0).then(|| crate::model::TokenScope {
+                                    zones: Some(vec![format!("z{}.test", step % 5)]),
+                                    max_role: Some(crate::model::ZoneRole::Editor),
+                                    expires_at: Some("2999-01-01T00:00:00.000Z".into()),
+                                });
+                                t.create_token_scoped(&u, &format!("t{step}"), &format!("th{step}"), &["a".into()], scope.as_ref())?;
                             }
                             112..=113 => {
                                 let id: Option<i64> = t
@@ -1426,6 +1437,17 @@ mod tests {
                                     let owner = t.change_user(tk.user_id, &accounts::UserChanges::default())?;
                                     if step % 2 == 0 {
                                         t.revoke_token(&owner, &tk)?;
+                                    } else if step % 3 == 0 {
+                                        // M1: scope changed (set, or cleared with `{}`).
+                                        let scope = if tk.scope.is_some() {
+                                            crate::model::TokenScope::default()
+                                        } else {
+                                            crate::model::TokenScope {
+                                                max_role: Some(crate::model::ZoneRole::Viewer),
+                                                ..Default::default()
+                                            }
+                                        };
+                                        t.update_token(&owner, &tk, None, Some(&scope))?;
                                     } else {
                                         t.update_token_tags(&owner, &tk, &[format!("g{step}")])?;
                                     }

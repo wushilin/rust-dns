@@ -8,7 +8,7 @@
 use super::openapi::{Forbidden, InvalidRequest, Unauthorized};
 use super::session::{Caller, WS_PROTOCOL};
 use super::AppState;
-use crate::model::{ChangeEvent, User, ZonePerm, ZoneRole};
+use crate::model::{ChangeEvent, TokenScope, User, ZonePerm, ZoneRole};
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -44,10 +44,16 @@ pub struct View {
 }
 
 impl View {
-    pub fn build(s: &AppState, user: &User) -> super::error::ApiResult<View> {
-        let zones = s.visible_zones(user)?;
+    /// What `user` sees through `scope` (M1: a token limited to zones or a
+    /// role sees only those zones, even when its owner is an administrator).
+    pub fn build(
+        s: &AppState,
+        user: &User,
+        scope: Option<&TokenScope>,
+    ) -> super::error::ApiResult<View> {
+        let zones = s.zones_of(user, scope)?;
         Ok(View {
-            admin: user.is_admin,
+            admin: user.is_admin && !scope.is_some_and(|s| s.limits_zones()),
             username: user.username.clone(),
             watch: zones
                 .iter()
@@ -152,7 +158,10 @@ pub async fn ws(
 }
 
 /// Is the caller's session / token still valid? Returns the current user.
-fn revalidate(s: &AppState, caller: &Caller) -> Result<User, &'static str> {
+/// The caller's user and token scope as they are now (M1: a token's scope
+/// may have been changed, or the token may have expired, since the upgrade).
+fn revalidate(s: &AppState, caller: &Caller) -> Result<(User, Option<TokenScope>), &'static str> {
+    let mut scope = None;
     if let Some(sid) = caller.session_id {
         match s.storage.get_session_by_id(sid) {
             Ok(Some(sess))
@@ -163,13 +172,21 @@ fn revalidate(s: &AppState, caller: &Caller) -> Result<User, &'static str> {
     }
     if let Some(tid) = caller.token_id {
         match s.storage.get_token(tid) {
-            Ok(Some(t)) if t.revoked_at.is_none() => {}
+            Ok(Some(t)) if t.revoked_at.is_none() => {
+                if t.scope
+                    .as_ref()
+                    .is_some_and(|sc| sc.expired_at(&crate::model::now_rfc3339()))
+                {
+                    return Err("token expired");
+                }
+                scope = t.scope;
+            }
             Ok(_) => return Err("token revoked"),
             Err(_) => return Err("token check failed"),
         }
     }
     match s.storage.get_user(caller.user.id) {
-        Ok(Some(u)) if u.disabled_at.is_none() => Ok(u),
+        Ok(Some(u)) if u.disabled_at.is_none() => Ok((u, scope)),
         Ok(Some(_)) => Err("account disabled"),
         Ok(None) => Err("account deleted"),
         Err(_) => Err("account check failed"),
@@ -186,7 +203,7 @@ async fn close(socket: &mut WebSocket, why: &'static str) {
 }
 
 async fn session(s: Arc<AppState>, caller: Caller, q: WsQuery, mut socket: WebSocket) {
-    let mut view = match View::build(&s, &caller.user) {
+    let mut view = match View::build(&s, &caller.user, caller.scope()) {
         Ok(v) => v,
         Err(_) => return,
     };
@@ -253,7 +270,7 @@ async fn session(s: Arc<AppState>, caller: Caller, q: WsQuery, mut socket: WebSo
                         let visible = view.change(&e);
                         // Access may have changed: re-check before the next event.
                         if matches!(e.entity.as_str(), "member" | "zone") {
-                            match revalidate(&s, &caller).and_then(|u| View::build(&s, &u).map_err(|_| "rights check failed")) {
+                            match revalidate(&s, &caller).and_then(|(u, sc)| View::build(&s, &u, sc.as_ref()).map_err(|_| "rights check failed")) {
                                 Ok(v) => view = v,
                                 Err(why) => { close(&mut socket, why).await; return; }
                             }
@@ -282,7 +299,7 @@ async fn session(s: Arc<AppState>, caller: Caller, q: WsQuery, mut socket: WebSo
                 }
             }
             _ = recheck.tick() => {
-                match revalidate(&s, &caller).and_then(|u| View::build(&s, &u).map_err(|_| "rights check failed")) {
+                match revalidate(&s, &caller).and_then(|(u, sc)| View::build(&s, &u, sc.as_ref()).map_err(|_| "rights check failed")) {
                     Ok(v) => view = v,
                     Err(why) => {
                         tracing::info!(user = %caller.user.username, why, "closing websocket");

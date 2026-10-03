@@ -511,10 +511,47 @@ Pre-deploy (must pass before the next deploy):
 
 Features (in this order; each with console UI where it applies, API with
 contract tests, typed changes that replicate, tests, AGENT.md rules):
-- [ ] M1. Per-token scopes: a token can be limited to a set of zones, a
+- [x] M1. Per-token scopes: a token can be limited to a set of zones, a
   maximum role (viewer/editor/owner) and an expiry time. Effective rights =
   min(owner's rights, token scope). Shown in the rights view and on the
   tokens page; old tokens keep full owner rights (no scope = unchanged).
+  Done. `model::TokenScope { zones?, max_role?, expires_at? }` beside the
+  permission table; `scoped_role` caps the owner's role (never raises it)
+  and `GlobalPerm::check(user, via, scope)` withholds: token management
+  for any scoped token (it could mint a wider one), every admin-only
+  permission (users, audit, server admin, TSIG, zone creation,
+  replication) for a token limited to zones or a role. An expiry alone
+  keeps the owner's rights until then. Enforced on the server for every
+  route through the `Caller` (`require`, `has`, `require_zone`,
+  `visible_zones`, `ws::View::build`); the changelog API and the
+  websocket (catch-up, live changes, live queries) filter through the
+  scoped view, and the websocket re-reads the token every 10 s (scope
+  changes narrow it, expiry closes it). Expired tokens get 401. Rights
+  view: `GET /users/{id}/rights?token_id=N` (and a scoped token asking
+  about itself) shows the scoped rights plus `token { id, name, scope }`.
+  API: `scope` on `POST /tokens`, `PUT /tokens/{id}` (`tags` and `scope`
+  each optional; `{}` clears; zones normalized, 1-256; expiry RFC 3339 in
+  the future), `TokenInfo.scope`. Storage: nullable `api_tokens.scope`
+  (JSON; NULL = unrestricted; added by the migration, nothing rewritten).
+  Replication: no new kind; optional `scope` in `ReplToken`
+  (`token_created`, snapshots) and in `token_tags_set` (present only when
+  the scope changed: the resulting scope); fixture untouched. Checksum:
+  new `Table::optional_columns` (`api_tokens.scope` counted only where
+  not NULL) so older versions match while no token is scoped. Console:
+  tokens page has a Scope column, "effective rights" per token, scope
+  fields in New token / Edit (zones, highest role, expiry); rights dialog
+  shows the scope. AGENT.md: new rule 5 (rights only through the Caller).
+  Tests: `model::permission_tests::{global_permission_table,
+  token_scope_caps_zone_roles}`, `api::tests::scoped_tokens_never_exceed_
+  their_owner` (zones, roles, admin token limited to a zone, token
+  management refused, rights doc, changelog, status, expiry 401,
+  widening from a session, validation, audit), replay test covers scoped
+  creates and scope changes, `replication::tables::tests::a_scope_column_
+  matches_older_versions_until_used`, `follow::token_scopes_replicate_
+  and_are_enforced_on_the_standby` (snapshot, rescope, clear; with the
+  previous binary: an old standby halts `diverged` at the first scoped
+  token), `openapi_spec` updated (tags optional on update, scope
+  documented).
 - [ ] M2. Zone-level record expiry policy: default expiry for new records
   and a maximum expiry (records created without an expiry get the default;
   longer ones are clamped or refused — choose and document). For
@@ -602,6 +639,19 @@ what the registrar's DS must match on the live zone; plan it separately.
   server download the lists itself (outbound HTTP(S) from gate and baba2).
   `[server] interfaces` (I11) could replace run.sh's ens5/eth0 rewrite of
   `bind` on gate/baba2; not required, owner's decision.
+
+- After phase M (M1): protocol 2, no new change kind, fixture untouched.
+  New nullable column `api_tokens.scope` (added NULL, nothing rewritten);
+  optional `scope` fields in `token_created` / `token_tags_set` and
+  snapshots. A d32d67f (or 3884ba8) standby follows as before while no
+  token is scoped. It CANNOT enforce a scope: it would store the token
+  without it (full owner rights for reads on that standby), so the table
+  checksum includes the scope and the old standby HALTS (`diverged`) at
+  its next reconcile after the first scoped token (test
+  `token_scopes_replicate_and_are_enforced_on_the_standby`). So: upgrade
+  the standby (baba2) first, then the primary (gate); create scoped
+  tokens only after both run this version. Do not downgrade once a scoped
+  token exists (the old binary would ignore the scope).
 
 ## Log
 
@@ -1181,3 +1231,4 @@ what the registrar's DS must match on the live zone; plan it separately.
   is safe in either order (protocol 2, no new change kind, no payload
   change; standby baba2 first as usual). Not deployed; owner's go-ahead.
   Continuing with M1.
+- 2026-10-04 (phase M): M1 done (token scopes; see M1 and Rollout).

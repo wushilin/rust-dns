@@ -367,6 +367,19 @@ pub struct Rights {
     /// Legend: every zone permission and the minimum role it needs.
     pub zone_permissions: Vec<ZonePermInfo>,
     pub notes: Vec<String>,
+    /// M1: the API token these rights are for (asked with `token_id`, or
+    /// the calling token itself), whose scope limits them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<RightsToken>,
+}
+
+/// The token a rights document is for.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RightsToken {
+    pub id: i64,
+    pub name: String,
+    /// `{}` = unrestricted (exactly the owner's rights).
+    pub scope: crate::model::TokenScope,
 }
 
 /// One account-level permission and whether the user holds it.

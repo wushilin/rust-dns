@@ -147,8 +147,11 @@ impl Harness {
             .method(method)
             .uri(format!("/api{path}"))
             .header("x-requested-with", "rust-dns");
-        if let Some(c) = cookie {
-            b = b.header("cookie", c);
+        match cookie {
+            // An API token instead of a session cookie.
+            Some(c) if c.starts_with("Bearer ") => b = b.header("authorization", c),
+            Some(c) => b = b.header("cookie", c),
+            None => {}
         }
         let req = match body {
             Some(j) => b
@@ -808,4 +811,357 @@ async fn api_reads_and_dns_stay_fast_during_a_long_write() {
         max_read < Duration::from_millis(300),
         "API read waited: {max_read:?}"
     );
+}
+
+/// M1: a scoped token never has more than its owner (the permission table
+/// narrowed by the scope, on every route), and the rights view, the zone
+/// list and the changelog show exactly what it may do.
+#[tokio::test]
+async fn scoped_tokens_never_exceed_their_owner() {
+    use serde_json::json;
+    let h = Harness::new();
+    h.state
+        .accounts
+        .sync_root(
+            "root",
+            &crate::auth::hash_password("root-password-1").unwrap(),
+            false,
+        )
+        .unwrap();
+    let alice = h.user("alice", "alice-password-1", None);
+    let root_c = h
+        .login("root", "root-password-1")
+        .await
+        .cookie
+        .expect("root session");
+    let alice_c = h
+        .login("alice", "alice-password-1")
+        .await
+        .cookie
+        .expect("alice session");
+    for (z, owner) in [("a.test", "alice"), ("b.test", "alice"), ("c.test", "root")] {
+        let r = h
+            .call(
+                "POST",
+                "/zones",
+                Some(&root_c),
+                Some(json!({ "name": z, "owner": owner })),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.json);
+        let r = h
+            .call(
+                "POST",
+                &format!("/zones/{z}/records"),
+                Some(&root_c),
+                Some(json!({ "name": "www", "type": "A", "value": "192.0.2.1" })),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.json);
+    }
+    let token = |c: String, body: serde_json::Value| {
+        let h = &h;
+        async move {
+            let r = h.call("POST", "/tokens", Some(&c), Some(body)).await;
+            assert_eq!(r.status, StatusCode::CREATED, "{}", r.json);
+            (
+                format!("Bearer {}", r.json["token"].as_str().unwrap()),
+                r.json["info"]["id"].as_i64().unwrap(),
+            )
+        }
+    };
+    // Validation.
+    for (scope, why) in [
+        (json!({ "zones": [] }), "no zone"),
+        (json!({ "zones": ["not a zone!"] }), "bad name"),
+        (json!({ "expires_at": "2001-01-01T00:00:00Z" }), "past"),
+        (json!({ "expires_at": "tomorrow" }), "not a time"),
+        (json!({ "max_role": "admin" }), "no such role"),
+    ] {
+        let r = h
+            .call(
+                "POST",
+                "/tokens",
+                Some(&alice_c),
+                Some(json!({ "name": "bad", "scope": scope })),
+            )
+            .await;
+        assert!(r.status.is_client_error(), "{why}: {} {}", r.status, r.json);
+    }
+
+    // Alice: a.test only, viewer.
+    let (t1, t1_id) = token(
+        alice_c.clone(),
+        json!({ "name": "ro", "scope": { "zones": ["A.test."], "max_role": "viewer" } }),
+    )
+    .await;
+    let r = h.call("GET", "/zones", Some(&t1), None).await;
+    let zones: Vec<(String, String)> = r.json["zones"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|z| {
+            (
+                z["name"].as_str().unwrap().into(),
+                z["role"].as_str().unwrap().into(),
+            )
+        })
+        .collect();
+    assert_eq!(zones, vec![("a.test".to_string(), "viewer".to_string())]);
+    assert_eq!(
+        h.call("GET", "/zones/a.test/records", Some(&t1), None)
+            .await
+            .status,
+        StatusCode::OK
+    );
+    let rec = json!({ "name": "x", "type": "A", "value": "192.0.2.9" });
+    let r = h
+        .call(
+            "POST",
+            "/zones/a.test/records",
+            Some(&t1),
+            Some(rec.clone()),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.json);
+    assert!(
+        r.json["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("scope")
+            || r.json.to_string().contains("scope"),
+        "{}",
+        r.json
+    );
+    for path in ["/zones/b.test", "/zones/b.test/records", "/zones/c.test"] {
+        assert_eq!(
+            h.call("GET", path, Some(&t1), None).await.status,
+            StatusCode::NOT_FOUND,
+            "{path}"
+        );
+    }
+    // No token management with a scoped token (it could widen itself).
+    let r = h
+        .call(
+            "POST",
+            "/tokens",
+            Some(&t1),
+            Some(json!({ "name": "wider" })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.json);
+    let r = h
+        .call(
+            "PUT",
+            &format!("/tokens/{t1_id}"),
+            Some(&t1),
+            Some(json!({ "scope": {} })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.json);
+    assert_eq!(
+        h.call("GET", "/tokens", Some(&t1), None).await.status,
+        StatusCode::FORBIDDEN
+    );
+    // Its rights document: the scope applied.
+    let r = h
+        .call(
+            "GET",
+            &format!("/users/{}/rights", alice.id),
+            Some(&t1),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.json);
+    assert_eq!(r.json["via"], "token");
+    assert_eq!(r.json["token"]["id"], t1_id);
+    assert_eq!(r.json["token"]["scope"]["zones"], json!(["a.test"]));
+    let zr = r.json["zones"].as_array().unwrap();
+    assert_eq!(zr.len(), 1, "{}", r.json);
+    assert_eq!(zr[0]["zone"], "a.test");
+    assert_eq!(zr[0]["role"], "viewer");
+    assert_eq!(zr[0]["permissions"], json!(["view", "export"]));
+    let own_tokens = r.json["global"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["perm"] == "manage_own_tokens")
+        .unwrap()
+        .clone();
+    assert_eq!(own_tokens["allowed"], false, "{own_tokens}");
+    // The same from alice's session with token_id; the session's own rights unchanged.
+    let r = h
+        .call(
+            "GET",
+            &format!("/users/{}/rights?token_id={t1_id}", alice.id),
+            Some(&alice_c),
+            None,
+        )
+        .await;
+    assert_eq!(r.json["zones"].as_array().unwrap().len(), 1, "{}", r.json);
+    let r = h
+        .call(
+            "GET",
+            &format!("/users/{}/rights", alice.id),
+            Some(&alice_c),
+            None,
+        )
+        .await;
+    assert_eq!(r.json["zones"].as_array().unwrap().len(), 2, "{}", r.json);
+    assert!(r.json.get("token").is_none());
+    // Another user's token id: not found.
+    let r = h
+        .call(
+            "GET",
+            &format!("/users/{}/rights?token_id={t1_id}", 1),
+            Some(&root_c),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.json);
+    // Changelog: only a.test.
+    let r = h.call("GET", "/changelog", Some(&t1), None).await;
+    let zs: std::collections::BTreeSet<String> = r.json["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["zone"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(zs.into_iter().collect::<Vec<_>>(), vec!["a.test"]);
+
+    // Alice: every zone, at most editor: records yes, settings and deletion no.
+    let (t2, _) = token(
+        alice_c.clone(),
+        json!({ "name": "ed", "scope": { "max_role": "editor" } }),
+    )
+    .await;
+    let r = h
+        .call(
+            "POST",
+            "/zones/b.test/records",
+            Some(&t2),
+            Some(rec.clone()),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.json);
+    assert_eq!(
+        h.call("DELETE", "/zones/b.test", Some(&t2), None)
+            .await
+            .status,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        h.call(
+            "PUT",
+            "/zones/b.test",
+            Some(&t2),
+            Some(json!({ "default_ttl": 600 }))
+        )
+        .await
+        .status,
+        StatusCode::FORBIDDEN
+    );
+
+    // Root (admin) limited to c.test: no account-wide rights at all.
+    let (t3, _) = token(
+        root_c.clone(),
+        json!({ "name": "c", "scope": { "zones": ["c.test"] } }),
+    )
+    .await;
+    for (m, path) in [
+        ("GET", "/users"),
+        ("GET", "/audit"),
+        ("GET", "/replication/snapshot"),
+        ("GET", "/tsig/keys"),
+    ] {
+        let st = h.call(m, path, Some(&t3), None).await.status;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{m} {path}");
+    }
+    let r = h
+        .call(
+            "POST",
+            "/zones",
+            Some(&t3),
+            Some(json!({ "name": "d.test" })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.json);
+    let r = h.call("GET", "/zones", Some(&t3), None).await;
+    assert_eq!(r.json["zones"].as_array().unwrap().len(), 1, "{}", r.json);
+    assert_eq!(
+        r.json["zones"][0]["role"], "owner",
+        "an admin's role on its zone"
+    );
+    let r = h.call("GET", "/changelog", Some(&t3), None).await;
+    assert!(r.json["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|e| e["zone"] == "c.test"));
+    let r = h.call("GET", "/status", Some(&t3), None).await;
+    assert_eq!(r.json["visible_zones"], 1);
+
+    // Expiry: refused once the time has passed (set directly: the API
+    // refuses a time in the past).
+    let (t4, t4_id) = token(
+        root_c.clone(),
+        json!({ "name": "soon", "scope": { "expires_at": "2999-01-01T00:00:00Z" } }),
+    )
+    .await;
+    let r = h.call("GET", "/users", Some(&t4), None).await;
+    assert_eq!(
+        r.status,
+        StatusCode::OK,
+        "an expiry alone keeps admin rights"
+    );
+    let actor = crate::model::Actor {
+        name: "test".into(),
+        ip: "127.0.0.1".into(),
+    };
+    let root = h.state.storage.get_user_by_name("root").unwrap().unwrap();
+    let info = h.state.storage.get_token(t4_id).unwrap().unwrap();
+    h.state
+        .accounts
+        .run(&actor, "update_token", |t| {
+            t.update_token(
+                &root,
+                &info,
+                None,
+                Some(&crate::model::TokenScope {
+                    expires_at: Some("2001-01-01T00:00:00.000Z".into()),
+                    ..Default::default()
+                }),
+            )
+        })
+        .unwrap();
+    let r = h.call("GET", "/zones", Some(&t4), None).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.json);
+
+    // The owner widens the scope again from a session: the token then has
+    // exactly the owner's rights.
+    let r = h
+        .call(
+            "PUT",
+            &format!("/tokens/{t1_id}"),
+            Some(&alice_c),
+            Some(json!({ "scope": {} })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.json);
+    assert!(r.json.get("scope").is_none(), "{}", r.json);
+    let r = h.call("GET", "/zones", Some(&t1), None).await;
+    assert_eq!(r.json["zones"].as_array().unwrap().len(), 2, "{}", r.json);
+    // Listed with its scope.
+    let r = h.call("GET", "/tokens", Some(&alice_c), None).await;
+    let ed = r.json["tokens"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "ed")
+        .unwrap()
+        .clone();
+    assert_eq!(ed["scope"], json!({ "max_role": "editor" }));
+    // Audited with before/after.
+    let r = h.call("GET", "/audit", Some(&root_c), None).await;
+    assert!(r.json.to_string().contains("\"scope\""), "{}", r.json);
 }

@@ -2991,3 +2991,143 @@ fn a_new_standby_follows_an_old_primary_and_copies_its_changelog() {
     drop(p);
     let _ = std::fs::remove_dir_all(&root_dir);
 }
+
+/// M1: a token's scope is part of its row: it replicates (created scoped,
+/// changed, cleared) and the standby enforces it like the primary;
+/// reconcile stays ok. With the previous release as standby: unscoped
+/// tokens keep it following, and the first scoped token makes it halt
+/// (diverged) — it cannot enforce a scope, so it must not look healthy.
+/// Recorded in plan.md (Rollout): upgrade the standby first, create scoped
+/// tokens only once both run this version.
+#[test]
+fn token_scopes_replicate_and_are_enforced_on_the_standby() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root_dir = std::env::temp_dir().join(format!(
+        "rust-dns-follow-scope-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root_dir).unwrap();
+    let mut p = Node::new(&root_dir, "primary", "rootpass-primary");
+    let mut s = Node::new(&root_dir, "standby", "rootpass-standby");
+    p.configure("");
+    p.start();
+    let pr = p.root();
+    fn post(n: &Node, a: &ureq::Agent, path: &str, body: Value) -> Value {
+        ok(
+            call(&Auth::Session(a), "POST", &n.api(path), Some(body)),
+            path,
+        )
+    }
+    post(
+        &p,
+        &pr,
+        "/users",
+        json!({ "username": "alice", "password": "alice-pass-1" }),
+    );
+    for z in ["a.test", "b.test"] {
+        post(&p, &pr, "/zones", json!({ "name": z, "owner": "alice" }));
+    }
+    let repl = post(&p, &pr, "/tokens", json!({ "name": "repl" }))["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let alice = p.login("alice", "alice-pass-1");
+    let scoped = post(
+        &p,
+        &alice,
+        "/tokens",
+        json!({ "name": "ro", "scope": { "zones": ["a.test"], "max_role": "viewer", "expires_at": "2999-01-01T00:00:00Z" } }),
+    );
+    let (tok, tid) = (
+        scoped["token"].as_str().unwrap().to_string(),
+        scoped["info"]["id"].as_i64().unwrap(),
+    );
+    s.configure(&follow_cfg(&p, "dns2", &repl));
+    s.start();
+    let sr = s.root();
+    wait_reconciled(&p, &pr, &s, &sr, "scoped token in the snapshot");
+    let zones = |n: &Node| -> Vec<String> {
+        let v = ok(
+            call(&Auth::Token(&tok), "GET", &n.api("/zones"), None),
+            "zones by token",
+        );
+        v["zones"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|z| {
+                format!(
+                    "{}:{}",
+                    z["name"].as_str().unwrap(),
+                    z["role"].as_str().unwrap()
+                )
+            })
+            .collect()
+    };
+    assert_eq!(zones(&p), vec!["a.test:viewer"]);
+    assert_eq!(zones(&s), vec!["a.test:viewer"], "enforced on the standby");
+    assert_eq!(
+        call(&Auth::Token(&tok), "GET", &s.api("/zones/b.test"), None).0,
+        404
+    );
+    // Changed while following: replayed as `token_tags_set` with the scope.
+    ok(
+        call(
+            &Auth::Session(&alice),
+            "PUT",
+            &p.api(&format!("/tokens/{tid}")),
+            Some(json!({ "scope": { "max_role": "editor" } })),
+        ),
+        "rescope",
+    );
+    wait_for("the new scope reaches the standby", 20, || {
+        zones(&s) == vec!["a.test:editor", "b.test:editor"]
+    });
+    wait_reconciled(&p, &pr, &s, &sr, "rescoped");
+    ok(
+        call(
+            &Auth::Session(&alice),
+            "PUT",
+            &p.api(&format!("/tokens/{tid}")),
+            Some(json!({ "scope": {} })),
+        ),
+        "unscope",
+    );
+    wait_for("the cleared scope reaches the standby", 20, || {
+        zones(&s) == vec!["a.test:owner", "b.test:owner"]
+    });
+    wait_reconciled(&p, &pr, &s, &sr, "unscoped");
+    drop(s);
+
+    // The previous release as standby.
+    let Some(prev) = prev_bin() else {
+        drop(p);
+        let _ = std::fs::remove_dir_all(&root_dir);
+        return;
+    };
+    let mut old = Node::new(&root_dir, "old", "rootpass-old");
+    old.bin = prev;
+    old.configure(&follow_cfg(&p, "dns3", &repl));
+    old.start();
+    let or = old.root();
+    wait_reconciled(&p, &pr, &old, &or, "old standby, no scoped token");
+    post(
+        &p,
+        &alice,
+        "/tokens",
+        json!({ "name": "ro2", "scope": { "zones": ["a.test"] } }),
+    );
+    let mut last = Value::Null;
+    wait_for("the old standby halts on the scoped token", 30, || {
+        last = status(&old, &or);
+        !last["follow"]["halted"].is_null()
+    });
+    assert_eq!(last["follow"]["halted"]["reason"], "diverged", "{last}");
+    eprintln!("old standby with a scoped token: {last}");
+    drop(old);
+    drop(p);
+    let _ = std::fs::remove_dir_all(&root_dir);
+}

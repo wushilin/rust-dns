@@ -78,7 +78,11 @@ pub(super) fn write(c: &Connection, ctx: &Ctx, change: &SecretChange) -> Result<
             used_at,
         } => recovery_code_used(c, ctx, *user_id, &code_hash.0, used_at)?,
         SecretChange::TokenCreated { token } => put_token(c, token)?,
-        SecretChange::TokenTagsSet { token_id, tags } => token_tags(c, *token_id, tags)?,
+        SecretChange::TokenTagsSet {
+            token_id,
+            tags,
+            scope,
+        } => token_tags(c, *token_id, tags, scope.as_ref())?,
         SecretChange::TokenRevoked {
             token_id,
             revoked_at,
@@ -286,11 +290,11 @@ fn recovery_code_used(
 
 fn put_token(c: &Connection, t: &ReplToken) -> Result<()> {
     c.execute(
-        "INSERT INTO api_tokens (id, user_id, name, token_hash, created_at, revoked_at, tags)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "INSERT INTO api_tokens (id, user_id, name, token_hash, created_at, revoked_at, tags, scope)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          ON CONFLICT(id) DO UPDATE SET user_id = excluded.user_id, name = excluded.name,
             token_hash = excluded.token_hash, created_at = excluded.created_at,
-            revoked_at = excluded.revoked_at, tags = excluded.tags",
+            revoked_at = excluded.revoked_at, tags = excluded.tags, scope = excluded.scope",
         params![
             t.id,
             t.user_id,
@@ -298,17 +302,29 @@ fn put_token(c: &Connection, t: &ReplToken) -> Result<()> {
             t.token_hash,
             t.created_at,
             t.revoked_at,
-            serde_json::to_string(&t.tags)?
+            serde_json::to_string(&t.tags)?,
+            crate::storage::scope_column(t.scope.as_ref()),
         ],
     )?;
     Ok(())
 }
 
-fn token_tags(c: &Connection, id: i64, tags: &[String]) -> Result<()> {
+fn token_tags(
+    c: &Connection,
+    id: i64,
+    tags: &[String],
+    scope: Option<&crate::model::TokenScope>,
+) -> Result<()> {
     c.execute(
         "UPDATE api_tokens SET tags = ?2 WHERE id = ?1",
         params![id, serde_json::to_string(tags)?],
     )?;
+    if let Some(scope) = scope {
+        c.execute(
+            "UPDATE api_tokens SET scope = ?2 WHERE id = ?1",
+            params![id, crate::storage::scope_column(Some(scope))],
+        )?;
+    }
     Ok(())
 }
 

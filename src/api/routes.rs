@@ -205,7 +205,7 @@ pub async fn status(State(s): St, caller: Caller) -> ApiResult<Json<ServerStatus
     use std::sync::atomic::Ordering::Relaxed;
     let (zones, records) = s.storage.counts()?;
     let (oldest, latest) = s.storage.changelog_bounds()?;
-    let visible = s.visible_zones(&caller.user)?.len();
+    let visible = s.visible_zones(&caller)?.len();
     let rt = s.dns.runtime.load();
     let cfg = s.reloader.current.load();
     Ok(Json(ServerStatus {
@@ -504,7 +504,7 @@ fn zone_view(s: &AppState, z: &Zone, role: ZoneRole, record_count: usize) -> Zon
 pub async fn list_zones(State(s): St, caller: Caller) -> ApiResult<Json<ZoneList>> {
     let catalog = s.cache.load();
     let zones = s
-        .visible_zones(&caller.user)?
+        .visible_zones(&caller)?
         .iter()
         .map(|(z, r)| {
             let count = catalog
@@ -949,7 +949,7 @@ pub struct ExportQuery {
 )]
 pub async fn export_all(State(s): St, caller: Caller) -> ApiResult<Response> {
     let names: Vec<String> = s
-        .visible_zones(&caller.user)?
+        .visible_zones(&caller)?
         .into_iter()
         .map(|(z, _)| z.name)
         .collect();
@@ -1068,7 +1068,7 @@ pub async fn import(
         None
     } else {
         Some(
-            s.visible_zones(&caller.user)?
+            s.visible_zones(&caller)?
                 .into_iter()
                 .filter(|(_, r)| ZonePerm::Import.allowed(*r))
                 .map(|(z, _)| z.name)
@@ -1368,6 +1368,10 @@ pub struct RightsQuery {
     /// `token` shows what the user's API tokens may do.
     #[param(inline, value_type = AuthVia, required = false, default = "session")]
     pub via: Option<String>,
+    /// M1: what this one token of the user may do (its scope applied);
+    /// implies `via=token`. Without it, a call made with a scoped token
+    /// about its own user shows that token's rights.
+    pub token_id: Option<i64>,
 }
 
 /// What a user (or an API token of that user) can actually do, generated from
@@ -1402,15 +1406,34 @@ pub async fn user_rights(
         .storage
         .get_user(id)?
         .ok_or_else(|| ApiError::not_found("user not found"))?;
-    let via = if q.via.as_deref() == Some("token") {
+    // M1: which token (and so which scope), if any.
+    let token = match q.token_id {
+        Some(tid) => Some(
+            s.storage
+                .get_token(tid)?
+                .filter(|t| t.user_id == user.id && t.revoked_at.is_none())
+                .ok_or_else(|| ApiError::not_found("token not found"))?,
+        ),
+        None if caller.via == AuthVia::Token
+            && id == caller.user.id
+            && q.via.as_deref() != Some("session") =>
+        {
+            caller
+                .token_id
+                .and_then(|t| s.storage.get_token(t).ok().flatten())
+        }
+        None => None,
+    };
+    let via = if token.is_some() || q.via.as_deref() == Some("token") {
         AuthVia::Token
     } else {
         AuthVia::Session
     };
+    let scope = token.as_ref().and_then(|t| t.scope.clone());
     let global = GlobalPerm::ALL
         .iter()
         .map(|p| {
-            let r = p.check(&user, via.as_str());
+            let r = p.check(&user, via.as_str(), scope.as_ref());
             GlobalRight {
                 perm: *p,
                 label: p.label(),
@@ -1422,7 +1445,7 @@ pub async fn user_rights(
         })
         .collect();
     let zones = s
-        .visible_zones(&user)?
+        .zones_of(&user, scope.as_ref())?
         .into_iter()
         .map(|(z, role)| {
             let source = if user.is_admin {
@@ -1461,8 +1484,31 @@ pub async fn user_rights(
         );
     }
     if via == AuthVia::Token {
-        notes.push("An API token acts as its owner: it has exactly these rights, and stops working if the owner is disabled.".into());
-        notes.push("Tokens do not expire and are not revoked by a password change; revoke them on the API tokens page.".into());
+        match &scope {
+            None => {
+                notes.push("An API token acts as its owner: it has exactly these rights, and stops working if the owner is disabled.".into());
+                notes.push("Tokens without an expiry do not expire and are not revoked by a password change; revoke them on the API tokens page.".into());
+            }
+            Some(sc) => {
+                notes.push("This token is scoped: it has its owner's rights limited by the scope, never more, and stops working if the owner is disabled.".into());
+                if let Some(z) = &sc.zones {
+                    notes.push(format!("Only on: {}.", z.join(", ")));
+                }
+                if let Some(r) = sc.max_role {
+                    notes.push(format!("At most the {} role on any zone.", r.as_str()));
+                }
+                if sc.limits_zones() {
+                    notes.push(
+                        "No account-wide rights (administration, creating zones, replication)."
+                            .into(),
+                    );
+                }
+                notes.push("A scoped token cannot create, change or revoke API tokens.".into());
+                if let Some(e) = &sc.expires_at {
+                    notes.push(format!("Expires at {e}."));
+                }
+            }
+        }
     }
     if user.disabled_at.is_some() {
         notes.insert(
@@ -1472,6 +1518,11 @@ pub async fn user_rights(
     }
     let tokens = s.storage.list_tokens(Some(user.id), None)?.len();
     Ok(Json(Rights {
+        token: token.map(|t| RightsToken {
+            id: t.id,
+            name: t.name,
+            scope: t.scope.unwrap_or_default(),
+        }),
         user: public_user(&user),
         via,
         active_tokens: tokens,
@@ -1562,12 +1613,10 @@ pub async fn changelog(
         Some(a) => s.storage.changelog_after(a, limit)?,
         None => s.storage.changelog_recent(limit)?,
     };
-    if !caller.user.is_admin {
-        // Same rules as the websocket feed: own zones only; membership
-        // changes and other users' IPs only for zone owners.
-        let view = super::ws::View::build(&s, &caller.user)?;
-        entries = entries.iter().filter_map(|e| view.change(e)).collect();
-    }
+    // Same rules as the websocket feed: own zones only (through a token's
+    // scope); membership changes and other users' IPs only for zone owners.
+    let view = super::ws::View::build(&s, &caller.user, caller.scope())?;
+    entries = entries.iter().filter_map(|e| view.change(e)).collect();
     let stale = matches!((q.after, oldest), (Some(a), Some(o)) if a + 1 < o);
     Ok(Json(ChangelogPage {
         entries,
@@ -2103,7 +2152,7 @@ fn verify_current_totp(s: &AppState, caller: &Caller, code: &str) -> ApiResult<(
 // ---- API tokens ------------------------------------------------------------------
 
 #[derive(Deserialize, ToSchema)]
-#[schema(example = json!({ "name": "ci-deploy", "tags": ["ci", "deploy"] }))]
+#[schema(example = json!({ "name": "ci-deploy", "tags": ["ci", "deploy"], "scope": { "zones": ["example.com"], "max_role": "editor", "expires_at": "2099-12-31T00:00:00.000Z" } }))]
 pub struct TokenBody {
     #[schema(max_length = 100, example = "ci-deploy")]
     pub name: String,
@@ -2112,6 +2161,10 @@ pub struct TokenBody {
     #[serde(default)]
     #[schema(max_items = 16, example = json!(["ci", "deploy"]))]
     pub tags: Vec<String>,
+    /// Optional limits (M1): only these zones, at most this role, until
+    /// this time. The token never has more than its owner's rights.
+    #[serde(default)]
+    pub scope: Option<TokenScope>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -2119,9 +2172,65 @@ pub struct TokenBody {
 pub struct TokenUpdateBody {
     /// The complete new tag list (replaces the old one; `[]` clears it).
     /// At most 16, each 1-256 characters of `[A-Za-z0-9_-]` after trimming
-    /// (case is kept); duplicates are dropped.
+    /// (case is kept); duplicates are dropped. Absent: unchanged.
+    #[serde(default)]
     #[schema(max_items = 16, example = json!(["ci", "deploy", "prod"]))]
-    pub tags: Vec<String>,
+    pub tags: Option<Vec<String>>,
+    /// The complete new scope (replaces the old one; `{}` removes every
+    /// limit). Absent: unchanged.
+    #[serde(default)]
+    pub scope: Option<TokenScope>,
+}
+
+/// Most zones one token scope may name.
+pub const MAX_SCOPE_ZONES: usize = 256;
+
+/// Validate and normalize a token scope (M1): zone names normalized,
+/// sorted and de-duplicated (1-256 of them when given; a zone that does
+/// not exist yet is allowed and grants nothing until it does), `expires_at`
+/// an RFC 3339 time in the future, stored in UTC with milliseconds.
+pub fn normalize_scope(raw: &TokenScope) -> ApiResult<TokenScope> {
+    let zones = match &raw.zones {
+        None => None,
+        Some(list) => {
+            let mut out = std::collections::BTreeSet::new();
+            for z in list {
+                out.insert(normalize_zone_name(z)?);
+            }
+            if out.is_empty() {
+                return Err(ApiError::bad_request(
+                    "scope.zones: name at least one zone, or leave it out for every zone",
+                ));
+            }
+            if out.len() > MAX_SCOPE_ZONES {
+                return Err(ApiError::bad_request(format!(
+                    "scope.zones: at most {MAX_SCOPE_ZONES} zones"
+                )));
+            }
+            Some(out.into_iter().collect())
+        }
+    };
+    let expires_at = match &raw.expires_at {
+        None => None,
+        Some(t) => {
+            let at = chrono::DateTime::parse_from_rfc3339(t.trim())
+                .map_err(|_| {
+                    ApiError::bad_request(
+                        "scope.expires_at: an RFC 3339 time, e.g. 2099-12-31T00:00:00Z",
+                    )
+                })?
+                .with_timezone(&chrono::Utc);
+            if at <= chrono::Utc::now() {
+                return Err(ApiError::bad_request("scope.expires_at is in the past"));
+            }
+            Some(at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        }
+    };
+    Ok(TokenScope {
+        zones,
+        max_role: raw.max_role,
+        expires_at,
+    })
 }
 
 #[derive(Deserialize, IntoParams)]
@@ -2206,7 +2315,7 @@ pub async fn list_tokens(
     tag = "Tokens",
     operation_id = "create_token",
     summary = "Create an API token",
-    description = "The token acts with exactly the caller's rights. Tokens do not expire; revoke them when no longer needed. Optional `tags` label the token (change them later with `PUT /tokens/{id}`).",
+    description = "The token acts with the caller's rights, limited by an optional `scope` (only some zones, at most a role, until a time; it never has more than its owner). A token with any scope cannot create, change or revoke tokens; one limited to zones or a role has no account-wide rights. Without an expiry a token does not expire; revoke it when no longer needed. Optional `tags` label the token (change tags and scope later with `PUT /tokens/{id}`).",
     request_body(content = TokenBody, example = json!({ "name": "ci-deploy", "tags": ["ci", "deploy"] })),
     responses(
         (status = 201, description = "Created. The plaintext token is returned only once.", body = TokenCreated),
@@ -2226,13 +2335,15 @@ pub async fn create_token(
         return Err(ApiError::bad_request("name is required"));
     }
     let tags = normalize_tags(&b.tags)?;
+    let scope = b.scope.as_ref().map(normalize_scope).transpose()?;
     let token = format!("rdns_{}", auth::random_token(32));
-    let info = s.accounts.create_token(
+    let info = s.accounts.create_token_scoped(
         &caller.actor(),
         &caller.user,
         &name,
         &auth::sha256_hex(&token),
         &tags,
+        scope.as_ref(),
     )?;
     Ok((StatusCode::CREATED, Json(TokenCreated { token, info })))
 }
@@ -2271,8 +2382,8 @@ pub async fn revoke_token(
     path = "/tokens/{id}",
     tag = "Tokens",
     operation_id = "update_token",
-    summary = "Update an API token's tags",
-    description = "Replaces the tag list. Own tokens; administrators (`manage_users`) may update anyone's. Revoked tokens cannot be changed (404). A change is recorded in the audit log as `token.update` with the tags before and after.",
+    summary = "Update an API token's tags and scope",
+    description = "Replaces the tag list and/or the scope (`{}` removes every limit; absent fields are unchanged). Own tokens; administrators (`manage_users`) may update anyone's. Not with a scoped token. Revoked tokens cannot be changed (404). A change is recorded in the audit log as `token.update` with the tags and scope before and after.",
     params(TokenIdPath),
     request_body(content = TokenUpdateBody, example = json!({ "tags": ["ci", "deploy", "prod"] })),
     responses(
@@ -2291,9 +2402,10 @@ pub async fn update_token(
 ) -> ApiResult<Json<TokenInfo>> {
     s.require(&caller, GlobalPerm::ManageOwnTokens)?;
     let (t, owner) = managed_token(&s, &caller, id, true)?;
-    let tags = normalize_tags(&b.tags)?;
+    let tags = b.tags.as_deref().map(normalize_tags).transpose()?;
+    let scope = b.scope.as_ref().map(normalize_scope).transpose()?;
     let info = s.accounts.run(&caller.actor(), "update_token", |tx| {
-        tx.update_token_tags(&owner, &t, &tags)
+        tx.update_token(&owner, &t, tags.as_deref(), scope.as_ref())
     })?;
     Ok(Json(info))
 }
