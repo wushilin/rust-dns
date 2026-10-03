@@ -154,7 +154,11 @@ mod tests {
             c.write_all(b"GET / HTTP/1.0\r\n\r\n").await.unwrap();
             c
         });
-        let (mut s, _) = l.accept().await.unwrap();
+        // Bounded: a client that cannot connect fails the test instead of hanging it.
+        let (mut s, _) = tokio::time::timeout(Duration::from_secs(10), l.accept())
+            .await
+            .expect("the client connects")
+            .unwrap();
         let src = read_proxy_header(&mut s, version).await;
         let _keep = client.await.unwrap();
         let mut rest = vec![0u8; 18];
@@ -216,7 +220,11 @@ mod tests {
             }
             c
         });
-        let (mut s, _) = l.accept().await.unwrap();
+        // Bounded: a client that cannot connect fails the test instead of hanging it.
+        let (mut s, _) = tokio::time::timeout(Duration::from_secs(10), l.accept())
+            .await
+            .expect("the client connects")
+            .unwrap();
         let src = read_proxy_header(&mut s, 1).await;
         let _keep = client.await.unwrap();
         assert_eq!(
@@ -241,7 +249,11 @@ mod tests {
             c.write_all(&h).await.unwrap();
             c
         });
-        let (mut s, _) = l.accept().await.unwrap();
+        // Bounded: a client that cannot connect fails the test instead of hanging it.
+        let (mut s, _) = tokio::time::timeout(Duration::from_secs(10), l.accept())
+            .await
+            .expect("the client connects")
+            .unwrap();
         let started = std::time::Instant::now();
         let r = read_proxy_header(&mut s, 2).await;
         let _keep = client.await.unwrap();

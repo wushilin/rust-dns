@@ -535,6 +535,7 @@ mod tests {
             owner_id: None,
             dnssec: true,
             signed_at: None,
+            overrides: None,
         }
     }
 

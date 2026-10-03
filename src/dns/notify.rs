@@ -33,7 +33,8 @@ pub async fn run(server: Arc<DnsServer>) {
                     pending.remove(&zone);
                     let targets = server.runtime.load().notify.clone();
                     if targets.is_empty() { continue; }
-                    let still_exists = server.cache.load().zones.contains_key(&crate::model::zone_fqdn(&zone));
+                    // Override zones are never announced (not authoritative).
+                    let still_exists = server.cache.load().zones.get(&crate::model::zone_fqdn(&zone)).is_some_and(|z| !z.zone.is_override());
                     if !still_exists { continue; }
                     for (to, key) in targets {
                         let s = server.clone();

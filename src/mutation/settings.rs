@@ -216,6 +216,254 @@ impl AuditTx<'_> {
     }
 }
 
+pub const RESOLVER_KEY: &str = "resolver";
+
+/// How forwarded queries pick among the upstreams (I6).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamStrategy {
+    /// Try the upstreams one after the other, in the order listed (the
+    /// behaviour before strategies existed).
+    #[default]
+    InOrder,
+    /// Prefer the healthy upstream with the lowest average latency.
+    Fastest,
+    /// Ask every healthy upstream at once; the first valid answer wins.
+    Parallel,
+}
+
+fn yes() -> bool {
+    true
+}
+fn one_day() -> u32 {
+    86_400
+}
+fn v4_prefix() -> u8 {
+    24
+}
+fn v6_prefix() -> u8 {
+    56
+}
+
+/// Resolver behaviour for forwarded queries, set from the console
+/// (Server settings -> Forwarding). Stored as the `resolver` setting
+/// (replicated as `setting_set`); absent: the defaults. Fields missing from
+/// a stored value (saved by an older version) take their defaults, and
+/// fields this version does not know are ignored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ResolverSettings {
+    /// `domain-needed`: never forward single-label names (`wpad`,
+    /// `printer`); they get NXDOMAIN here unless an own or override zone
+    /// has them. Default on.
+    #[serde(default = "yes")]
+    pub domain_needed: bool,
+    /// `bogus-priv`: never forward reverse lookups of private and special
+    /// ranges (RFC 6303: 10/8, 172.16/12, 192.168/16, 100.64/10, 127/8,
+    /// 169.254/16, 0/8, fc00::/7, fe80::/10, ::1, ::); NXDOMAIN here unless
+    /// an own zone or automatic PTR covers the address. Default on.
+    #[serde(default = "yes")]
+    pub bogus_priv: bool,
+    /// `stop-dns-rebind`: forwarded answers that contain private,
+    /// loopback, link-local, CGNAT, ULA, `0.0.0.0` or `::` addresses are
+    /// refused. Never applied to own or override zones. Default off.
+    #[serde(default)]
+    pub rebind_protection: bool,
+    /// Domains (and everything below them) exempt from rebinding
+    /// protection (`rebind-domain-ok`).
+    #[serde(default)]
+    #[schema(example = json!(["internal", "amazonaws.com"]))]
+    pub rebind_allow: Vec<String>,
+    /// Serve stale (RFC 8767): when every upstream fails or times out,
+    /// answer from an expired cache entry (TTL 30 s). Default off.
+    #[serde(default)]
+    pub serve_stale: bool,
+    /// How long past its expiry a cache entry may still be served stale,
+    /// seconds (60 to 604800).
+    #[serde(default = "one_day")]
+    #[schema(example = 86400)]
+    pub max_stale_age_secs: u32,
+    #[serde(default)]
+    pub strategy: UpstreamStrategy,
+    /// Record types never forwarded (`filter-AAAA`, `filter-rr`): such a
+    /// query gets an empty answer (NODATA) here. Default none.
+    #[serde(default)]
+    #[schema(example = json!(["AAAA"]))]
+    pub filter_types: Vec<String>,
+    /// EDNS Client Subnet (`add-subnet`, RFC 7871) on forwarded queries.
+    /// Default off.
+    #[serde(default)]
+    pub ecs: bool,
+    /// Prefix of an IPv4 client address sent upstream (1 to 32).
+    #[serde(default = "v4_prefix")]
+    #[schema(example = 24)]
+    pub ecs_ipv4_prefix: u8,
+    /// Prefix of an IPv6 client address sent upstream (1 to 128).
+    #[serde(default = "v6_prefix")]
+    #[schema(example = 56)]
+    pub ecs_ipv6_prefix: u8,
+    /// Also send the subnet of clients in private and special ranges.
+    #[serde(default)]
+    pub ecs_private_clients: bool,
+}
+
+impl Default for ResolverSettings {
+    fn default() -> Self {
+        // One source of truth for the defaults: the serde defaults.
+        serde_json::from_str("{}").expect("defaults")
+    }
+}
+
+/// Record types that may be filtered (`filter_types`): data types only.
+pub fn parse_filter_type(s: &str) -> Result<hickory_proto::rr::RecordType, String> {
+    use hickory_proto::rr::RecordType as T;
+    let t = s.trim().to_ascii_uppercase();
+    let rt: T = t
+        .parse()
+        .map_err(|_| format!("'{s}' is not a record type"))?;
+    match rt {
+        T::A
+        | T::AAAA
+        | T::MX
+        | T::TXT
+        | T::SRV
+        | T::HTTPS
+        | T::SVCB
+        | T::CNAME
+        | T::PTR
+        | T::NS
+        | T::CAA
+        | T::NAPTR
+        | T::SSHFP
+        | T::TLSA
+        | T::ANY
+        | T::SOA
+        | T::DS
+        | T::DNSKEY => Ok(rt),
+        _ => Err(format!("'{s}' cannot be filtered")),
+    }
+}
+
+impl ResolverSettings {
+    /// Validate and normalise; every problem is listed.
+    pub fn validate(mut self) -> Result<Self, Vec<String>> {
+        let mut errs = Vec::new();
+        let mut allow = Vec::new();
+        for a in self
+            .rebind_allow
+            .iter()
+            .map(|a| a.trim().trim_end_matches('.').to_ascii_lowercase())
+            .filter(|a| !a.is_empty())
+        {
+            let ok = a.len() <= 253
+                && a.split('.').all(|l| {
+                    !l.is_empty()
+                        && l.len() <= 63
+                        && l.bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                });
+            if !ok {
+                errs.push(format!("rebind allowlist: '{a}' is not a domain name"));
+            } else if !allow.contains(&a) {
+                allow.push(a);
+            }
+        }
+        if allow.len() > 200 {
+            errs.push("rebind allowlist: at most 200 domains".into());
+        }
+        self.rebind_allow = allow;
+        if !(60..=604_800).contains(&self.max_stale_age_secs) {
+            errs.push("max_stale_age_secs must be between 60 and 604800".into());
+        }
+        let mut types: Vec<String> = Vec::new();
+        for t in self.filter_types.iter().filter(|t| !t.trim().is_empty()) {
+            match parse_filter_type(t) {
+                Ok(rt) => {
+                    let s = rt.to_string();
+                    if !types.contains(&s) {
+                        types.push(s);
+                    }
+                }
+                Err(e) => errs.push(e),
+            }
+        }
+        self.filter_types = types;
+        if !(1..=32).contains(&self.ecs_ipv4_prefix) {
+            errs.push("ecs_ipv4_prefix must be between 1 and 32".into());
+        }
+        if !(1..=128).contains(&self.ecs_ipv6_prefix) {
+            errs.push("ecs_ipv6_prefix must be between 1 and 128".into());
+        }
+        if errs.is_empty() {
+            Ok(self)
+        } else {
+            Err(errs)
+        }
+    }
+}
+
+/// The stored resolver settings, with who set them and when.
+pub fn load_resolver(storage: &Storage) -> Result<Option<(ResolverSettings, String, String)>> {
+    match storage.get_setting(RESOLVER_KEY)? {
+        None => Ok(None),
+        Some((value, by, at)) => Ok(Some((serde_json::from_str(&value)?, by, at))),
+    }
+}
+
+/// The stored blocklist configuration, with who set it and when.
+pub fn load_blocklists(
+    storage: &Storage,
+) -> Result<Option<(crate::blocklist::BlocklistSettings, String, String)>> {
+    match storage.get_setting(crate::blocklist::SETTINGS_KEY)? {
+        None => Ok(None),
+        Some((value, by, at)) => Ok(Some((serde_json::from_str(&value)?, by, at))),
+    }
+}
+
+impl AuditTx<'_> {
+    /// Store a console setting `key` (replacing any previous value) and
+    /// audit it as `action` (`settings.<key>.update`) with before/after.
+    pub fn set_setting<T: Serialize>(
+        &mut self,
+        key: &str,
+        action: &'static str,
+        actor: &str,
+        before: Option<&T>,
+        after: &T,
+    ) -> Result<()> {
+        self.record(crate::mutation::SecretChange::SettingSet {
+            setting: crate::replication::types::ReplSetting {
+                key: key.into(),
+                value: serde_json::to_string(after)?,
+                updated_by: actor.to_string(),
+                updated_at: crate::model::now_rfc3339(),
+            },
+        })?;
+        self.push(
+            action,
+            None,
+            key,
+            serde_json::json!({ "before": before, "after": after }),
+        );
+        Ok(())
+    }
+
+    /// Remove a console setting `key` (defaults apply again); audited as
+    /// `settings.<key>.reset`. Returns whether there was one.
+    pub fn clear_setting<T: Serialize>(
+        &mut self,
+        key: &str,
+        action: &'static str,
+        before: &T,
+    ) -> Result<bool> {
+        let stored = self.has_setting(key)?;
+        if stored {
+            self.record(crate::mutation::SecretChange::SettingCleared { key: key.into() })?;
+            self.push(action, None, key, serde_json::json!({ "before": before }));
+        }
+        Ok(stored)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -192,7 +192,7 @@ filters instead of branches in `dns/handler.rs`.
     semantics (answer / drop / pass / post-process, ordering, a filter that
     panics does not take down the server — the query gets SERVFAIL and the
     panic is logged).
-- [ ] P2. Write the Phase I items as filters on this pipeline (each I item's
+- [x] P2. Write the Phase I items as filters on this pipeline (each I item's
   text below stays the spec; "filter" is the implementation shape).
 
 ## Phase I: dnsmasq-style resolver features (owner, 2026-10-03)
@@ -208,7 +208,7 @@ Defaults must not change answers for existing deployments except where noted.
 
 Order: I1-I4 first (core, ~2 days), then I5-I6, then I7, then the rest.
 
-- [ ] I1. Override zones (covers conditional forwarding). A zone of type
+- [x] I1. Override zones (covers conditional forwarding). A zone of type
   `override` (default type stays `authoritative`) with its own upstream list
   and a mode: `transparent` (default: a name+type defined locally is
   answered from the local records, anything else under the zone is forwarded
@@ -230,16 +230,16 @@ Order: I1-I4 first (core, ~2 days), then I5-I6, then I7, then the rest.
   upstreams with a fake resolver, REFUSED for disallowed clients, no AA, not
   in AXFR, no AD, longest-match vs a signed parent (delv still validates the
   parent), replication to a standby.
-- [ ] I2. `domain-needed`: never forward single-label names (no dot except the
+- [x] I2. `domain-needed`: never forward single-label names (no dot except the
   root). Answer NXDOMAIN locally unless an own/override zone has the name.
   Default ON. Console: toggle in Server settings → Forwarding with a short
   explanation (privacy, `wpad` risk). Counter for refused-locally queries.
-- [ ] I3. `bogus-priv`: never forward reverse lookups for private/special
+- [x] I3. `bogus-priv`: never forward reverse lookups for private/special
   ranges (RFC 6303 zones: 10/8, 172.16/12, 192.168/16, 100.64/10 CGNAT,
   127/8, 169.254/16, 0/8, fc00::/7, fe80::/10, ::1, unspecified). Answer
   NXDOMAIN locally unless an own zone or auto-PTR covers the address (own
   reverse zones always win). Default ON. Console toggle + counter.
-- [ ] I4. Rebinding protection (`stop-dns-rebind`). Default OFF. When on:
+- [x] I4. Rebinding protection (`stop-dns-rebind`). Default OFF. When on:
   forwarded answers containing private, loopback, link-local, CGNAT, ULA,
   `0.0.0.0` or `::` addresses are refused (REFUSED), counted and logged with
   the name. Never applied to own or override zones. Allowlist of domain
@@ -248,18 +248,18 @@ Order: I1-I4 first (core, ~2 days), then I5-I6, then I7, then the rest.
   blocked answer, allowlisted answer, own zone with a private address
   unaffected, override zone unaffected, CNAME chain ending in a private
   address blocked.
-- [ ] I5. Serve stale (RFC 8767). Default OFF. When on and every upstream fails
+- [x] I5. Serve stale (RFC 8767). Default OFF. When on and every upstream fails
   or times out, answer from an expired cache entry (TTL 30 s, per RFC 8767)
   up to `max_stale_age` (default 1 day). Console toggle + max age + counter
   of stale answers. Tests with a fake upstream that goes away.
-- [ ] I6. Upstream strategy and health. Strategies: `in_order` (current),
+- [x] I6. Upstream strategy and health. Strategies: `in_order` (current),
   `fastest` (track latency, prefer the fastest healthy one), `parallel`
   (send to all, first valid answer wins; respect the in-flight cap from C1).
   Health: per upstream latency (EWMA), success/failure counts, last error,
   marked down after N consecutive failures and probed back. Console:
   dropdown + live health table on Server settings. Applies per override zone
   too. Tests with fake upstreams of different speeds and one dead.
-- [ ] I7. Blocklists. Console page "Blocklists": list URLs (formats: hosts
+- [x] I7. Blocklists. Console page "Blocklists": list URLs (formats: hosts
   file, plain domains, Adblock `||domain^`), refresh interval, on/off per
   list, allowlist, block action (NXDOMAIN or 0.0.0.0/::), per-list counts and
   last refresh status, "test a name" box. Only the list configuration
@@ -270,24 +270,39 @@ Order: I1-I4 first (core, ~2 days), then I5-I6, then I7, then the rest.
   zones win). Size limits and failure handling (keep the last good copy).
   Tests: each format, allowlist, action, refresh with a local HTTP server,
   memory for 1M entries measured.
-- [ ] I8. Hosts-file import. "Import hosts file" in the Import/Export dialog:
+- [x] I8. Hosts-file import. "Import hosts file" in the Import/Export dialog:
   paste or upload `/etc/hosts`-format text, choose the target zone (names
   outside it are listed and skipped), preview, import in one transaction
   (same merge/replace modes as JSON import). Tests: parsing (comments,
   multiple names per line, IPv6), preview, transaction rollback on error.
-- [ ] I9. Filter record types from forwarded answers (`filter-AAAA`,
+- [x] I9. Filter record types from forwarded answers (`filter-AAAA`,
   `filter-rr`). Console multi-select of types; answer NODATA for a filtered
   type. Default empty. Tests.
-- [ ] I10. EDNS Client Subnet on forwarded queries (`add-subnet`). Default OFF;
+- [x] I10. EDNS Client Subnet on forwarded queries (`add-subnet`). Default OFF;
   console toggle + prefix lengths (IPv4 /24, IPv6 /56 defaults); never for
   clients in private ranges unless chosen; cache key includes the subnet
   scope returned. `add-mac` is out of scope (MACs are only known on the same
   LAN segment). Tests with a fake upstream that echoes the option.
-- [ ] I11. Follow interfaces (`bind-dynamic` / `interface=`). Listener choice
+- [x] I11. Follow interfaces (`bind-dynamic` / `interface=`). Listener choice
   by interface name (per server; does not replicate), console shows current
   addresses per interface; sockets re-bound when addresses appear/disappear
   (poll or netlink on Linux; poll elsewhere). Replaces the `run.sh` ens5/eth0
   rewrite. Tests: unit for the address diffing; integration where possible.
+
+- [ ] J2. (found in I11) Interfaces are polled (`interface_poll_secs`,
+  default 5 s), not followed through netlink: a new address is served
+  within one interval. Netlink (Linux) would make it immediate.
+- [x] J3. (found by the P1 gate) The unit test `api::proxy::tests::
+  v1_split_across_segments` hung for 17 minutes once in the gate while
+  other local load (dnsperf, the equivalence script) ran: its spawned
+  client's `connect` evidently failed (only the test's LISTEN socket
+  remained) and the test waited on `accept` without a timeout. Passed on
+  rerun and 5/5 alone. Fixed: the three proxy tests' `accept` is bounded
+  (10 s), so such a failure fails instead of hanging. Same gate run:
+  `tests/forwarding.rs` `tcp_fallback_answers_are_truncated_for_udp_
+  clients` failed once with AddrInUse: its fake upstream binds a free UDP
+  port and then TCP on the same number, which another process had; the
+  helper now retries with another port.
 
 Considered and NOT planned (owner may revisit): validating DNSSEC on
 forwarded answers ourselves (several days, subtle; upstreams already
@@ -323,6 +338,45 @@ a router-sized footprint (a design property, not a feature).
   `zone_updated` (owner cleared, no serial bump) and `member_removed`
   before `user_deleted`. An old (3884ba8) standby replays those as
   before. Upgrade order: either; standby (baba2) first still preferred.
+
+- After phase P and I (this session; not deployed): replication protocol
+  stays 2, no new change kind. Everything new is either a console setting
+  (`setting_set` / `setting_cleared` with the new keys `resolver` and
+  `blocklists`, values are JSON with serde defaults, unknown fields
+  ignored) or a zone row field (`override`, present only for override
+  zones, in `zone_created` / `zone_updated` and snapshots). New nullable
+  column `zones.override_spec` (added NULL by the migration, nothing
+  rewritten), in `compat_columns` (left out of the table checksum, covered
+  by the per-zone checksum). Without that classification the 3884ba8
+  standby halted at its first reconcile ("table zones: differs"): found by
+  the new mixed-version test and fixed before any commit.
+  What a 3884ba8 standby does with each (tests `phase_i_settings_keep_an_
+  old_standby_following`, `an_old_standby_cannot_represent_an_override_
+  zone`, real 3884ba8 binary):
+  - resolver settings, blocklists, forwarding override: stored as rows,
+    never applied (it has no such features); follows, reconcile ok. Once
+    upgraded in place it applies them at startup.
+  - override zones: it CANNOT represent them. It applies the zone as an
+    ordinary authoritative zone (serving it with AA), the per-zone
+    checksum differs and the standby HALTS (diverged), as for any
+    divergence. So: upgrade the standby (baba2) first, then the primary
+    (gate), and create override zones only after both run this version.
+    A standby that halted this way must be rebuilt (`--prepare-standby`)
+    after its upgrade: its database has the zone without the type.
+  - Do NOT downgrade a server once an override zone exists (the old binary
+    would include the unknown column in its table checksum, and serve the
+    zone as authoritative).
+  Default changes (owner's choice): domain-needed and bogus-priv are ON
+  for clients allowed to forward: single-label names and reverse names of
+  private ranges (RFC 6303) not covered by own zones / automatic PTR are
+  answered NXDOMAIN here instead of being forwarded. Equivalence against
+  7f7e547 with the defaults: 141 of 20,743 cases differ, all for
+  `7.1.1.10.in-addr.arpa.` (private reverse name, previously forwarded);
+  with both switched off: 0 differences. Everything else is off by
+  default and changes no answer. Blocklists, once configured, make every
+  server download the lists itself (outbound HTTP(S) from gate and baba2).
+  `[server] interfaces` (I11) could replace run.sh's ens5/eth0 rewrite of
+  `bind` on gate/baba2; not required, owner's decision.
 
 ## Log
 
@@ -699,4 +753,93 @@ a router-sized footprint (a design property, not a feature).
   clients, 8 s, alternating runs): 7f7e547 334.5k/341.8k/335.6k/326.4k
   q/s (mean 334.6k), 93ddd9d 338.1k/342.5k/326.3k/324.0k (mean 332.7k):
   no measurable difference (-0.6%, within run-to-run noise of +-2%).
-
+- 2026-10-03 (phase P session): P1 gate on 104b216 (clean worktree,
+  `REQUIRE_BIND_TOOLS=1 REQUIRE_PREV_BIN=1`, 3884ba8 binary): fmt, clippy,
+  196 unit tests, suites api_contract 5, dnssec 3, dnssec_changes 1, e2e
+  5, follow 5 (mixed-version included), forwarding 8, hardening 10,
+  openapi_spec 8, tsig 7, UI, OpenAPI, validator, conformance 123, smoke,
+  cargo-audit only `paste`. Two environmental flakes on the way, see J3
+  (a hung proxy unit test, an AddrInUse in a forwarding test helper; both
+  passed on rerun; both made robust).
+- 2026-10-03 (phase P session): P2 / I1-I11 done as filters (one commit:
+  the items share `src/dns/filters.rs`, `pipeline.rs`, `mod.rs` and the
+  settings plumbing, so per-item commits would not each build; recorded
+  here instead). Design:
+  - Chain (`pipeline.rs` table): edns, request, special, transfer,
+    authoritative, override, recursion, [domain_needed], [bogus_priv],
+    [filter_types], [blocklist], [open_resolver], [rebind (post)],
+    [serve_stale (post)], forward. Bracketed = only in the chain when on.
+  - Settings: one console setting `resolver` (`ResolverSettings`: I2-I6,
+    I9, I10; absent = defaults) and one `blocklists` (I7), both through
+    `AuditTx::set_setting` / `clear_setting` (typed `setting_set` /
+    `setting_cleared`, audited `settings.<key>.update/reset`), applied by
+    `DnsServer::set_resolver` / `set_blocklists`, on a standby by
+    `load_console_settings` after replicated account changes. API
+    `GET/PUT/DELETE /settings/resolver`, `GET/PUT /blocklists`, `POST
+    /blocklists/refresh`, `POST /blocklists/test`, `POST
+    /zones/{zone}/import/hosts`; zone create/update take `override`.
+  - I1: `zones.override_spec` (JSON of `ZoneOverride {mode, upstreams}`),
+    `Zone.overrides` (`override` in JSON). Catalog keeps override zones but
+    never signs them, gives them no auto-PTR entries; `Lookup::Override`
+    for names whose longest zone is an override zone; CNAME/DNAME chases,
+    glue and DS parent lookups use only authoritative zones
+    (`find_auth_zone`); AXFR/IXFR and NOTIFY skip them; DNSSEC cannot be
+    turned on for them. Filter `override`: ACL (REFUSED), local data via
+    `lookup_override` (non-AA, no RRSIG), local CNAME to elsewhere chased
+    through the zone's upstreams, transparent -> zone upstreams (cache
+    scope = hash of the upstream set, AD cleared), static (or no
+    upstreams) -> local NXDOMAIN/NODATA with SOA. Export/import carry the
+    `override` object (new zones only).
+  - I4 rebind: post filter on `forward` answers (relayed and cache hits),
+    REFUSED, per-name log of the last 100 names. I5: the forward cache keeps
+    expired entries while serve-stale is on (`Caps.stale_secs`), post
+    filter replaces an upstream-failure SERVFAIL with the stale entry, TTL
+    30. I6: `forward::Health` (EWMA latency, counts, last error, down after
+    3 failures, one probe per 30 s), `forward_via` with in_order (exactly
+    the old order; health only recorded), fastest, parallel (`select_ok`,
+    one in-flight slot per query). I7: `src/blocklist.rs` (per-line format
+    detection, sorted `Vec<u64>` of keyed SipHash per list, suffix match,
+    allowlist, download task with size/time limits keeping the last good
+    copy, `ArcSwap` of the compiled set). I8: `parse_hosts` + `Mutator::
+    import_hosts` (one transaction via the JSON import). I9: pre filter,
+    NODATA. I10: ECS option built from the decoded request, reply
+    re-encoded for the client (our option removed, the client's own EDNS),
+    cache scope per client subnet, scope-0 answers shared. I11:
+    `dns/ifaces.rs`, `getifaddrs` polling, per-address listeners aborted
+    when the address goes; status in `/api/status` `listeners.interfaces`
+    and on the dashboard.
+  - Console: Server settings -> Resolver card (toggles, strategy,
+    upstream health incl. override zones, rebind allowlist and recent list,
+    stale, filtered types, ECS); Blocklists page (lists, status, allowlist,
+    action, interval, download now, test a name); new-zone type selector,
+    override badge and "Override settings" dialog on the zone page;
+    Import/Export -> Hosts file tab (preview, import). Browser-checked in
+    Chrome on a throwaway local instance: pages render, saves work, hosts
+    preview/import works, no console errors.
+  Tests: `tests/resolver.rs` (`domain_needed_bogus_priv_and_filtered_
+  types`, `rebinding_protection`, `serve_stale_when_every_upstream_fails`,
+  `upstream_strategies_and_health`, `edns_client_subnet`, `override_zones`,
+  `an_override_zone_under_a_signed_parent` (dnssec-verify of the parent's
+  AXFR, delv on parent names; delv on the override name reports a broken
+  trust chain, as documented), `blocklists_block_forwarded_names`); unit
+  `private_reverse_names`, `special_addresses`, `dangling_cnames`,
+  `expired_entries_are_served_stale_within_the_window`, blocklist
+  `every_format_parses`, `suffix_matching_and_the_allowlist`,
+  `settings_validate`, `a_million_entries_are_compact`,
+  `refresh_keeps_the_last_good_copy`, hosts `hosts_files_parse`,
+  `hosts_import_is_one_transaction`, ifaces `address_changes_are_diffed`,
+  `wanted_interfaces_without_link_local`, `loopback_is_listed`,
+  `following_an_interface_binds_its_addresses`; pipeline default-chain
+  test extended; follow `phase_i_settings_keep_an_old_standby_following`
+  and `an_old_standby_cannot_represent_an_override_zone` (3884ba8);
+  conformance.py: 4 override checks (127 total; the local harness seeds an
+  override zone under the signed test zone).
+  Memory for 1M blocklist entries: 8,000,000 bytes for the set (test
+  `a_million_entries_are_compact`), built in well under a second; the
+  download text is dropped after parsing.
+  Equivalence vs 7f7e547 (release): with domain_needed/bogus_priv off
+  (`--new-resolver`) 0 differences in 20,743 cases; with the defaults 141,
+  all `7.1.1.10.in-addr.arpa.` (I3, intended).
+  Throughput (release, `scripts/bench-tcp-local.sh`, alternating):
+  7f7e547 338.8k/339.4k/340.5k/316.3k q/s (the last one while a cargo
+  build ran), phase I tree 341.5k/338.2k/351.2k/345.6k: no regression.

@@ -62,6 +62,7 @@ fn zone() -> Zone {
         owner_id: None,
         dnssec: false,
         signed_at: None,
+        overrides: None,
     }
 }
 

@@ -1,6 +1,6 @@
 //! JSON export and import (one transaction).
 
-use super::ops::{apply_zone_input, new_zone, soa_differs};
+use super::ops::{apply_override, apply_zone_input, new_zone, soa_differs};
 use super::*;
 
 /// JSON export / import document.
@@ -49,6 +49,11 @@ pub struct ExportZone {
     pub default_ttl: Option<u32>,
     #[serde(default)]
     pub owner: Option<String>,
+    /// An override zone's settings (I1). On import they apply to a zone
+    /// the import creates; an existing zone keeps its type.
+    #[serde(rename = "override", default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub overrides: Option<ZoneOverride>,
     #[serde(default)]
     #[schema(default = json!([]))]
     pub records: Vec<ExportRecord>,
@@ -92,7 +97,153 @@ pub struct ImportSummary {
     pub records_skipped: usize,
 }
 
+/// A name of a hosts file that is not imported, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
+pub struct HostsSkip {
+    /// Line number (1-based).
+    pub line: usize,
+    #[schema(example = "www.other.example")]
+    pub name: String,
+    #[schema(example = "outside the zone")]
+    pub reason: String,
+}
+
+/// A hosts file read for one zone (I8).
+#[derive(Debug, Clone, Default, Serialize, utoipa::ToSchema)]
+pub struct HostsParse {
+    /// The A / AAAA records to import (names relative to the zone).
+    pub records: Vec<HostsRecord>,
+    pub skipped: Vec<HostsSkip>,
+}
+
+/// One record from a hosts file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
+pub struct HostsRecord {
+    /// Relative to the zone (`@` for the apex).
+    #[schema(example = "nas")]
+    pub name: String,
+    #[serde(rename = "type")]
+    pub rtype: RecordType,
+    #[schema(example = "192.168.1.10")]
+    pub value: String,
+}
+
+/// Read `/etc/hosts`-format text for `zone`: `address name [name...]`,
+/// `#` comments. Names inside the zone (or with no dot: taken as relative
+/// to the zone, as dnsmasq's `expand-hosts`) become A / AAAA records;
+/// names outside the zone, loopback and unspecified addresses, and lines
+/// that are not understood are listed as skipped. Duplicates are dropped.
+pub fn parse_hosts(text: &str, zone: &str) -> HostsParse {
+    let mut out = HostsParse::default();
+    for (i, raw) in text.lines().enumerate() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut words = line.split_whitespace();
+        let first = words.next().unwrap_or("");
+        let skip = |out: &mut HostsParse, name: &str, reason: &str| {
+            out.skipped.push(HostsSkip {
+                line: i + 1,
+                name: name.to_string(),
+                reason: reason.to_string(),
+            })
+        };
+        let ip: std::net::IpAddr = match first.parse() {
+            Ok(ip) => ip,
+            Err(_) => {
+                skip(&mut out, first, "not an IP address");
+                continue;
+            }
+        };
+        let names: Vec<&str> = words.collect();
+        if names.is_empty() {
+            skip(&mut out, first, "no name after the address");
+            continue;
+        }
+        if ip.is_loopback() || ip.is_unspecified() {
+            for n in names {
+                skip(&mut out, n, "loopback or unspecified address");
+            }
+            continue;
+        }
+        let rtype = if ip.is_ipv4() {
+            RecordType::A
+        } else {
+            RecordType::AAAA
+        };
+        for n in names {
+            let lower = n.trim_end_matches('.').to_ascii_lowercase();
+            // A dotted name is absolute; a single label is relative.
+            let input = if lower.contains('.') || zone == "." {
+                format!("{lower}.")
+            } else {
+                lower.clone()
+            };
+            match normalize_record_name(&input, zone) {
+                Ok(name) => {
+                    let r = HostsRecord {
+                        name,
+                        rtype,
+                        value: ip.to_string(),
+                    };
+                    if !out.records.contains(&r) {
+                        out.records.push(r);
+                    }
+                }
+                Err(e) if e.0.contains("not inside zone") => skip(&mut out, n, "outside the zone"),
+                Err(e) => skip(&mut out, n, &e.0),
+            }
+        }
+    }
+    out
+}
+
 impl Mutator {
+    /// Import a hosts file into `zone` (one transaction, as a JSON import
+    /// of its A / AAAA records with `mode`).
+    pub async fn import_hosts(
+        &self,
+        actor: Actor,
+        zone: &str,
+        records: &[HostsRecord],
+        mode: ImportMode,
+        allowed: Option<Vec<String>>,
+    ) -> MResult<ImportSummary> {
+        let name = normalize_zone_name(zone)?;
+        if self.storage.get_zone(&name)?.is_none() {
+            return Err(MutationError::NotFound(format!("zone '{name}' not found")));
+        }
+        let doc = ExportDoc {
+            version: 1,
+            exported_at: now_rfc3339(),
+            zones: vec![ExportZone {
+                name,
+                serial: None,
+                soa_mname: None,
+                soa_rname: None,
+                refresh: None,
+                retry: None,
+                expire: None,
+                minimum: None,
+                default_ttl: None,
+                owner: None,
+                overrides: None,
+                records: records
+                    .iter()
+                    .map(|r| ExportRecord {
+                        name: r.name.clone(),
+                        rtype: r.rtype,
+                        value: r.value.clone(),
+                        ttl: None,
+                        expires_at: None,
+                    })
+                    .collect(),
+            }],
+        };
+        self.import(actor, doc, mode, None, allowed).await
+    }
+
     // ---- import --------------------------------------------------------
 
     /// Import a document as one transaction: every zone and record in it is
@@ -128,6 +279,10 @@ impl Mutator {
                     minimum: ez.minimum,
                     default_ttl: ez.default_ttl,
                     owner: None,
+                    overrides: ez.overrides.as_ref().map(|o| ZoneOverrideInput {
+                        mode: Some(o.mode),
+                        upstreams: Some(o.upstreams.iter().map(|u| u.to_string()).collect()),
+                    }),
                 };
                 let zone = match t.zone(&name)? {
                     Some(before) => {
@@ -143,6 +298,7 @@ impl Mutator {
                     None => {
                         let mut z = new_zone(&defaults, &name, owner_id);
                         apply_zone_input(&mut z, &input)?;
+                        apply_override(&mut z, &input, true)?;
                         if let Some(s) = ez.serial {
                             z.serial = s;
                         }
@@ -247,6 +403,7 @@ pub fn export_zone(zd: &crate::cache::ZoneData) -> ExportZone {
         minimum: Some(z.minimum),
         default_ttl: Some(z.default_ttl),
         owner: None,
+        overrides: z.overrides.as_deref().cloned(),
         records,
     }
 }
@@ -255,6 +412,109 @@ pub fn export_zone(zd: &crate::cache::ZoneData) -> ExportZone {
 mod tests {
     use super::*;
     use crate::mutation::test_support::*;
+
+    #[test]
+    fn hosts_files_parse() {
+        let text = "\
+# comment
+127.0.0.1   localhost
+::1         localhost ip6-localhost
+192.168.1.10  nas.home.test nas   # trailing comment
+192.168.1.11\tPrinter.Home.Test. printer
+fd00::10    nas.home.test
+10.0.0.1    www.other.example home.test
+not-an-ip   x.home.test
+0.0.0.0     blocked.home.test
+192.168.1.12
+192.168.1.10 nas
+";
+        let p = parse_hosts(text, "home.test");
+        let got: Vec<(&str, RecordType, &str)> = p
+            .records
+            .iter()
+            .map(|r| (r.name.as_str(), r.rtype, r.value.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("nas", RecordType::A, "192.168.1.10"),
+                ("printer", RecordType::A, "192.168.1.11"),
+                ("nas", RecordType::AAAA, "fd00::10"),
+                ("@", RecordType::A, "10.0.0.1"),
+            ],
+            "duplicates dropped, case folded, apex as @"
+        );
+        let reasons: Vec<(usize, &str, &str)> = p
+            .skipped
+            .iter()
+            .map(|s| (s.line, s.name.as_str(), s.reason.as_str()))
+            .collect();
+        assert_eq!(
+            reasons,
+            vec![
+                (2, "localhost", "loopback or unspecified address"),
+                (3, "localhost", "loopback or unspecified address"),
+                (3, "ip6-localhost", "loopback or unspecified address"),
+                (7, "www.other.example", "outside the zone"),
+                (8, "not-an-ip", "not an IP address"),
+                (9, "blocked.home.test", "loopback or unspecified address"),
+                (10, "192.168.1.12", "no name after the address"),
+            ]
+        );
+    }
+
+    /// A hosts import is one transaction: an invalid record rolls the whole
+    /// import back; replace mode keeps only what the file has.
+    #[tokio::test]
+    async fn hosts_import_is_one_transaction() {
+        let (s, m, _) = setup();
+        m.create_zone(
+            actor(),
+            ZoneInput {
+                name: Some("home.test".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let p = parse_hosts("192.168.1.10 nas\n192.168.1.11 printer\n", "home.test");
+        let sum = m
+            .import_hosts(actor(), "home.test", &p.records, ImportMode::Merge, None)
+            .await
+            .unwrap();
+        assert_eq!(sum.records_added, 2);
+        // Bad value: the whole import fails, nothing is added.
+        let mut bad = parse_hosts("192.168.1.20 tv\n", "home.test").records;
+        bad.push(HostsRecord {
+            name: "broken".into(),
+            rtype: RecordType::A,
+            value: "not-an-address".into(),
+        });
+        assert!(m
+            .import_hosts(actor(), "home.test", &bad, ImportMode::Merge, None)
+            .await
+            .is_err());
+        let zid = s.get_zone("home.test").unwrap().unwrap().id;
+        let names: Vec<String> = s
+            .list_records(zid)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        assert!(!names.contains(&"tv".to_string()), "rolled back: {names:?}");
+        // Replace: only what the file has.
+        let p = parse_hosts("192.168.1.30 only\n", "home.test");
+        let sum = m
+            .import_hosts(actor(), "home.test", &p.records, ImportMode::Replace, None)
+            .await
+            .unwrap();
+        assert_eq!((sum.records_added, sum.records_removed), (1, 2));
+        assert!(m
+            .import_hosts(actor(), "missing.test", &p.records, ImportMode::Merge, None)
+            .await
+            .is_err());
+    }
 
     /// H1: an import's record checks look at one name (an index lookup),
     /// not the whole zone, so a large import is linear. 6,000 records took
@@ -277,6 +537,7 @@ mod tests {
                 minimum: None,
                 default_ttl: None,
                 owner: None,
+                overrides: None,
                 records: (0..n)
                     .map(|i| ExportRecord {
                         // Two records per name: the per-name checks still apply.

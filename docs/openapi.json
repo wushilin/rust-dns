@@ -1769,6 +1769,70 @@
         }
       }
     },
+    "/zones/{zone}/import/hosts": {
+      "post": {
+        "tags": [
+          "Import/Export"
+        ],
+        "summary": "Import a hosts file into a zone",
+        "description": "Reads `/etc/hosts`-format text and adds its A / AAAA records to the zone in one transaction (same `merge` / `replace` modes as the JSON import). Names outside the zone are listed and skipped. `preview: true` changes nothing. Needs the zone's import permission (owner).",
+        "operationId": "import_hosts",
+        "parameters": [
+          {
+            "name": "zone",
+            "in": "path",
+            "description": "Zone name, e.g. `example.com`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "example.com"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HostsImportInput"
+              },
+              "example": {
+                "mode": "merge",
+                "preview": false,
+                "text": "192.168.1.10 nas.home.example nas\n192.168.1.11 printer\n"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Parsed records, skipped names and (unless a preview) the import summary.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostsImportResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/ConflictOrReadOnly"
+          }
+        }
+      }
+    },
     "/changelog": {
       "get": {
         "tags": [
@@ -2890,6 +2954,285 @@
         }
       }
     },
+    "/settings/resolver": {
+      "get": {
+        "tags": [
+          "Server"
+        ],
+        "summary": "Resolver settings and upstream health (admin)",
+        "description": "Settings for forwarded queries (domain-needed, bogus-priv, rebinding protection, serve stale, upstream strategy, filtered types, EDNS Client Subnet), whether they were saved from the console, and what this server observed: upstream health, names refused by rebinding protection, counters. Needs `server_admin`.",
+        "operationId": "get_resolver_settings",
+        "responses": {
+          "200": {
+            "description": "Settings in effect.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResolverView"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "Server"
+        ],
+        "summary": "Change resolver settings (admin)",
+        "description": "Saves the resolver settings and applies them at once (no restart); replicated to standbys. Omitted fields take their defaults. The change and its audit entry (`settings.resolver.update`) are one transaction. Needs `server_admin`.",
+        "operationId": "update_resolver_settings",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResolverSettings"
+              },
+              "example": {
+                "bogus_priv": true,
+                "domain_needed": true,
+                "ecs": false,
+                "ecs_ipv4_prefix": 24,
+                "ecs_ipv6_prefix": 56,
+                "ecs_private_clients": false,
+                "filter_types": [
+                  "AAAA"
+                ],
+                "max_stale_age_secs": 86400,
+                "rebind_allow": [
+                  "internal"
+                ],
+                "rebind_protection": true,
+                "serve_stale": true,
+                "strategy": "fastest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Saved and applied.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResolverView"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/ReadOnly"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Server"
+        ],
+        "summary": "Use the default resolver settings again (admin)",
+        "description": "Removes the saved resolver settings; the defaults apply at once (domain-needed and bogus-priv on, everything else off, upstreams in order). Audited as `settings.resolver.reset`. No-op when nothing is saved. Needs `server_admin`.",
+        "operationId": "reset_resolver_settings",
+        "responses": {
+          "200": {
+            "description": "Defaults in effect.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResolverView"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/ReadOnly"
+          }
+        }
+      }
+    },
+    "/blocklists": {
+      "get": {
+        "tags": [
+          "Server"
+        ],
+        "summary": "Blocklists and their download state (admin)",
+        "description": "The blocklist configuration (replicated) and, per list, this server's last download, entries in use, errors and blocked queries. Blocklists apply to forwarded queries only. Needs `server_admin`.",
+        "operationId": "get_blocklists",
+        "responses": {
+          "200": {
+            "description": "Blocklists.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BlocklistView"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "Server"
+        ],
+        "summary": "Change the blocklists (admin)",
+        "description": "Saves the list URLs, allowlist, block action and refresh interval; replicated to standbys, each server downloads the lists itself (new lists at once). Audited as `settings.blocklists.update`. Needs `server_admin`.",
+        "operationId": "update_blocklists",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BlocklistSettings"
+              },
+              "example": {
+                "action": "nxdomain",
+                "allow": [
+                  "example.com"
+                ],
+                "lists": [
+                  {
+                    "enabled": true,
+                    "name": "StevenBlack",
+                    "url": "https://blocklists.example/hosts.txt"
+                  }
+                ],
+                "refresh_hours": 24
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Saved and applied.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BlocklistView"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/ReadOnly"
+          }
+        }
+      }
+    },
+    "/blocklists/refresh": {
+      "post": {
+        "tags": [
+          "Server"
+        ],
+        "summary": "Download every enabled blocklist now (admin)",
+        "description": "Starts a download of every enabled list on this server (not replicated); the result shows in `GET /blocklists` when it finishes. Needs `server_admin`.",
+        "operationId": "refresh_blocklists",
+        "responses": {
+          "200": {
+            "description": "Started.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BlocklistView"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/ReadOnly"
+          }
+        }
+      }
+    },
+    "/blocklists/test": {
+      "post": {
+        "tags": [
+          "Server"
+        ],
+        "summary": "Would a name be blocked? (admin)",
+        "description": "Checks a name against the allowlist and every list in use on this server. Own and override zones are answered before blocklists, so a name they hold is never blocked whatever this says. Needs `server_admin`.",
+        "operationId": "test_blocklists",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BlockTestInput"
+              },
+              "example": {
+                "name": "ads.example.com"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Outcome.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BlockTest"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/ReadOnly"
+          }
+        }
+      }
+    },
     "/tsig/keys": {
       "get": {
         "tags": [
@@ -3860,6 +4203,194 @@
           "token"
         ]
       },
+      "BlockAction": {
+        "type": "string",
+        "description": "What a blocked name is answered with.",
+        "enum": [
+          "nxdomain",
+          "null_address"
+        ]
+      },
+      "BlockMatch": {
+        "type": "object",
+        "description": "Why a name is blocked: the list and the entry that matched.",
+        "required": [
+          "list",
+          "url",
+          "entry"
+        ],
+        "properties": {
+          "list": {
+            "type": "string",
+            "description": "Name of the list."
+          },
+          "url": {
+            "type": "string"
+          },
+          "entry": {
+            "type": "string",
+            "description": "The entry that matched (the name or a parent of it)."
+          }
+        }
+      },
+      "BlockTest": {
+        "type": "object",
+        "description": "The outcome of a name test (`POST /blocklists/test`).",
+        "required": [
+          "name",
+          "blocked",
+          "allowed_by",
+          "matches"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The name tested (lower-case, no trailing dot)."
+          },
+          "blocked": {
+            "type": "boolean",
+            "description": "Blocked (forwarded queries for it are answered by the block action)."
+          },
+          "allowed_by": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The allowlist entry that exempts it, if any."
+          },
+          "matches": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BlockMatch"
+            },
+            "description": "Every list entry that matches."
+          }
+        }
+      },
+      "BlockTestInput": {
+        "type": "object",
+        "description": "A name to test against the blocklists.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        },
+        "example": {
+          "name": "ads.example.com"
+        }
+      },
+      "BlocklistSettings": {
+        "type": "object",
+        "description": "The blocklist configuration (replicated; downloads are per server).",
+        "properties": {
+          "lists": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BlocklistSource"
+            }
+          },
+          "allow": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Domains never blocked (suffix match: `example.com` also allows\n`www.example.com`).",
+            "example": [
+              "example.com"
+            ]
+          },
+          "action": {
+            "$ref": "#/components/schemas/BlockAction"
+          },
+          "refresh_hours": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Hours between downloads of each list (1 to 168).",
+            "example": 24,
+            "minimum": 0
+          }
+        }
+      },
+      "BlocklistSource": {
+        "type": "object",
+        "description": "One list to download.",
+        "required": [
+          "name",
+          "url"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Display name.",
+            "example": "StevenBlack hosts"
+          },
+          "url": {
+            "type": "string",
+            "description": "`https://` (or `http://`) URL of a hosts file, a plain list of\ndomains or an Adblock-style list (`||domain^`); the format is\ndetected per line.",
+            "example": "https://blocklists.example/hosts.txt"
+          },
+          "enabled": {
+            "type": "boolean"
+          }
+        }
+      },
+      "BlocklistView": {
+        "type": "object",
+        "description": "Blocklist configuration and this server's download state.",
+        "required": [
+          "settings",
+          "updated_by",
+          "updated_at",
+          "lists",
+          "entries",
+          "memory_bytes",
+          "blocked"
+        ],
+        "properties": {
+          "settings": {
+            "$ref": "#/components/schemas/BlocklistSettings"
+          },
+          "updated_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "updated_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "lists": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ListStatus"
+            },
+            "description": "Per list: entries in use, last download, errors, blocked queries\n(this server)."
+          },
+          "entries": {
+            "type": "integer",
+            "description": "Domains in use over all enabled lists (before de-duplication across\nlists).",
+            "minimum": 0
+          },
+          "memory_bytes": {
+            "type": "integer",
+            "description": "Memory held by the lists in use, bytes.",
+            "minimum": 0
+          },
+          "blocked": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Forwarded queries blocked since start (this server).",
+            "minimum": 0
+          }
+        }
+      },
       "CacheFlushResult": {
         "type": "object",
         "description": "Result of a cache flush.",
@@ -4164,7 +4695,8 @@
           "open_resolver_truncated",
           "open_resolver_any",
           "open_resolver_rate_limited",
-          "forward_overflow"
+          "forward_overflow",
+          "stale_answers"
         ],
         "properties": {
           "queries": {
@@ -4279,6 +4811,12 @@
             "type": "integer",
             "format": "int64",
             "description": "Queries not forwarded (UDP dropped, TCP SERVFAIL) because\n`[forwarding].max_inflight` forwarded queries were already waiting\nfor an upstream.",
+            "minimum": 0
+          },
+          "stale_answers": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Stale cache entries served because every upstream failed (serve\nstale, RFC 8767).",
             "minimum": 0
           }
         }
@@ -4913,6 +5451,10 @@
               "string",
               "null"
             ]
+          },
+          "override": {
+            "$ref": "#/components/schemas/ZoneOverride",
+            "description": "An override zone's settings (I1). On import they apply to a zone\nthe import creates; an existing zone keeps its type."
           },
           "records": {
             "type": "array",
@@ -5604,6 +6146,114 @@
           "promoted_from": "https://dns1.example.net:8053"
         }
       },
+      "HostsImportInput": {
+        "type": "object",
+        "description": "A hosts file to import into one zone.",
+        "required": [
+          "text"
+        ],
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "`/etc/hosts` format: `address name [name...]`, `#` comments. Names\nwithout a dot are taken as relative to the zone."
+          },
+          "mode": {
+            "$ref": "#/components/schemas/ImportMode",
+            "description": "`merge` (default) adds missing records; `replace` replaces every\nrecord of the zone with the file's."
+          },
+          "preview": {
+            "type": "boolean",
+            "description": "Only parse and list what would be imported; change nothing."
+          }
+        },
+        "example": {
+          "mode": "merge",
+          "preview": true,
+          "text": "192.168.1.10 nas.home.example nas\n192.168.1.11 printer\n"
+        }
+      },
+      "HostsImportResult": {
+        "type": "object",
+        "description": "What a hosts file holds for the zone, and what importing it changed.",
+        "required": [
+          "records",
+          "skipped",
+          "summary"
+        ],
+        "properties": {
+          "records": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HostsRecord"
+            }
+          },
+          "skipped": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HostsSkip"
+            },
+            "description": "Names not imported (outside the zone, loopback, unparseable)."
+          },
+          "summary": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ImportSummary",
+                "description": "`null` for a preview."
+              }
+            ]
+          }
+        }
+      },
+      "HostsRecord": {
+        "type": "object",
+        "description": "One record from a hosts file.",
+        "required": [
+          "name",
+          "type",
+          "value"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Relative to the zone (`@` for the apex).",
+            "example": "nas"
+          },
+          "type": {
+            "$ref": "#/components/schemas/RecordType"
+          },
+          "value": {
+            "type": "string",
+            "example": "192.168.1.10"
+          }
+        }
+      },
+      "HostsSkip": {
+        "type": "object",
+        "description": "A name of a hosts file that is not imported, and why.",
+        "required": [
+          "line",
+          "name",
+          "reason"
+        ],
+        "properties": {
+          "line": {
+            "type": "integer",
+            "description": "Line number (1-based).",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string",
+            "example": "www.other.example"
+          },
+          "reason": {
+            "type": "string",
+            "example": "outside the zone"
+          }
+        }
+      },
       "Identity": {
         "type": "object",
         "description": "Public identity (no authentication): lets a returning old primary find\nout whether its peer was promoted away from its history.",
@@ -5641,6 +6291,14 @@
           "role": "promoted",
           "writable": true
         }
+      },
+      "ImportMode": {
+        "type": "string",
+        "description": "`merge` adds missing zones and records; `replace` replaces the records of\neach zone in the document.",
+        "enum": [
+          "merge",
+          "replace"
+        ]
       },
       "ImportSummary": {
         "type": "object",
@@ -5700,13 +6358,113 @@
           "status": "ok"
         }
       },
+      "InterfaceStatus": {
+        "type": "object",
+        "description": "One interface's addresses and which of them are bound.",
+        "required": [
+          "name",
+          "addresses",
+          "bound"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "example": "eth0"
+          },
+          "addresses": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Current addresses (link-local IPv6 left out)."
+          },
+          "bound": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Addresses with a DNS listener (UDP and/or TCP) right now."
+          }
+        }
+      },
+      "ListStatus": {
+        "type": "object",
+        "description": "Download state of one list on this server.",
+        "required": [
+          "url",
+          "name",
+          "enabled",
+          "entries",
+          "skipped_lines",
+          "capped",
+          "loaded_at",
+          "attempted_at",
+          "error",
+          "blocked"
+        ],
+        "properties": {
+          "url": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "entries": {
+            "type": "integer",
+            "description": "Domains in the copy in use (0 before the first good download).",
+            "minimum": 0
+          },
+          "skipped_lines": {
+            "type": "integer",
+            "description": "Lines not understood in the last good download.",
+            "minimum": 0
+          },
+          "capped": {
+            "type": "boolean",
+            "description": "The list had more than the per-list maximum; the rest was ignored."
+          },
+          "loaded_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Time of the last good download."
+          },
+          "attempted_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Time of the last attempt."
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Error of the last attempt (the last good copy stays in use)."
+          },
+          "blocked": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Forwarded queries this list blocked since start.",
+            "minimum": 0
+          }
+        }
+      },
       "ListenerStatus": {
         "type": "object",
         "required": [
           "bind",
           "port",
           "udp",
-          "tcp"
+          "tcp",
+          "interfaces"
         ],
         "properties": {
           "bind": {
@@ -5725,6 +6483,13 @@
           },
           "tcp": {
             "type": "boolean"
+          },
+          "interfaces": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/InterfaceStatus"
+            },
+            "description": "`[server].interfaces` (per server): their current addresses and\nwhich are bound; empty when `bind` is used."
           }
         }
       },
@@ -5951,6 +6716,14 @@
         "description": "Always `ok`.",
         "enum": [
           "ok"
+        ]
+      },
+      "OverrideMode": {
+        "type": "string",
+        "description": "How an override zone treats names it does not define itself.",
+        "enum": [
+          "transparent",
+          "static"
         ]
       },
       "ParentDsCheck": {
@@ -6221,6 +6994,34 @@
         },
         "example": {
           "code": "123456"
+        }
+      },
+      "RebindEntry": {
+        "type": "object",
+        "description": "One name refused by rebinding protection.",
+        "required": [
+          "name",
+          "count",
+          "address",
+          "last_at"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "address": {
+            "type": "string",
+            "description": "The address that made the answer refused (last seen)."
+          },
+          "last_at": {
+            "type": "string",
+            "format": "date-time"
+          }
         }
       },
       "Record": {
@@ -6768,6 +7569,172 @@
           "halted": {
             "type": "boolean",
             "description": "Replication halted because the data diverged (see the status)."
+          }
+        }
+      },
+      "ResolverSettings": {
+        "type": "object",
+        "description": "Resolver behaviour for forwarded queries, set from the console\n(Server settings -> Forwarding). Stored as the `resolver` setting\n(replicated as `setting_set`); absent: the defaults. Fields missing from\na stored value (saved by an older version) take their defaults, and\nfields this version does not know are ignored.",
+        "properties": {
+          "domain_needed": {
+            "type": "boolean",
+            "description": "`domain-needed`: never forward single-label names (`wpad`,\n`printer`); they get NXDOMAIN here unless an own or override zone\nhas them. Default on."
+          },
+          "bogus_priv": {
+            "type": "boolean",
+            "description": "`bogus-priv`: never forward reverse lookups of private and special\nranges (RFC 6303: 10/8, 172.16/12, 192.168/16, 100.64/10, 127/8,\n169.254/16, 0/8, fc00::/7, fe80::/10, ::1, ::); NXDOMAIN here unless\nan own zone or automatic PTR covers the address. Default on."
+          },
+          "rebind_protection": {
+            "type": "boolean",
+            "description": "`stop-dns-rebind`: forwarded answers that contain private,\nloopback, link-local, CGNAT, ULA, `0.0.0.0` or `::` addresses are\nrefused. Never applied to own or override zones. Default off."
+          },
+          "rebind_allow": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Domains (and everything below them) exempt from rebinding\nprotection (`rebind-domain-ok`).",
+            "example": [
+              "internal",
+              "amazonaws.com"
+            ]
+          },
+          "serve_stale": {
+            "type": "boolean",
+            "description": "Serve stale (RFC 8767): when every upstream fails or times out,\nanswer from an expired cache entry (TTL 30 s). Default off."
+          },
+          "max_stale_age_secs": {
+            "type": "integer",
+            "format": "int32",
+            "description": "How long past its expiry a cache entry may still be served stale,\nseconds (60 to 604800).",
+            "example": 86400,
+            "minimum": 0
+          },
+          "strategy": {
+            "$ref": "#/components/schemas/UpstreamStrategy"
+          },
+          "filter_types": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Record types never forwarded (`filter-AAAA`, `filter-rr`): such a\nquery gets an empty answer (NODATA) here. Default none.",
+            "example": [
+              "AAAA"
+            ]
+          },
+          "ecs": {
+            "type": "boolean",
+            "description": "EDNS Client Subnet (`add-subnet`, RFC 7871) on forwarded queries.\nDefault off."
+          },
+          "ecs_ipv4_prefix": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Prefix of an IPv4 client address sent upstream (1 to 32).",
+            "example": 24,
+            "minimum": 0
+          },
+          "ecs_ipv6_prefix": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Prefix of an IPv6 client address sent upstream (1 to 128).",
+            "example": 56,
+            "minimum": 0
+          },
+          "ecs_private_clients": {
+            "type": "boolean",
+            "description": "Also send the subnet of clients in private and special ranges."
+          }
+        }
+      },
+      "ResolverView": {
+        "type": "object",
+        "description": "Resolver settings in effect, with what this server observed.",
+        "required": [
+          "settings",
+          "source",
+          "updated_by",
+          "updated_at",
+          "upstream_health",
+          "zone_upstreams",
+          "rebind_blocked",
+          "rebind_blocked_total",
+          "domain_needed_answered",
+          "bogus_priv_answered",
+          "filtered_answered",
+          "stale_answers"
+        ],
+        "properties": {
+          "settings": {
+            "$ref": "#/components/schemas/ResolverSettings"
+          },
+          "source": {
+            "$ref": "#/components/schemas/SettingSource",
+            "description": "`config`: the defaults (nothing saved); `console`: saved settings."
+          },
+          "updated_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "updated_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "upstream_health": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UpstreamHealth"
+            },
+            "description": "Health of the forwarding upstreams on this server, in order."
+          },
+          "zone_upstreams": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ZoneUpstreams"
+            },
+            "description": "Health of the upstreams of each override zone with its own."
+          },
+          "rebind_blocked": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RebindEntry"
+            },
+            "description": "Names refused by rebinding protection on this server, most recent\nfirst (at most 100)."
+          },
+          "rebind_blocked_total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Answers refused by rebinding protection since start.",
+            "minimum": 0
+          },
+          "domain_needed_answered": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Queries answered NXDOMAIN by `domain_needed` since start.",
+            "minimum": 0
+          },
+          "bogus_priv_answered": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Queries answered NXDOMAIN by `bogus_priv` since start.",
+            "minimum": 0
+          },
+          "filtered_answered": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Queries answered NODATA by `filter_types` since start.",
+            "minimum": 0
+          },
+          "stale_answers": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Stale answers served since start.",
+            "minimum": 0
           }
         }
       },
@@ -7727,6 +8694,76 @@
           }
         }
       },
+      "UpstreamHealth": {
+        "type": "object",
+        "description": "Health of one upstream as this server saw it (I6).",
+        "required": [
+          "upstream",
+          "latency_ms",
+          "successes",
+          "failures",
+          "consecutive_failures",
+          "down",
+          "last_error",
+          "last_error_at"
+        ],
+        "properties": {
+          "upstream": {
+            "type": "string",
+            "description": "`ip:port`."
+          },
+          "latency_ms": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Average answer time (exponentially weighted, milliseconds); `null`\nbefore the first answer."
+          },
+          "successes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "failures": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "consecutive_failures": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Failures in a row (3 mark the upstream down).",
+            "minimum": 0
+          },
+          "down": {
+            "type": "boolean",
+            "description": "Marked down: skipped by the `fastest` and `parallel` strategies\nexcept for one probe every 30 seconds."
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_error_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          }
+        }
+      },
+      "UpstreamStrategy": {
+        "type": "string",
+        "description": "How forwarded queries pick among the upstreams (I6).",
+        "enum": [
+          "in_order",
+          "fastest",
+          "parallel"
+        ]
+      },
       "UpstreamTestInput": {
         "type": "object",
         "description": "Upstreams to probe before saving.",
@@ -8136,6 +9173,10 @@
             ],
             "format": "date-time",
             "description": "DNSSEC signing epoch: the signature window starts one hour before\nit and does not move when the zone changes; the primary sets it when\nsigning is turned on and when it re-signs. Absent: signing is off,\nor the zone was signed by a version without it (the window then\nfollows `updated_at` until the zone's next change)."
+          },
+          "override": {
+            "$ref": "#/components/schemas/ZoneOverride",
+            "description": "Present for an override zone (I1): not authoritative, answered only\nfor clients allowed to use forwarding, names it does not define go\nto its upstreams (`transparent`) or get NXDOMAIN (`static`). Absent\nfor an ordinary authoritative zone."
           }
         }
       },
@@ -8342,6 +9383,10 @@
               "null"
             ],
             "description": "Owner username. Create: defaults to the caller. Update: administrators\nonly; empty string clears the owner."
+          },
+          "override": {
+            "$ref": "#/components/schemas/ZoneOverrideInput",
+            "description": "Create: makes an override zone (I1) instead of an authoritative\none. Update: changes the mode or upstreams of an override zone (the\ntype itself is chosen at creation and cannot change)."
           }
         }
       },
@@ -8380,6 +9425,46 @@
               "updated_at": "2026-01-15T09:30:00.000Z"
             }
           ]
+        }
+      },
+      "ZoneOverride": {
+        "type": "object",
+        "description": "The override settings of a zone (I1).",
+        "properties": {
+          "mode": {
+            "$ref": "#/components/schemas/OverrideMode"
+          },
+          "upstreams": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Upstreams for names this zone does not define (`ip:port`); empty:\nthe server's forwarding upstreams. An override zone without records\nis conditional forwarding (`server=/example.com/10.8.0.1`).",
+            "example": [
+              "10.8.0.1:53"
+            ]
+          }
+        }
+      },
+      "ZoneOverrideInput": {
+        "type": "object",
+        "description": "Override settings as entered (I1).",
+        "properties": {
+          "mode": {
+            "$ref": "#/components/schemas/OverrideMode",
+            "description": "Default `transparent` on creation; unchanged when omitted on update."
+          },
+          "upstreams": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "IP addresses with an optional port (53 when omitted), at most 8;\nempty: the server's forwarding upstreams. Unchanged when omitted on\nupdate.",
+            "example": [
+              "10.8.0.1",
+              "[fd00::53]:53"
+            ]
+          }
         }
       },
       "ZonePerm": {
@@ -8451,6 +9536,27 @@
           "owner"
         ],
         "example": "owner"
+      },
+      "ZoneUpstreams": {
+        "type": "object",
+        "description": "Health of the upstreams of one override zone.",
+        "required": [
+          "zone",
+          "upstreams"
+        ],
+        "properties": {
+          "zone": {
+            "type": "string",
+            "description": "The override zone.",
+            "example": "corp.example"
+          },
+          "upstreams": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UpstreamHealth"
+            }
+          }
+        }
       },
       "ZoneView": {
         "allOf": [

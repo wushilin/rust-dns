@@ -8,6 +8,7 @@ pub mod guard;
 pub mod openapi;
 pub mod proxy;
 pub mod replication;
+pub mod resolver;
 pub mod routes;
 pub mod session;
 pub mod settings;
@@ -353,6 +354,7 @@ fn api_router() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(routes::export_zone))
         .routes(routes!(routes::export_all))
         .routes(routes!(routes::import))
+        .routes(routes!(routes::import_hosts))
         .routes(routes!(routes::changelog))
         .routes(routes!(routes::audit))
         .routes(routes!(ws::ws))
@@ -375,6 +377,17 @@ fn api_router() -> OpenApiRouter<Arc<AppState>> {
         ))
         .routes(routes!(settings::test_upstreams))
         .routes(routes!(settings::flush_forward_cache))
+        .routes(routes!(
+            resolver::get_resolver,
+            resolver::update_resolver,
+            resolver::reset_resolver
+        ))
+        .routes(routes!(
+            resolver::get_blocklists,
+            resolver::update_blocklists
+        ))
+        .routes(routes!(resolver::refresh_blocklists))
+        .routes(routes!(resolver::test_blocklists))
         .routes(routes!(tsig::list_tsig_keys, tsig::create_tsig_key))
         .routes(routes!(tsig::update_tsig_key, tsig::delete_tsig_key))
         .routes(routes!(tsig::reveal_tsig_key))

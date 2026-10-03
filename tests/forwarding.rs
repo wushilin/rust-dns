@@ -43,9 +43,15 @@ fn fake_upstream_with(
     ttl: u32,
 ) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
-    let port = sock.local_addr().unwrap().port();
-    let tcp = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    // The TCP port of the same number may be taken by something else
+    // (seen once in the gate): pick another pair then.
+    let (sock, port, tcp) = loop {
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = sock.local_addr().unwrap().port();
+        if let Ok(tcp) = std::net::TcpListener::bind(("127.0.0.1", port)) {
+            break (sock, port, tcp);
+        }
+    };
     let count = std::sync::Arc::new(AtomicUsize::new(0));
     let answer = move |q: &Message, over_tcp: bool| -> Vec<u8> {
         let mut r = Message::new(q.metadata.id, MessageType::Response, q.metadata.op_code);

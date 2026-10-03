@@ -27,6 +27,12 @@ max_tracked_addresses = 1000
 [transfer]
 allow = ["127.0.0.0/8"]
 
+[forwarding]
+# No upstreams: foreign names stay REFUSED (and RA clear); the ACL lets
+# 127.0.0.1 use the override zone seeded below.
+upstreams = []
+allowed_clients = ["127.0.0.0/8"]
+
 [database]
 path = "$TMP/rust-dns.db"
 
@@ -56,7 +62,19 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 python3 "$ROOT/scripts/seed-conformance.py" "http://127.0.0.1:$WEB_PORT"
-python3 "$ROOT/scripts/conformance.py" "$ZONE" 127.0.0.1 "$DNS_PORT"
+# An override zone (I1) for the override checks (CONFORMANCE_OVERRIDE).
+python3 - "http://127.0.0.1:$WEB_PORT" <<'PY'
+import http.cookiejar, json, sys, urllib.request
+base = sys.argv[1]
+o = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+def req(path, body):
+    r = urllib.request.Request(base + path, data=json.dumps(body).encode(), headers={"Content-Type": "application/json", "X-Requested-With": "rust-dns"})
+    o.open(r, timeout=5).read()
+req("/api/auth/login", {"username": "root", "password": "ci-root-password"})
+req("/api/zones", {"name": "vpn.signed.test", "override": {"mode": "static"}})
+req("/api/zones/vpn.signed.test/records", {"name": "gw", "type": "A", "value": "10.8.0.1"})
+PY
+CONFORMANCE_OVERRIDE=vpn.signed.test python3 "$ROOT/scripts/conformance.py" "$ZONE" 127.0.0.1 "$DNS_PORT"
 if [ "${RUN_COMPLIANCE:-0}" = "1" ]; then
   "$ROOT/scripts/compliance.sh" "$ZONE" 127.0.0.1 "$DNS_PORT"
 fi

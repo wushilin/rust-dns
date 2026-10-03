@@ -77,7 +77,11 @@ pub const TABLES: &[Table] = &[
         // standby whose value lags (changes applied by a version without
         // the column) converges at the zone's next serial bump. Comparing
         // it would halt such a standby in a mixed-version pair.
-        compat_columns: &["dnssec", "signed_at"],
+        // `override_spec` (I1, override zones) is covered by the per-zone
+        // checksum (the zone row as JSON, where `override` appears only for
+        // an override zone), so a version without the column computes the
+        // same table checksum while no override zone exists.
+        compat_columns: &["dnssec", "signed_at", "override_spec"],
         ..replicated("zones", "id", ("zone", "zones"))
     },
     replicated("records", "id", ("record", "records")),

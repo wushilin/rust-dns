@@ -109,7 +109,9 @@ impl ZoneData {
             if r.rtype == RecordType::NS && owner != apex && !delegations.contains(&owner) {
                 delegations.push(owner.clone());
             }
-            if matches!(r.rtype, RecordType::A | RecordType::AAAA) {
+            // Override zones are not authoritative: their addresses give
+            // no automatic PTR answers.
+            if matches!(r.rtype, RecordType::A | RecordType::AAAA) && zone.overrides.is_none() {
                 if let Ok(ip) = r.value.parse::<std::net::IpAddr>() {
                     reverse.push((reverse_name(&ip), owner.clone()));
                 }
@@ -213,7 +215,9 @@ impl Catalog {
         signer: &crate::dnssec::Signer,
         now: i64,
     ) {
-        if !zd.zone.dnssec {
+        // An override zone is never signed (the flag cannot be set on one;
+        // this is the second line).
+        if !zd.zone.dnssec || zd.zone.is_override() {
             signer.forget(zd.zone.id);
             return;
         }
@@ -360,10 +364,17 @@ impl Catalog {
         }
     }
 
-    /// Find records of any zone at an absolute owner name (used for CNAME
-    /// chasing and glue).
+    /// Longest-suffix match among the authoritative zones only: `None` when
+    /// the closest zone is an override zone (its data is never served
+    /// authoritatively, e.g. by a CNAME chase or as glue).
+    pub fn find_auth_zone(&self, qname: &str) -> Option<&Arc<ZoneData>> {
+        self.find_zone(qname).filter(|z| !z.zone.is_override())
+    }
+
+    /// Find records of any authoritative zone at an absolute owner name
+    /// (used for CNAME chasing and glue).
     pub fn records_anywhere(&self, owner: &str) -> Option<(&Arc<ZoneData>, &Vec<Rec>)> {
-        let z = self.find_zone(owner)?;
+        let z = self.find_auth_zone(owner)?;
         z.records_at(owner).map(|r| (z, r))
     }
 }
@@ -555,6 +566,7 @@ mod tests {
             owner_id: None,
             dnssec: false,
             signed_at: None,
+            overrides: None,
         }
     }
     fn rec(id: i64, zone_id: i64, name: &str, t: RecordType, v: &str) -> Record {

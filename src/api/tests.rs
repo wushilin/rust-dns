@@ -700,6 +700,7 @@ async fn api_reads_and_dns_stay_fast_during_a_long_write() {
             minimum: None,
             default_ttl: None,
             owner: None,
+            overrides: None,
             records: (0..n)
                 .map(|i| ExportRecord {
                     name: format!("h{i}"),

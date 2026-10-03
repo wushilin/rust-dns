@@ -533,6 +533,9 @@ pub struct ListenerStatus {
     pub port: u16,
     pub udp: bool,
     pub tcp: bool,
+    /// `[server].interfaces` (per server): their current addresses and
+    /// which are bound; empty when `bind` is used.
+    pub interfaces: Vec<crate::dns::ifaces::InterfaceStatus>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]

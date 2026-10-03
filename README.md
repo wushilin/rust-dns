@@ -26,6 +26,11 @@ Single static binary, one SQLite file, one TOML config. Zero JavaScript build.
 - UDP and TCP on any set of bind addresses and any port, IPv4 and IPv6.
 - Optional forwarding of foreign names to upstream resolvers, restricted to an
   allow-list of client networks so you never become an open resolver.
+- dnsmasq-style resolver features, set from the console (see
+  [Resolver features](#resolver-features)): override zones (local names and
+  conditional forwarding), domain-needed, bogus-priv, rebinding protection,
+  serve-stale, upstream strategies with health, blocklists, filtered record
+  types, EDNS Client Subnet, hosts-file import and following interfaces.
 - Per-client rate limiting (N queries per second per IPv4 address or IPv6 /64)
   in a fixed-size counter table: memory is bounded and a flood from many
   (spoofed) sources cannot reset a limited client. Every Nth limited UDP query
@@ -231,6 +236,55 @@ Before exposing rust-dns to the internet, note:
 - **TSIG is unaffected** by these changes.
 - **BIND zone-file import and export were removed** (the parser followed
   `$INCLUDE` to files on the server). JSON import/export remains.
+
+## Resolver features
+
+Queries run through a pipeline of filters (`src/dns/pipeline.rs`, order and
+contract in its module docs): EDNS and request checks, special queries,
+transfers, own zones, override zones, the forwarding ACL, then the resolver
+filters below and the forwarder. Every filter is counted in `/metrics`
+(`rustdns_filter_queries_total{filter,outcome}`) and `/api/status`
+(`pipeline`); the live query view shows which filter answered. Settings are
+console settings (Server settings -> Resolver, and the Blocklists page),
+replicated to standbys, applied without a restart.
+
+- **Override zones**: a zone created with type *override* is not
+  authoritative. It answers only clients allowed to use forwarding, never
+  sets AA or AD, is never signed, transferred or announced by NOTIFY. Names
+  and types it defines are answered from it; everything else under it goes
+  to its own upstreams (*transparent*, the default) or gets NXDOMAIN
+  (*static*, for blocking). With no records it is conditional forwarding
+  (dnsmasq `server=/example.com/10.8.0.1`). The longest zone wins between
+  own and override zones. Under a DNSSEC-signed parent the parent's data and
+  signatures do not change, but a validating resolver asking through this
+  server sees the parent deny the override names: use override zones under
+  a signed parent only for clients that do not validate them.
+- **domain-needed** (on by default): single-label names (`wpad`, `printer`)
+  are never forwarded; NXDOMAIN unless an own or override zone has them.
+- **bogus-priv** (on by default): reverse lookups for private and special
+  ranges (RFC 6303) are never forwarded; NXDOMAIN unless an own reverse zone
+  or automatic PTR covers the address.
+- **Rebinding protection** (off by default): forwarded answers with private,
+  loopback, link-local, CGNAT, ULA, `0.0.0.0` or `::` addresses are refused,
+  except for allowlisted domains; the console lists recently refused names.
+- **Serve stale** (RFC 8767, off by default): when every upstream fails, an
+  expired cached answer (up to `max_stale_age_secs`) is returned with TTL 30.
+- **Upstream strategy**: `in_order` (default, as before), `fastest`, or
+  `parallel`; per-upstream latency, failures and a down state (3 failures in a
+  row, probed again every 30 s) on the Server settings page.
+- **Blocklists**: hosts files, plain domain lists and Adblock `||domain^`
+  lists, downloaded by each server (the URLs replicate, the downloads do
+  not), matched by suffix, with an allowlist and NXDOMAIN or null-address
+  answers; forwarded queries only. About 8 bytes of memory per entry.
+- **Filtered types** (`filter-AAAA`): listed types get NODATA, never forwarded.
+- **EDNS Client Subnet** (off by default): the client's subnet (/24, /56 by
+  default; not for private clients unless chosen) is sent upstream and
+  answers are cached per subnet.
+- **Hosts-file import**: Import / Export -> Hosts file, or
+  `POST /api/zones/{zone}/import/hosts` (preview, then one transaction).
+- **Following interfaces**: `[server] interfaces = ["eth0"]` listens on that
+  interface's addresses and follows them as they change (polled every
+  `interface_poll_secs`); per server, not replicated.
 
 ## Running an open resolver
 

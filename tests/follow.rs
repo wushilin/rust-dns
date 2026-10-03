@@ -2352,3 +2352,256 @@ fn an_expired_record_stops_being_served_on_a_cut_off_standby() {
     drop(s);
     let _ = std::fs::remove_dir_all(&root_dir);
 }
+
+/// Phase I, mixed versions. A new primary with every new console setting
+/// configured (resolver settings, blocklists, a forwarding override:
+/// `setting_set` changes of keys an old version does not use) keeps a
+/// standby on the previous release following, never halted, reconcile ok
+/// at every step. After the standby is upgraded in place it applies them
+/// (they replicated as rows) and an override zone created then reaches it
+/// with its type. An override zone created while the standby is still on
+/// the previous release cannot be represented there: see
+/// `an_old_standby_cannot_represent_an_override_zone`.
+#[test]
+fn phase_i_settings_keep_an_old_standby_following() {
+    let Some(prev) = prev_bin() else { return };
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root_dir = std::env::temp_dir().join(format!(
+        "rust-dns-follow-phasei-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root_dir).unwrap();
+    let mut p = Node::new(&root_dir, "primary", "rootpass-primary");
+    let mut s = Node::new(&root_dir, "standby", "rootpass-standby");
+    let new_bin = p.bin.clone();
+    s.bin = prev.clone();
+    let fwd = "[forwarding]\nallowed_clients = [\"127.0.0.0/8\"]\n";
+    p.configure(fwd);
+    p.start();
+    let pr = p.root();
+    let token = ok(
+        call(
+            &Auth::Session(&pr),
+            "POST",
+            &p.api("/tokens"),
+            Some(json!({ "name": "repl" })),
+        ),
+        "token",
+    )["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let put = |path: &str, body: Value| {
+        ok(
+            call(&Auth::Session(&pr), "PUT", &p.api(path), Some(body)),
+            path,
+        );
+    };
+    ok(
+        call(
+            &Auth::Session(&pr),
+            "POST",
+            &p.api("/zones"),
+            Some(json!({ "name": "mix.test" })),
+        ),
+        "zone",
+    );
+    let add = |name: &str, v: &str| {
+        ok(
+            call(
+                &Auth::Session(&pr),
+                "POST",
+                &p.api("/zones/mix.test/records"),
+                Some(json!({ "name": name, "type": "A", "value": v })),
+            ),
+            "record",
+        );
+    };
+    add("www", "192.0.2.1");
+    put(
+        "/settings/forwarding",
+        json!({ "upstreams": ["192.0.2.53"], "allowed_clients": ["127.0.0.0/8"], "timeout_ms": 500 }),
+    );
+    put(
+        "/settings/resolver",
+        json!({ "domain_needed": false, "rebind_protection": true, "rebind_allow": ["internal"], "serve_stale": true, "strategy": "fastest", "filter_types": ["AAAA"], "ecs": true }),
+    );
+    put(
+        "/blocklists",
+        json!({ "lists": [{ "name": "none", "url": "http://127.0.0.1:9/never.txt" }], "allow": ["example.com"], "action": "null_address" }),
+    );
+    // The previous release follows from a snapshot that has these rows.
+    s.configure(&format!("{fwd}{}", follow_cfg(&p, "dns2", &token)));
+    s.start();
+    let sr = s.root();
+    wait_reconciled(&p, &pr, &s, &sr, "old standby, after the snapshot");
+    // Changed again while following: replayed as `setting_set`.
+    put(
+        "/settings/resolver",
+        json!({ "bogus_priv": false, "strategy": "parallel" }),
+    );
+    put(
+        "/blocklists",
+        json!({ "lists": [{ "name": "none", "url": "http://127.0.0.1:9/other.txt", "enabled": false }] }),
+    );
+    std::thread::sleep(Duration::from_millis(1100));
+    add("mixed", "192.0.2.2");
+    wait_for("the change reaches the old standby", 20, || {
+        soa_serial(s.dns, "mix.test.") == soa_serial(p.dns, "mix.test.")
+    });
+    wait_reconciled(&p, &pr, &s, &sr, "old standby, after changes");
+    assert_eq!(status(&s, &sr)["follow"]["state"], "following");
+    // The old standby keeps answering its zones as before.
+    assert_eq!(
+        answers(s.dns, "mixed.mix.test.", RecordType::A).1,
+        vec!["mixed.mix.test. 300 192.0.2.2"]
+    );
+
+    // Upgrade the standby in place: it applies the replicated settings.
+    s.stop();
+    s.bin = new_bin.clone();
+    s.start();
+    let sr = s.root();
+    wait_reconciled(&p, &pr, &s, &sr, "upgraded standby");
+    let v = ok(
+        call(
+            &Auth::Session(&sr),
+            "GET",
+            &s.api("/settings/resolver"),
+            None,
+        ),
+        "standby resolver settings",
+    );
+    assert_eq!(v["source"], "console");
+    assert_eq!(v["settings"]["strategy"], "parallel");
+    assert_eq!(v["settings"]["bogus_priv"], false);
+    let v = ok(
+        call(&Auth::Session(&sr), "GET", &s.api("/blocklists"), None),
+        "standby blocklists",
+    );
+    assert_eq!(
+        v["settings"]["lists"][0]["url"],
+        "http://127.0.0.1:9/other.txt"
+    );
+    // An override zone now replicates with its type.
+    ok(
+        call(
+            &Auth::Session(&pr),
+            "POST",
+            &p.api("/zones"),
+            Some(json!({ "name": "corp.test", "override": { "mode": "static" } })),
+        ),
+        "override zone",
+    );
+    ok(
+        call(
+            &Auth::Session(&pr),
+            "POST",
+            &p.api("/zones/corp.test/records"),
+            Some(json!({ "name": "gw", "type": "A", "value": "10.8.0.1" })),
+        ),
+        "override record",
+    );
+    wait_for("the override zone reaches the standby", 20, || {
+        query(s.dns, "gw.corp.test.", RecordType::A)
+            .answers
+            .iter()
+            .any(|r| r.data.to_string() == "10.8.0.1")
+    });
+    let m = query(s.dns, "gw.corp.test.", RecordType::A);
+    assert!(
+        !m.metadata.authoritative,
+        "the standby serves it as an override zone"
+    );
+    assert_eq!(
+        query(s.dns, "nope.corp.test.", RecordType::A)
+            .metadata
+            .response_code,
+        ResponseCode::NXDomain
+    );
+    wait_reconciled(&p, &pr, &s, &sr, "upgraded standby, override zone");
+    drop(p);
+    drop(s);
+    let _ = std::fs::remove_dir_all(&root_dir);
+}
+
+/// What an old (previous release) standby does with an override zone
+/// created on a new primary: it cannot store the type, so it applies the
+/// zone as an ordinary authoritative zone, the per-zone checksum differs
+/// and the standby HALTS (diverged), as for any divergence. Recorded in
+/// plan.md (Rollout): upgrade the standby before creating override zones.
+#[test]
+fn an_old_standby_cannot_represent_an_override_zone() {
+    let Some(prev) = prev_bin() else { return };
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root_dir = std::env::temp_dir().join(format!(
+        "rust-dns-follow-ovold-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root_dir).unwrap();
+    let mut p = Node::new(&root_dir, "primary", "rootpass-primary");
+    let mut s = Node::new(&root_dir, "standby", "rootpass-standby");
+    s.bin = prev.clone();
+    p.configure("");
+    p.start();
+    let pr = p.root();
+    let token = ok(
+        call(
+            &Auth::Session(&pr),
+            "POST",
+            &p.api("/tokens"),
+            Some(json!({ "name": "repl" })),
+        ),
+        "token",
+    )["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    s.configure(&follow_cfg(&p, "dns2", &token));
+    s.start();
+    let sr = s.root();
+    wait_reconciled(&p, &pr, &s, &sr, "old standby");
+    ok(
+        call(
+            &Auth::Session(&pr),
+            "POST",
+            &p.api("/zones"),
+            Some(json!({ "name": "corp.test", "override": { "mode": "static" } })),
+        ),
+        "override zone",
+    );
+    let head = status(&p, &pr)["head"].clone();
+    let mut last = Value::Null;
+    wait_for("the old standby reconciles at the new head", 30, || {
+        last = status(&s, &sr);
+        last["head"] == head
+            && last["follow"]["last_reconcile_result"].is_string()
+            && last["follow"]["last_reconcile_at"] != Value::Null
+            && !last["follow"]["last_reconcile_result"]
+                .as_str()
+                .unwrap()
+                .ends_with(&format!("offset {}", head.as_i64().unwrap() - 1))
+    });
+    eprintln!("old standby with an override zone: {last}");
+    let r = last["follow"]["last_reconcile_result"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        !r.starts_with("ok"),
+        "an old standby cannot match an override zone: {r}"
+    );
+    assert_eq!(last["follow"]["halted"]["reason"], "diverged", "{last}");
+    // It serves the zone authoritatively (it does not know the type).
+    let m = query(s.dns, "x.corp.test.", RecordType::A);
+    assert!(m.metadata.authoritative, "old standby: authoritative");
+    drop(p);
+    drop(s);
+    let _ = std::fs::remove_dir_all(&root_dir);
+}

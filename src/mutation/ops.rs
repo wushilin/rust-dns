@@ -46,6 +46,50 @@ pub(super) fn apply_zone_input(z: &mut Zone, input: &ZoneInput) -> Result<(), In
     Ok(())
 }
 
+/// Apply the override part of a zone input (I1). Creating: an `override`
+/// object makes an override zone. Updating: only an override zone takes
+/// one (the type is chosen at creation).
+pub(super) fn apply_override(
+    z: &mut Zone,
+    input: &ZoneInput,
+    creating: bool,
+) -> Result<(), Invalid> {
+    let Some(o) = &input.overrides else {
+        return Ok(());
+    };
+    if !creating && z.overrides.is_none() {
+        return Err(Invalid(
+            "an authoritative zone cannot become an override zone; the type is chosen when the zone is created".into(),
+        ));
+    }
+    let mut spec = z.overrides.as_deref().cloned().unwrap_or_default();
+    if let Some(m) = o.mode {
+        spec.mode = m;
+    }
+    if let Some(ups) = &o.upstreams {
+        let mut out: Vec<std::net::SocketAddr> = Vec::new();
+        for u in ups.iter().map(|u| u.trim()).filter(|u| !u.is_empty()) {
+            let sa = crate::mutation::settings::parse_upstream(u)
+                .map_err(|e| Invalid(format!("override upstream: {e}")))?;
+            if !out.contains(&sa) {
+                out.push(sa);
+            }
+        }
+        if out.len() > crate::mutation::settings::MAX_UPSTREAMS {
+            return Err(Invalid(format!(
+                "at most {} override upstreams",
+                crate::mutation::settings::MAX_UPSTREAMS
+            )));
+        }
+        spec.upstreams = out;
+    }
+    if z.dnssec {
+        return Err(Invalid("an override zone is never DNSSEC-signed".into()));
+    }
+    z.overrides = Some(Box::new(spec));
+    Ok(())
+}
+
 pub(super) fn soa_differs(a: &Zone, b: &Zone) -> bool {
     (
         &a.soa_mname,
@@ -106,6 +150,7 @@ pub(super) fn default_zone(name: &str, owner_id: Option<i64>) -> Zone {
         owner_id,
         dnssec: false,
         signed_at: None,
+        overrides: None,
     }
 }
 
@@ -152,6 +197,7 @@ impl Mutator {
             let name = normalize_zone_name(input.name.as_deref().unwrap_or(""))?;
             let mut z = new_zone(&defaults, &name, owner_id);
             apply_zone_input(&mut z, &input)?;
+            apply_override(&mut z, &input, true)?;
             t.create_zone(z)
         })
         .await
@@ -171,6 +217,7 @@ impl Mutator {
                 let before = t.require_zone(&name)?;
                 let mut after = before.clone();
                 apply_zone_input(&mut after, &input)?;
+                apply_override(&mut after, &input, false)?;
                 if let Some(o) = new_owner {
                     after.owner_id = o;
                 }

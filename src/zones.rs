@@ -80,6 +80,9 @@ pub enum Lookup {
     Answer(Answer),
     /// No zone matches and no auto-PTR hit: caller may forward or refuse.
     NotOurs,
+    /// The closest zone is an override zone (I1): not answered
+    /// authoritatively; the `override` filter handles it.
+    Override(Arc<ZoneData>),
 }
 
 fn name_of(s: &str) -> Option<Name> {
@@ -285,6 +288,24 @@ fn find_dname(z: &ZoneData, key: &str) -> Option<(String, String)> {
     }
 }
 
+/// The local data of an override zone for a query (I1): the same rules as
+/// an authoritative answer (wildcards, CNAME / DNAME, empty non-terminals),
+/// never signed and never authoritative. A CNAME chase continues into own
+/// authoritative zones; a target elsewhere is left to the caller.
+pub fn lookup_override(
+    catalog: &Catalog,
+    zone: &Arc<ZoneData>,
+    qname: &Name,
+    qtype: RecordType,
+) -> Answer {
+    let key = key_of(qname);
+    let mut ans = Answer::new(ResponseCode::NoError);
+    resolve_into(catalog, zone, qname, &key, qtype, false, &mut ans, 0, false);
+    ans.authoritative = false;
+    ans.proofs.clear();
+    ans
+}
+
 pub fn lookup(catalog: &Catalog, qname: &Name, qtype: RecordType, auto_ptr: bool) -> Lookup {
     lookup_dnssec(catalog, qname, qtype, auto_ptr, false)
 }
@@ -301,6 +322,7 @@ pub fn lookup_dnssec(
 ) -> Lookup {
     let key = key_of(qname);
     let zone = match catalog.find_zone(&key) {
+        Some(z) if z.zone.is_override() => return Lookup::Override(z.clone()),
         Some(z) => z.clone(),
         None => {
             if auto_ptr && (qtype == RecordType::PTR || qtype == RecordType::ANY) {
@@ -340,7 +362,7 @@ fn ds_parent_side(
         Some((_, rest)) if !rest.is_empty() => rest,
         _ => ".",
     };
-    let p = catalog.find_zone(parent)?;
+    let p = catalog.find_auth_zone(parent)?;
     if p.cut_for(key) != Some(key) {
         return None;
     }
@@ -539,7 +561,7 @@ fn resolve_into(
                 );
                 ans.answers.push(cname);
                 if qtype != RecordType::CNAME && depth < MAX_CNAME_HOPS {
-                    if let Some(tz) = catalog.find_zone(&new_key) {
+                    if let Some(tz) = catalog.find_auth_zone(&new_key) {
                         let tz = tz.clone();
                         let mut sub = Answer::new(ResponseCode::NoError);
                         resolve_into(
@@ -656,7 +678,7 @@ fn resolve_into(
     if let Some(target) = cname_target {
         if depth < MAX_CNAME_HOPS {
             let tkey = key_of(&target);
-            if let Some(tz) = catalog.find_zone(&tkey) {
+            if let Some(tz) = catalog.find_auth_zone(&tkey) {
                 let tz = tz.clone();
                 let mut sub = Answer::new(ResponseCode::NoError);
                 resolve_into(
@@ -772,6 +794,7 @@ mod tests {
             owner_id: None,
             dnssec: false,
             signed_at: None,
+            overrides: None,
         }
     }
     fn rec(id: i64, zone_id: i64, name: &str, t: Rt, v: &str) -> StoredRecord {
@@ -814,7 +837,7 @@ mod tests {
     fn q(name: &str, t: RecordType) -> Answer {
         match lookup(&catalog(), &Name::from_ascii(name).unwrap(), t, true) {
             Lookup::Answer(a) => a,
-            Lookup::NotOurs => panic!("expected an answer for {name}"),
+            _ => panic!("expected an answer for {name}"),
         }
     }
 
@@ -938,7 +961,7 @@ mod tests {
             true,
         ) {
             Lookup::Answer(a) => assert_eq!(a.answers.len(), 1, "auto PTR without a reverse zone"),
-            Lookup::NotOurs => panic!(),
+            _ => panic!(),
         }
         assert!(matches!(
             lookup(

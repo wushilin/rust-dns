@@ -39,7 +39,8 @@ pub use dnssec_ops::DnssecChange;
 pub use gate::WriteGate;
 #[allow(unused_imports)]
 pub use import_export::{
-    export_zone, ExportDoc, ExportRecord, ExportZone, ImportMode, ImportSummary,
+    export_zone, parse_hosts, ExportDoc, ExportRecord, ExportZone, HostsRecord, HostsSkip,
+    ImportMode, ImportSummary,
 };
 pub(crate) use tx::catalog_zones;
 #[allow(unused_imports)]

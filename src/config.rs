@@ -244,6 +244,12 @@ pub struct ServerConfig {
     /// Only answer UDP queries that carry a valid server cookie (RFC 7873 §5.2.3 strict mode).
     /// Off by default; on public servers it breaks clients without cookie support.
     pub cookies_required: bool,
+    /// Listen on the addresses of these network interfaces instead of
+    /// `bind`, following them as addresses appear and disappear (I11,
+    /// dnsmasq `interface=` / `bind-dynamic`). Empty = use `bind`.
+    pub interfaces: Vec<String>,
+    /// How often the interfaces' addresses are checked, seconds.
+    pub interface_poll_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -574,6 +580,8 @@ impl Default for ServerConfig {
             nsid: String::new(),
             cookies: true,
             cookies_required: false,
+            interfaces: Vec::new(),
+            interface_poll_secs: 5,
         }
     }
 }
@@ -685,6 +693,8 @@ default_hostmaster = ""  # SOA RNAME for new zones, e.g. "hostmaster@example.com
 nsid = ""                # EDNS NSID reply (RFC 5001), e.g. the host name; empty = off
 cookies = true           # issue/verify DNS server cookies (RFC 7873)
 cookies_required = false # strict mode: UDP queries without a valid cookie get BADCOOKIE
+interfaces = []          # e.g. ["eth0"]: listen on these interfaces' addresses (followed) instead of bind
+interface_poll_secs = 5
 
 [forwarding]
 upstreams = []           # e.g. ["1.1.1.1:53", "[2606:4700:4700::1111]:53"]; empty = REFUSED for foreign names

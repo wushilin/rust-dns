@@ -946,6 +946,7 @@ mod tests {
                     minimum: None,
                     default_ttl: None,
                     owner: None,
+                    overrides: None,
                     records: vec![ExportRecord {
                         name: "ok".into(),
                         rtype: RecordType::A,
@@ -965,6 +966,7 @@ mod tests {
                     minimum: None,
                     default_ttl: None,
                     owner: None,
+                    overrides: None,
                     records: vec![ExportRecord {
                         name: "bad".into(),
                         rtype: RecordType::AAAA,
@@ -995,6 +997,7 @@ mod tests {
                     minimum: None,
                     default_ttl: None,
                     owner: None,
+                    overrides: None,
                     records: vec![],
                 },
                 ExportZone {
@@ -1008,6 +1011,7 @@ mod tests {
                     minimum: None,
                     default_ttl: None,
                     owner: None,
+                    overrides: None,
                     records: vec![],
                 },
             ],
@@ -1344,6 +1348,7 @@ mod tests {
                             minimum: None,
                             default_ttl: None,
                             owner: None,
+                            overrides: None,
                             records: recs,
                         }],
                     };

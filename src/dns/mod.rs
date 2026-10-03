@@ -6,6 +6,7 @@ pub mod filters;
 pub mod forward;
 pub mod fwdcache;
 pub mod handler;
+pub mod ifaces;
 pub mod keyring;
 pub mod notify;
 pub mod pipeline;
@@ -16,7 +17,7 @@ pub mod udp;
 use crate::cache::Cache;
 use crate::config::{Cidr, Config, ForwardingConfig, ProxyConfig, ServerConfig};
 use crate::events::Bus;
-use crate::mutation::settings::ForwardingSettings;
+use crate::mutation::settings::{ForwardingSettings, ResolverSettings};
 use crate::ratelimit::RateLimiter;
 use arc_swap::ArcSwap;
 use std::net::SocketAddr;
@@ -53,6 +54,8 @@ pub struct Stats {
     pub forward_inflight: std::sync::atomic::AtomicUsize,
     /// When the overflow warning was last logged (seconds since the epoch).
     pub forward_overflow_warned: AtomicU64,
+    /// Stale cache entries served because every upstream failed (I5).
+    pub stale_answers: AtomicU64,
     /// Latency histogram buckets in microseconds: <=100, <=500, <=1000, <=5000, <=20000, >20000
     pub latency: [AtomicU64; 6],
     pub latency_sum_us: AtomicU64,
@@ -90,6 +93,7 @@ impl Stats {
             open_resolver_any: self.open_resolver_any.load(Relaxed),
             open_resolver_rate_limited: self.open_resolver_rate_limited.load(Relaxed),
             forward_overflow: self.forward_overflow.load(Relaxed),
+            stale_answers: self.stale_answers.load(Relaxed),
         }
     }
 }
@@ -140,6 +144,9 @@ pub struct DnsCounters {
     /// `[forwarding].max_inflight` forwarded queries were already waiting
     /// for an upstream.
     pub forward_overflow: u64,
+    /// Stale cache entries served because every upstream failed (serve
+    /// stale, RFC 8767).
+    pub stale_answers: u64,
 }
 
 /// Settings that can change at runtime via config reload.
@@ -159,6 +166,12 @@ pub struct Runtime {
     pub nsid: String,
     pub cookies: bool,
     pub cookies_required: bool,
+    /// Resolver behaviour for forwarded queries (console settings, I2-I10).
+    pub resolver: ResolverSettings,
+    /// `resolver.filter_types` parsed.
+    pub filter_types: Vec<hickory_proto::rr::RecordType>,
+    /// A blocklist is switched on (the `blocklist` filter is in the chain).
+    pub blocklists: bool,
     /// The query pipeline's filter chain for this snapshot (see
     /// [`pipeline::chain_for`]); replaced together with everything above.
     pub chain: Vec<pipeline::Filter>,
@@ -168,6 +181,21 @@ impl Runtime {
     /// Runtime settings from the config file, with the console/API forwarding
     /// override (if any) replacing upstreams, allowed clients and timeout.
     pub fn from_config(cfg: &Config, forwarding_override: Option<&ForwardingSettings>) -> Self {
+        Self::with_settings(
+            cfg,
+            forwarding_override,
+            &ResolverSettings::default(),
+            false,
+        )
+    }
+
+    /// Runtime settings from the config file and every console setting.
+    pub fn with_settings(
+        cfg: &Config,
+        forwarding_override: Option<&ForwardingSettings>,
+        resolver: &ResolverSettings,
+        blocklists: bool,
+    ) -> Self {
         let mut forwarding = cfg.forwarding.clone();
         if let Some(o) = forwarding_override {
             forwarding.upstreams = o.upstreams.clone();
@@ -202,6 +230,13 @@ impl Runtime {
             nsid: cfg.server.nsid.clone(),
             cookies: cfg.server.cookies,
             cookies_required: cfg.server.cookies_required,
+            filter_types: resolver
+                .filter_types
+                .iter()
+                .filter_map(|t| crate::mutation::settings::parse_filter_type(t).ok())
+                .collect(),
+            resolver: resolver.clone(),
+            blocklists,
             chain: Vec::new(),
         };
         rt.chain = pipeline::chain_for(&rt);
@@ -221,6 +256,11 @@ impl Runtime {
         fwdcache::Caps {
             max_ttl: self.forwarding.cache_max_ttl,
             negative_max_ttl: self.forwarding.cache_negative_max_ttl,
+            stale_secs: if self.resolver.serve_stale {
+                self.resolver.max_stale_age_secs
+            } else {
+                0
+            },
         }
     }
 
@@ -252,6 +292,16 @@ pub struct DnsServer {
     pub tsig_keys: ArcSwap<keyring::Keyring>,
     /// Forwarding settings set from the console/API; override the config file.
     forwarding_override: std::sync::RwLock<Option<ForwardingSettings>>,
+    /// Resolver settings set from the console/API (defaults when unset).
+    resolver: std::sync::RwLock<ResolverSettings>,
+    /// Health of every upstream (global and override zones), I6.
+    pub upstream_health: forward::Health,
+    /// Downloaded blocklists (I7; per server).
+    pub blocklists: Arc<crate::blocklist::Blocklists>,
+    /// Forwarded answers refused by rebinding protection, by name (I4).
+    pub rebind_log: filters::RebindLog,
+    /// Followed interfaces and their bound addresses (I11).
+    pub interfaces: ifaces::Follower,
 }
 
 /// What the handler wants sent back.
@@ -293,6 +343,11 @@ impl DnsServer {
             fwd_cache: fwdcache::ForwardCache::new(cfg.forwarding.cache_entries),
             tsig_keys: ArcSwap::from_pointee(keyring::Keyring::default()),
             forwarding_override: std::sync::RwLock::new(None),
+            resolver: std::sync::RwLock::new(ResolverSettings::default()),
+            upstream_health: forward::Health::default(),
+            blocklists: Arc::new(crate::blocklist::Blocklists::default()),
+            rebind_log: filters::RebindLog::default(),
+            interfaces: ifaces::Follower::default(),
         }
     }
 
@@ -302,6 +357,58 @@ impl DnsServer {
             .forwarding_override
             .write()
             .unwrap_or_else(|p| p.into_inner()) = o;
+        self.reload(cfg);
+    }
+
+    /// Replace the resolver settings (`None`: the defaults) and apply them now.
+    pub fn set_resolver(&self, r: Option<ResolverSettings>, cfg: &Config) {
+        *self.resolver.write().unwrap_or_else(|p| p.into_inner()) = r.unwrap_or_default();
+        self.reload(cfg);
+    }
+
+    pub fn resolver(&self) -> ResolverSettings {
+        self.resolver
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// Replace the blocklist configuration (`None`: none) and apply it now.
+    pub fn set_blocklists(&self, b: Option<crate::blocklist::BlocklistSettings>, cfg: &Config) {
+        self.blocklists.configure(b.unwrap_or_default());
+        self.reload(cfg);
+    }
+
+    /// Load every console setting from the database and apply it (startup;
+    /// a standby after replicated changes). An unreadable setting is
+    /// logged and left at its previous value.
+    pub fn load_console_settings(&self, storage: &crate::storage::Storage, cfg: &Config) {
+        use crate::mutation::settings as st;
+        match st::load_forwarding(storage) {
+            Ok(o) => {
+                *self
+                    .forwarding_override
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner()) = o.map(|(f, _, _)| f)
+            }
+            Err(e) => tracing::error!(error = %e, "stored forwarding settings are unreadable"),
+        }
+        match st::load_resolver(storage) {
+            Ok(o) => {
+                *self.resolver.write().unwrap_or_else(|p| p.into_inner()) =
+                    o.map(|(r, _, _)| r).unwrap_or_default()
+            }
+            Err(e) => tracing::error!(error = %e, "stored resolver settings are unreadable"),
+        }
+        match st::load_blocklists(storage) {
+            Ok(o) => {
+                let next = o.map(|(b, _, _)| b).unwrap_or_default();
+                if next != self.blocklists.settings() {
+                    self.blocklists.configure(next);
+                }
+            }
+            Err(e) => tracing::error!(error = %e, "stored blocklist settings are unreadable"),
+        }
         self.reload(cfg);
     }
 
@@ -349,7 +456,12 @@ impl DnsServer {
     /// A console/API forwarding override keeps precedence over the file.
     pub fn reload(&self, cfg: &Config) {
         let o = self.forwarding_override();
-        let next = Runtime::from_config(cfg, o.as_ref());
+        let next = Runtime::with_settings(
+            cfg,
+            o.as_ref(),
+            &self.resolver(),
+            self.blocklists.settings().active(),
+        );
         let old = self.runtime.load();
         if old.forwarding.upstreams != next.forwarding.upstreams {
             self.fwd_cache.clear();
@@ -411,8 +523,29 @@ impl Proto {
     }
 }
 
+/// A UDP socket for DNS (inside the runtime).
+pub fn bind_udp(addr: SocketAddr) -> std::io::Result<tokio::net::UdpSocket> {
+    let s = std::net::UdpSocket::bind(addr)?;
+    s.set_nonblocking(true)?;
+    tokio::net::UdpSocket::from_std(s)
+}
+
+/// A TCP listener for DNS (inside the runtime).
+pub fn bind_tcp(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    let l = std::net::TcpListener::bind(addr)?;
+    l.set_nonblocking(true)?;
+    tokio::net::TcpListener::from_std(l)
+}
+
 /// Bind all configured listeners and run them until the process exits.
+/// With `[server].interfaces`, the listeners follow those interfaces'
+/// addresses instead ([`ifaces::follow`]).
 pub async fn serve(server: Arc<DnsServer>) -> anyhow::Result<()> {
+    if !server.listen.interfaces.is_empty() {
+        tracing::info!(interfaces = ?server.listen.interfaces, "DNS listeners follow these interfaces' addresses");
+        ifaces::follow(server).await;
+        return Ok(());
+    }
     let mut tasks = Vec::new();
     let mut bound = 0;
     for ip in &server.listen.bind {

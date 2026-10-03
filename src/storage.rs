@@ -94,7 +94,10 @@ CREATE TABLE IF NOT EXISTS zones (
     dnssec      INTEGER NOT NULL DEFAULT 0,
     -- DNSSEC signing epoch (see model::Zone::signed_at). NULL: unsigned, or
     -- signed by a version without it (the epoch is then updated_at).
-    signed_at   TEXT
+    signed_at   TEXT,
+    -- Override zone (I1): JSON of model::ZoneOverride; NULL for an
+    -- ordinary authoritative zone.
+    override_spec TEXT
 );
 CREATE TABLE IF NOT EXISTS records (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -351,6 +354,11 @@ fn migrate(conn: &Connection) -> Result<()> {
     // before the upgrade; the primary pins it at the zone's next change.
     if !zcols.is_empty() && !zcols.iter().any(|c| c == "signed_at") {
         conn.execute_batch("ALTER TABLE zones ADD COLUMN signed_at TEXT")?;
+    }
+    // I1: NULL for every existing zone (all authoritative); nothing else
+    // is rewritten.
+    if !zcols.is_empty() && !zcols.iter().any(|c| c == "override_spec") {
+        conn.execute_batch("ALTER TABLE zones ADD COLUMN override_spec TEXT")?;
     }
     let rcols: Vec<String> = conn
         .prepare("SELECT name FROM pragma_table_info('records')")?
@@ -1044,11 +1052,15 @@ fn row_to_zone(r: &Row<'_>) -> rusqlite::Result<Zone> {
         owner_id: r.get(12)?,
         dnssec: r.get::<_, i64>(13)? != 0,
         signed_at: r.get(14)?,
+        overrides: r
+            .get::<_, Option<String>>(15)?
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .map(Box::new),
     })
 }
 
 const ZONE_COLS: &str =
-    "id, name, serial, soa_mname, soa_rname, refresh, retry, expire, minimum, default_ttl, created_at, updated_at, owner_id, dnssec, signed_at";
+    "id, name, serial, soa_mname, soa_rname, refresh, retry, expire, minimum, default_ttl, created_at, updated_at, owner_id, dnssec, signed_at, override_spec";
 
 pub(crate) const USER_COLS: &str =
     "id, username, password_hash, display_name, is_admin, is_root, mfa_required, totp_secret, totp_enrolled_at, disabled_at, created_at, updated_at";
@@ -1468,7 +1480,12 @@ mod tests {
         assert!(!cols(&conn).contains(&"signed_at".to_string()));
         migrate(&conn).unwrap();
         migrate(&conn).unwrap(); // idempotent
-        assert_eq!(cols(&conn).last().map(String::as_str), Some("signed_at"));
+        let c = cols(&conn);
+        assert_eq!(
+            &c[c.len() - 2..],
+            &["signed_at".to_string(), "override_spec".to_string()],
+            "added at the end, in the order of the fresh schema"
+        );
         let z = get_zone(&conn, "old.test").unwrap().unwrap();
         assert!(z.dnssec);
         assert_eq!(z.signed_at, None);

@@ -28,6 +28,10 @@ pub struct Key {
     qtype: RecordType,
     class: DNSClass,
     dnssec_ok: bool,
+    /// What else the answer depends on: 0 for the global upstreams; a hash
+    /// of the upstream set for an override zone, of the client subnet sent
+    /// with EDNS Client Subnet.
+    scope: u64,
 }
 
 impl Key {
@@ -37,7 +41,14 @@ impl Key {
             qtype,
             class,
             dnssec_ok,
+            scope: 0,
         }
+    }
+
+    /// The same question in another scope (see the field).
+    pub fn scoped(mut self, scope: u64) -> Self {
+        self.scope = scope;
+        self
     }
 }
 
@@ -46,7 +57,14 @@ impl Key {
 pub struct Caps {
     pub max_ttl: u32,
     pub negative_max_ttl: u32,
+    /// Serve stale (RFC 8767): how long past its expiry an entry is kept
+    /// for [`ForwardCache::get_stale`]; 0 = off (expired entries are
+    /// dropped when looked up).
+    pub stale_secs: u32,
 }
+
+/// TTL of a stale answer (RFC 8767 §4).
+pub const STALE_TTL: u32 = 30;
 
 struct Entry {
     message: Message,
@@ -161,7 +179,10 @@ impl ForwardCache {
         let age = now.saturating_duration_since(e.stored).as_secs() as u32;
         let lifetime = e.lifetime(caps);
         if age >= lifetime {
-            g.pop(key);
+            // Kept while it may still be served stale.
+            if caps.stale_secs == 0 || age >= lifetime.saturating_add(caps.stale_secs) {
+                g.pop(key);
+            }
             self.misses.fetch_add(1, Relaxed);
             return None;
         }
@@ -178,6 +199,36 @@ impl ForwardCache {
         adjust(&mut m.answers);
         adjust(&mut m.authorities);
         adjust(&mut m.additionals);
+        Some(m)
+    }
+
+    /// An expired entry within the stale window (RFC 8767), every TTL set
+    /// to [`STALE_TTL`]; for when every upstream failed.
+    pub fn get_stale(&self, key: &Key, caps: Caps) -> Option<Message> {
+        self.get_stale_at(key, caps, Instant::now())
+    }
+
+    fn get_stale_at(&self, key: &Key, caps: Caps, now: Instant) -> Option<Message> {
+        if caps.stale_secs == 0 {
+            return None;
+        }
+        let g = self.lock();
+        let e = g.peek(key)?;
+        let age = now.saturating_duration_since(e.stored).as_secs() as u32;
+        if age >= e.lifetime(caps).saturating_add(caps.stale_secs) {
+            return None;
+        }
+        let mut m = e.message.clone();
+        for r in m
+            .answers
+            .iter_mut()
+            .chain(m.authorities.iter_mut())
+            .chain(m.additionals.iter_mut())
+        {
+            if r.record_type() != RecordType::OPT {
+                r.ttl = STALE_TTL;
+            }
+        }
         Some(m)
     }
 
@@ -214,6 +265,7 @@ mod tests {
     const CAPS: Caps = Caps {
         max_ttl: 86_400,
         negative_max_ttl: 3_600,
+        stale_secs: 0,
     };
 
     fn name(n: &str) -> Name {
@@ -271,6 +323,7 @@ mod tests {
         let caps = Caps {
             max_ttl: 100,
             negative_max_ttl: 50,
+            stale_secs: 0,
         };
         c.store_at(key("b."), &positive("b.", &[3600]), caps, t0);
         // a: lives 120 s (lowest record TTL), never raised.
@@ -318,6 +371,7 @@ mod tests {
         let lowered = Caps {
             max_ttl: 60,
             negative_max_ttl: 60,
+            stale_secs: 0,
         };
         let m = c
             .get_at(&key("a."), lowered, t0 + Duration::from_secs(10))
@@ -344,6 +398,7 @@ mod tests {
         let caps = Caps {
             max_ttl: 300,
             negative_max_ttl: 60,
+            stale_secs: 0,
         };
         c.store_at(key("a."), &positive("a.", &[1000, 250]), caps, t0);
         for s in [0u64, 1, 100, 249] {
@@ -354,6 +409,48 @@ mod tests {
                 assert!(t as u64 <= 250 - s, "at {s}s got ttl {t}");
             }
         }
+    }
+
+    /// I5: with serve-stale on, an expired entry stays (a miss for normal
+    /// lookups) and is served stale with TTL 30 until the stale window ends;
+    /// with it off, nothing stale is kept. Scopes do not mix.
+    #[test]
+    fn expired_entries_are_served_stale_within_the_window() {
+        let c = ForwardCache::new(10);
+        let t0 = Instant::now();
+        let stale = Caps {
+            stale_secs: 600,
+            ..CAPS
+        };
+        c.store_at(key("a."), &positive("a.", &[100]), stale, t0);
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        assert!(
+            c.get_stale_at(&key("a."), stale, at(50)).is_some(),
+            "not expired yet is fine too"
+        );
+        assert!(
+            c.get_at(&key("a."), stale, at(100)).is_none(),
+            "expired: a miss"
+        );
+        let m = c.get_stale_at(&key("a."), stale, at(300)).unwrap();
+        assert_eq!(ttls(&m), vec![STALE_TTL]);
+        assert!(
+            c.get_stale_at(&key("a."), stale, at(700)).is_none(),
+            "past the window"
+        );
+        assert!(c.get_at(&key("a."), stale, at(700)).is_none());
+        assert!(
+            c.get_stale_at(&key("a."), stale, at(300)).is_none(),
+            "dropped after the window"
+        );
+        // Off: the expired entry is dropped at the first lookup.
+        c.store_at(key("b."), &positive("b.", &[100]), CAPS, t0);
+        assert!(c.get_at(&key("b."), CAPS, at(100)).is_none());
+        assert!(c.get_stale_at(&key("b."), stale, at(101)).is_none());
+        // Scope: another upstream set is another entry.
+        c.store_at(key("s.").scoped(7), &positive("s.", &[100]), CAPS, t0);
+        assert!(c.get_at(&key("s."), CAPS, t0).is_none());
+        assert!(c.get_at(&key("s.").scoped(7), CAPS, t0).is_some());
     }
 
     #[test]

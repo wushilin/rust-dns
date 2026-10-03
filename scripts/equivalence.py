@@ -1392,6 +1392,10 @@ def main():
     ap.add_argument("--keep", action="store_true", help="keep the temporary directory")
     ap.add_argument("--workdir", help="parent directory for the temporary directory")
     ap.add_argument("--show", type=int, default=25, help="differences printed in full (default 25)")
+    ap.add_argument("--new-resolver", metavar="JSON",
+                    help="PUT this JSON to B's /api/settings/resolver before the matrix (e.g. "
+                         "'{\"domain_needed\":false,\"bogus_priv\":false}' to compare a version "
+                         "with the phase I filters against one without them, all switched off)")
     ap.add_argument("--self-test", action="store_true",
                     help="perturb the query sent to B in a few cases and check that exactly those "
                          "are reported (proves the comparison detects differences)")
@@ -1434,6 +1438,14 @@ def main():
 
         # ---- 2. main phase
         A, B = start_pair(base, new, work, dbs[0], dbs[1], ups)
+        if args.new_resolver:
+            # Stored in B's database: applies to every later phase too.
+            api = Api(f"http://127.0.0.1:{B.web}")
+            api.req("/api/auth/login", {"username": "root", "password": ROOT_PASSWORD})
+            code, res = api.req("/api/settings/resolver", json.loads(args.new_resolver), method="PUT")
+            if code != 200:
+                raise RuntimeError(f"B: PUT /api/settings/resolver: {code} {res}")
+            log(f"B: resolver settings {json.dumps(res['settings'])}")
         serials = zone_serials(A.port, zones)
         if zone_serials(B.port, zones) != serials:
             log("warning: zone serials differ between A and B")

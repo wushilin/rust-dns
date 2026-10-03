@@ -202,6 +202,9 @@ a.tablink { color: var(--accent); cursor: pointer; }
 .rtool .search .ico { position: absolute; left: 10px; top: 50%; transform: translateY(-50%); color: var(--muted); pointer-events: none; }
 .rtool .search input { padding-left: 32px; }
 .rtool .btn.primary { flex: none; }
+table.mini { margin: 6px 0 10px; font-size: 13px; }
+table.mini th, table.mini td { padding: 5px 8px; }
+#resolver-card h3, #bl-main h3 { margin: 18px 0 4px; }
 table.records th:first-child, table.records td:first-child { padding-left: 16px; }
 table.records th:last-child, table.records td:last-child { padding-right: 16px; }
 table.records tbody tr:last-child td { border-bottom: 0; }
@@ -386,6 +389,7 @@ textarea { resize: vertical; }
       <a href="#/users" data-nav="users" data-admin title="Users"><span class="nav-ico" data-ico="users"></span><span class="lbl">Users</span></a>
       <a href="#/audit" data-nav="audit" data-admin title="Audit log"><span class="nav-ico" data-ico="shield"></span><span class="lbl">Audit log</span></a>
       <a href="#/server" data-nav="server" data-admin title="Server settings"><span class="nav-ico" data-ico="sliders"></span><span class="lbl">Server settings</span></a>
+      <a href="#/blocklists" data-nav="blocklists" data-admin title="Blocklists"><span class="nav-ico" data-ico="block"></span><span class="lbl">Blocklists</span></a>
       <a href="#/tsig" data-nav="tsig" data-admin title="TSIG keys"><span class="nav-ico" data-ico="lock"></span><span class="lbl">TSIG keys</span></a>
       <a href="#/replication" data-nav="replication" data-admin title="Replication"><span class="nav-ico" data-ico="servers"></span><span class="lbl">Replication</span></a>
       <div class="nav-sec">Account</div>
@@ -423,6 +427,7 @@ const num = n => (n ?? 0).toLocaleString();
 
 // Icons: 24px stroke glyphs, currentColor, so they follow the theme.
 const ICONS = {
+  block: '<circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/>',
   dashboard: '<rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/>',
   globe: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/>',
   pulse: '<path d="M3 12h4l3-8 4 16 3-8h4"/>',
@@ -675,7 +680,7 @@ async function route() {
   $$('#side nav a').forEach(a => a.classList.toggle('active', a.dataset.nav === page));
   $('#app').classList.remove('nav-open');
   if (S.panel && !(page === 'zones' && arg === S.panel.zone)) closeDrawer();
-  const views = { dashboard: viewDashboard, zones: arg ? () => viewZone(arg) : viewZones, queries: viewQueries, changelog: viewChangelog, audit: viewAudit, server: viewServer, tsig: viewTsig, replication: viewReplication, api: viewApi, users: viewUsers, tokens: viewTokens, account: viewAccount };
+  const views = { dashboard: viewDashboard, zones: arg ? () => viewZone(arg) : viewZones, queries: viewQueries, changelog: viewChangelog, audit: viewAudit, server: viewServer, blocklists: viewBlocklists, tsig: viewTsig, replication: viewReplication, api: viewApi, users: viewUsers, tokens: viewTokens, account: viewAccount };
   const v = views[page] || viewDashboard;
   try { await v(); } catch (e) { if (e.code !== 'login_required') { $('#main').innerHTML = `<div class="empty">${esc(e.message)}</div>`; } }
 }
@@ -810,7 +815,9 @@ function listenersHtml(st) {
   const xfr = st.transfer && (st.transfer.allow || []).length;
   if (xfr && L.tcp) cmds.push([`${digAt(t)} ${zone} AXFR`, `Zone transfer (full copy), allowed only from ${st.transfer.allow.join(', ')}.`]);
   return `<div class="row between"><h2 style="margin:0">DNS listeners</h2><span class="hint">port ${L.port}${L.port !== 53 ? ' (not the standard 53: clients must be told the port)' : ''}</span></div>
-    <div class="tw" style="margin-top:8px"><table><thead><tr><th>Address</th><th>Protocols</th><th>Meaning</th></tr></thead><tbody>${(L.bind || []).map(addrRow).join('') || '<tr><td colspan="3" class="empty">No listeners</td></tr>'}</tbody></table></div>
+    ${(L.interfaces || []).length ? `<p class="hint" style="margin:8px 0 0">Following interfaces (<span class="mono">[server].interfaces</span>): listeners are opened and closed as their addresses change.</p>
+      <div class="tw" style="margin-top:8px"><table><thead><tr><th>Interface</th><th>Addresses</th><th>Listening</th></tr></thead><tbody>${L.interfaces.map(i => `<tr><td class="mono">${esc(i.name)}</td><td class="mono">${i.addresses.length ? i.addresses.map(esc).join('<br>') : '<span class="hint">no address</span>'}</td><td>${i.addresses.map(a => i.bound.includes(a) ? '<span class="badge ok">yes</span>' : '<span class="badge bad">no</span>').join('<br>')} ${protos}</td></tr>`).join('')}</tbody></table></div>`
+    : `<div class="tw" style="margin-top:8px"><table><thead><tr><th>Address</th><th>Protocols</th><th>Meaning</th></tr></thead><tbody>${(L.bind || []).map(addrRow).join('') || '<tr><td colspan="3" class="empty">No listeners</td></tr>'}</tbody></table></div>`}
     <p class="hint" style="margin:10px 0 0"><span class="mono">0.0.0.0</span> and <span class="mono">::</span> mean every address of this host; a specific address means clients must use exactly that address.</p>
     ${t.note ? `<div class="note info">${ico('info', 's')}<span>${esc(t.note)}</span></div>` : ''}
     <h3 style="margin-top:16px">Try it</h3>
@@ -848,7 +855,7 @@ function renderZonesTable() {
   const f = ($('#z-filter')?.value || '').toLowerCase();
   const zs = S.zones.filter(z => z.name.includes(f));
   $('#z-table').innerHTML = zs.length ? `<table><thead><tr><th>Zone</th><th>Records</th><th>Serial</th><th>Owner</th><th>Your role</th><th>Updated</th></tr></thead><tbody>
-    ${zs.map(z => `<tr class="clickable" data-href="#/zones/${encodeURIComponent(z.name)}"><td><b class="mono">${esc(z.name)}</b></td><td>${num(z.record_count)}</td><td class="mono">${z.serial}</td><td>${esc(z.owner || '–')}</td><td><span class="badge">${esc(z.role)}</span></td><td class="hint">${ago(z.updated_at)}</td></tr>`).join('')}
+    ${zs.map(z => `<tr class="clickable" data-href="#/zones/${encodeURIComponent(z.name)}"><td><b class="mono">${esc(z.name)}</b>${z.override ? ' <span class="badge warn" title="Override zone: not authoritative">override</span>' : ''}</td><td>${num(z.record_count)}</td><td class="mono">${z.serial}</td><td>${esc(z.owner || '–')}</td><td><span class="badge">${esc(z.role)}</span></td><td class="hint">${ago(z.updated_at)}</td></tr>`).join('')}
   </tbody></table>` : `<div class="empty">${S.zones.length ? 'No zones match' : (S.user.is_admin ? 'No zones yet. Create one to get started.' : 'No zones have been shared with you.')}</div>`;
 }
 function zoneForm(z = {}) {
@@ -863,16 +870,38 @@ function zoneForm(z = {}) {
     ${S.user.is_admin ? `<div class="field"><label>Owner (username)</label><input type="text" name="owner" value="${esc(z.owner || '')}" placeholder="${esc(S.user.username)}"></div>` : ''}
   </div>`;
 }
+// Override zones (I1): mode and upstreams, used when creating and on the zone page.
+function overrideFields(o) {
+  return `<div class="note">${ico('info', 's')}<span>An override zone is <b>not authoritative</b>: it answers only clients allowed to use forwarding, never sets AA or AD, is never signed and never transferred. Names and types defined here are answered from here; the rest goes to the upstreams below (<i>transparent</i>) or gets NXDOMAIN (<i>static</i>). With no records it is conditional forwarding.</span></div>
+    <div class="grid two" style="gap:0 16px">
+      <div class="field"><label>Names not defined here</label><select id="ov-mode">
+        <option value="transparent"${o.mode !== 'static' ? ' selected' : ''}>Forward them (transparent)</option>
+        <option value="static"${o.mode === 'static' ? ' selected' : ''}>Answer NXDOMAIN (static, for blocking)</option></select></div>
+      <div class="field"><label>Upstreams for this zone (one per line)</label><textarea id="ov-up" rows="3" spellcheck="false" placeholder="10.8.0.1\n[fd00::53]:53">${esc((o.upstreams || []).join('\n'))}</textarea>
+        <span class="hint">Empty: the server's forwarding upstreams.</span></div></div>`;
+}
+function readOverride(m) { return { mode: m.querySelector('#ov-mode').value, upstreams: m.querySelector('#ov-up').value.split('\n').map(x => x.trim()).filter(Boolean) }; }
+function overrideModal(z) {
+  openModal(`<h2>Override zone ${esc(z.name)}</h2>${overrideFields(z.override)}<div class="error" id="m-err"></div>
+    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="m-ok">Save</button></div>`, m => {
+    m.querySelector('#m-ok').onclick = async () => { try { await PUT('/zones/' + encodeURIComponent(z.name), { override: readOverride(m) }); closeModal(); toast('Override settings saved', 'ok'); reloadZone(); } catch (e) { m.querySelector('#m-err').textContent = e.message; } };
+  });
+}
 function readForm(m) { const o = {}; m.querySelectorAll('[name]').forEach(i => { const v = i.type === 'number' ? (i.value === '' ? null : Number(i.value)) : i.value.trim(); if (v !== null && v !== '') o[i.name] = v; }); return o; }
 function newZoneModal() {
   openModal(`<h2>New zone</h2>
     <div class="field"><label>Zone name</label><input type="text" name="name" placeholder="example.com  ·  0.0.10.in-addr.arpa  ·  ."></div>
+    <div class="field"><label>Type</label><select id="nz-type">
+      <option value="auth">Authoritative (this server is the source of truth for the zone)</option>
+      <option value="override">Override (local names for clients that use forwarding; everything else forwarded)</option></select></div>
+    <div id="nz-ov" class="hidden">${overrideFields({ mode: 'transparent', upstreams: [] })}</div>
     <p class="hint">Leave the SOA fields empty to use the server defaults.</p>
     ${zoneForm({ soa_mname: '', soa_rname: '' })}
     <div class="error" id="m-err"></div>
     <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="m-ok">Create</button></div>`, m => {
     m.querySelectorAll('[name=default_ttl],[name=minimum],[name=refresh],[name=retry],[name=expire]').forEach(i => i.value = '');
-    $('#m-ok').onclick = async () => { try { const z = await POST('/zones', readForm(m)); closeModal(); await refreshZones(); location.hash = '#/zones/' + encodeURIComponent(z.name); toast(`Zone ${z.name} created`, 'ok'); } catch (e) { $('#m-err').textContent = e.message; } };
+    m.querySelector('#nz-type').onchange = e => m.querySelector('#nz-ov').classList.toggle('hidden', e.target.value !== 'override');
+    $('#m-ok').onclick = async () => { try { const body = readForm(m); if (m.querySelector('#nz-type').value === 'override') body.override = readOverride(m); const z = await POST('/zones', body); closeModal(); await refreshZones(); location.hash = '#/zones/' + encodeURIComponent(z.name); toast(`Zone ${z.name} created`, 'ok'); } catch (e) { $('#m-err').textContent = e.message; } };
   });
 }
 // ---------------------------------------------------------------------------
@@ -896,14 +925,15 @@ function renderZone(keepFilter) {
         <h1 class="mono zname">${esc(z.fqdn)}</h1>
         <div class="actions">
           <button class="btn" id="z-io">Import / Export</button>
+          ${isOwner && z.override ? '<button class="btn" id="z-ov">Override settings</button>' : ''}
           ${isOwner ? '<button class="btn" id="z-edit">Settings</button><button class="btn danger" id="z-del">Delete zone</button>' : ''}
         </div>
       </div>
       <div class="chips">
         <button class="chip-btn" data-panel="soa" title="Start of authority: serial, timers, contacts">${ico('info', 's')} SOA <span class="sub mono">serial ${z.serial}</span></button>
-        <button class="chip-btn${delegWarn ? ' warn' : ''}" data-panel="deleg" title="${dl.reverse ? 'How reverse delegation works' : 'Nameservers and glue for your registrar'}">${ico(delegWarn ? 'warn' : 'deleg', 's')} ${dl.reverse ? 'Reverse delegation' : 'Delegation'} <span class="sub">${dl.ns.length} NS</span></button>
+        ${z.override ? '' : `<button class="chip-btn${delegWarn ? ' warn' : ''}" data-panel="deleg" title="${dl.reverse ? 'How reverse delegation works' : 'Nameservers and glue for your registrar'}">${ico(delegWarn ? 'warn' : 'deleg', 's')} ${dl.reverse ? 'Reverse delegation' : 'Delegation'} <span class="sub">${dl.ns.length} NS</span></button>`}
         <button class="chip-btn" data-panel="dig" title="Commands to query this zone">${ico('term', 's')} Test with dig</button>
-        <button class="chip-btn" data-panel="dnssec" title="DNSSEC signing: status, DS record for the registrar, checks">${ico('shield', 's')} DNSSEC <span class="sub">${z.dnssec ? 'signing' : 'off'}</span></button>
+        ${z.override ? `<span class="badge warn" title="Answered only for clients allowed to use forwarding; never AA, AD, signed or transferred">Override zone · not authoritative · ${z.override.mode === 'static' ? 'static' : 'transparent'}${z.override.upstreams.length ? ' → ' + esc(z.override.upstreams.join(', ')) : ''}</span>` : `<button class="chip-btn" data-panel="dnssec" title="DNSSEC signing: status, DS record for the registrar, checks">${ico('shield', 's')} DNSSEC <span class="sub">${z.dnssec ? 'signing' : 'off'}</span></button>`}
         ${isOwner ? `<button class="chip-btn" data-panel="access" title="Who can see and edit this zone">${ico('lock', 's')} Access <span class="sub">${z.members.length}</span></button>` : ''}
         <span class="meta">owner <b>${esc(z.owner || '–')}</b> · you are <span class="badge">${esc(z.role)}</span> · default TTL ${z.default_ttl}s</span>
       </div>
@@ -922,6 +952,7 @@ function renderZone(keepFilter) {
   if ($('#r-add')) $('#r-add').onclick = () => recordModal(null);
   $('#z-io').onclick = () => ioModal(z.name);
   if ($('#z-edit')) $('#z-edit').onclick = zoneSettingsModal;
+  if ($('#z-ov')) $('#z-ov').onclick = () => overrideModal(z);
   if ($('#z-del')) $('#z-del').onclick = async () => { if (await confirmModal('Delete zone', `Delete ${z.name} and all ${z.records.length} records? This cannot be undone.`)) { try { await DEL('/zones/' + encodeURIComponent(z.name)); toast('Zone deleted', 'ok'); closeDrawer(); await refreshZones(); location.hash = '#/zones'; } catch (e) { toast(e.message, 'err'); } } };
   $$('[data-panel]').forEach(b => b.onclick = () => openZonePanel(b.dataset.panel));
   renderRecords();
@@ -1462,7 +1493,7 @@ function ioModal(zoneName) {
     ? `<option value="${esc(zoneName)}">${esc(zoneName)}</option>`
     : `<option value="">All zones (${S.zones.length})</option>` + S.zones.map(z => `<option value="${esc(z.name)}">${esc(z.name)}</option>`).join('');
   openModal(`<h2>Import / Export${zoneName ? ` · <span class="mono">${esc(zoneName)}</span>` : ''}</h2>
-    <div class="tabs"><button data-tab="export" class="on">Export</button>${canImport ? '<button data-tab="import">Import</button>' : ''}</div>
+    <div class="tabs"><button data-tab="export" class="on">Export</button>${canImport ? '<button data-tab="import">Import</button><button data-tab="hosts">Hosts file</button>' : ''}</div>
     <section data-pane="export">
       <div class="field"><label>Zone</label><select id="ex-scope">${scopeOptions}</select></div>
       <p class="hint" id="ex-hint"></p>
@@ -1477,6 +1508,16 @@ function ioModal(zoneName) {
         <span class="hint" id="im-mode-hint"></span></div>
       <div class="io-summary" id="im-preview">Choose a file or paste its contents.</div>
       <div class="foot"><button class="btn" data-close>Close</button><button class="btn primary" id="im-go" disabled>Import</button></div>
+    </section>
+    <section data-pane="hosts" class="hidden">
+      <div class="field"><label>Zone</label><select id="ho-zone">${(zoneName ? [zoneName] : ownedZones.concat(S.user.is_admin ? S.zones.map(z => z.name).filter(n => !ownedZones.includes(n)) : [])).map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join('')}</select></div>
+      <div class="field"><label>File</label><input type="file" id="ho-file"></div>
+      <div class="field"><label>Or paste (<span class="mono">/etc/hosts</span> format)</label><textarea id="ho-text" rows="7" spellcheck="false" placeholder="192.168.1.10  nas.home.example nas\nfd00::10      nas.home.example"></textarea>
+        <span class="hint">Names without a dot are taken as relative to the zone; names outside it are listed and skipped.</span></div>
+      <div class="field"><label>Mode</label><div class="seg">
+        <label><input type="radio" name="ho-mode" value="merge" checked>Merge</label><label><input type="radio" name="ho-mode" value="replace">Replace all records</label></div></div>
+      <div class="io-summary" id="ho-preview">Paste or choose a hosts file, then preview.</div>
+      <div class="foot"><button class="btn" data-close>Close</button><button class="btn" id="ho-prev">Preview</button><button class="btn primary" id="ho-go" disabled>Import</button></div>
     </section>` : ''}`, m => {
     const val = name => (m.querySelector(`[name=${name}]:checked`) || {}).value;
     // tabs
@@ -1492,6 +1533,29 @@ function ioModal(zoneName) {
         : 'SOA settings and records, including TTLs and expiry times, as JSON (re-importable here).';
     };
     $('#ex-scope').onchange = exUpdate; exUpdate();
+
+    // ---- hosts file (I8): preview, then import in one transaction
+    if (m.querySelector('#ho-text')) {
+      const hoBody = preview => ({ text: $('#ho-text').value, mode: val('ho-mode'), preview });
+      const hoUrl = () => '/zones/' + encodeURIComponent($('#ho-zone').value) + '/import/hosts';
+      const hoShow = (r, done) => {
+        const box = $('#ho-preview'); box.classList.remove('bad');
+        const recs = r.records.slice(0, 50).map(x => `<div class="mono">${esc(x.name)} ${x.type} ${esc(x.value)}</div>`).join('') + (r.records.length > 50 ? `<div class="hint">… ${r.records.length - 50} more</div>` : '');
+        const skip = r.skipped.length ? `<div style="margin-top:6px"><b>Skipped ${r.skipped.length}:</b>${r.skipped.slice(0, 30).map(s => `<div class="hint">line ${s.line}: <span class="mono">${esc(s.name)}</span> (${esc(s.reason)})</div>`).join('')}</div>` : '';
+        box.innerHTML = (done ? `<b>Imported:</b> ${r.summary.records_added} added, ${r.summary.records_removed} removed, ${r.summary.records_skipped} already present<br>` : `<b>${r.records.length} record${r.records.length === 1 ? '' : 's'} to import</b>`) + recs + skip;
+      };
+      $('#ho-file').onchange = async e => { const f = e.target.files[0]; if (f) { $('#ho-text').value = await f.text(); $('#ho-go').disabled = true; } };
+      $('#ho-text').oninput = () => { $('#ho-go').disabled = true; };
+      $('#ho-prev').onclick = async () => {
+        try { const r = await POST(hoUrl(), hoBody(true)); hoShow(r, false); $('#ho-go').disabled = !r.records.length; }
+        catch (e) { const b = $('#ho-preview'); b.classList.add('bad'); b.textContent = e.message; }
+      };
+      $('#ho-go').onclick = async () => {
+        $('#ho-go').disabled = true;
+        try { const r = await POST(hoUrl(), hoBody(false)); hoShow(r, true); toast('Hosts file imported', 'ok'); if (S.zone && S.zone.name === $('#ho-zone').value) reloadZone(); }
+        catch (e) { const b = $('#ho-preview'); b.classList.add('bad'); b.textContent = e.message; }
+      };
+    }
     $('#ex-go').onclick = () => {
       const zone = $('#ex-scope').value;
       const a = document.createElement('a');
@@ -1773,7 +1837,9 @@ async function viewServer() {
         <span class="k">Hits</span><span>${num(f.cache.hits)}</span><span class="k">Misses</span><span>${num(f.cache.misses)}</span>
         <span class="k">Hit rate</span><span>${(f.cache.hit_rate * 100).toFixed(1)}%</span></div>` : '<p class="hint">The cache is off (<code>[forwarding].cache_entries = 0</code>).</p>'}
       <div class="error" id="fc-err"></div>
-    </div>`;
+    </div>
+    <div id="resolver-card"></div>`;
+  renderResolver();
   const body = () => ({
     upstreams: $('#fw-up').value.split('\n').map(x => x.trim()).filter(Boolean),
     allowed_clients: $('#fw-acl').value.split('\n').map(x => x.trim()).filter(Boolean),
@@ -1809,6 +1875,138 @@ async function viewServer() {
   if ($('#fw-reset')) $('#fw-reset').onclick = async () => {
     try { await DEL('/settings/forwarding'); toast('Using the config file again', 'ok'); viewServer(); }
     catch (e) { $('#fw-err').textContent = e.message; }
+  };
+}
+
+// Resolver behaviour for forwarded queries (I2-I6, I9, I10): one card with
+// sub-sections, saved together (PUT /settings/resolver).
+async function renderResolver() {
+  const host = $('#resolver-card'); if (!host) return;
+  let r;
+  try { r = await GET('/settings/resolver'); }
+  catch (e) { host.innerHTML = `<div class="card panel" style="max-width:820px;margin-top:16px"><h2>Resolver</h2><div class="error">${esc(e.message)}</div></div>`; return; }
+  const s = r.settings;
+  const chk = (id, on, label, hint) => `<label style="display:flex;gap:8px;align-items:flex-start;margin:8px 0"><input type="checkbox" id="${id}"${on ? ' checked' : ''}><span><b>${label}</b><br><span class="hint">${hint}</span></span></label>`;
+  const healthRows = list => list.map(h => `<tr><td class="mono">${esc(h.upstream)}</td><td>${h.down ? '<span class="badge bad">down</span>' : '<span class="badge ok">up</span>'}</td><td>${h.latency_ms == null ? '–' : h.latency_ms.toFixed(1) + ' ms'}</td><td>${num(h.successes)}</td><td>${num(h.failures)}</td><td class="hint">${h.last_error ? esc(h.last_error) + (h.last_error_at ? ' · ' + ago(h.last_error_at) : '') : ''}</td></tr>`).join('');
+  const zoneHealth = (r.zone_upstreams || []).map(z => `<tr><td colspan="6" class="hint">override zone <span class="mono">${esc(z.zone)}</span></td></tr>` + healthRows(z.upstreams)).join('');
+  const src = r.source === 'console' ? `<span class="badge">set in the console</span> <span class="hint">by ${esc(r.updated_by || '?')} ${r.updated_at ? ago(r.updated_at) : ''}</span>` : '<span class="badge muted">defaults</span>';
+  host.innerHTML = `<div class="card panel" style="max-width:820px;margin-top:16px"><div class="row between"><h2>Resolver</h2><div>${src}</div></div>
+    <p class="hint">How forwarded queries are handled. Own zones and override zones are always answered first and are never affected. Saved settings apply at once and are copied to standbys.</p>
+    <h3>Local answers</h3>
+    ${chk('rs-dn', s.domain_needed, 'Never forward single-label names (domain-needed)', `Names such as <span class="mono">wpad</span> or <span class="mono">printer</span> get NXDOMAIN here instead of leaking to the upstreams (privacy; a forwarded <span class="mono">wpad</span> lookup can be answered by an attacker). Answered so far: ${num(r.domain_needed_answered)}.`)}
+    ${chk('rs-bp', s.bogus_priv, 'Never forward private reverse lookups (bogus-priv)', `PTR lookups for private and special ranges (10/8, 172.16/12, 192.168/16, 100.64/10, 127/8, 169.254/16, fc00::/7, fe80::/10, ...) get NXDOMAIN here unless an own reverse zone or automatic PTR covers the address. Answered so far: ${num(r.bogus_priv_answered)}.`)}
+    <div class="field"><label>Record types never forwarded (filter-rr)</label><input type="text" id="rs-ft" value="${esc((s.filter_types || []).join(' '))}" placeholder="AAAA HTTPS">
+      <span class="hint">Space separated. Such queries get an empty answer (NODATA). Answered so far: ${num(r.filtered_answered)}.</span></div>
+    <h3>Rebinding protection</h3>
+    ${chk('rs-rb', s.rebind_protection, 'Refuse forwarded answers that point into private networks (stop-dns-rebind)', 'An answer from an upstream with a private, loopback, link-local, CGNAT, ULA, 0.0.0.0 or :: address is refused (REFUSED) and logged.')}
+    <div class="field"><label>Domains allowed to resolve to private addresses (one per line, includes subdomains)</label>
+      <textarea id="rs-rba" rows="3" spellcheck="false" placeholder="internal\namazonaws.com">${esc((s.rebind_allow || []).join('\n'))}</textarea></div>
+    ${r.rebind_blocked.length ? `<details><summary class="hint">Recently refused: ${num(r.rebind_blocked_total)} answers</summary><table class="mini"><thead><tr><th>Name</th><th>Address</th><th>Count</th><th>Last</th></tr></thead><tbody>${r.rebind_blocked.map(e => `<tr><td class="mono">${esc(e.name)}</td><td class="mono">${esc(e.address)}</td><td>${num(e.count)}</td><td class="hint">${ago(e.last_at)}</td></tr>`).join('')}</tbody></table></details>` : '<p class="hint">Nothing refused so far.</p>'}
+    <h3>Upstreams</h3>
+    <div class="grid two" style="gap:0 16px">
+      <div class="field"><label>Strategy</label><select id="rs-st">
+        <option value="in_order"${s.strategy === 'in_order' ? ' selected' : ''}>In order (try the next one when one fails)</option>
+        <option value="fastest"${s.strategy === 'fastest' ? ' selected' : ''}>Fastest healthy upstream first</option>
+        <option value="parallel"${s.strategy === 'parallel' ? ' selected' : ''}>All at once, first answer wins</option></select>
+        <span class="hint">Also used by override zones with their own upstreams. An upstream that fails 3 times in a row is marked down and tried again every 30 s.</span></div>
+      <div></div></div>
+    <table class="mini"><thead><tr><th>Upstream</th><th>State</th><th>Latency</th><th>Answers</th><th>Failures</th><th>Last error</th></tr></thead><tbody>${healthRows(r.upstream_health) + zoneHealth || '<tr><td colspan="6" class="empty">No upstreams.</td></tr>'}</tbody></table>
+    ${chk('rs-ss', s.serve_stale, 'Serve stale answers when every upstream fails (RFC 8767)', `An expired cached answer is returned with a 30 s TTL instead of SERVFAIL. Served so far: ${num(r.stale_answers)}.`)}
+    <div class="field"><label>Serve stale answers up to (seconds past their expiry)</label><input type="text" inputmode="numeric" id="rs-sa" value="${s.max_stale_age_secs}"></div>
+    <h3>EDNS Client Subnet</h3>
+    ${chk('rs-ecs', s.ecs, 'Send the client\'s subnet to the upstreams (add-subnet, RFC 7871)', 'Lets CDNs answer for the client\'s location; the upstream learns the client\'s network. Answers are cached per subnet.')}
+    <div class="grid two" style="gap:0 16px">
+      <div class="field"><label>IPv4 prefix length</label><input type="text" inputmode="numeric" id="rs-e4" value="${s.ecs_ipv4_prefix}"></div>
+      <div class="field"><label>IPv6 prefix length</label><input type="text" inputmode="numeric" id="rs-e6" value="${s.ecs_ipv6_prefix}"></div></div>
+    ${chk('rs-ep', s.ecs_private_clients, 'Also for clients in private ranges', 'Off: clients with private addresses are forwarded without a subnet.')}
+    <div class="error" id="rs-err"></div>
+    <div class="row" style="margin-top:12px"><button class="btn primary" id="rs-save">Save and apply</button>${r.source === 'console' ? '<button class="btn" id="rs-reset">Reset to defaults</button>' : ''}</div>
+  </div>`;
+  $('#rs-save').onclick = async () => {
+    $('#rs-err').textContent = '';
+    const b = {
+      domain_needed: $('#rs-dn').checked, bogus_priv: $('#rs-bp').checked,
+      rebind_protection: $('#rs-rb').checked, rebind_allow: $('#rs-rba').value.split('\n').map(x => x.trim()).filter(Boolean),
+      serve_stale: $('#rs-ss').checked, max_stale_age_secs: Number($('#rs-sa').value.trim()),
+      strategy: $('#rs-st').value, filter_types: $('#rs-ft').value.split(/[\s,]+/).filter(Boolean),
+      ecs: $('#rs-ecs').checked, ecs_ipv4_prefix: Number($('#rs-e4').value.trim()), ecs_ipv6_prefix: Number($('#rs-e6').value.trim()),
+      ecs_private_clients: $('#rs-ep').checked,
+    };
+    try { await PUT('/settings/resolver', b); toast('Resolver settings applied', 'ok'); renderResolver(); }
+    catch (e) { $('#rs-err').textContent = e.message; }
+  };
+  if ($('#rs-reset')) $('#rs-reset').onclick = async () => {
+    try { await DEL('/settings/resolver'); toast('Resolver defaults in effect', 'ok'); renderResolver(); }
+    catch (e) { $('#rs-err').textContent = e.message; }
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Blocklists (I7): list URLs (replicated), downloads and counts per server
+// ---------------------------------------------------------------------------
+async function viewBlocklists() {
+  if (!S.user.is_admin) { location.hash = '#/dashboard'; return; }
+  const b = await GET('/blocklists');
+  const s = b.settings;
+  S.blLists = s.lists.map(l => ({ ...l }));
+  const st = url => b.lists.find(x => x.url === url) || {};
+  const rows = () => S.blLists.length ? S.blLists.map((l, i) => { const x = st(l.url); return `<tr>
+      <td><input type="checkbox" data-bl-on="${i}"${l.enabled ? ' checked' : ''} aria-label="Enabled"></td>
+      <td><b>${esc(l.name)}</b><div class="hint mono" style="word-break:break-all">${esc(l.url)}</div></td>
+      <td>${x.loaded_at ? num(x.entries) + (x.capped ? ' <span class="badge warn">capped</span>' : '') : '<span class="hint">not loaded</span>'}</td>
+      <td class="hint">${x.loaded_at ? ago(x.loaded_at) : '–'}${x.error ? `<div style="color:var(--danger);word-break:break-word;max-width:320px">${esc(x.error)}${x.attempted_at ? ' · ' + ago(x.attempted_at) : ''}</div>` : ''}</td>
+      <td>${num(x.blocked || 0)}</td>
+      <td><button class="btn sm" data-bl-del="${i}">Remove</button></td></tr>`; }).join('') : '<tr><td colspan="6" class="empty">No lists yet.</td></tr>';
+  $('#main').innerHTML = `<div class="topbar"><h1>Blocklists</h1></div>
+    <div class="card panel" id="bl-main" style="max-width:900px">
+      <p class="hint">Forwarded queries for names on these lists (and names below them) are blocked. Own zones and override zones always win. The configuration is copied to standbys; every server downloads the lists itself and keeps the last good copy when a download fails.
+        In use here: ${num(b.entries)} entries, ${(b.memory_bytes / 1048576).toFixed(1)} MiB; ${num(b.blocked)} queries blocked since start.</p>
+      <div class="tw"><table class="mini"><thead><tr><th>On</th><th>List</th><th>Entries</th><th>Last download</th><th>Blocked</th><th></th></tr></thead><tbody id="bl-rows">${rows()}</tbody></table></div>
+      <div class="grid two" style="gap:0 16px">
+        <div class="field"><label>Add a list: URL</label><input type="text" id="bl-url" placeholder="https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"></div>
+        <div class="field"><label>Name</label><div class="row"><input type="text" id="bl-name" placeholder="StevenBlack"><button class="btn" id="bl-add">Add</button></div></div></div>
+      <p class="hint">Formats, detected per line: hosts files (<span class="mono">0.0.0.0 ads.example.com</span>), plain domains, Adblock (<span class="mono">||ads.example.com^</span>).</p>
+      <h3>Settings</h3>
+      <div class="grid two" style="gap:0 16px">
+        <div class="field"><label>Answer for a blocked name</label><select id="bl-act">
+          <option value="nxdomain"${s.action === 'nxdomain' ? ' selected' : ''}>NXDOMAIN (name does not exist)</option>
+          <option value="null_address"${s.action === 'null_address' ? ' selected' : ''}>0.0.0.0 / :: (null address)</option></select></div>
+        <div class="field"><label>Download every (hours)</label><input type="text" inputmode="numeric" id="bl-hours" value="${s.refresh_hours}"></div></div>
+      <div class="field"><label>Never block (allowlist, one domain per line, includes subdomains)</label><textarea id="bl-allow" rows="4" spellcheck="false">${esc(s.allow.join('\n'))}</textarea></div>
+      <div class="error" id="bl-err"></div>
+      <div class="row" style="margin-top:12px"><button class="btn primary" id="bl-save">Save and apply</button><button class="btn" id="bl-refresh">Download now</button></div>
+      <h3>Test a name</h3>
+      <div class="row"><input type="text" id="bl-test" placeholder="ads.example.com" style="max-width:360px"><button class="btn" id="bl-testbtn">Test</button></div>
+      <div id="bl-testout" class="io-summary hidden"></div>
+    </div>`;
+  const redraw = () => { $('#bl-rows').innerHTML = rows(); wire(); };
+  const wire = () => {
+    $$('[data-bl-on]').forEach(c => c.onchange = () => { S.blLists[+c.dataset.blOn].enabled = c.checked; });
+    $$('[data-bl-del]').forEach(c => c.onclick = () => { S.blLists.splice(+c.dataset.blDel, 1); redraw(); });
+  };
+  wire();
+  $('#bl-add').onclick = () => {
+    const url = $('#bl-url').value.trim(); if (!url) return;
+    S.blLists.push({ name: $('#bl-name').value.trim() || url, url, enabled: true });
+    $('#bl-url').value = ''; $('#bl-name').value = ''; redraw();
+  };
+  $('#bl-save').onclick = async () => {
+    $('#bl-err').textContent = '';
+    try {
+      await PUT('/blocklists', { lists: S.blLists, allow: $('#bl-allow').value.split('\n').map(x => x.trim()).filter(Boolean), action: $('#bl-act').value, refresh_hours: Number($('#bl-hours').value.trim()) });
+      toast('Blocklists saved; downloads start now', 'ok'); viewBlocklists();
+    } catch (e) { $('#bl-err').textContent = e.message; }
+  };
+  $('#bl-refresh').onclick = async () => { try { await POST('/blocklists/refresh'); toast('Downloading', 'ok'); setTimeout(viewBlocklists, 1500); } catch (e) { $('#bl-err').textContent = e.message; } };
+  $('#bl-testbtn').onclick = async () => {
+    const box = $('#bl-testout'); box.classList.remove('hidden', 'bad', 'warn');
+    try {
+      const t = await POST('/blocklists/test', { name: $('#bl-test').value.trim() });
+      box.classList.toggle('warn', t.blocked);
+      box.innerHTML = t.blocked ? `<b>${esc(t.name)}</b> is blocked by ${t.matches.map(m => `${esc(m.list)} (entry <span class="mono">${esc(m.entry)}</span>)`).join(', ')}`
+        : t.allowed_by ? `<b>${esc(t.name)}</b> is allowlisted (<span class="mono">${esc(t.allowed_by)}</span>)${t.matches.length ? '; it is on ' + t.matches.map(m => esc(m.list)).join(', ') : ''}`
+        : `<b>${esc(t.name)}</b> is not blocked`;
+    } catch (e) { box.classList.add('bad'); box.textContent = e.message; }
   };
 }
 

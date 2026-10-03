@@ -100,17 +100,216 @@ fn restore(client_req: &[u8], span: &std::ops::Range<usize>, mut reply: Vec<u8>)
     reply
 }
 
+/// Forward to the upstreams of `cfg`, in order (the upstream probe of the
+/// console; queries go through [`forward_via`]).
 pub async fn forward(cfg: &ForwardingConfig, req: &[u8], proto: Proto) -> Result<Vec<u8>> {
-    let span = question_span(req).ok_or_else(|| anyhow!("query has no single question"))?;
-    let to = Duration::from_millis(cfg.timeout_ms.max(100));
-    let mut last_err = anyhow!("no upstreams configured");
-    for upstream in &cfg.upstreams {
-        match exchange_with_fallbacks(*upstream, req, &span, proto, to).await {
-            Ok(b) => return Ok(restore(req, &span, b)),
-            Err(e) => {
-                tracing::debug!(%upstream, error = %e, "upstream failed");
-                last_err = e;
+    forward_via(
+        &cfg.upstreams,
+        cfg.timeout_ms,
+        UpstreamStrategy::InOrder,
+        None,
+        req,
+        proto,
+    )
+    .await
+}
+
+/// Health of one upstream as this server saw it (I6).
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct UpstreamHealth {
+    /// `ip:port`.
+    pub upstream: String,
+    /// Average answer time (exponentially weighted, milliseconds); `null`
+    /// before the first answer.
+    #[schema(required = true)]
+    pub latency_ms: Option<f64>,
+    pub successes: u64,
+    pub failures: u64,
+    /// Failures in a row (3 mark the upstream down).
+    pub consecutive_failures: u32,
+    /// Marked down: skipped by the `fastest` and `parallel` strategies
+    /// except for one probe every 30 seconds.
+    pub down: bool,
+    #[schema(required = true)]
+    pub last_error: Option<String>,
+    #[schema(required = true, format = DateTime)]
+    pub last_error_at: Option<String>,
+}
+
+struct HealthEntry {
+    view: UpstreamHealth,
+    last_attempt: Option<std::time::Instant>,
+}
+
+/// Failures in a row that mark an upstream down.
+pub const DOWN_AFTER: u32 = 3;
+/// How often a down upstream is tried again (one query).
+pub const PROBE_EVERY: Duration = Duration::from_secs(30);
+
+/// Per-upstream health, shared by all queries of this server.
+#[derive(Default)]
+pub struct Health {
+    inner: std::sync::Mutex<std::collections::HashMap<SocketAddr, HealthEntry>>,
+}
+
+impl Health {
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<SocketAddr, HealthEntry>> {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn entry(
+        m: &mut std::collections::HashMap<SocketAddr, HealthEntry>,
+        u: SocketAddr,
+    ) -> &mut HealthEntry {
+        m.entry(u).or_insert_with(|| HealthEntry {
+            view: UpstreamHealth {
+                upstream: u.to_string(),
+                latency_ms: None,
+                successes: 0,
+                failures: 0,
+                consecutive_failures: 0,
+                down: false,
+                last_error: None,
+                last_error_at: None,
+            },
+            last_attempt: None,
+        })
+    }
+
+    pub fn record_ok(&self, u: SocketAddr, elapsed: Duration) {
+        let mut g = self.lock();
+        let e = Self::entry(&mut g, u);
+        let ms = elapsed.as_secs_f64() * 1000.0;
+        e.view.latency_ms = Some(match e.view.latency_ms {
+            None => ms,
+            Some(old) => old * 0.8 + ms * 0.2,
+        });
+        e.view.successes += 1;
+        e.view.consecutive_failures = 0;
+        if e.view.down {
+            tracing::info!(upstream = %u, "upstream answers again; marked up");
+        }
+        e.view.down = false;
+    }
+
+    pub fn record_err(&self, u: SocketAddr, err: &anyhow::Error) {
+        let mut g = self.lock();
+        let e = Self::entry(&mut g, u);
+        e.view.failures += 1;
+        e.view.consecutive_failures += 1;
+        e.view.last_error = Some(format!("{err:#}"));
+        e.view.last_error_at = Some(crate::model::now_rfc3339());
+        if !e.view.down && e.view.consecutive_failures >= DOWN_AFTER {
+            tracing::warn!(upstream = %u, error = %err, "upstream marked down after {DOWN_AFTER} failures in a row");
+            e.view.down = true;
+        }
+    }
+
+    /// The upstreams to try, in order, for `strategy`: `in_order` keeps
+    /// the configured order (down or not); `fastest` puts usable upstreams
+    /// by average latency first (unmeasured ones before measured ones, so
+    /// they get measured) and down ones last; `parallel` returns the usable
+    /// ones (all of them if none is usable). A down upstream counts as
+    /// usable once per [`PROBE_EVERY`] (the probe).
+    pub fn plan(&self, ups: &[SocketAddr], strategy: UpstreamStrategy) -> Vec<SocketAddr> {
+        if strategy == UpstreamStrategy::InOrder || ups.len() <= 1 {
+            return ups.to_vec();
+        }
+        let now = std::time::Instant::now();
+        let mut g = self.lock();
+        let mut usable: Vec<(SocketAddr, f64)> = Vec::new();
+        let mut down: Vec<SocketAddr> = Vec::new();
+        for u in ups {
+            let e = Self::entry(&mut g, *u);
+            let probe_due = e
+                .last_attempt
+                .is_none_or(|t| now.duration_since(t) >= PROBE_EVERY);
+            if !e.view.down || probe_due {
+                if e.view.down {
+                    e.last_attempt = Some(now); // one probe per interval
+                }
+                usable.push((*u, e.view.latency_ms.unwrap_or(-1.0)));
+            } else {
+                down.push(*u);
             }
+        }
+        match strategy {
+            UpstreamStrategy::Parallel if usable.is_empty() => down,
+            UpstreamStrategy::Parallel => usable.into_iter().map(|(u, _)| u).collect(),
+            _ => {
+                usable.sort_by(|a, b| a.1.total_cmp(&b.1));
+                usable.into_iter().map(|(u, _)| u).chain(down).collect()
+            }
+        }
+    }
+
+    fn attempted(&self, u: SocketAddr) {
+        let mut g = self.lock();
+        Self::entry(&mut g, u).last_attempt = Some(std::time::Instant::now());
+    }
+
+    /// Health of `ups`, in that order (upstreams never asked included).
+    pub fn report(&self, ups: &[SocketAddr]) -> Vec<UpstreamHealth> {
+        let mut g = self.lock();
+        ups.iter()
+            .map(|u| Self::entry(&mut g, *u).view.clone())
+            .collect()
+    }
+}
+
+pub use crate::mutation::settings::UpstreamStrategy;
+
+/// Forward `req` to `upstreams` with `strategy`, recording each upstream's
+/// health in `health`. The accepted reply carries the client's ID and
+/// question bytes.
+pub async fn forward_via(
+    upstreams: &[SocketAddr],
+    timeout_ms: u64,
+    strategy: UpstreamStrategy,
+    health: Option<&Health>,
+    req: &[u8],
+    proto: Proto,
+) -> Result<Vec<u8>> {
+    let span = question_span(req).ok_or_else(|| anyhow!("query has no single question"))?;
+    let to = Duration::from_millis(timeout_ms.max(100));
+    let order = match health {
+        Some(h) => h.plan(upstreams, strategy),
+        None => upstreams.to_vec(),
+    };
+    let one = |upstream: SocketAddr| {
+        let span = span.clone();
+        async move {
+            if let Some(h) = health {
+                h.attempted(upstream);
+            }
+            let started = std::time::Instant::now();
+            let r = exchange_with_fallbacks(upstream, req, &span, proto, to).await;
+            if let Some(h) = health {
+                match &r {
+                    Ok(_) => h.record_ok(upstream, started.elapsed()),
+                    Err(e) => h.record_err(upstream, e),
+                }
+            }
+            if let Err(e) = &r {
+                tracing::debug!(%upstream, error = %e, "upstream failed");
+            }
+            r
+        }
+    };
+    if strategy == UpstreamStrategy::Parallel && order.len() > 1 {
+        let all: Vec<_> = order.iter().map(|u| Box::pin(one(*u))).collect();
+        return match futures::future::select_ok(all).await {
+            Ok((b, _)) => Ok(restore(req, &span, b)),
+            Err(e) => Err(e),
+        };
+    }
+    let mut last_err = anyhow!("no upstreams configured");
+    for upstream in order {
+        match one(upstream).await {
+            Ok(b) => return Ok(restore(req, &span, b)),
+            Err(e) => last_err = e,
         }
     }
     Err(last_err)

@@ -159,6 +159,39 @@ pub struct Zone {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(format = DateTime)]
     pub signed_at: Option<String>,
+    /// Present for an override zone (I1): not authoritative, answered only
+    /// for clients allowed to use forwarding, names it does not define go
+    /// to its upstreams (`transparent`) or get NXDOMAIN (`static`). Absent
+    /// for an ordinary authoritative zone.
+    #[serde(rename = "override", default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub overrides: Option<Box<ZoneOverride>>,
+}
+
+/// How an override zone treats names it does not define itself.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OverrideMode {
+    /// Names and types defined here are answered from here; everything
+    /// else under the zone is forwarded to the zone's upstreams.
+    #[default]
+    Transparent,
+    /// Everything under the zone is answered from here; missing names get
+    /// NXDOMAIN (blocking).
+    Static,
+}
+
+/// The override settings of a zone (I1).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ZoneOverride {
+    #[serde(default)]
+    pub mode: OverrideMode,
+    /// Upstreams for names this zone does not define (`ip:port`); empty:
+    /// the server's forwarding upstreams. An override zone without records
+    /// is conditional forwarding (`server=/example.com/10.8.0.1`).
+    #[serde(default)]
+    #[schema(value_type = Vec<String>, example = json!(["10.8.0.1:53"]))]
+    pub upstreams: Vec<std::net::SocketAddr>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -166,6 +199,11 @@ fn is_false(b: &bool) -> bool {
 }
 
 impl Zone {
+    /// An override zone (I1), not an authoritative one.
+    pub fn is_override(&self) -> bool {
+        self.overrides.is_some()
+    }
+
     /// The time the DNSSEC signature window is derived from: `signed_at`,
     /// or (zones signed before `signed_at` existed) `updated_at`.
     pub fn signing_epoch(&self) -> &str {
@@ -203,6 +241,25 @@ pub struct ZoneInput {
     /// Owner username. Create: defaults to the caller. Update: administrators
     /// only; empty string clears the owner.
     pub owner: Option<String>,
+    /// Create: makes an override zone (I1) instead of an authoritative
+    /// one. Update: changes the mode or upstreams of an override zone (the
+    /// type itself is chosen at creation and cannot change).
+    #[serde(rename = "override", default)]
+    #[schema(nullable = false, example = json!({ "mode": "transparent", "upstreams": ["10.8.0.1"] }))]
+    pub overrides: Option<ZoneOverrideInput>,
+}
+
+/// Override settings as entered (I1).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct ZoneOverrideInput {
+    /// Default `transparent` on creation; unchanged when omitted on update.
+    #[schema(nullable = false)]
+    pub mode: Option<OverrideMode>,
+    /// IP addresses with an optional port (53 when omitted), at most 8;
+    /// empty: the server's forwarding upstreams. Unchanged when omitted on
+    /// update.
+    #[schema(nullable = false, example = json!(["10.8.0.1", "[fd00::53]:53"]))]
+    pub upstreams: Option<Vec<String>>,
 }
 
 // ---------------------------------------------------------------------------

@@ -238,6 +238,7 @@ pub async fn status(State(s): St, caller: Caller) -> ApiResult<Json<ServerStatus
             port: s.dns.listen.port,
             udp: s.dns.listen.udp,
             tcp: s.dns.listen.tcp,
+            interfaces: s.dns.interfaces.status(),
         },
         forwarding: ForwardingStatus {
             upstreams: rt.forwarding.upstreams.clone(),
@@ -1079,6 +1080,82 @@ pub async fn import(
         )
         .await?;
     Ok(Json(summary))
+}
+
+/// A hosts file to import into one zone.
+#[derive(Debug, Deserialize, ToSchema)]
+#[schema(example = json!({ "text": "192.168.1.10 nas.home.example nas\n192.168.1.11 printer\n", "mode": "merge", "preview": true }))]
+pub struct HostsImportInput {
+    /// `/etc/hosts` format: `address name [name...]`, `#` comments. Names
+    /// without a dot are taken as relative to the zone.
+    pub text: String,
+    /// `merge` (default) adds missing records; `replace` replaces every
+    /// record of the zone with the file's.
+    #[serde(default)]
+    #[schema(nullable = false)]
+    pub mode: Option<ImportMode>,
+    /// Only parse and list what would be imported; change nothing.
+    #[serde(default)]
+    pub preview: bool,
+}
+
+/// What a hosts file holds for the zone, and what importing it changed.
+#[derive(Debug, serde::Serialize, ToSchema)]
+pub struct HostsImportResult {
+    pub records: Vec<crate::mutation::HostsRecord>,
+    /// Names not imported (outside the zone, loopback, unparseable).
+    pub skipped: Vec<crate::mutation::HostsSkip>,
+    /// `null` for a preview.
+    #[schema(required = true)]
+    pub summary: Option<ImportSummary>,
+}
+
+#[utoipa::path(
+    post,
+    path = "/zones/{zone}/import/hosts",
+    tag = "Import/Export",
+    operation_id = "import_hosts",
+    summary = "Import a hosts file into a zone",
+    description = "Reads `/etc/hosts`-format text and adds its A / AAAA records to the zone in one transaction (same `merge` / `replace` modes as the JSON import). Names outside the zone are listed and skipped. `preview: true` changes nothing. Needs the zone's import permission (owner).",
+    params(ZonePath),
+    request_body(content = HostsImportInput, example = json!({ "text": "192.168.1.10 nas.home.example nas\n192.168.1.11 printer\n", "mode": "merge", "preview": false })),
+    responses(
+        (status = 200, description = "Parsed records, skipped names and (unless a preview) the import summary.", body = HostsImportResult),
+        (status = 400, response = BadRequest),
+        (status = 401, response = Unauthorized),
+        (status = 403, response = Forbidden),
+        (status = 404, response = NotFound),
+        (status = 409, response = Conflict),
+    ),
+)]
+pub async fn import_hosts(
+    State(s): St,
+    caller: Caller,
+    Path(ZonePath { zone }): Path<ZonePath>,
+    Json(input): Json<HostsImportInput>,
+) -> ApiResult<Json<HostsImportResult>> {
+    let (z, _) = s.require_zone(&caller, &zone, ZonePerm::Import)?;
+    let parsed = crate::mutation::parse_hosts(&input.text, &z.name);
+    let summary = if input.preview {
+        None
+    } else {
+        Some(
+            s.mutator
+                .import_hosts(
+                    caller.actor(),
+                    &z.name,
+                    &parsed.records,
+                    input.mode.unwrap_or(ImportMode::Merge),
+                    Some(vec![z.name.clone()]),
+                )
+                .await?,
+        )
+    };
+    Ok(Json(HostsImportResult {
+        records: parsed.records,
+        skipped: parsed.skipped,
+        summary,
+    }))
 }
 
 // ---- sessions ------------------------------------------------------------------

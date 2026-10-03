@@ -1,6 +1,7 @@
 mod api;
 mod auth;
 mod backup;
+mod blocklist;
 mod cache;
 mod config;
 mod dns;
@@ -211,16 +212,13 @@ async fn main() -> anyhow::Result<()> {
         &cfg,
     ));
     // Forwarding settings saved from the console/API override the config file.
-    match mutation::settings::load_forwarding(&storage) {
-        Ok(Some((f, by, at))) => {
-            tracing::info!(upstreams = ?f.upstreams, set_by = %by, set_at = %at, "forwarding settings from the console override the config file");
-            dns.set_forwarding_override(Some(f), &cfg);
-        }
-        Ok(None) => {}
-        Err(e) => {
-            tracing::error!(error = %e, "stored forwarding settings are unreadable; using the config file")
-        }
+    if let Ok(Some((f, by, at))) = mutation::settings::load_forwarding(&storage) {
+        tracing::info!(upstreams = ?f.upstreams, set_by = %by, set_at = %at, "forwarding settings from the console override the config file");
     }
+    // Forwarding override, resolver settings and blocklists (an unreadable
+    // one is logged; the config file / defaults apply).
+    dns.load_console_settings(&storage, &cfg);
+    tokio::spawn(dns.blocklists.clone().run(blocklist::http_client()));
     for w in dns.open_resolver_warnings() {
         tracing::warn!("{w}");
     }

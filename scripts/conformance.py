@@ -630,6 +630,27 @@ while cur in chain and cur not in walk:
 owners = {name for (name, rdtype, _) in zone_rrsets if not any(name.is_subdomain(c) and name != c for c in (dns.name.from_text("sub.signed.test."), dns.name.from_text("secure.signed.test.")))}
 check("4034 §4.1.1: NSEC chain in canonical order covers every authoritative name and wraps to the apex", cur == SZ and set(walk) == owners and walk == sorted(walk), f"{len(walk)} links, {len(owners)} names")
 
+# --- override zones (I1); only where the harness seeded one -----------------
+import os
+OV = os.environ.get("CONFORMANCE_OVERRIDE")
+if OV:
+    r = q(f"gw.{OV}.", "A", edns=0, want_dnssec=True)
+    check("rust-dns override zone: answered, not authoritative (AA=0), never AD, no RRSIG (under a signed parent)",
+          r.rcode() == dns.rcode.NOERROR and not (r.flags & dns.flags.AA) and not (r.flags & dns.flags.AD)
+          and r.answer and all(rr.rdtype != dns.rdatatype.RRSIG for rr in r.answer), r.to_text())
+    r = q(f"nope.{OV}.", "A")
+    check("rust-dns override zone (static): a missing name is NXDOMAIN, not authoritative",
+          r.rcode() == dns.rcode.NXDOMAIN and not (r.flags & dns.flags.AA), r.to_text())
+    try:
+        r = dns.query.tcp(dns.message.make_query(OV, "AXFR"), IP, port=PORT, timeout=3)
+        refused = r.rcode() == dns.rcode.REFUSED
+    except Exception as e:
+        refused, r = True, e
+    check("rust-dns override zone: never transferred (AXFR REFUSED)", refused, str(r))
+    r = sq("signed.test.", "SOA")
+    check("rust-dns override zone: the signed parent still answers with signatures",
+          any(rr.rdtype == dns.rdatatype.RRSIG for rr in r.answer), r.to_text())
+
 failed = [n for n, ok, _ in results if not ok]
 print(f"\n{len(results) - len(failed)}/{len(results)} checks passed")
 sys.exit(1 if failed else 0)

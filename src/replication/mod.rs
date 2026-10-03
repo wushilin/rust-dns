@@ -106,7 +106,7 @@ pub struct Replication {
     http: reqwest::Client,
 }
 
-fn ensure_crypto() {
+pub(crate) fn ensure_crypto() {
     // ring: builds on every release target without cmake/NASM.
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
@@ -1059,10 +1059,8 @@ impl Replication {
             tracing::error!(error = %e, "reloading TSIG keys after replication failed");
         }
         let cfg = self.reloader.current.load_full();
-        match crate::mutation::settings::load_forwarding(&self.storage) {
-            Ok(o) => self.dns.set_forwarding_override(o.map(|(f, _, _)| f), &cfg),
-            Err(e) => tracing::error!(error = %e, "replicated forwarding settings are unreadable"),
-        }
+        // Forwarding, resolver and blocklist settings.
+        self.dns.load_console_settings(&self.storage, &cfg);
     }
 
     /// Compare checksums with the primary. A difference means a change was

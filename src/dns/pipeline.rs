@@ -31,9 +31,16 @@
 //! | `special`       | CHAOS `version.bind` / `version.server`, classes other than IN/ANY |
 //! | `transfer`      | AXFR / IXFR (ACL, TSIG key scope), qtype OPT (FORMERR)              |
 //! | `authoritative` | own zones (minimal ANY, DNSSEC, wildcards, CNAME/DNAME, referrals, auto-PTR) |
+//! | `override`      | override zones (I1): local data, else the zone's upstreams / NXDOMAIN |
 //! | `recursion`     | the forwarding ACL and RD: REFUSED for clients that may not recurse |
+//! | `domain_needed` | single-label names: NXDOMAIN, never forwarded (I2; console toggle) |
+//! | `bogus_priv`    | reverse lookups of private ranges: NXDOMAIN (I3; console toggle)   |
+//! | `filter_types`  | record types never forwarded: NODATA (I9; when types are listed)   |
+//! | `blocklist`     | names on a blocklist: NXDOMAIN or 0.0.0.0 / :: (I7; when a list is on) |
 //! | `open_resolver` | open resolver safeguards (only in the chain while that mode is on) |
-//! | `forward`       | forward cache, in-flight cap (C1), upstreams                        |
+//! | `rebind`        | post: refuses forwarded answers with private addresses (I4; toggle) |
+//! | `serve_stale`   | post: an expired cache entry when every upstream failed (I5; toggle) |
+//! | `forward`       | forward cache, in-flight cap (C1), upstream strategy (I6), ECS (I10) |
 //!
 //! Static dispatch: [`Filter`] is an enum and the chain a `Vec` of it, so a
 //! query costs no allocation per filter and no boxed future; switching a
@@ -61,13 +68,20 @@ pub enum Filter {
     Recursion,
     OpenResolver,
     Forward,
+    Override,
+    DomainNeeded,
+    BogusPriv,
+    Types,
+    Blocklist,
+    Rebind,
+    ServeStale,
     /// A filter whose behaviour a test chooses (chain semantics tests).
     #[cfg(test)]
     Probe(std::sync::Arc<probe::Probe>),
 }
 
 /// Number of [`FilterStats`] slots (one per filter kind).
-pub const FILTER_KINDS: usize = 9;
+pub const FILTER_KINDS: usize = 16;
 
 impl Filter {
     pub fn name(&self) -> &'static str {
@@ -80,6 +94,13 @@ impl Filter {
             Filter::Recursion => "recursion",
             Filter::OpenResolver => "open_resolver",
             Filter::Forward => "forward",
+            Filter::Override => "override",
+            Filter::DomainNeeded => "domain_needed",
+            Filter::BogusPriv => "bogus_priv",
+            Filter::Types => "filter_types",
+            Filter::Blocklist => "blocklist",
+            Filter::Rebind => "rebind",
+            Filter::ServeStale => "serve_stale",
             #[cfg(test)]
             Filter::Probe(p) => p.name,
         }
@@ -96,8 +117,15 @@ impl Filter {
             Filter::Recursion => 5,
             Filter::OpenResolver => 6,
             Filter::Forward => 7,
+            Filter::Override => 8,
+            Filter::DomainNeeded => 9,
+            Filter::BogusPriv => 10,
+            Filter::Types => 11,
+            Filter::Blocklist => 12,
+            Filter::Rebind => 13,
+            Filter::ServeStale => 14,
             #[cfg(test)]
-            Filter::Probe(_) => 8,
+            Filter::Probe(_) => 15,
         }
     }
 
@@ -111,12 +139,20 @@ impl Filter {
         "recursion",
         "open_resolver",
         "forward",
+        "override",
+        "domain_needed",
+        "bogus_priv",
+        "filter_types",
+        "blocklist",
+        "rebind",
+        "serve_stale",
     ];
 
     /// Whether [`DnsServer::post`] does anything for this filter (saves the
     /// walk back for chains without post-processing).
     fn has_post(&self) -> bool {
         match self {
+            Filter::Rebind | Filter::ServeStale => true,
             #[cfg(test)]
             Filter::Probe(_) => true,
             _ => false,
@@ -132,10 +168,29 @@ pub fn chain_for(rt: &Runtime) -> Vec<Filter> {
         Filter::Special,
         Filter::Transfer,
         Filter::Authoritative,
+        Filter::Override,
         Filter::Recursion,
     ];
+    if rt.resolver.domain_needed {
+        c.push(Filter::DomainNeeded);
+    }
+    if rt.resolver.bogus_priv {
+        c.push(Filter::BogusPriv);
+    }
+    if !rt.filter_types.is_empty() {
+        c.push(Filter::Types);
+    }
+    if rt.blocklists {
+        c.push(Filter::Blocklist);
+    }
     if rt.open_resolver() {
         c.push(Filter::OpenResolver);
+    }
+    if rt.resolver.rebind_protection {
+        c.push(Filter::Rebind);
+    }
+    if rt.resolver.serve_stale {
+        c.push(Filter::ServeStale);
     }
     c.push(Filter::Forward);
     c
@@ -261,6 +316,8 @@ pub enum Response {
     Relayed {
         bytes: Vec<u8>,
         parsed: Result<Message, ()>,
+        /// `forward`, or `override` for an override zone's upstreams.
+        source: &'static str,
     },
     /// Several messages (AXFR over TCP); the query event was emitted.
     Transfer(Vec<Vec<u8>>),
@@ -286,6 +343,12 @@ pub(super) struct QueryCtx<'a> {
     pub(super) rt: &'a Runtime,
     /// Index of the filter running now (named in a panic report).
     current: usize,
+    /// The override zone the name falls in (set by `authoritative`).
+    pub(super) override_zone: Option<std::sync::Arc<crate::cache::ZoneData>>,
+    /// The forward cache key of a forwarded query (set by `forward`).
+    pub(super) fwd_key: Option<super::fwdcache::Key>,
+    /// Every upstream failed or timed out (set by `forward`).
+    pub(super) upstream_failed: bool,
 }
 
 impl QueryCtx<'_> {
@@ -367,6 +430,9 @@ impl DnsServer {
             signed_by,
             rt,
             current: 0,
+            override_zone: None,
+            fwd_key: None,
+            upstream_failed: false,
         };
         let run = std::panic::AssertUnwindSafe(self.run_chain(&rt.chain, &mut q));
         match futures::FutureExt::catch_unwind(run).await {
@@ -451,6 +517,12 @@ impl DnsServer {
             Filter::Recursion => self.filter_recursion(q),
             Filter::OpenResolver => self.filter_open_resolver(q),
             Filter::Forward => self.filter_forward(q).await,
+            Filter::Override => self.filter_override(q).await,
+            Filter::DomainNeeded => self.filter_domain_needed(q),
+            Filter::BogusPriv => self.filter_bogus_priv(q),
+            Filter::Types => self.filter_types(q),
+            Filter::Blocklist => self.filter_blocklist(q),
+            Filter::Rebind | Filter::ServeStale => Step::Next,
             #[cfg(test)]
             Filter::Probe(p) => p.pre(q).await,
         }
@@ -460,6 +532,8 @@ impl DnsServer {
     /// filter produced.
     fn post(&self, f: &Filter, q: &mut QueryCtx<'_>, resp: &mut Response) {
         match f {
+            Filter::Rebind => self.post_rebind(q, resp),
+            Filter::ServeStale => self.post_serve_stale(q, resp),
             #[cfg(test)]
             Filter::Probe(p) => p.post(q, resp),
             _ => {
@@ -472,9 +546,11 @@ impl DnsServer {
     fn complete(&self, resp: Response, q: &QueryCtx<'_>) -> Reply {
         match resp {
             Response::Message(m, source) => Reply::One(self.finish(m, &q.meta, source)),
-            Response::Relayed { bytes, parsed } => {
-                Reply::One(self.finish_relayed(bytes, parsed, q))
-            }
+            Response::Relayed {
+                bytes,
+                parsed,
+                source,
+            } => Reply::One(self.finish_relayed(bytes, parsed, source, q)),
             Response::Transfer(ms) => Reply::Many(ms),
             Response::Bytes(b) => Reply::One(b),
             Response::Drop => Reply::None,
@@ -488,6 +564,7 @@ impl DnsServer {
         &self,
         bytes: Vec<u8>,
         parsed: Result<Message, ()>,
+        source: &'static str,
         q: &QueryCtx<'_>,
     ) -> Vec<u8> {
         let ctx = &q.meta;
@@ -528,7 +605,7 @@ impl DnsServer {
             rcode,
             answers,
             result,
-            "forward",
+            source,
         );
         bytes
     }
@@ -580,6 +657,7 @@ pub mod probe {
 mod tests {
     use super::probe::{Act, Probe};
     use super::*;
+    use crate::mutation::settings::ResolverSettings;
     use hickory_proto::op::Query;
     use hickory_proto::rr::{Name, RecordType};
     use std::sync::{Arc, Mutex};
@@ -735,7 +813,7 @@ mod tests {
             ("error", "boom", "Server Failure")
         );
         assert_eq!(s.stats.errors.load(Relaxed), 2);
-        let probes = &s.filter_stats.counts[8];
+        let probes = &s.filter_stats.counts[15];
         assert_eq!(probes[PANICKED].load(Relaxed), 2);
         // The server keeps answering.
         with_chain(
@@ -754,6 +832,7 @@ mod tests {
         let names = |s: &DnsServer| -> Vec<&'static str> {
             s.runtime.load().chain.iter().map(Filter::name).collect()
         };
+        // Defaults: domain_needed and bogus_priv on (I2, I3).
         assert_eq!(
             names(&s),
             vec![
@@ -762,7 +841,10 @@ mod tests {
                 "special",
                 "transfer",
                 "authoritative",
+                "override",
                 "recursion",
+                "domain_needed",
+                "bogus_priv",
                 "forward"
             ]
         );
@@ -770,6 +852,17 @@ mod tests {
         cfg.forwarding.upstreams = vec!["192.0.2.53:53".parse().unwrap()];
         cfg.forwarding.open_resolver = true;
         s.reload(&cfg);
+        assert!(names(&s).contains(&"open_resolver"));
+        // Every resolver filter switched on, in the documented order.
+        s.set_resolver(
+            Some(ResolverSettings {
+                rebind_protection: true,
+                serve_stale: true,
+                filter_types: vec!["AAAA".into()],
+                ..Default::default()
+            }),
+            &cfg,
+        );
         assert_eq!(
             names(&s),
             vec![
@@ -778,11 +871,28 @@ mod tests {
                 "special",
                 "transfer",
                 "authoritative",
+                "override",
                 "recursion",
+                "domain_needed",
+                "bogus_priv",
+                "filter_types",
                 "open_resolver",
+                "rebind",
+                "serve_stale",
                 "forward"
             ]
         );
+        // Switched off: absent (the chain is rebuilt at once).
+        s.set_resolver(
+            Some(ResolverSettings {
+                domain_needed: false,
+                bogus_priv: false,
+                ..Default::default()
+            }),
+            &cfg,
+        );
+        assert!(!names(&s).contains(&"domain_needed") && !names(&s).contains(&"bogus_priv"));
+        s.set_resolver(None, &cfg);
         s.reload(&crate::config::Config::default());
         // A name in no zone, from a client that may not recurse: passed by
         // everything up to `recursion`, which refuses it.

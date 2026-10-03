@@ -46,6 +46,11 @@ impl Mutator {
                     t.update_zone(z.clone(), after)?;
                     return Ok((z.name, false, true));
                 }
+                if z.is_override() {
+                    return Err(MutationError::Invalid(
+                        "an override zone is not authoritative and is never DNSSEC-signed".into(),
+                    ));
+                }
                 if new_key && z.dnssec {
                     return Err(MutationError::Conflict(
                         "the key cannot be replaced while signing is on: remove the DS at the registrar, wait for its TTL, turn signing off, then turn it on with a new key".into(),
