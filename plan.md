@@ -856,3 +856,13 @@ a router-sized footprint (a design property, not a feature).
   (baba2 first, see Rollout; create override zones only after both run
   this version).
 
+- 2026-10-03: DEPLOYED d32d67f (GitHub build 31917b02…, smoke-tested) to
+  baba2 (dns2) first, then gate (dns1). Each: config check passed, previous
+  binary kept as rust-dns.prev, restarted via processmaster. Verified after
+  each: delv fully validated 158/158 (all 74 records + extras, UDP and TCP)
+  against that host with the static DNSKEY anchor; baba2 `up_to_date` at
+  offset 120, lag 0, not halted, no conflict; both at serial 14; Google,
+  Cloudflare and Quad9 return AD; single-label names answered NXDOMAIN
+  locally (I2 default on), forwarding works. No override zones created yet
+  (safe now that both run this version). Next: watch the first automatic
+  re-sign (due ~2026-10-04) on the new code.
