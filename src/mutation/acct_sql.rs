@@ -1,21 +1,30 @@
 //! The only SQL that writes the replicated account tables (users, recovery
-//! codes, API tokens, console settings, TSIG keys), one function per
-//! account `Change`. Private to the mutation module.
+//! codes, API tokens, console settings, TSIG keys, DNSSEC keys), one
+//! private function per account `Change`.
 //!
-//! The same functions run on the primary (called by `AuditTx::record`, which
-//! also queues the change for the changelog) and on a standby (called by
-//! `replay::apply` for the primary's changes), so both write identical rows.
-//! On a standby, [`Ctx::local_root`] names the account from its own config:
-//! that account keeps its local password, MFA and recovery codes (see
-//! `mutation::replica`).
+//! No write without a change, enforced by the compiler: the functions are
+//! private to this file and the only way in is [`write`], which takes the
+//! typed [`Change`] and returns a [`Written`] receipt. The receipt is
+//! `#[must_use]` and can only be turned in two ways: [`Written::log_into`]
+//! (the primary: the change joins the transaction's changelog rows) or
+//! [`Written::replayed`] (a standby replaying the primary's change, whose
+//! changelog row it copies; a snapshot entity). Dropping it unused does not
+//! build (`-D warnings`).
 //!
-//! `tests::only_acct_sql_writes_account_tables` scans the mutation sources
-//! and fails if any other file writes these tables (the snapshot loader and
-//! `--prepare-standby` in `replica.rs` excepted).
+//! The same code runs on the primary and on a standby, so both write
+//! identical rows. On a standby, [`Ctx::local_root`] names the account from
+//! its own config: that account keeps its local password, MFA and recovery
+//! codes (see `mutation::replica`).
+//!
+//! Second line: `tests::only_acct_sql_writes_account_tables` scans the
+//! mutation sources and fails if any other file contains SQL that writes
+//! these tables (the snapshot loader and `--prepare-standby` in
+//! `replica.rs` excepted).
 
+use super::Change;
 use crate::replication::data;
 use crate::replication::types::{ReplSetting, ReplToken, ReplTsigKey, ReplUser};
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 
 /// How a change is applied.
@@ -30,6 +39,67 @@ impl Ctx<'_> {
     pub fn verbatim() -> Ctx<'static> {
         Ctx { local_root: None }
     }
+}
+
+/// Proof that an account change was written to its table. It must be
+/// turned in: logged (primary) or declared a replay (standby, snapshot).
+#[must_use = "an account write must be changelogged (log_into) or be a replay (replayed)"]
+pub(super) struct Written(());
+
+impl Written {
+    /// Primary: queue the change for the changelog rows of this transaction.
+    pub(super) fn log_into(self, change: Change, changes: &mut Vec<Change>) {
+        changes.push(change);
+    }
+
+    /// The change comes from the primary's changelog (the caller copies its
+    /// row) or from a snapshot: nothing to log here.
+    pub(super) fn replayed(self) {}
+}
+
+/// Apply one account-class change to its table. The only entry to the SQL
+/// of this file. Exhaustive: a new kind of change does not compile until it
+/// is handled here or declared a DNS change.
+pub(super) fn write(c: &Connection, ctx: &Ctx, change: &Change) -> Result<Written> {
+    match change {
+        Change::UserCreated { user } | Change::UserUpdated { user } => put_user(c, ctx, user)?,
+        Change::UserDeleted { user_id, username } => delete_user(c, ctx, *user_id, username)?,
+        Change::TotpStepAccepted { user_id, step } => totp_step(c, ctx, *user_id, *step)?,
+        Change::RecoveryCodesReplaced {
+            user_id,
+            code_hashes,
+        } => recovery_codes(c, ctx, *user_id, &code_hashes.0)?,
+        Change::RecoveryCodeUsed {
+            user_id,
+            code_hash,
+            used_at,
+        } => recovery_code_used(c, ctx, *user_id, &code_hash.0, used_at)?,
+        Change::TokenCreated { token } => put_token(c, token)?,
+        Change::TokenTagsSet { token_id, tags } => token_tags(c, *token_id, tags)?,
+        Change::TokenRevoked {
+            token_id,
+            revoked_at,
+        } => token_revoked(c, *token_id, revoked_at)?,
+        Change::TsigKeySet { key } => put_tsig_key(c, key)?,
+        Change::TsigKeyDeleted { name } => delete_tsig_key(c, name)?,
+        Change::SettingSet { setting } => put_setting(c, setting)?,
+        Change::SettingCleared { key } => delete_setting(c, key)?,
+        Change::DnssecKeySet { key } => put_dnssec_key(c, key)?,
+        Change::DnssecKeyDeleted { zone_id, .. } => delete_dnssec_key(c, *zone_id)?,
+        Change::ZoneCreated { .. }
+        | Change::ZoneUpdated { .. }
+        | Change::ZoneDeleted { .. }
+        | Change::RecordCreated { .. }
+        | Change::RecordUpdated { .. }
+        | Change::RecordExpired { .. }
+        | Change::RecordReaped { .. }
+        | Change::RecordDeleted { .. }
+        | Change::SerialBumped { .. }
+        | Change::MemberSet { .. }
+        | Change::MemberRemoved { .. }
+        | Change::ZoneResigned { .. } => bail!("not an account change: {:?}", change.meta()),
+    }
+    Ok(Written(()))
 }
 
 /// Next id for a new row of an AUTOINCREMENT table (ids are part of the facts).
@@ -52,7 +122,7 @@ pub(super) fn next_id(c: &Connection, table: &str) -> Result<i64> {
 
 /// Give a user a new id, carrying every reference along (foreign keys are
 /// deferred for the transaction).
-pub(super) fn move_user_id(c: &Connection, from: i64, to: i64) -> Result<()> {
+fn move_user_id(c: &Connection, from: i64, to: i64) -> Result<()> {
     c.execute_batch("PRAGMA defer_foreign_keys = ON")?;
     for (table, col) in [
         ("sessions", "user_id"),
@@ -86,7 +156,7 @@ fn is_local_root(c: &Connection, ctx: &Ctx, user_id: i64) -> Result<bool> {
 }
 
 /// UserCreated / UserUpdated: the row becomes `u`.
-pub(super) fn put_user(c: &Connection, ctx: &Ctx, u: &ReplUser) -> Result<()> {
+fn put_user(c: &Connection, ctx: &Ctx, u: &ReplUser) -> Result<()> {
     if let Some(root) = ctx.local_root {
         let local = data::user_by_name(c, root)?;
         if u.username == root {
@@ -155,7 +225,7 @@ pub(super) fn put_user(c: &Connection, ctx: &Ctx, u: &ReplUser) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn delete_user(c: &Connection, ctx: &Ctx, user_id: i64, username: &str) -> Result<()> {
+fn delete_user(c: &Connection, ctx: &Ctx, user_id: i64, username: &str) -> Result<()> {
     if ctx.local_root == Some(username) {
         return Ok(()); // our root stays (as a local-only account)
     }
@@ -166,7 +236,7 @@ pub(super) fn delete_user(c: &Connection, ctx: &Ctx, user_id: i64, username: &st
     Ok(())
 }
 
-pub(super) fn totp_step(c: &Connection, ctx: &Ctx, user_id: i64, step: i64) -> Result<()> {
+fn totp_step(c: &Connection, ctx: &Ctx, user_id: i64, step: i64) -> Result<()> {
     if is_local_root(c, ctx, user_id)? {
         return Ok(());
     }
@@ -177,12 +247,7 @@ pub(super) fn totp_step(c: &Connection, ctx: &Ctx, user_id: i64, step: i64) -> R
     Ok(())
 }
 
-pub(super) fn recovery_codes(
-    c: &Connection,
-    ctx: &Ctx,
-    user_id: i64,
-    hashes: &[String],
-) -> Result<()> {
+fn recovery_codes(c: &Connection, ctx: &Ctx, user_id: i64, hashes: &[String]) -> Result<()> {
     if is_local_root(c, ctx, user_id)? {
         return Ok(());
     }
@@ -199,7 +264,7 @@ pub(super) fn recovery_codes(
     Ok(())
 }
 
-pub(super) fn recovery_code_used(
+fn recovery_code_used(
     c: &Connection,
     ctx: &Ctx,
     user_id: i64,
@@ -216,7 +281,7 @@ pub(super) fn recovery_code_used(
     Ok(())
 }
 
-pub(super) fn put_token(c: &Connection, t: &ReplToken) -> Result<()> {
+fn put_token(c: &Connection, t: &ReplToken) -> Result<()> {
     c.execute(
         "INSERT INTO api_tokens (id, user_id, name, token_hash, created_at, revoked_at, tags)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -236,7 +301,7 @@ pub(super) fn put_token(c: &Connection, t: &ReplToken) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn token_tags(c: &Connection, id: i64, tags: &[String]) -> Result<()> {
+fn token_tags(c: &Connection, id: i64, tags: &[String]) -> Result<()> {
     c.execute(
         "UPDATE api_tokens SET tags = ?2 WHERE id = ?1",
         params![id, serde_json::to_string(tags)?],
@@ -244,7 +309,7 @@ pub(super) fn token_tags(c: &Connection, id: i64, tags: &[String]) -> Result<()>
     Ok(())
 }
 
-pub(super) fn token_revoked(c: &Connection, id: i64, at: &str) -> Result<()> {
+fn token_revoked(c: &Connection, id: i64, at: &str) -> Result<()> {
     c.execute(
         "UPDATE api_tokens SET revoked_at = ?2 WHERE id = ?1 AND revoked_at IS NULL",
         params![id, at],
@@ -252,7 +317,7 @@ pub(super) fn token_revoked(c: &Connection, id: i64, at: &str) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn put_tsig_key(c: &Connection, k: &ReplTsigKey) -> Result<()> {
+fn put_tsig_key(c: &Connection, k: &ReplTsigKey) -> Result<()> {
     let secret = data_encoding::BASE64
         .decode(k.secret.as_bytes())
         .with_context(|| format!("TSIG key {}: secret is not base64", k.name))?;
@@ -275,12 +340,12 @@ pub(super) fn put_tsig_key(c: &Connection, k: &ReplTsigKey) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn delete_tsig_key(c: &Connection, name: &str) -> Result<()> {
+fn delete_tsig_key(c: &Connection, name: &str) -> Result<()> {
     c.execute("DELETE FROM tsig_keys WHERE name = ?1", params![name])?;
     Ok(())
 }
 
-pub(super) fn put_setting(c: &Connection, s: &ReplSetting) -> Result<()> {
+fn put_setting(c: &Connection, s: &ReplSetting) -> Result<()> {
     c.execute(
         "INSERT INTO settings (key, value, updated_by, updated_at) VALUES (?1, ?2, ?3, ?4)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_by = excluded.updated_by, updated_at = excluded.updated_at",
@@ -289,15 +354,12 @@ pub(super) fn put_setting(c: &Connection, s: &ReplSetting) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn delete_setting(c: &Connection, key: &str) -> Result<()> {
+fn delete_setting(c: &Connection, key: &str) -> Result<()> {
     c.execute("DELETE FROM settings WHERE key = ?1", params![key])?;
     Ok(())
 }
 
-pub(super) fn put_dnssec_key(
-    c: &Connection,
-    k: &crate::replication::types::ReplDnssecKey,
-) -> Result<()> {
+fn put_dnssec_key(c: &Connection, k: &crate::replication::types::ReplDnssecKey) -> Result<()> {
     c.execute(
         "INSERT INTO dnssec_keys (zone_id, zone, algorithm, flags, key_tag, public_key, private_key, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
@@ -318,7 +380,7 @@ pub(super) fn put_dnssec_key(
     Ok(())
 }
 
-pub(super) fn delete_dnssec_key(c: &Connection, zone_id: i64) -> Result<()> {
+fn delete_dnssec_key(c: &Connection, zone_id: i64) -> Result<()> {
     c.execute(
         "DELETE FROM dnssec_keys WHERE zone_id = ?1",
         params![zone_id],
@@ -328,6 +390,71 @@ pub(super) fn delete_dnssec_key(c: &Connection, zone_id: i64) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// B2: the compiler enforces "no account write without its change":
+    /// the SQL functions are private, `write` is the only entry and its
+    /// receipt is `#[must_use]`; the raw connection of an `AuditTx` is
+    /// private to accounts.rs.
+    #[test]
+    fn account_tables_are_written_only_through_write() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mutation");
+        let src = std::fs::read_to_string(dir.join("acct_sql.rs")).unwrap();
+        let code = src.split("#[cfg(test)]").next().unwrap();
+        let public: Vec<&str> = code
+            .lines()
+            .filter(|l| l.trim_start().starts_with("pub") && l.contains(" fn "))
+            .map(|l| l.trim())
+            .collect();
+        for l in &public {
+            assert!(
+                [
+                    "fn verbatim(",
+                    "fn log_into(",
+                    "fn replayed(",
+                    "fn write(",
+                    "fn next_id("
+                ]
+                .iter()
+                .any(|ok| l.contains(ok)),
+                "acct_sql exposes a write function besides `write`: {l}"
+            );
+        }
+        assert!(code.contains("#[must_use = \"an account write must be changelogged"));
+        let accounts = std::fs::read_to_string(dir.join("accounts.rs")).unwrap();
+        assert!(
+            accounts.contains("pub struct AuditTx<'a> {\n    conn: &'a Connection,"),
+            "AuditTx.conn must stay private"
+        );
+        // A DNS change is not written here.
+        let s = crate::storage::Storage::open_memory().unwrap();
+        let dns = Change::SerialBumped {
+            zone: "a.test".into(),
+            zone_id: 1,
+            serial: 2,
+            updated_at: "t".into(),
+        };
+        let r = s.write(&crate::mutation::TOKEN, |c| -> Result<()> {
+            assert!(write(c, &Ctx::verbatim(), &dns).is_err());
+            // An account change is, and the receipt must be turned in.
+            let set = Change::SettingSet {
+                setting: ReplSetting {
+                    key: "k".into(),
+                    value: "{}".into(),
+                    updated_by: "t".into(),
+                    updated_at: "t".into(),
+                },
+            };
+            let mut log = Vec::new();
+            write(c, &Ctx::verbatim(), &set)?.log_into(set.clone(), &mut log);
+            assert_eq!(log.len(), 1);
+            write(c, &Ctx::verbatim(), &set)?.replayed();
+            Ok(())
+        });
+        r.unwrap();
+        assert!(s.get_setting("k").unwrap().is_some());
+    }
+
     /// Structural guarantee: no file of the mutation module other than this
     /// one (and the snapshot loader / `--prepare-standby` in replica.rs)
     /// writes an account table.

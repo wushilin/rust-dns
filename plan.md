@@ -27,16 +27,16 @@ OpenAPI snapshot + validator, conformance (123), smoke-release, cargo-audit.
 
 ## Phase B: read-only connection (structure + isolation)
 
-- [ ] B1. Second SQLite connection opened read-only (`query_only`) for all
+- [x] B1. Second SQLite connection opened read-only (`query_only`) for all
   reads: `with_conn`, `read_tx`, catalog inputs, API reads. The write
   connection is reachable only through `Storage::write` (token) and the
   listed bookkeeping methods. `read_tx` can no longer write. Test: a write
   through the read path fails.
-- [ ] B2. `AuditTx.conn` no longer `pub(super)`: account writes only through
+- [x] B2. `AuditTx.conn` no longer `pub(super)`: account writes only through
   `acct_sql` functions that return the `Change` they made (`#[must_use]`),
   so the compiler, not the source-scan test, enforces "no write without a
   change". Keep the scan test as a second line.
-- [ ] B3. API handlers stop blocking runtime threads on the database during
+- [x] B3. API handlers stop blocking runtime threads on the database during
   long writes: reads use the read connection (WAL: readers don't wait for
   the writer). Account writes run in `spawn_blocking`. Test: API read and DNS
   latency while a long write holds the write connection.
@@ -103,6 +103,14 @@ OpenAPI snapshot + validator, conformance (123), smoke-release, cargo-audit.
   server bug; not investigated further. Make the test helper retry transport
   errors, or find the cause.
 
+- [ ] H1. (found in B3) `Mutator::import` is quadratic in the number of
+  records of a zone: every record re-reads and re-checks the zone's records
+  (`create_record` -> `records()` + `record_conflict`). Debug build: 1,500
+  records 2.8 s, 6,000 records 44 s, all inside one write transaction (the
+  write connection is held that long; with B1/B3 reads and DNS no longer
+  wait, other writes still do). Fix: validate against an in-memory index
+  kept for the transaction.
+
 ## Rollout (after everything above passes)
 
 - Build on GitHub; upgrade baba2 first, then gate (new change kinds / columns).
@@ -147,3 +155,52 @@ OpenAPI snapshot + validator, conformance (123), smoke-release, cargo-audit.
   validator, conformance 123, smoke pass. `tests/follow.rs` failed once
   (G2) and passed on rerun. cargo-audit: `paste` plus a new `yoke-derive`
   yanked notice, fixed (G1).
+- 2026-10-03: wire-format fixture written BEFORE any refactor (HEAD d8cbf1c
+  code): `tests/fixtures/changelog_payloads.jsonl`, 72 real changelog
+  payloads (up to 3 of each of the 27 kinds) taken from the randomized
+  replay test's database (`UPDATE_FIXTURES=1`; never regenerate it: it
+  stands for rows stored by old versions). Test
+  `stored_changelog_payloads_round_trip_byte_for_byte` (deserialize,
+  serialize as `append_changelog` does, compare bytes; every kind covered).
+- 2026-10-03: B1 done. `Storage` has the write connection and 4 read
+  connections (`PRAGMA query_only = ON`; not `SQLITE_OPEN_READ_ONLY`, see
+  F1). All reads (`with_read`, `read_tx`, catalog inputs, API) take a free
+  read connection and run in their own read transaction; a read started
+  after a commit sees it. Bookkeeping stays on the write connection:
+  `save_replica`, `prune_*`, `scrub_account_changes`, `backup_to` wait for
+  it; `touch_session` and the token `last_used_*` update are skipped while
+  a write transaction runs (best effort, so a request never waits).
+  `authenticate_token` reads on a read connection and writes separately.
+  4 readers rather than 1: not measured; chosen because a snapshot, the
+  catalog inputs and `quick_check` hold a connection for their whole
+  duration and API requests should not queue behind them. Test databases
+  (`open_memory`) are now files in a temp directory (WAL, removed on drop)
+  so both kinds of connection see the same data as in production.
+  Tests: `a_write_through_the_read_path_fails`,
+  `reads_see_committed_writes_and_keep_their_snapshot`,
+  `reads_and_request_bookkeeping_do_not_wait_for_a_long_write`.
+- 2026-10-03: B2 done. `acct_sql`'s SQL functions are private; the one
+  entry is `acct_sql::write(conn, ctx, &Change) -> Written`, and `Written`
+  is `#[must_use]` with exactly two exits: `log_into` (primary: queued for
+  the changelog) and `replayed` (standby / snapshot). `AuditTx.conn` is
+  private to accounts.rs; settings.rs and tsig.rs read through
+  `AuditTx::tsig_key` / `has_setting` and write only with `record`.
+  `Tx::set_dnssec_key` / `delete_dnssec_key` and `replay::apply` use the
+  same entry. replica.rs (the replication writer) gets the connection as
+  an explicit closure argument. Limit, stated plainly: SQL is text, so
+  accounts.rs (sessions, replica list: local tables) and replica.rs could
+  still contain a raw statement against an account table; the source-scan
+  test stays as the second line for that. Tests:
+  `account_tables_are_written_only_through_write`,
+  `only_acct_sql_writes_account_tables`.
+- 2026-10-03: B3 done, differently from the plan: instead of wrapping ~30
+  call sites in `spawn_blocking` (their closures borrow request state),
+  `Storage::write` and the waiting bookkeeping methods run inside
+  `storage::blocking` (`tokio::task::block_in_place` on a multi-thread
+  runtime worker; a plain call elsewhere). Every write path is covered at
+  one point, including ones added later. Test
+  `api_reads_and_dns_stay_fast_during_a_long_write` (2 workers, a
+  1,500-record import holding the write connection 2.8 s, 6 queued account
+  writes): 396 probes, max API read 0.41 ms, max DNS answer 0.11 ms. With
+  `blocking` disabled the same test gets 2 probes in 2.8 s (the runtime is
+  stalled for the whole import) and fails.

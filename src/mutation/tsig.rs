@@ -6,7 +6,7 @@
 use super::accounts::AuditTx;
 use crate::dns::tsig::Algorithm;
 use crate::model::{normalize_domain, normalize_zone_name, now_rfc3339, Invalid};
-use crate::storage::{self as db, StoredTsigKey};
+use crate::storage::StoredTsigKey;
 use anyhow::Result;
 use rand::RngCore;
 
@@ -105,7 +105,7 @@ impl AuditTx<'_> {
         actor: &str,
         k: &NewTsigKey,
     ) -> Result<Option<StoredTsigKey>> {
-        if db::get_tsig_key(self.conn, &k.name)?.is_some() {
+        if self.tsig_key(&k.name)?.is_some() {
             return Ok(None);
         }
         let now = now_rfc3339();
@@ -120,7 +120,7 @@ impl AuditTx<'_> {
                 updated_at: now,
             },
         })?;
-        let key = db::get_tsig_key(self.conn, &k.name)?.expect("just inserted");
+        let key = self.tsig_key(&k.name)?.expect("just inserted");
         let mut d = detail(&key);
         d["source"] = serde_json::json!(if k.imported { "imported" } else { "generated" });
         self.push("tsig.create", None, &key.name, d);
@@ -139,7 +139,7 @@ impl AuditTx<'_> {
             row.updated_at = now_rfc3339();
             self.record(crate::mutation::Change::TsigKeySet { key: row })?;
         }
-        let after = db::get_tsig_key(self.conn, &before.name)?.expect("exists");
+        let after = self.tsig_key(&before.name)?.expect("exists");
         if before.zones != after.zones {
             self.push(
                 "tsig.update",
@@ -152,7 +152,7 @@ impl AuditTx<'_> {
     }
 
     pub fn delete_tsig_key(&mut self, k: &StoredTsigKey) -> Result<bool> {
-        let n = usize::from(db::get_tsig_key(self.conn, &k.name)?.is_some());
+        let n = usize::from(self.tsig_key(&k.name)?.is_some());
         if n > 0 {
             self.record(crate::mutation::Change::TsigKeyDeleted {
                 name: k.name.clone(),

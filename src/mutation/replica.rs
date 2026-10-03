@@ -348,13 +348,17 @@ fn system(what: &str) -> Actor {
 
 impl Mutator {
     /// Run a replication write under the write lock: `f` gets the raw
-    /// connection and an [`AuditTx`] whose rows commit with it. Committed:
-    /// the catalog is rebuilt and `events` (if any) published.
+    /// connection (this module is the replication writer: history,
+    /// changelog rows with the primary's offsets, snapshot loads) and an
+    /// [`AuditTx`] whose rows commit with it. Committed: the catalog is
+    /// rebuilt and `events` (if any) published.
     async fn replica_write<T: Send + 'static>(
         &self,
         operation: &'static str,
         actor: Actor,
-        f: impl for<'t> FnOnce(&mut AuditTx<'t>) -> Result<(T, Vec<ChangeEvent>)> + Send + 'static,
+        f: impl for<'t> FnOnce(&'t Connection, &mut AuditTx<'t>) -> Result<(T, Vec<ChangeEvent>)>
+            + Send
+            + 'static,
     ) -> MResult<T> {
         let _guard = self.lock.lock().await;
         let storage = self.storage.clone();
@@ -362,7 +366,7 @@ impl Mutator {
         let joined = tokio::task::spawn_blocking(move || {
             storage.write(&TOKEN, |conn| -> Result<_> {
                 let mut t = AuditTx::begin(conn);
-                let out = f(&mut t)?;
+                let out = f(conn, &mut t)?;
                 let audit = t.commit_entries(&a, operation)?;
                 Ok((out, audit))
             })
@@ -406,8 +410,8 @@ impl Mutator {
         if events.is_empty() {
             return Ok((self.storage.changelog_head()?, false));
         }
-        self.replica_write("replication_apply", system("apply"), move |t| {
-            let out = apply_changes(t.conn, &primary_history, &events, &root.username)?;
+        self.replica_write("replication_apply", system("apply"), move |c, _t| {
+            let out = apply_changes(c, &primary_history, &events, &root.username)?;
             let dns = events
                 .into_iter()
                 .filter(|e| {
@@ -428,8 +432,7 @@ impl Mutator {
         root: LocalRoot,
         source: String,
     ) -> MResult<BootstrapSummary> {
-        self.replica_write("replication_bootstrap", system("bootstrap"), move |t| {
-            let c = t.conn;
+        self.replica_write("replication_bootstrap", system("bootstrap"), move |c, t| {
             let sum = load_snapshot(c, &snap, &root.username)?;
             c.execute("DELETE FROM changelog", [])?;
             set_changelog_seq(c, snap.offset)?;
@@ -449,8 +452,8 @@ impl Mutator {
     /// Standby: stop replicating for good (until `--prepare-standby`): the
     /// data diverged from the primary. Local state only; audited.
     pub async fn replica_halt(&self, info: HaltInfo) -> MResult<()> {
-        self.replica_write("replication_halt", system("halt"), move |t| {
-            set_state(t.conn, K_HALTED, Some(&serde_json::to_string(&info)?))?;
+        self.replica_write("replication_halt", system("halt"), move |c, t| {
+            set_state(c, K_HALTED, Some(&serde_json::to_string(&info)?))?;
             t.push(
                 "replication.halt",
                 None,
@@ -465,10 +468,10 @@ impl Mutator {
     /// Standby: the primary was promoted from this node's history at or
     /// after our position; continue in its history without a snapshot.
     pub async fn replica_adopt_history(&self, h: History, source: String) -> MResult<()> {
-        self.replica_write("replication_adopt_history", system("adopt"), move |t| {
-            let old = data::history(t.conn)?;
-            set_history(t.conn, &h)?;
-            set_state(t.conn, K_FOLLOWING, Some(&source))?;
+        self.replica_write("replication_adopt_history", system("adopt"), move |c, t| {
+            let old = data::history(c)?;
+            set_history(c, &h)?;
+            set_state(c, K_FOLLOWING, Some(&source))?;
             t.push(
                 "replication.adopt_history",
                 None,
@@ -489,8 +492,7 @@ impl Mutator {
         from: String,
         how: &'static str,
     ) -> MResult<History> {
-        self.replica_write("replication_promote", actor, move |t| {
-            let c = t.conn;
+        self.replica_write("replication_promote", actor, move |c, t| {
             let old = data::history(c)?;
             let head = data::changelog_head(c)?;
             let h = History {
@@ -819,7 +821,7 @@ mod tests {
         })
         .unwrap();
         pa.run(&actor(), "tsig", |t| {
-            let k = crate::storage::get_tsig_key(t.conn, "k1.")?.unwrap();
+            let k = crate::storage::get_tsig_key(t.conn(), "k1.")?.unwrap();
             t.update_tsig_key_zones(&k, &["a.test".into()])
         })
         .unwrap();

@@ -624,17 +624,19 @@ impl<'a> Tx<'a> {
     /// Store a zone's signing key. An account-class change: the private
     /// key reaches standbys but never the changelog API or websocket.
     pub fn set_dnssec_key(&mut self, key: crate::replication::types::ReplDnssecKey) -> MResult<()> {
-        acct_sql::put_dnssec_key(self.conn, &key)?;
-        self.changes.push(Change::DnssecKeySet { key });
+        let change = Change::DnssecKeySet { key };
+        acct_sql::write(self.conn, &acct_sql::Ctx::verbatim(), &change)?
+            .log_into(change, &mut self.changes);
         Ok(())
     }
 
     pub fn delete_dnssec_key(&mut self, zone: &Zone) -> MResult<()> {
-        acct_sql::delete_dnssec_key(self.conn, zone.id)?;
-        self.changes.push(Change::DnssecKeyDeleted {
+        let change = Change::DnssecKeyDeleted {
             zone_id: zone.id,
             zone: zone.name.clone(),
-        });
+        };
+        acct_sql::write(self.conn, &acct_sql::Ctx::verbatim(), &change)?
+            .log_into(change, &mut self.changes);
         Ok(())
     }
 
@@ -2402,6 +2404,67 @@ mod tests {
         assert!(d.nsec_at("x.w.test.").is_some());
     }
 
+    fn fixture_path() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/changelog_payloads.jsonl")
+    }
+
+    /// The changelog wire format is a contract with stored rows and with
+    /// servers of other versions: payloads written by an earlier version
+    /// (the fixture: real rows of every kind) must deserialize and
+    /// serialize back to the same bytes.
+    #[test]
+    fn stored_changelog_payloads_round_trip_byte_for_byte() {
+        let text = std::fs::read_to_string(fixture_path()).unwrap();
+        let mut kinds = std::collections::BTreeSet::new();
+        for (i, line) in text.lines().enumerate() {
+            let change: Change = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("fixture line {}: {e}: {line}", i + 1));
+            // As `sql::append_changelog` writes it.
+            let again = serde_json::to_string(&serde_json::to_value(&change).unwrap()).unwrap();
+            assert_eq!(again, line, "fixture line {}", i + 1);
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            kinds.insert(v["kind"].as_str().unwrap().to_string());
+            // The class and row columns derive from the payload alone.
+            let (_, entity, _, _) = change.meta();
+            assert!(!entity.is_empty());
+        }
+        let expected = [
+            "dnssec_key_deleted",
+            "dnssec_key_set",
+            "member_removed",
+            "member_set",
+            "record_created",
+            "record_deleted",
+            "record_expired",
+            "record_reaped",
+            "record_updated",
+            "recovery_code_used",
+            "recovery_codes_replaced",
+            "serial_bumped",
+            "setting_cleared",
+            "setting_set",
+            "token_created",
+            "token_revoked",
+            "token_tags_set",
+            "totp_step_accepted",
+            "tsig_key_deleted",
+            "tsig_key_set",
+            "user_created",
+            "user_deleted",
+            "user_updated",
+            "zone_created",
+            "zone_deleted",
+            "zone_resigned",
+            "zone_updated",
+        ];
+        assert_eq!(
+            kinds.iter().map(String::as_str).collect::<Vec<_>>(),
+            expected,
+            "the fixture covers every kind"
+        );
+    }
+
     fn dump(s: &Storage) -> serde_json::Value {
         s.read_tx(|c| {
             let mut v = serde_json::Map::new();
@@ -2639,7 +2702,7 @@ mod tests {
                             }
                             108 => {
                                 let u = t.change_user(uid, &accounts::UserChanges::default())?;
-                                let hash: Option<String> = t.conn.query_row(
+                                let hash: Option<String> = t.conn().query_row(
                                     "SELECT code_hash FROM recovery_codes WHERE user_id = ?1 AND used_at IS NULL LIMIT 1",
                                     [u.id],
                                     |r| r.get(0),
@@ -2654,14 +2717,14 @@ mod tests {
                             }
                             112..=113 => {
                                 let id: Option<i64> = t
-                                    .conn
+                                    .conn()
                                     .query_row(
                                         "SELECT id FROM api_tokens WHERE revoked_at IS NULL ORDER BY id DESC LIMIT 1",
                                         [],
                                         |r| r.get(0),
                                     )
                                     .ok();
-                                if let Some(tk) = id.and_then(|id| db::get_token(t.conn, id).ok().flatten()) {
+                                if let Some(tk) = id.and_then(|id| db::get_token(t.conn(), id).ok().flatten()) {
                                     let owner = t.change_user(tk.user_id, &accounts::UserChanges::default())?;
                                     if step % 2 == 0 {
                                         t.revoke_token(&owner, &tk)?;
@@ -2672,7 +2735,7 @@ mod tests {
                             }
                             114..=116 => {
                                 let name = format!("k{}.", step % 3);
-                                match crate::storage::get_tsig_key(t.conn, &name)? {
+                                match crate::storage::get_tsig_key(t.conn(), &name)? {
                                     None => {
                                         t.create_tsig_key(
                                             "tester",
@@ -2809,6 +2872,31 @@ mod tests {
                 events.iter().any(|e| e.payload["kind"] == kind),
                 "history contains {kind}"
             );
+        }
+        // UPDATE_FIXTURES=1: store real payloads of every kind, exactly as
+        // written to the changelog (the wire-format fixture, see
+        // `stored_changelog_payloads_round_trip_byte_for_byte`).
+        if std::env::var("UPDATE_FIXTURES").is_ok() {
+            let raw: Vec<String> = s
+                .read_tx(|c| {
+                    let mut st = c.prepare("SELECT payload FROM changelog ORDER BY offset")?;
+                    let rows = st.query_map([], |r| r.get(0))?;
+                    Ok(rows.collect::<Result<_, _>>()?)
+                })
+                .unwrap();
+            let mut per_kind: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            for line in raw {
+                let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+                let list = per_kind
+                    .entry(v["kind"].as_str().unwrap().to_string())
+                    .or_default();
+                if list.len() < 3 && !list.contains(&line) {
+                    list.push(line);
+                }
+            }
+            let out: Vec<String> = per_kind.into_values().flatten().collect();
+            std::fs::create_dir_all(fixture_path().parent().unwrap()).unwrap();
+            std::fs::write(fixture_path(), out.join("\n") + "\n").unwrap();
         }
         let n = replay::replay(&target, &events).unwrap();
         assert_eq!(n, events.len());

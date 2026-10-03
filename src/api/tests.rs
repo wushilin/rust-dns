@@ -593,3 +593,174 @@ fn path_templates_match_single_segments() {
     assert!(!allowed_when_read_only("POST", "/zones"));
     assert!(allowed_when_read_only("POST", "/auth/login"));
 }
+
+/// B3: while a long write (a large import) holds the write connection, API
+/// reads and DNS answers stay fast, also when more account writes than
+/// runtime workers are waiting for it. Account writes are synchronous calls
+/// from handlers: `Storage::write` hands the worker's other tasks to another
+/// thread first (`storage::blocking`), and reads use the read connections.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_reads_and_dns_stay_fast_during_a_long_write() {
+    use crate::mutation::{ExportDoc, ExportRecord, ExportZone, ImportMode};
+    use hickory_proto::op::{Message, Query};
+    use hickory_proto::rr::{Name, RecordType};
+
+    let h = Arc::new(Harness::new());
+    let actor = crate::model::Actor {
+        name: "test".into(),
+        ip: "127.0.0.1".into(),
+    };
+    h.state.accounts.sync_root("root", "x", false).unwrap();
+    let root = h.state.storage.get_user_by_name("root").unwrap().unwrap();
+    let token = "rdns_latency_probe";
+    h.state
+        .accounts
+        .create_token(&actor, &root, "probe", &crate::auth::sha256_hex(token), &[])
+        .unwrap();
+    h.state
+        .mutator
+        .create_zone(
+            actor.clone(),
+            crate::model::ZoneInput {
+                name: Some("lat.test".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    h.state
+        .mutator
+        .create_record(
+            actor.clone(),
+            "lat.test",
+            crate::model::RecordInput {
+                name: Some("www".into()),
+                rtype: Some(crate::model::RecordType::A),
+                value: Some("192.0.2.1".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let mut q = Message::query();
+    q.add_query(Query::query(
+        Name::from_ascii("www.lat.test.").unwrap(),
+        RecordType::A,
+    ));
+    let dns_req = q.to_vec().unwrap();
+    let client: std::net::SocketAddr = "127.0.0.1:5300".parse().unwrap();
+
+    let read = |h: Arc<Harness>| async move {
+        let t = Instant::now();
+        let req = HttpRequest::builder()
+            .uri("/api/zones")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = h.app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        t.elapsed()
+    };
+    let dns = |h: Arc<Harness>, req: Vec<u8>| async move {
+        let t = Instant::now();
+        match h
+            .state
+            .dns
+            .handle(&req, client, crate::dns::Proto::Udp)
+            .await
+        {
+            crate::dns::Reply::One(b) => {
+                let m = Message::from_vec(&b).unwrap();
+                assert_eq!(m.answers.len(), 1);
+            }
+            _ => panic!("no DNS answer"),
+        }
+        t.elapsed()
+    };
+    // Warm up (first use of the router and the caches).
+    read(h.clone()).await;
+    dns(h.clone(), dns_req.clone()).await;
+
+    // The long write: one transaction importing many records.
+    let n = 1500;
+    let doc = ExportDoc {
+        version: 1,
+        exported_at: String::new(),
+        zones: vec![ExportZone {
+            name: "big.test".into(),
+            serial: None,
+            soa_mname: None,
+            soa_rname: None,
+            refresh: None,
+            retry: None,
+            expire: None,
+            minimum: None,
+            default_ttl: None,
+            owner: None,
+            records: (0..n)
+                .map(|i| ExportRecord {
+                    name: format!("h{i}"),
+                    rtype: crate::model::RecordType::A,
+                    value: format!("198.51.{}.{}", i / 250, i % 250 + 1),
+                    ttl: None,
+                    expires_at: None,
+                })
+                .collect(),
+        }],
+    };
+    let import_started = Instant::now();
+    let m = h.state.mutator.clone();
+    let a2 = actor.clone();
+    let import = tokio::spawn(async move {
+        m.import(a2, doc, ImportMode::Merge, None, None)
+            .await
+            .unwrap();
+        import_started.elapsed()
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // More account writes than workers, all waiting for the write connection.
+    let mut writers = Vec::new();
+    for _ in 0..6 {
+        let h2 = h.clone();
+        let a = actor.clone();
+        writers.push(tokio::spawn(async move {
+            h2.state.accounts.run(&a, "probe", |_t| Ok(())).unwrap();
+            import_started.elapsed()
+        }));
+    }
+    let (mut max_read, mut max_dns, mut probes) = (Duration::ZERO, Duration::ZERO, 0u32);
+    while !import.is_finished() {
+        let r = tokio::spawn(read(h.clone())).await.unwrap();
+        let d = tokio::spawn(dns(h.clone(), dns_req.clone())).await.unwrap();
+        max_read = max_read.max(r);
+        max_dns = max_dns.max(d);
+        probes += 1;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let import_took = import.await.unwrap();
+    let mut first_writer = Duration::MAX;
+    for w in writers {
+        first_writer = first_writer.min(w.await.unwrap());
+    }
+    eprintln!(
+        "B3 latency: import of {n} records held the write connection {import_took:?}; {probes} probes; max API read {max_read:?}, max DNS answer {max_dns:?}; queued account writes finished after {first_writer:?}"
+    );
+    assert!(
+        import_took > Duration::from_millis(400),
+        "the import must be long enough to measure: {import_took:?}"
+    );
+    assert!(probes >= 10, "probes ran during the write: {probes}");
+    assert!(
+        first_writer + Duration::from_millis(150) >= import_took,
+        "the account writes waited for the import"
+    );
+    assert!(
+        max_dns < Duration::from_millis(150),
+        "DNS waited: {max_dns:?}"
+    );
+    assert!(
+        max_read < Duration::from_millis(300),
+        "API read waited: {max_read:?}"
+    );
+}

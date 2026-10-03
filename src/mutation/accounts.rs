@@ -74,11 +74,12 @@ pub struct UserChanges {
 /// settings, TSIG keys) go through [`AuditTx::record`]: it applies a typed
 /// [`Change`] with the same code a standby replays it with, and queues it
 /// for the changelog, which is written with the audit rows at commit.
-/// Sessions are local and written directly (bookkeeping, audited).
+/// The connection is private to this file: sibling modules (settings,
+/// tsig) read through the methods below and can write only with `record`.
+/// Sessions and the replica list are local tables, written here directly
+/// (bookkeeping, audited).
 pub struct AuditTx<'a> {
-    // Reads for sibling mutation modules (settings, tsig); their writes go
-    // through `record`.
-    pub(super) conn: &'a Connection,
+    conn: &'a Connection,
     entries: Vec<AuditEntry>,
     changes: Vec<Change>,
 }
@@ -130,11 +131,30 @@ impl<'a> AuditTx<'a> {
     }
 
     /// Apply an account change and queue it for the changelog. The only
-    /// way to write a replicated account table.
+    /// way to write a replicated account table (see `acct_sql`).
     pub(super) fn record(&mut self, change: Change) -> Result<()> {
-        super::replay::apply(self.conn, &change, &Ctx::verbatim())?;
-        self.changes.push(change);
+        acct_sql::write(self.conn, &Ctx::verbatim(), &change)?.log_into(change, &mut self.changes);
         Ok(())
+    }
+
+    // ---- reads for sibling mutation modules -------------------------------
+
+    pub(super) fn tsig_key(&self, name: &str) -> Result<Option<db::StoredTsigKey>> {
+        db::get_tsig_key(self.conn, name)
+    }
+
+    pub(super) fn has_setting(&self, key: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM settings WHERE key = ?1)",
+            params![key],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Tests: look at the transaction's state.
+    #[cfg(test)]
+    pub(super) fn conn(&self) -> &Connection {
+        self.conn
     }
 
     pub(super) fn push(

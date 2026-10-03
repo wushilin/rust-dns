@@ -1,12 +1,44 @@
-//! SQLite persistence. All writes go through a transaction obtained from
-//! [`Storage::with_tx`]; the DNS hot path never touches this module.
+//! SQLite persistence. The DNS hot path never touches this module.
+//!
+//! Two kinds of connection to the one database file (WAL mode):
+//! - the write connection: data writes go through [`Storage::write`] (a
+//!   transaction, only the mutation module can open one); the bookkeeping
+//!   methods of this file (session `last_seen_at`, token `last_used_*`,
+//!   replica tracking, pruning, scrubbing, backup) use it too;
+//! - a few read connections (`PRAGMA query_only = ON`): every read
+//!   (`with_read`, [`Storage::read_tx`], the catalog inputs, the API). In
+//!   WAL mode a reader never waits for the writer, so a long write (a large
+//!   import, a slow fsync) does not delay API reads, and a read can never
+//!   write.
+//!
+//! A read that starts after a write committed sees it (each read runs in
+//! its own read transaction, begun at its first statement).
 
 use crate::model::*;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard, TryLockError};
+
+/// Read connections per database. Reads are short; a handful lets API reads
+/// go on while one connection serves a long one (a snapshot, the catalog
+/// inputs, an integrity check).
+const READERS: usize = 4;
+
+/// Run blocking database work without stalling the async runtime: on a
+/// multi-thread runtime worker the other tasks of this worker (DNS queries
+/// among them) move to another thread first. Elsewhere (a blocking thread,
+/// a current-thread test runtime, no runtime) `f` simply runs.
+pub fn blocking<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS users (
@@ -205,7 +237,35 @@ pub struct TokenInfo {
 pub const TOKEN_USE_WRITE_INTERVAL_SECS: i64 = 60;
 
 pub struct Storage {
+    /// The write connection.
     conn: Mutex<Connection>,
+    /// Read-only connections (`query_only`), see the module documentation.
+    readers: Vec<Mutex<Connection>>,
+    next_reader: AtomicUsize,
+    /// Tests: the temporary directory of an [`Storage::open_memory`] database.
+    #[cfg(test)]
+    temp_dir: Option<std::path::PathBuf>,
+}
+
+#[cfg(test)]
+impl Drop for Storage {
+    fn drop(&mut self) {
+        if let Some(d) = self.temp_dir.take() {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+}
+
+fn open_reader(path: &Path) -> Result<Connection> {
+    // Not SQLITE_OPEN_READ_ONLY: such a handle cannot always attach to the
+    // WAL (see `--check`); `query_only` refuses every write just the same.
+    let conn = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("opening database {} for reading", path.display()))?;
+    conn.execute_batch("PRAGMA busy_timeout = 5000; PRAGMA query_only = ON;")?;
+    Ok(conn)
 }
 
 /// API tokens gained `last_used_ip` and `tags` (a JSON array of strings).
@@ -328,32 +388,48 @@ fn ensure_history_id(conn: &Connection) -> Result<()> {
 
 impl Storage {
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with(path, "FULL")
+    }
+
+    fn open_with(path: &Path, synchronous: &str) -> Result<Self> {
         let conn = Connection::open(path)
             .with_context(|| format!("opening database {}", path.display()))?;
-        conn.execute_batch(
+        conn.execute_batch(&format!(
             "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = FULL;
+             PRAGMA synchronous = {synchronous};
              PRAGMA foreign_keys = ON;
-             PRAGMA busy_timeout = 5000;",
-        )?;
+             PRAGMA busy_timeout = 5000;"
+        ))?;
         conn.execute_batch(SCHEMA)?;
         migrate(&conn)?;
+        let readers = (0..READERS)
+            .map(|_| open_reader(path).map(Mutex::new))
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             conn: Mutex::new(conn),
+            readers,
+            next_reader: AtomicUsize::new(0),
+            #[cfg(test)]
+            temp_dir: None,
         })
     }
 
+    /// Online backup. Runs on the write connection (a backup whose source
+    /// is written through another connection restarts), so writes wait for
+    /// it; reads do not.
     pub fn backup_to(&self, path: &Path) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.backup(rusqlite::MAIN_DB, path, None)
-            .with_context(|| format!("backing up database to {}", path.display()))
+        blocking(|| {
+            let conn = self.writer();
+            conn.backup(rusqlite::MAIN_DB, path, None)
+                .with_context(|| format!("backing up database to {}", path.display()))
+        })
     }
 
-    /// Cheap liveness probe: one trivial query through the shared connection.
+    /// Cheap liveness probe: one trivial query through a read connection.
     /// Unlike [`Storage::check`] it does not scan the database, so it is safe
     /// to call from unauthenticated health checks.
     pub fn ping(&self) -> Result<()> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             let one: i64 = c.query_row("SELECT 1", [], |r| r.get(0))?;
             anyhow::ensure!(one == 1, "unexpected ping result {one}");
             Ok(())
@@ -361,9 +437,9 @@ impl Storage {
     }
 
     /// Full integrity check (`PRAGMA quick_check`). Scans the whole database
-    /// while holding the connection lock; admin/backup use only.
+    /// on one read connection; admin/backup use only.
     pub fn check(&self) -> Result<()> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             let integrity: String = c.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
             anyhow::ensure!(integrity == "ok", "SQLite quick_check: {integrity}");
             let _: i64 = c.query_row("SELECT COUNT(*) FROM zones", [], |r| r.get(0))?;
@@ -371,15 +447,41 @@ impl Storage {
         })
     }
 
+    /// Tests: a private throwaway database. A file in a temporary directory
+    /// (removed on drop) rather than `:memory:`, so that the read
+    /// connections see the same data and behave as in production (WAL).
     #[cfg(test)]
     pub fn open_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory()?;
-        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-        conn.execute_batch(SCHEMA)?;
-        migrate(&conn)?;
-        Ok(Self {
-            conn: Mutex::new(conn),
-        })
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "rust-dns-test-{}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed),
+            crate::auth::random_token(6)
+        ));
+        std::fs::create_dir_all(&dir)?;
+        let mut s = Self::open_with(&dir.join("test.db"), "OFF")?;
+        s.temp_dir = Some(dir);
+        Ok(s)
+    }
+
+    /// The write connection. One poison policy everywhere: a panic in one
+    /// closure must not make every later database call panic.
+    fn writer(&self) -> MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// A free read connection, or (all busy) wait for one.
+    fn reader(&self) -> MutexGuard<'_, Connection> {
+        for m in &self.readers {
+            match m.try_lock() {
+                Ok(g) => return g,
+                Err(TryLockError::Poisoned(p)) => return p.into_inner(),
+                Err(TryLockError::WouldBlock) => {}
+            }
+        }
+        let i = self.next_reader.fetch_add(1, Ordering::Relaxed) % self.readers.len();
+        self.readers[i].lock().unwrap_or_else(|p| p.into_inner())
     }
 
     /// Run `f` inside a write transaction: commit on `Ok`, roll back on `Err`
@@ -391,29 +493,52 @@ impl Storage {
         _token: &crate::mutation::WriteToken,
         f: impl FnOnce(&Transaction) -> std::result::Result<T, E>,
     ) -> std::result::Result<T, E> {
-        let mut conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-        let tx = conn.transaction()?;
-        let out = f(&tx)?;
-        tx.commit()?;
-        Ok(out)
+        // Waiting for the write lock and the fsync at commit may take long:
+        // never on a runtime worker's time (see [`blocking`]).
+        blocking(|| {
+            let mut conn = self.writer();
+            let tx = conn.transaction()?;
+            let out = f(&tx)?;
+            tx.commit()?;
+            Ok(out)
+        })
     }
 
-    /// Run `f` inside one read transaction, so everything it reads is one
-    /// consistent state (replication snapshots and checksums).
+    /// Run `f` inside one read transaction on a read connection, so
+    /// everything it reads is one consistent state (replication snapshots
+    /// and checksums). It cannot write: the connection is `query_only`.
     pub fn read_tx<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let conn = self.reader();
         // A `Transaction` rolls back when dropped, also when `f` panics:
-        // the shared connection is never left inside a transaction.
+        // the connection is never left inside a transaction.
         let tx = conn.unchecked_transaction()?;
         let out = f(&tx);
         drop(tx);
         out
     }
 
+    /// Bookkeeping write on the write connection (waits for a running
+    /// write transaction).
+    fn bookkeeping<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        blocking(|| f(&self.writer()))
+    }
+
+    /// Best-effort bookkeeping on a request path (`last_seen_at`,
+    /// `last_used_at`): skipped while a write transaction holds the
+    /// connection, so a request never waits behind a long write.
+    fn bookkeeping_if_idle(&self, f: impl FnOnce(&Connection) -> Result<()>) -> Result<()> {
+        let conn = match self.conn.try_lock() {
+            Ok(g) => g,
+            Err(TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(TryLockError::WouldBlock) => return Ok(()),
+        };
+        f(&conn)
+    }
+
     /// Replica tracking (primary side): bookkeeping like token `last_used_at`,
     /// written outside the mutation module and never replicated.
     pub fn save_replica(&self, instance: &str, data: &str, last_seen: &str) -> Result<()> {
-        self.with_conn(|c| {
+        self.bookkeeping(|c| {
             c.execute(
                 "INSERT INTO replicas (instance, data, last_seen) VALUES (?1, ?2, ?3)
                  ON CONFLICT(instance) DO UPDATE SET data = excluded.data, last_seen = excluded.last_seen",
@@ -424,7 +549,7 @@ impl Storage {
     }
 
     pub fn load_replicas(&self) -> Result<Vec<String>> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             let mut stmt = c.prepare("SELECT data FROM replicas ORDER BY instance")?;
             let rows = stmt.query_map([], |r| r.get(0))?;
             Ok(rows.collect::<Result<_, _>>()?)
@@ -433,46 +558,44 @@ impl Storage {
 
     /// Bookkeeping: forget replicas not seen since `cutoff`.
     pub fn prune_replicas(&self, cutoff: &str) -> Result<usize> {
-        self.with_conn(|c| {
+        self.bookkeeping(|c| {
             Ok(c.execute("DELETE FROM replicas WHERE last_seen < ?1", params![cutoff])?)
         })
     }
 
     /// The replication bookkeeping (`replication_state`) as key/value pairs.
     pub fn replication_state(&self) -> Result<std::collections::BTreeMap<String, String>> {
-        self.with_conn(replication_state)
+        self.with_read(replication_state)
     }
 
-    /// Tests only: run raw SQL on the connection (set up or corrupt state).
+    /// Tests only: run raw SQL on the write connection (set up or corrupt state).
     #[cfg(test)]
     pub fn exec_raw(&self, sql: &str) -> Result<()> {
-        self.with_conn(|c| Ok(c.execute_batch(sql)?))
+        Ok(self.writer().execute_batch(sql)?)
     }
 
-    fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-        // Same poison policy as `write`: a panic in one closure must not
-        // make every later database call panic.
-        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-        f(&conn)
+    /// A read on a read connection, in its own read transaction.
+    fn with_read<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        self.read_tx(f)
     }
 
     // ---- zones ---------------------------------------------------------
 
     pub fn list_zones(&self) -> Result<Vec<Zone>> {
-        self.with_conn(list_zones)
+        self.with_read(list_zones)
     }
 
     pub fn get_zone(&self, name: &str) -> Result<Option<Zone>> {
-        self.with_conn(|c| get_zone(c, name))
+        self.with_read(|c| get_zone(c, name))
     }
 
     pub fn list_records(&self, zone_id: i64) -> Result<Vec<Record>> {
-        self.with_conn(|c| list_records(c, zone_id))
+        self.with_read(|c| list_records(c, zone_id))
     }
 
     #[cfg(test)]
     pub fn all_records(&self) -> Result<Vec<Record>> {
-        self.with_conn(all_records)
+        self.with_read(all_records)
     }
 
     /// Server-side filtered, paged record listing. Returns (page, total matching).
@@ -483,7 +606,7 @@ impl Storage {
         offset: usize,
         limit: usize,
     ) -> Result<(Vec<Record>, i64)> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             let pat = format!("%{}%", q.to_ascii_lowercase().replace('%', "\\%").replace('_', "\\_"));
             let filter = "(?2 = '' OR lower(name) LIKE ?3 ESCAPE '\\' OR lower(rtype) LIKE ?3 ESCAPE '\\' OR lower(value) LIKE ?3 ESCAPE '\\')";
             let total: i64 = c.query_row(
@@ -502,7 +625,7 @@ impl Storage {
 
     /// The earliest expiry that has not been processed yet, if any.
     pub fn next_expiry(&self) -> Result<Option<String>> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             Ok(c.query_row(
                 "SELECT MIN(expires_at) FROM records WHERE expires_at IS NOT NULL AND expired_noted = 0",
                 [],
@@ -513,7 +636,7 @@ impl Storage {
 
     /// Whether any record's expiry is at or before `cutoff` (something to reap).
     pub fn oldest_expiry_before(&self, cutoff: &str) -> Result<bool> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             Ok(c.query_row(
                 "SELECT EXISTS (SELECT 1 FROM records WHERE expires_at IS NOT NULL AND expires_at <= ?1)",
                 params![cutoff],
@@ -523,7 +646,7 @@ impl Storage {
     }
 
     pub fn counts(&self) -> Result<(i64, i64)> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             let z: i64 = c.query_row("SELECT COUNT(*) FROM zones", [], |r| r.get(0))?;
             let r: i64 = c.query_row("SELECT COUNT(*) FROM records", [], |r| r.get(0))?;
             Ok((z, r))
@@ -533,7 +656,7 @@ impl Storage {
     // ---- changelog -----------------------------------------------------
 
     pub fn changelog_after(&self, after: i64, limit: usize) -> Result<Vec<ChangeEvent>> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             let mut stmt = c.prepare(
                 "SELECT offset, ts, actor, actor_ip, action, entity, zone, entity_id, payload, txn, command
                  FROM changelog WHERE offset > ?1 AND class = 'dns' ORDER BY offset ASC LIMIT ?2",
@@ -544,7 +667,7 @@ impl Storage {
     }
 
     pub fn changelog_recent(&self, limit: usize) -> Result<Vec<ChangeEvent>> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             let mut stmt = c.prepare(
                 "SELECT offset, ts, actor, actor_ip, action, entity, zone, entity_id, payload, txn, command
                  FROM changelog WHERE class = 'dns' ORDER BY offset DESC LIMIT ?1",
@@ -558,7 +681,7 @@ impl Storage {
 
     /// `(oldest_retained_offset, latest_offset)`; both `None` when empty.
     pub fn changelog_bounds(&self) -> Result<(Option<i64>, Option<i64>)> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             let r: (Option<i64>, Option<i64>) = c.query_row(
                 "SELECT MIN(offset), MAX(offset) FROM changelog WHERE class = 'dns'",
                 [],
@@ -570,7 +693,7 @@ impl Storage {
 
     /// The next offset that will be assigned, even if the log is empty or pruned.
     pub fn changelog_head(&self) -> Result<i64> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             let seq: Option<i64> = c
                 .query_row(
                     "SELECT seq FROM sqlite_sequence WHERE name = 'changelog'",
@@ -588,7 +711,7 @@ impl Storage {
     /// such a row gets `gap` and loads a snapshot. Bookkeeping, like pruning.
     pub fn scrub_account_changes(&self, older_than: DateTime<Utc>) -> Result<usize> {
         let cutoff = older_than.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        self.with_conn(|c| {
+        self.bookkeeping(|c| {
             Ok(c.execute(
                 "UPDATE changelog SET payload = '{\"kind\":\"scrubbed\"}'
                  WHERE class = 'account' AND ts < ?1 AND payload <> '{\"kind\":\"scrubbed\"}'",
@@ -599,7 +722,7 @@ impl Storage {
 
     pub fn prune_changelog(&self, older_than: DateTime<Utc>) -> Result<usize> {
         let cutoff = older_than.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        self.with_conn(|c| {
+        self.bookkeeping(|c| {
             let n = c.execute("DELETE FROM changelog WHERE ts < ?1", params![cutoff])?;
             Ok(n)
         })
@@ -612,7 +735,7 @@ impl Storage {
         after: i64,
         limit: usize,
     ) -> Result<Vec<crate::mutation::accounts::AuditRecord>> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             let mut stmt = c.prepare(
                 "SELECT id, ts, txn, operation, actor, actor_ip, action, target_user_id, target, detail
                  FROM audit_log WHERE id > ?1 ORDER BY id ASC LIMIT ?2",
@@ -626,7 +749,7 @@ impl Storage {
         &self,
         limit: usize,
     ) -> Result<Vec<crate::mutation::accounts::AuditRecord>> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             let mut stmt = c.prepare(
                 "SELECT id, ts, txn, operation, actor, actor_ip, action, target_user_id, target, detail
                  FROM audit_log ORDER BY id DESC LIMIT ?1",
@@ -641,11 +764,11 @@ impl Storage {
     /// A console/API setting: (JSON value, updated_by, updated_at).
     /// Every TSIG key, secrets included (for the DNS keyring and reveal).
     pub fn list_tsig_keys(&self) -> Result<Vec<StoredTsigKey>> {
-        self.with_conn(list_tsig_keys)
+        self.with_read(list_tsig_keys)
     }
 
     pub fn get_tsig_key(&self, name: &str) -> Result<Option<StoredTsigKey>> {
-        self.with_conn(|c| get_tsig_key(c, name))
+        self.with_read(|c| get_tsig_key(c, name))
     }
 
     /// A zone's DNSSEC key (private key included: callers must not expose it).
@@ -653,7 +776,7 @@ impl Storage {
         &self,
         zone_id: i64,
     ) -> Result<Option<crate::replication::types::ReplDnssecKey>> {
-        self.with_conn(|c| get_dnssec_key(c, zone_id))
+        self.with_read(|c| get_dnssec_key(c, zone_id))
     }
 
     /// Zones, records and DNSSEC keys read in one transaction (catalog build).
@@ -668,7 +791,7 @@ impl Storage {
     }
 
     pub fn get_setting(&self, key: &str) -> Result<Option<(String, String, String)>> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             Ok(c.query_row(
                 "SELECT value, updated_by, updated_at FROM settings WHERE key = ?1",
                 params![key],
@@ -680,13 +803,13 @@ impl Storage {
 
     pub fn prune_audit(&self, older_than: DateTime<Utc>) -> Result<usize> {
         let cutoff = older_than.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        self.with_conn(|c| Ok(c.execute("DELETE FROM audit_log WHERE ts < ?1", params![cutoff])?))
+        self.bookkeeping(|c| Ok(c.execute("DELETE FROM audit_log WHERE ts < ?1", params![cutoff])?))
     }
 
     // ---- users ---------------------------------------------------------
 
     pub fn list_users(&self) -> Result<Vec<User>> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             let mut stmt =
                 c.prepare(&format!("SELECT {USER_COLS} FROM users ORDER BY username"))?;
             let rows = stmt.query_map([], row_to_user)?;
@@ -695,11 +818,11 @@ impl Storage {
     }
 
     pub fn get_user(&self, id: i64) -> Result<Option<User>> {
-        self.with_conn(|c| get_user(c, id))
+        self.with_read(|c| get_user(c, id))
     }
 
     pub fn get_user_by_name(&self, username: &str) -> Result<Option<User>> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             Ok(c.query_row(
                 &format!("SELECT {USER_COLS} FROM users WHERE username = ?1"),
                 params![username],
@@ -712,7 +835,7 @@ impl Storage {
     // ---- sessions ------------------------------------------------------
 
     pub fn get_session(&self, token_hash: &str) -> Result<Option<Session>> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             Ok(c.query_row(
                 "SELECT id, token_hash, user_id, state, pending_secret, ip, user_agent, created_at, expires_at, last_seen_at
                  FROM sessions WHERE token_hash = ?1",
@@ -724,7 +847,7 @@ impl Storage {
     }
 
     pub fn get_session_by_id(&self, id: i64) -> Result<Option<Session>> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             Ok(c.query_row(
                 "SELECT id, token_hash, user_id, state, pending_secret, ip, user_agent, created_at, expires_at, last_seen_at
                  FROM sessions WHERE id = ?1",
@@ -736,7 +859,7 @@ impl Storage {
     }
 
     pub fn touch_session(&self, id: i64) -> Result<()> {
-        self.with_conn(|c| {
+        self.bookkeeping_if_idle(|c| {
             c.execute(
                 "UPDATE sessions SET last_seen_at = ?2 WHERE id = ?1",
                 params![id, now_rfc3339()],
@@ -746,7 +869,7 @@ impl Storage {
     }
 
     pub fn list_sessions(&self, user_id: i64) -> Result<Vec<Session>> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             let mut stmt = c.prepare(
                 "SELECT id, token_hash, user_id, state, pending_secret, ip, user_agent, created_at, expires_at, last_seen_at
                  FROM sessions WHERE user_id = ?1 AND state = 'active' ORDER BY last_seen_at DESC",
@@ -759,7 +882,7 @@ impl Storage {
     // ---- recovery codes ------------------------------------------------
 
     pub fn recovery_codes_left(&self, user_id: i64) -> Result<i64> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             Ok(c.query_row(
                 "SELECT COUNT(*) FROM recovery_codes WHERE user_id = ?1 AND used_at IS NULL",
                 params![user_id],
@@ -769,7 +892,7 @@ impl Storage {
     }
 
     pub fn prune_sessions(&self) -> Result<usize> {
-        self.with_conn(|c| {
+        self.bookkeeping(|c| {
             Ok(c.execute(
                 "DELETE FROM sessions WHERE expires_at < ?1",
                 params![now_rfc3339()],
@@ -780,12 +903,12 @@ impl Storage {
     // ---- zone members --------------------------------------------------
 
     pub fn list_members(&self, zone_id: i64) -> Result<Vec<Member>> {
-        self.with_conn(|c| list_members(c, zone_id))
+        self.with_read(|c| list_members(c, zone_id))
     }
 
     /// All (zone_id, role) pairs a user can reach via membership.
     pub fn memberships_for_user(&self, user_id: i64) -> Result<Vec<(i64, String)>> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             let mut stmt =
                 c.prepare("SELECT zone_id, role FROM zone_members WHERE user_id = ?1")?;
             let rows = stmt.query_map(params![user_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
@@ -798,7 +921,7 @@ impl Storage {
     /// Active tokens, of one user or of everyone, optionally only those
     /// carrying `tag` (already normalized).
     pub fn list_tokens(&self, user_id: Option<i64>, tag: Option<&str>) -> Result<Vec<TokenInfo>> {
-        self.with_conn(|c| {
+        self.with_read(|c| {
             let mut stmt = c.prepare(&format!(
                 "SELECT {TOKEN_COLS} FROM api_tokens
                  WHERE (?1 IS NULL OR user_id = ?1) AND revoked_at IS NULL
@@ -811,11 +934,12 @@ impl Storage {
     }
 
     pub fn get_token(&self, id: i64) -> Result<Option<TokenInfo>> {
-        self.with_conn(|c| get_token(c, id))
+        self.with_read(|c| get_token(c, id))
     }
 
     /// Look up an active API token by hash and record its use (time and
-    /// client IP). Bookkeeping, not audited. To keep token-authenticated
+    /// client IP). Bookkeeping, not audited (and skipped while a write
+    /// transaction is running). To keep token-authenticated
     /// traffic from turning every request into a write, the single UPDATE
     /// runs only when the IP changed or `last_used_at` is older than
     /// [`TOKEN_USE_WRITE_INTERVAL_SECS`]; the returned info reflects the use.
@@ -824,7 +948,8 @@ impl Storage {
         token_hash: &str,
         ip: std::net::IpAddr,
     ) -> Result<Option<TokenInfo>> {
-        self.with_conn(|c| {
+        let found = self.with_read(|c| {
+            let mut write = false;
             let t = c
                 .query_row(
                     &format!(
@@ -843,15 +968,25 @@ impl Storage {
             let stale = t.last_used_at.as_deref().is_none_or(|at| *at < *stale_before);
             if stale || t.last_used_ip.as_deref() != Some(ip.as_str()) {
                 let at = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-                c.execute(
-                    "UPDATE api_tokens SET last_used_at = ?1, last_used_ip = ?2 WHERE id = ?3",
-                    params![at, ip, t.id],
-                )?;
                 t.last_used_at = Some(at);
                 t.last_used_ip = Some(ip);
+                write = true;
             }
-            Ok(Some(t))
-        })
+            Ok(Some((t, write)))
+        })?;
+        let Some((t, write)) = found else {
+            return Ok(None);
+        };
+        if write {
+            self.bookkeeping_if_idle(|c| {
+                c.execute(
+                    "UPDATE api_tokens SET last_used_at = ?1, last_used_ip = ?2 WHERE id = ?3",
+                    params![t.last_used_at, t.last_used_ip, t.id],
+                )?;
+                Ok(())
+            })?;
+        }
+        Ok(Some(t))
     }
 }
 
@@ -1111,6 +1246,113 @@ mod tests {
             |_t| Ok(()),
         )
         .unwrap();
+    }
+
+    /// B1: reads use `query_only` connections; nothing can write through
+    /// the read path, whatever SQL it runs.
+    #[test]
+    fn a_write_through_the_read_path_fails() {
+        let s = Storage::open_memory().unwrap();
+        for sql in [
+            "INSERT INTO settings (key, value, updated_by, updated_at) VALUES ('k','v','a','t')",
+            "DELETE FROM users",
+            "CREATE TABLE x (y)",
+            "UPDATE replication_state SET value = 'x'",
+        ] {
+            let e = s
+                .read_tx(|c| Ok(c.execute_batch(sql)?))
+                .expect_err("writes are refused");
+            assert!(format!("{e:#}").contains("readonly"), "{sql}: {e:#}");
+        }
+        // Every read connection is read-only, not just the first.
+        let guards: Vec<_> = (0..READERS).map(|_| s.reader()).collect();
+        for g in &guards {
+            assert!(g.execute_batch("DELETE FROM zones").is_err());
+            let q: i64 = g.query_row("PRAGMA query_only", [], |r| r.get(0)).unwrap();
+            assert_eq!(q, 1);
+        }
+        drop(guards);
+        assert!(s.get_setting("k").unwrap().is_none());
+    }
+
+    /// B1: a read that starts after a commit sees it (the catalog rebuild
+    /// after a commit relies on this), on every read connection; and a
+    /// read transaction keeps its snapshot while writes go on.
+    #[test]
+    fn reads_see_committed_writes_and_keep_their_snapshot() {
+        let s = Storage::open_memory().unwrap();
+        let add = |name: &str| {
+            s.exec_raw(&format!(
+                "INSERT INTO zones (name, soa_mname, soa_rname, created_at, updated_at) VALUES ('{name}','n.','h.','t','t')"
+            ))
+            .unwrap()
+        };
+        for i in 0..(READERS * 3) {
+            add(&format!("z{i}.test"));
+            // Rotate through the readers by holding some of them.
+            let held: Vec<_> = (0..(i % READERS)).map(|_| s.reader()).collect();
+            assert_eq!(s.counts().unwrap().0, i as i64 + 1, "read-your-writes");
+            drop(held);
+        }
+        let n = READERS as i64 * 3;
+        s.read_tx(|c| {
+            let before: i64 = c.query_row("SELECT COUNT(*) FROM zones", [], |r| r.get(0))?;
+            add("later.test"); // commits on the write connection meanwhile
+            let after: i64 = c.query_row("SELECT COUNT(*) FROM zones", [], |r| r.get(0))?;
+            assert_eq!((before, after), (n, n), "one consistent state");
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(s.counts().unwrap().0, n + 1);
+    }
+
+    /// B1/B3: readers do not wait for a write transaction, and request-path
+    /// bookkeeping is skipped instead of waiting.
+    #[test]
+    fn reads_and_request_bookkeeping_do_not_wait_for_a_long_write() {
+        let s = std::sync::Arc::new(Storage::open_memory().unwrap());
+        let id = insert_token(&s, "a", "ha", "[]");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let s2 = s.clone();
+        let writer = std::thread::spawn(move || {
+            let mut c = s2.conn.lock().unwrap();
+            let tx = c.transaction().unwrap();
+            tx.execute(
+                "INSERT INTO zones (name, soa_mname, soa_rname, created_at, updated_at) VALUES ('w.test','n.','h.','t','t')",
+                [],
+            )
+            .unwrap();
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            tx.commit().unwrap();
+        });
+        started_rx.recv().unwrap();
+        let t0 = std::time::Instant::now();
+        for _ in 0..50 {
+            assert_eq!(s.counts().unwrap().0, 0, "uncommitted data is not visible");
+            assert!(s.get_token(id).unwrap().is_some());
+        }
+        // Token use during the write: authenticated, the timestamp write skipped.
+        let t = s
+            .authenticate_token("ha", "127.0.0.1".parse().unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(t.last_used_at.is_some());
+        s.touch_session(1).unwrap();
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(2),
+            "reads waited for the writer: {:?}",
+            t0.elapsed()
+        );
+        assert!(s.get_token(id).unwrap().unwrap().last_used_at.is_none());
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
+        assert_eq!(s.counts().unwrap().0, 1);
+        // Idle again: the use is recorded.
+        s.authenticate_token("ha", "127.0.0.1".parse().unwrap())
+            .unwrap();
+        assert!(s.get_token(id).unwrap().unwrap().last_used_at.is_some());
     }
 
     #[test]

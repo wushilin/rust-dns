@@ -4,8 +4,7 @@
 //! serials), so applying the payloads in offset order to an empty database
 //! reproduces the zones, records and zone members of the source. This is the
 //! basis for a follower server and is checked by the replay tests.
-// `apply` is used by standby mode (mutation::replica) and by `AuditTx`;
-// `replay` by the tests.
+// `apply` is used by standby mode (mutation::replica); `replay` by the tests.
 #![allow(dead_code)]
 
 use super::acct_sql::{self, Ctx};
@@ -51,36 +50,25 @@ pub(super) fn apply(c: &Connection, change: &Change, ctx: &Ctx) -> Result<()> {
         Change::MemberRemoved {
             zone_id, user_id, ..
         } => sql::delete_member(c, *zone_id, *user_id)?,
-        Change::UserCreated { user } | Change::UserUpdated { user } => {
-            acct_sql::put_user(c, ctx, user)?
-        }
-        Change::UserDeleted { user_id, username } => {
-            acct_sql::delete_user(c, ctx, *user_id, username)?
-        }
-        Change::TotpStepAccepted { user_id, step } => acct_sql::totp_step(c, ctx, *user_id, *step)?,
-        Change::RecoveryCodesReplaced {
-            user_id,
-            code_hashes,
-        } => acct_sql::recovery_codes(c, ctx, *user_id, &code_hashes.0)?,
-        Change::RecoveryCodeUsed {
-            user_id,
-            code_hash,
-            used_at,
-        } => acct_sql::recovery_code_used(c, ctx, *user_id, &code_hash.0, used_at)?,
-        Change::TokenCreated { token } => acct_sql::put_token(c, token)?,
-        Change::TokenTagsSet { token_id, tags } => acct_sql::token_tags(c, *token_id, tags)?,
-        Change::TokenRevoked {
-            token_id,
-            revoked_at,
-        } => acct_sql::token_revoked(c, *token_id, revoked_at)?,
-        Change::TsigKeySet { key } => acct_sql::put_tsig_key(c, key)?,
-        Change::TsigKeyDeleted { name } => acct_sql::delete_tsig_key(c, name)?,
-        Change::SettingSet { setting } => acct_sql::put_setting(c, setting)?,
-        Change::SettingCleared { key } => acct_sql::delete_setting(c, key)?,
         // The serial bump that goes with it is its own change.
         Change::ZoneResigned { .. } => {}
-        Change::DnssecKeySet { key } => acct_sql::put_dnssec_key(c, key)?,
-        Change::DnssecKeyDeleted { zone_id, .. } => acct_sql::delete_dnssec_key(c, *zone_id)?,
+        // Account class: one entry point, which hands back a receipt; this
+        // is a replay (the caller copies the primary's changelog row).
+        Change::UserCreated { .. }
+        | Change::UserUpdated { .. }
+        | Change::UserDeleted { .. }
+        | Change::TotpStepAccepted { .. }
+        | Change::RecoveryCodesReplaced { .. }
+        | Change::RecoveryCodeUsed { .. }
+        | Change::TokenCreated { .. }
+        | Change::TokenTagsSet { .. }
+        | Change::TokenRevoked { .. }
+        | Change::TsigKeySet { .. }
+        | Change::TsigKeyDeleted { .. }
+        | Change::SettingSet { .. }
+        | Change::SettingCleared { .. }
+        | Change::DnssecKeySet { .. }
+        | Change::DnssecKeyDeleted { .. } => acct_sql::write(c, ctx, change)?.replayed(),
     }
     Ok(())
 }

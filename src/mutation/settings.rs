@@ -6,7 +6,6 @@ use super::accounts::AuditTx;
 use crate::config::Cidr;
 use crate::storage::Storage;
 use anyhow::Result;
-use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
 use utoipa::ToSchema;
@@ -201,17 +200,11 @@ impl AuditTx<'_> {
 
     /// Remove the override: the config file applies again.
     pub fn clear_forwarding(&mut self, before: &ForwardingSettings) -> Result<bool> {
-        let n: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM settings WHERE key = ?1",
-            params![FORWARDING_KEY],
-            |r| r.get(0),
-        )?;
-        if n > 0 {
+        let stored = self.has_setting(FORWARDING_KEY)?;
+        if stored {
             self.record(crate::mutation::Change::SettingCleared {
                 key: FORWARDING_KEY.into(),
             })?;
-        }
-        if n > 0 {
             self.push(
                 "settings.forwarding.reset",
                 None,
@@ -219,7 +212,7 @@ impl AuditTx<'_> {
                 serde_json::json!({ "before": before }),
             );
         }
-        Ok(n > 0)
+        Ok(stored)
     }
 }
 
