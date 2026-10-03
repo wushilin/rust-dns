@@ -123,6 +123,7 @@ cache_negative_max_ttl = 3600 # cap for NXDOMAIN / no-data answers
 open_resolver = false         # true = deliberate open resolver; see "Running an open resolver"
 open_resolver_max_udp_payload = 512  # open resolver: bigger forwarded UDP answers are sent TC=1
 open_resolver_rate_per_second = 20   # open resolver: forwarded queries/s per client; 0 = no extra limit
+max_inflight = 1024           # forwarded queries waiting for an upstream at once (over it: UDP dropped, TCP SERVFAIL)
 
 [rate_limit]
 max_resolutions_per_second_per_address = 500   # per IPv4 address / IPv6 /64

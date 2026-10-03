@@ -915,3 +915,122 @@ fn open_resolver_from_the_config_file() {
     drop(srv);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// C1: forwarded queries waiting for an upstream are capped
+/// (`[forwarding].max_inflight`). With a stalled upstream, queries over the
+/// cap are turned away at once (UDP dropped, TCP SERVFAIL) and counted, and
+/// authoritative answers are not delayed.
+#[test]
+fn forwarding_is_capped_and_authoritative_answers_do_not_wait() {
+    // A resolver that receives and never answers.
+    let stalled = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let up = stalled.local_addr().unwrap().port();
+    let dir = std::env::temp_dir().join(format!(
+        "rust-dns-fwdcap-{}-{}",
+        std::process::id(),
+        rand_id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let srv = Server::start_with(
+        dir.clone(),
+        free_port(),
+        free_port(),
+        &format!(
+            "upstreams = [\"127.0.0.1:{up}\"]\nallowed_clients = [\"127.0.0.0/8\"]\ntimeout_ms = 3000\ncache_entries = 0\nmax_inflight = 4"
+        ),
+    );
+    let web = srv.web.clone();
+    let root = login(&web, "root", "rootpass123");
+    let (s, v) = call(
+        &root,
+        "POST",
+        &format!("{web}/api/zones"),
+        Some(serde_json::json!({ "name": "cap.test" })),
+    );
+    assert_eq!(s, 201, "{v}");
+    let (s, v) = call(
+        &root,
+        "POST",
+        &format!("{web}/api/zones/cap.test/records"),
+        Some(serde_json::json!({ "name": "www", "type": "A", "value": "192.0.2.7" })),
+    );
+    assert_eq!(s, 201, "{v}");
+
+    // 12 foreign names at once, each from its own socket.
+    let started = Instant::now();
+    let socks: Vec<UdpSocket> = (0..12)
+        .map(|i| {
+            let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let mut m = Message::new(1000 + i, MessageType::Query, OpCode::Query);
+            m.metadata.recursion_desired = true;
+            m.add_query(Query::query(
+                Name::from_ascii(format!("n{i}.stalled.example.")).unwrap(),
+                RecordType::A,
+            ));
+            sock.send_to(&m.to_vec().unwrap(), ("127.0.0.1", srv.dns))
+                .unwrap();
+            sock
+        })
+        .collect();
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(metric(&web, &root, "rustdns_forward_inflight"), "4");
+    assert_eq!(metric(&web, &root, "rustdns_forward_overflow_total"), "8");
+
+    // Authoritative answers do not wait behind the stalled forwards.
+    for _ in 0..20 {
+        let t = Instant::now();
+        let r = query(srv.dns, "www.cap.test.");
+        assert_eq!(r.answers.len(), 1, "{r:?}");
+        assert!(
+            t.elapsed() < Duration::from_millis(500),
+            "authoritative answer took {:?}",
+            t.elapsed()
+        );
+    }
+    // Over the cap, TCP is told at once (not after the upstream timeout).
+    let t = Instant::now();
+    let r = query_tcp(srv.dns, "tcp.stalled.example.", RecordType::A);
+    assert_eq!(r.metadata.response_code, ResponseCode::ServFail);
+    assert!(
+        t.elapsed() < Duration::from_millis(500),
+        "{:?}",
+        t.elapsed()
+    );
+    assert_eq!(metric(&web, &root, "rustdns_forward_overflow_total"), "9");
+    let (_, st) = call(&root, "GET", &format!("{web}/api/status"), None);
+    assert_eq!(st["dns"]["forward_overflow"], 9, "{st}");
+    assert!(started.elapsed() < Duration::from_millis(2500));
+
+    // After the upstream timeout exactly the 4 admitted queries get their
+    // SERVFAIL; the 8 over the cap were dropped (the client retries).
+    std::thread::sleep(Duration::from_millis(3200).saturating_sub(started.elapsed()));
+    let mut servfail = 0;
+    let mut buf = [0u8; 4096];
+    for s in &socks {
+        s.set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        if let Ok(n) = s.recv(&mut buf) {
+            let m = Message::from_bytes(&buf[..n]).unwrap();
+            assert_eq!(m.metadata.response_code, ResponseCode::ServFail);
+            servfail += 1;
+        }
+    }
+    assert_eq!(servfail, 4);
+    // The slots are free again: forwarding resumes (and times out again).
+    assert_eq!(metric(&web, &root, "rustdns_forward_inflight"), "0");
+    let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut m = Message::new(77, MessageType::Query, OpCode::Query);
+    m.metadata.recursion_desired = true;
+    m.add_query(Query::query(
+        Name::from_ascii("again.stalled.example.").unwrap(),
+        RecordType::A,
+    ));
+    s.send_to(&m.to_vec().unwrap(), ("127.0.0.1", srv.dns))
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(metric(&web, &root, "rustdns_forward_inflight"), "1");
+    assert_eq!(metric(&web, &root, "rustdns_forward_overflow_total"), "9");
+    drop(stalled);
+    drop(srv);
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -106,6 +106,11 @@ pub struct ForwardingView {
     /// extra limit (`[forwarding].open_resolver_rate_per_second`, config file only).
     #[schema(example = 20)]
     pub open_resolver_rate_per_second: u32,
+    /// Most forwarded queries waiting for an upstream at one time; over it
+    /// UDP queries are dropped and TCP queries get SERVFAIL
+    /// (`[forwarding].max_inflight`, config file only).
+    #[schema(example = 1024)]
+    pub max_inflight: usize,
     /// The config file's values, for comparison and reset.
     pub config: ForwardingFileValues,
     pub cache: ForwardCacheInfo,
@@ -199,6 +204,7 @@ fn view(s: &AppState) -> ApiResult<ForwardingView> {
         open_resolver: rt.forwarding.open_resolver,
         open_resolver_max_udp_payload: rt.forwarding.open_resolver_max_udp_payload,
         open_resolver_rate_per_second: rt.forwarding.open_resolver_rate_per_second,
+        max_inflight: rt.forwarding.max_inflight,
         cache: cache_info(s),
         source,
         updated_by,

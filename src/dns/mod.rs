@@ -44,6 +44,13 @@ pub struct Stats {
     pub open_resolver_any: AtomicU64,
     /// Open resolver: forwarded queries over the per-client limit.
     pub open_resolver_rate_limited: AtomicU64,
+    /// Queries not forwarded because `[forwarding].max_inflight` forwarded
+    /// queries were already waiting for an upstream.
+    pub forward_overflow: AtomicU64,
+    /// Forwarded queries waiting for an upstream right now.
+    pub forward_inflight: std::sync::atomic::AtomicUsize,
+    /// When the overflow warning was last logged (seconds since the epoch).
+    pub forward_overflow_warned: AtomicU64,
     /// Latency histogram buckets in microseconds: <=100, <=500, <=1000, <=5000, <=20000, >20000
     pub latency: [AtomicU64; 6],
     pub latency_sum_us: AtomicU64,
@@ -80,6 +87,7 @@ impl Stats {
             open_resolver_truncated: self.open_resolver_truncated.load(Relaxed),
             open_resolver_any: self.open_resolver_any.load(Relaxed),
             open_resolver_rate_limited: self.open_resolver_rate_limited.load(Relaxed),
+            forward_overflow: self.forward_overflow.load(Relaxed),
         }
     }
 }
@@ -126,6 +134,10 @@ pub struct DnsCounters {
     /// Open resolver mode: forwarded queries over
     /// `[forwarding].open_resolver_rate_per_second` for their client.
     pub open_resolver_rate_limited: u64,
+    /// Queries not forwarded (UDP dropped, TCP SERVFAIL) because
+    /// `[forwarding].max_inflight` forwarded queries were already waiting
+    /// for an upstream.
+    pub forward_overflow: u64,
 }
 
 /// Settings that can change at runtime via config reload.

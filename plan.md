@@ -43,7 +43,7 @@ OpenAPI snapshot + validator, conformance (123), smoke-release, cargo-audit.
 
 ## Phase C: bounded work on the DNS path
 
-- [ ] C1. UDP: cap in-flight forwarded queries with a semaphore (config
+- [x] C1. UDP: cap in-flight forwarded queries with a semaphore (config
   `[forwarding] max_inflight`, default 1024); over the cap, answer SERVFAIL
   (TCP) / drop (UDP) and count it. Authoritative answers are not queued
   behind forwards. Test with a stalled fake upstream.
@@ -204,3 +204,20 @@ OpenAPI snapshot + validator, conformance (123), smoke-release, cargo-audit.
   writes): 396 probes, max API read 0.41 ms, max DNS answer 0.11 ms. With
   `blocking` disabled the same test gets 2 probes in 2.8 s (the runtime is
   stalled for the whole import) and fails.
+- 2026-10-03: gate after phase B (commit 3365eb2, run on a scratch worktree
+  of the commit): all steps pass; 177 unit tests, integration suites
+  5/3/4/3/7/10/8/7, conformance 123, cargo-audit only `paste`.
+- 2026-10-03: C1 done. `[forwarding] max_inflight` (default 1024, >= 1,
+  config file only; shown by `GET /settings/forwarding`). Finding: UDP
+  queries already run as one task each, so authoritative answers never
+  queued behind forwards; what was missing is the bound. A forwarded
+  query takes a slot only after the authoritative lookup and the cache
+  missed; over the cap it is not queued but turned away at once (UDP
+  dropped, TCP SERVFAIL), counted in `dns.forward_overflow` /
+  `rustdns_forward_overflow_total` (gauge `rustdns_forward_inflight`), one
+  warning a minute. A counter with an RAII guard rather than a semaphore,
+  so a reload can change the cap. Test
+  `forwarding_is_capped_and_authoritative_answers_do_not_wait`
+  (tests/forwarding.rs: stalled upstream, cap 4, 12 queries: 4 in flight,
+  8 dropped, TCP SERVFAIL at once, 20 authoritative answers each under
+  500 ms, slots freed after the timeout). OpenAPI snapshot refreshed.

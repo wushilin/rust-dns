@@ -382,6 +382,15 @@ pub async fn metrics(State(s): St, _caller: Caller) -> ApiResult<Response> {
         "Forwarded queries over the open resolver per-client limit",
         d.open_resolver_rate_limited.load(Relaxed),
     );
+    m(
+        "rustdns_forward_overflow_total",
+        "Queries not forwarded because [forwarding].max_inflight was reached",
+        d.forward_overflow.load(Relaxed),
+    );
+    out.push_str(&format!(
+        "# HELP rustdns_forward_inflight Forwarded queries waiting for an upstream\n# TYPE rustdns_forward_inflight gauge\nrustdns_forward_inflight {}\n",
+        d.forward_inflight.load(Relaxed)
+    ));
     out.push_str(&format!(
         "# HELP rustdns_open_resolver 1 while open resolver mode is in effect\n# TYPE rustdns_open_resolver gauge\nrustdns_open_resolver {}\n",
         u8::from(s.dns.runtime.load().open_resolver())

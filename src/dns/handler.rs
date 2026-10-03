@@ -43,6 +43,26 @@ fn slip_reply(req: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// One of the `[forwarding].max_inflight` slots; freed on drop.
+struct InflightSlot<'a>(&'a super::Stats);
+
+impl<'a> InflightSlot<'a> {
+    fn take(stats: &'a super::Stats, max: usize) -> Option<Self> {
+        let n = stats.forward_inflight.fetch_add(1, Relaxed);
+        if n >= max.max(1) {
+            stats.forward_inflight.fetch_sub(1, Relaxed);
+            return None;
+        }
+        Some(InflightSlot(stats))
+    }
+}
+
+impl Drop for InflightSlot<'_> {
+    fn drop(&mut self) {
+        self.0.forward_inflight.fetch_sub(1, Relaxed);
+    }
+}
+
 /// Per-request context threaded through the handler.
 struct Ctx {
     client: SocketAddr,
@@ -574,6 +594,38 @@ impl DnsServer {
                         return Reply::One(self.finish(cached, &ctx, "cache"));
                     }
                 }
+                // Bounded: a slow or dead upstream must not pile up tasks and
+                // sockets without limit. Only forwarding takes a slot (the
+                // authoritative answer and the cache hit returned above),
+                // and a query over the cap is turned away at once rather
+                // than queued: UDP dropped (no amplification, the client
+                // retries), TCP SERVFAIL.
+                let Some(_slot) = InflightSlot::take(&self.stats, rt.forwarding.max_inflight)
+                else {
+                    self.stats.forward_overflow.fetch_add(1, Relaxed);
+                    // One warning a minute, not one per query.
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let last = self.stats.forward_overflow_warned.load(Relaxed);
+                    if now >= last + 60
+                        && self
+                            .stats
+                            .forward_overflow_warned
+                            .compare_exchange(last, now, Relaxed, Relaxed)
+                            .is_ok()
+                    {
+                        tracing::warn!(max_inflight = rt.forwarding.max_inflight, "forwarding: [forwarding].max_inflight queries are waiting for upstreams; further queries are dropped (UDP) or answered SERVFAIL (TCP) until some finish");
+                    }
+                    return match proto {
+                        Proto::Udp => Reply::None,
+                        Proto::Tcp => {
+                            resp.metadata.response_code = ResponseCode::ServFail;
+                            Reply::One(self.finish(resp, &ctx, "error"))
+                        }
+                    };
+                };
                 match super::forward::forward(&rt.forwarding, req, proto).await {
                     Ok(bytes) => {
                         self.stats.forwarded.fetch_add(1, Relaxed);

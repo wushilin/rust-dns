@@ -274,6 +274,12 @@ pub struct ForwardingConfig {
     /// Open resolver only: forwarded queries per second per client (IPv4
     /// address / IPv6 /64), on top of `[rate_limit]`. 0 = no extra limit.
     pub open_resolver_rate_per_second: u32,
+    /// Most forwarded queries waiting for an upstream at one time (each
+    /// holds a task and a socket until the upstream answers or
+    /// `timeout_ms` passes). Over the cap a query is not forwarded: UDP is
+    /// dropped (the client retries), TCP gets SERVFAIL. Authoritative
+    /// answers and cache hits are not affected.
+    pub max_inflight: usize,
 }
 
 /// Largest accepted forwarding cache TTL cap (one week).
@@ -591,6 +597,7 @@ impl Default for ForwardingConfig {
             open_resolver: false,
             open_resolver_max_udp_payload: 512,
             open_resolver_rate_per_second: 20,
+            max_inflight: 1024,
         }
     }
 }
@@ -692,6 +699,7 @@ cache_negative_max_ttl = 3600  # cap for NXDOMAIN/no-data answers (otherwise min
 open_resolver = false
 open_resolver_max_udp_payload = 512 # open resolver: larger forwarded UDP answers are sent truncated (TC=1)
 open_resolver_rate_per_second = 20  # open resolver: forwarded queries/s per client (IPv4 / IPv6 /64); 0 = off
+max_inflight = 1024      # forwarded queries waiting for an upstream at once; over it UDP is dropped, TCP gets SERVFAIL
 
 [transfer]
 allow = []               # networks allowed to AXFR zones (for BIND/NSD secondaries), e.g. ["203.0.113.5/32"]
@@ -1069,6 +1077,9 @@ pub fn validate(cfg: &Config) -> Result<()> {
         cfg.forwarding.cache_negative_max_ttl,
     ) {
         errs.push(format!("[forwarding].{e}"));
+    }
+    if cfg.forwarding.max_inflight == 0 {
+        errs.push("[forwarding].max_inflight must be at least 1".into());
     }
     if cfg.forwarding.timeout_ms == 0 {
         errs.push("[forwarding].timeout_ms must be greater than zero".into());
@@ -1523,6 +1534,7 @@ default_primary_ns = "bad..name"
 default_hostmaster = "@example.com"
 [forwarding]
 timeout_ms = 0
+max_inflight = 0
 allowed_clients = ["10.0.0.0/33"]
 [transfer]
 allow = ["nope"]
@@ -1554,6 +1566,7 @@ max_files = 0
             "[server].default_primary_ns",
             "[server].default_hostmaster",
             "[forwarding].timeout_ms",
+            "[forwarding].max_inflight",
             "[forwarding].allowed_clients: '10.0.0.0/33'",
             "[transfer].allow: 'nope'",
             "[transfer].notify entry '0.0.0.0:53'",
@@ -1573,7 +1586,7 @@ max_files = 0
         ] {
             assert!(msg.contains(needle), "missing {needle:?} in:\n{msg}");
         }
-        assert!(msg.starts_with("22 configuration error(s):"), "{msg}");
+        assert!(msg.starts_with("23 configuration error(s):"), "{msg}");
     }
 
     #[test]
@@ -1663,6 +1676,7 @@ notify = ["192.0.2.1:53", { address = "192.0.2.2:5300", key = "other." }, { addr
         assert!(!cfg.forwarding.open_resolver);
         assert_eq!(cfg.forwarding.open_resolver_max_udp_payload, 512);
         assert_eq!(cfg.forwarding.open_resolver_rate_per_second, 20);
+        assert_eq!(cfg.forwarding.max_inflight, 1024);
         assert!(open_resolver_warnings(&cfg.forwarding).is_empty());
         // Without the flag: refused, and the message names the override.
         let msg = err_of("[forwarding]\nallowed_clients = [\"0.0.0.0/0\", \"::/0\"]");

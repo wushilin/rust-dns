@@ -4163,7 +4163,8 @@
           "tsig_errors",
           "open_resolver_truncated",
           "open_resolver_any",
-          "open_resolver_rate_limited"
+          "open_resolver_rate_limited",
+          "forward_overflow"
         ],
         "properties": {
           "queries": {
@@ -4272,6 +4273,12 @@
             "type": "integer",
             "format": "int64",
             "description": "Open resolver mode: forwarded queries over\n`[forwarding].open_resolver_rate_per_second` for their client.",
+            "minimum": 0
+          },
+          "forward_overflow": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Queries not forwarded (UDP dropped, TCP SERVFAIL) because\n`[forwarding].max_inflight` forwarded queries were already waiting\nfor an upstream.",
             "minimum": 0
           }
         }
@@ -5287,6 +5294,7 @@
           "open_resolver",
           "open_resolver_max_udp_payload",
           "open_resolver_rate_per_second",
+          "max_inflight",
           "config",
           "cache"
         ],
@@ -5366,6 +5374,12 @@
             "format": "int32",
             "description": "Forwarded queries per second per client in open resolver mode; 0 = no\nextra limit (`[forwarding].open_resolver_rate_per_second`, config file only).",
             "example": 20,
+            "minimum": 0
+          },
+          "max_inflight": {
+            "type": "integer",
+            "description": "Most forwarded queries waiting for an upstream at one time; over it\nUDP queries are dropped and TCP queries get SERVFAIL\n(`[forwarding].max_inflight`, config file only).",
+            "example": 1024,
             "minimum": 0
           },
           "config": {
