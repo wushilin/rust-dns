@@ -64,48 +64,65 @@ struct SignedBy {
 }
 
 impl DnsServer {
-    /// Handle one request.
-    pub async fn handle(&self, req: &[u8], client: SocketAddr, proto: Proto) -> Reply {
-        // Dual-stack sockets report IPv4 clients as ::ffff:a.b.c.d; use the plain IPv4 form
-        // for rate limiting, ACLs, cookies, logs and the live feed.
-        let client = SocketAddr::new(client.ip().to_canonical(), client.port());
-        let started = Instant::now();
+    /// Admission: the first thing done for a request, before it is copied,
+    /// given a task or decoded. Counts the query and asks the per-client rate
+    /// limiter. `None`: admitted, go on with [`handle_admitted`]. `Some`:
+    /// the reply to send instead (`Reply::None` = drop). Costs one counter
+    /// lookup; a flood never reaches the parser.
+    ///
+    /// [`handle_admitted`]: DnsServer::handle_admitted
+    pub fn admit(&self, req: &[u8], client: SocketAddr, proto: Proto) -> Option<Reply> {
+        let ip = client.ip().to_canonical();
         self.stats.queries.fetch_add(1, Relaxed);
         match proto {
             Proto::Udp => self.stats.udp.fetch_add(1, Relaxed),
             Proto::Tcp => self.stats.tcp.fetch_add(1, Relaxed),
         };
-        let rt = self.runtime.load_full();
-
-        // Rate limit before parsing anything.
-        match self.limiter.check(client.ip()) {
-            Decision::Allow => {}
-            d => {
-                self.stats.rate_limited.fetch_add(1, Relaxed);
-                if matches!(d, Decision::RejectFirst) {
-                    tracing::warn!(client = %client.ip(), "rate limit exceeded; dropping queries for this window");
-                }
-                // UDP: drop silently (no amplification), except that every
-                // Nth limited query ("slip") gets an empty truncated answer so
-                // a real client whose address is being spoofed can retry over
-                // TCP. TCP: the peer is real, say REFUSED.
-                return match proto {
-                    Proto::Udp if d == Decision::Slip => {
-                        slip_reply(req).map(Reply::One).unwrap_or(Reply::None)
-                    }
-                    Proto::Udp => Reply::None,
-                    Proto::Tcp => req
-                        .get(..2)
-                        .map(|id| {
-                            Reply::One(header_only(
-                                u16::from_be_bytes([id[0], id[1]]),
-                                ResponseCode::Refused,
-                            ))
-                        })
-                        .unwrap_or(Reply::None),
-                };
-            }
+        let d = match self.limiter.check(ip) {
+            Decision::Allow => return None,
+            d => d,
+        };
+        self.stats.rate_limited.fetch_add(1, Relaxed);
+        if matches!(d, Decision::RejectFirst) {
+            tracing::warn!(client = %ip, "rate limit exceeded; dropping queries for this window");
         }
+        // UDP: drop silently (no amplification), except that every Nth
+        // limited query ("slip") gets an empty truncated answer so a real
+        // client whose address is being spoofed can retry over TCP. The slip
+        // reply echoes header and question bytes; nothing is decoded.
+        // TCP: the peer is real, say REFUSED.
+        Some(match proto {
+            Proto::Udp if d == Decision::Slip => {
+                slip_reply(req).map(Reply::One).unwrap_or(Reply::None)
+            }
+            Proto::Udp => Reply::None,
+            Proto::Tcp => req
+                .get(..2)
+                .map(|id| {
+                    Reply::One(header_only(
+                        u16::from_be_bytes([id[0], id[1]]),
+                        ResponseCode::Refused,
+                    ))
+                })
+                .unwrap_or(Reply::None),
+        })
+    }
+
+    /// Handle one request: admission, then the answer.
+    pub async fn handle(&self, req: &[u8], client: SocketAddr, proto: Proto) -> Reply {
+        match self.admit(req, client, proto) {
+            Some(reply) => reply,
+            None => self.handle_admitted(req, client, proto).await,
+        }
+    }
+
+    /// Handle a request that [`admit`](DnsServer::admit) let through.
+    pub async fn handle_admitted(&self, req: &[u8], client: SocketAddr, proto: Proto) -> Reply {
+        // Dual-stack sockets report IPv4 clients as ::ffff:a.b.c.d; use the plain IPv4 form
+        // for ACLs, cookies, logs and the live feed.
+        let client = SocketAddr::new(client.ip().to_canonical(), client.port());
+        let started = Instant::now();
+        let rt = self.runtime.load_full();
 
         if req.len() < 12 {
             self.stats.errors.fetch_add(1, Relaxed);
@@ -894,5 +911,43 @@ mod tests {
         let out = summarize(&many, &q);
         assert_eq!(out.len(), RESULT_MAX_ITEMS + 1);
         assert_eq!(out.last().unwrap(), "… 4 more");
+    }
+
+    #[test]
+    fn over_limit_packets_are_refused_at_admission_without_decoding() {
+        use crate::ratelimit::RateLimiter;
+        let cfg = crate::config::Config::default();
+        let server = DnsServer::new(
+            std::sync::Arc::new(crate::cache::Cache::new(crate::cache::Catalog::empty())),
+            std::sync::Arc::new(crate::events::Bus::new(8, 8)),
+            std::sync::Arc::new(RateLimiter::new(3, std::time::Duration::from_secs(60), 100)),
+            &cfg,
+        );
+        let peer: SocketAddr = "192.0.2.9:5000".parse().unwrap();
+        // Garbage that no parser accepts: admission never looks inside.
+        let junk = [0xffu8; 40];
+        for _ in 0..3 {
+            assert!(
+                server.admit(&junk, peer, Proto::Udp).is_none(),
+                "under the limit"
+            );
+        }
+        for _ in 0..50 {
+            assert!(
+                matches!(server.admit(&junk, peer, Proto::Udp), Some(Reply::None)),
+                "over the limit: dropped at admission"
+            );
+        }
+        assert_eq!(server.stats.rate_limited.load(Relaxed), 50);
+        assert_eq!(server.stats.errors.load(Relaxed), 0, "nothing was decoded");
+        // TCP peers are real: REFUSED with the query id echoed.
+        match server.admit(&[0x12, 0x34, 0, 0], peer, Proto::Tcp) {
+            Some(Reply::One(m)) => assert_eq!(&m[..2], &[0x12, 0x34]),
+            _ => panic!("expected REFUSED"),
+        }
+        // Another client is unaffected.
+        assert!(server
+            .admit(&junk, "192.0.2.10:5000".parse().unwrap(), Proto::Udp)
+            .is_none());
     }
 }

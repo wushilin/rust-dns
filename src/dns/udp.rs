@@ -13,11 +13,19 @@ pub async fn run(server: Arc<DnsServer>, sock: Arc<UdpSocket>) {
                 continue;
             }
         };
+        // Admission first: an over-limit packet is dropped (or gets the
+        // slip reply) right here, without a copy, a task or a decode.
+        if let Some(reply) = server.admit(&buf[..n], peer, Proto::Udp) {
+            if let Reply::One(m) = reply {
+                let _ = sock.send_to(&m, peer).await;
+            }
+            continue;
+        }
         let req = buf[..n].to_vec();
         let server = server.clone();
         let sock = sock.clone();
         tokio::spawn(async move {
-            let resp = match server.handle(&req, peer, Proto::Udp).await {
+            let resp = match server.handle_admitted(&req, peer, Proto::Udp).await {
                 Reply::None => return,
                 Reply::One(m) => m,
                 Reply::Many(mut ms) => ms.remove(0),

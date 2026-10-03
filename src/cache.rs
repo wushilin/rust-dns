@@ -195,12 +195,18 @@ impl Catalog {
 
 pub struct Cache {
     inner: ArcSwap<Catalog>,
+    /// Build tickets: taken before a build reads the database.
+    next_ticket: std::sync::atomic::AtomicU64,
+    /// Ticket of the catalog currently stored.
+    stored_ticket: std::sync::Mutex<u64>,
 }
 
 impl Cache {
     pub fn new(catalog: Catalog) -> Self {
         Cache {
             inner: ArcSwap::from_pointee(catalog),
+            next_ticket: std::sync::atomic::AtomicU64::new(1),
+            stored_ticket: std::sync::Mutex::new(0),
         }
     }
 
@@ -208,8 +214,31 @@ impl Cache {
         self.inner.load_full()
     }
 
-    pub fn store(&self, catalog: Catalog) {
+    /// Take a build ticket. Call it BEFORE reading the database for a
+    /// rebuild: a build with a later ticket has read at least as new a state
+    /// as any change committed before that ticket was taken.
+    pub fn ticket(&self) -> u64 {
+        self.next_ticket
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Store a catalog built under `ticket`, unless a catalog from a later
+    /// ticket is already in place (a slower, older build must never replace
+    /// a newer one). Returns whether it was stored.
+    pub fn store_built(&self, ticket: u64, catalog: Catalog) -> bool {
+        let mut stored = self.stored_ticket.lock().unwrap_or_else(|p| p.into_inner());
+        if ticket <= *stored {
+            return false;
+        }
+        *stored = ticket;
         self.inner.store(Arc::new(catalog));
+        true
+    }
+
+    #[cfg(test)]
+    pub fn store(&self, catalog: Catalog) {
+        let t = self.ticket();
+        self.store_built(t, catalog);
     }
 }
 
@@ -285,5 +314,21 @@ mod tests {
             Some("deleg.example.com.")
         );
         assert_eq!(z.delegation_for("www.example.com."), None);
+    }
+
+    #[test]
+    fn an_older_build_never_replaces_a_newer_one() {
+        let cache = Cache::new(Catalog::empty());
+        let slow = cache.ticket(); // started first, finishes last
+        let fast = cache.ticket();
+        let mut newer = Catalog::empty();
+        newer.built_at = "newer".into();
+        assert!(cache.store_built(fast, newer));
+        let mut older = Catalog::empty();
+        older.built_at = "older".into();
+        assert!(!cache.store_built(slow, older), "stale build refused");
+        assert_eq!(cache.load().built_at, "newer");
+        cache.store(Catalog::empty());
+        assert_ne!(cache.load().built_at, "newer", "a later build still wins");
     }
 }

@@ -332,7 +332,7 @@ impl Storage {
             .with_context(|| format!("opening database {}", path.display()))?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = NORMAL;
+             PRAGMA synchronous = FULL;
              PRAGMA foreign_keys = ON;
              PRAGMA busy_timeout = 5000;",
         )?;
@@ -402,9 +402,11 @@ impl Storage {
     /// consistent state (replication snapshots and checksums).
     pub fn read_tx<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-        conn.execute_batch("BEGIN DEFERRED")?;
-        let out = f(&conn);
-        let _ = conn.execute_batch("COMMIT");
+        // A `Transaction` rolls back when dropped, also when `f` panics:
+        // the shared connection is never left inside a transaction.
+        let tx = conn.unchecked_transaction()?;
+        let out = f(&tx);
+        drop(tx);
         out
     }
 
@@ -441,8 +443,16 @@ impl Storage {
         self.with_conn(replication_state)
     }
 
+    /// Tests only: run raw SQL on the connection (set up or corrupt state).
+    #[cfg(test)]
+    pub fn exec_raw(&self, sql: &str) -> Result<()> {
+        self.with_conn(|c| Ok(c.execute_batch(sql)?))
+    }
+
     fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-        let conn = self.conn.lock().unwrap();
+        // Same poison policy as `write`: a panic in one closure must not
+        // make every later database call panic.
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         f(&conn)
     }
 
@@ -1073,6 +1083,35 @@ pub fn get_record(c: &Connection, id: i64) -> Result<Option<Record>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_panic_in_a_read_leaves_the_connection_usable() {
+        let s = std::sync::Arc::new(Storage::open_memory().unwrap());
+        for _ in 0..2 {
+            let s2 = s.clone();
+            let r = std::thread::spawn(move || {
+                let _ = s2.read_tx(|_c| -> Result<()> { panic!("boom inside a read") });
+            })
+            .join();
+            assert!(r.is_err());
+        }
+        // Not left inside a transaction, and the mutex poison is tolerated:
+        // reads and write transactions still work.
+        s.ping().unwrap();
+        assert!(s.list_zones().unwrap().is_empty());
+        s.read_tx(|c| Ok(c.query_row("SELECT 1", [], |r| r.get::<_, i64>(0))?))
+            .unwrap();
+        let a = crate::mutation::accounts::Accounts::new(s.clone());
+        a.run(
+            &crate::model::Actor {
+                name: "t".into(),
+                ip: "t".into(),
+            },
+            "probe",
+            |_t| Ok(()),
+        )
+        .unwrap();
+    }
 
     #[test]
     fn ping_and_check_ok() {

@@ -776,16 +776,16 @@ pub struct Mutator {
     signer: Arc<crate::dnssec::Signer>,
 }
 
-/// Read zones, records and keys and build (and sign) the catalog.
-fn build_catalog(storage: &Storage, signer: &crate::dnssec::Signer) -> Result<Catalog> {
+/// Read zones, records and keys, build (and sign) the catalog and store it.
+/// The ticket is taken before the read, so a slower build that read an
+/// older state can never replace a newer catalog, whoever started it (a
+/// commit, the DNSSEC re-signer, a retry, a promotion).
+fn rebuild_catalog(storage: &Storage, signer: &crate::dnssec::Signer, cache: &Cache) -> Result<()> {
+    let ticket = cache.ticket();
     let (zones, records, keys) = storage.catalog_inputs()?;
-    Ok(Catalog::build_signed(
-        zones,
-        records,
-        &keys,
-        signer,
-        chrono::Utc::now(),
-    ))
+    let catalog = Catalog::build_signed(zones, records, &keys, signer, chrono::Utc::now());
+    cache.store_built(ticket, catalog);
+    Ok(())
 }
 
 /// What `PUT /zones/{zone}/dnssec` did.
@@ -1079,9 +1079,7 @@ impl Mutator {
 
     /// Rebuild the catalog from storage (used at startup).
     pub fn rebuild(&self) -> Result<()> {
-        let catalog = build_catalog(&self.storage, &self.signer)?;
-        self.cache.store(catalog);
-        Ok(())
+        rebuild_catalog(&self.storage, &self.signer, &self.cache)
     }
 
     /// Run one operation as one SQLite transaction.
@@ -1147,45 +1145,31 @@ impl Mutator {
     /// Rebuild the in-memory catalog after a commit. A failure is logged and
     /// retried in the background; it never un-commits the change.
     async fn refresh_catalog(&self) {
-        let storage = self.storage.clone();
-        let signer = self.signer.clone();
-        let build = || {
-            let storage = storage.clone();
-            let signer = signer.clone();
-            tokio::task::spawn_blocking(move || -> Result<Catalog> {
-                build_catalog(&storage, &signer)
-            })
+        let build =
+            |storage: Arc<Storage>, signer: Arc<crate::dnssec::Signer>, cache: Arc<Cache>| {
+                tokio::task::spawn_blocking(move || rebuild_catalog(&storage, &signer, &cache))
+            };
+        let (storage, signer, cache) = (
+            self.storage.clone(),
+            self.signer.clone(),
+            self.cache.clone(),
+        );
+        let err = match build(storage.clone(), signer.clone(), cache.clone()).await {
+            Ok(Ok(())) => return,
+            Ok(Err(e)) => e.to_string(),
+            Err(e) => e.to_string(),
         };
-        match build().await {
-            Ok(Ok(c)) => self.cache.store(c),
-            other => {
-                let err = match other {
-                    Ok(Err(e)) => e.to_string(),
-                    Err(e) => e.to_string(),
-                    _ => unreachable!(),
-                };
-                tracing::error!(error = %err, "catalog rebuild failed after commit; DNS answers are stale until it succeeds");
-                let cache = self.cache.clone();
-                tokio::spawn(async move {
-                    for attempt in 1..=10u64 {
-                        tokio::time::sleep(std::time::Duration::from_secs(attempt)).await;
-                        let s = storage.clone();
-                        let sg = signer.clone();
-                        if let Ok(Ok(c)) =
-                            tokio::task::spawn_blocking(move || -> Result<Catalog> {
-                                build_catalog(&s, &sg)
-                            })
-                            .await
-                        {
-                            cache.store(c);
-                            tracing::info!(attempt, "catalog rebuilt after earlier failure");
-                            return;
-                        }
-                    }
-                    tracing::error!("catalog rebuild still failing; restart the server");
-                });
+        tracing::error!(error = %err, "catalog rebuild failed after commit; DNS answers are stale until it succeeds");
+        tokio::spawn(async move {
+            for attempt in 1..=10u64 {
+                tokio::time::sleep(std::time::Duration::from_secs(attempt)).await;
+                if let Ok(Ok(())) = build(storage.clone(), signer.clone(), cache.clone()).await {
+                    tracing::info!(attempt, "catalog rebuilt after earlier failure");
+                    return;
+                }
             }
-        }
+            tracing::error!("catalog rebuild still failing; restart the server");
+        });
     }
 
     // ---- zones ---------------------------------------------------------

@@ -397,7 +397,7 @@ mod tests {
     use crate::storage::Storage;
 
     fn exec(s: &Storage, sql: &str) {
-        s.read_tx(|c| Ok(c.execute_batch(sql)?)).unwrap();
+        s.exec_raw(sql).unwrap();
     }
 
     #[test]
