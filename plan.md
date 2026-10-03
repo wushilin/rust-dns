@@ -87,10 +87,21 @@ OpenAPI snapshot + validator, conformance (123), smoke-release, cargo-audit.
 
 ## Also noted during deployment (small)
 
-- [ ] F1. `--check` reports a database as "fresh" when its data is still in
+- [x] F1. `--check` reports a database as "fresh" when its data is still in
   the WAL (seen on baba2). Read through a normal connection.
-- [ ] F2. Replica tracking flags `conflict` after two quick restarts of one
+- [x] F2. Replica tracking flags `conflict` after two quick restarts of one
   standby. Flag only when an earlier session id comes back.
+
+- [x] G1. (found by the gate, 2026-10-03) `cargo audit` reports a second
+  notice besides `paste`: `yoke-derive 0.8.3` was yanked. Lockfile bump to
+  0.8.4 (`cargo update -p yoke-derive`; build-time derive crate under idna).
+- [ ] G2. (found by the gate) `tests/follow.rs`
+  `primary_standby_failover_and_rejoin` failed once with a transport error
+  from the test's HTTP client right after a server restart (`POST /zones:
+  ... Error encountered in a header: Invalid argument (os error 22)`), and
+  passed when rerun alone. Looks like a test-client race on macOS, not a
+  server bug; not investigated further. Make the test helper retry transport
+  errors, or find the cause.
 
 ## Rollout (after everything above passes)
 
@@ -116,3 +127,23 @@ OpenAPI snapshot + validator, conformance (123), smoke-release, cargo-audit.
   `handle_admitted`. Test
   `over_limit_packets_are_refused_at_admission_without_decoding`.
   Gate after phase A + C2: clippy clean, 215 tests pass.
+- 2026-10-03: F1 done. Cause: `--check` opened the database with
+  `SQLITE_OPEN_READ_ONLY` and turned every read error into "no data"
+  (`unwrap_or_default`), so a database whose content it could not read was
+  called fresh. Now a normal connection with `query_only = ON` and a busy
+  timeout (never creates the file), and an error is reported as an error.
+  Tests `check_sees_data_that_is_still_in_the_wal`,
+  `check_does_not_call_an_unreadable_database_fresh` (main.rs). Not
+  reproduced with baba2's exact conditions (file ownership there is
+  unknown to me); the test covers WAL-only data with the writer still open.
+- 2026-10-03: F2 done. The tracker counted "source switched twice within
+  the window" (two restarts = two switches). Now it keeps the sources seen
+  recently (session id; the address for a standby that sends none) and
+  flags a conflict only when one of them comes back (A, B, A). The stored
+  entry gained `earlier` and lost `switches` (old rows load; unknown fields
+  are ignored). Tests `two_quick_restarts_are_not_a_conflict`,
+  `two_processes_with_one_id_conflict_but_a_restart_does_not`.
+- 2026-10-03: gate after F1/F2: fmt, clippy, 171 unit tests, UI, OpenAPI,
+  validator, conformance 123, smoke pass. `tests/follow.rs` failed once
+  (G2) and passed on rerun. cargo-audit: `paste` plus a new `yoke-derive`
+  yanked notice, fixed (G1).

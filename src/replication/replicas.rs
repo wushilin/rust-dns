@@ -97,9 +97,11 @@ pub struct Entry {
     pub bootstrapping_since: Option<DateTime<Utc>>,
     /// Previous lag seen, to tell catching up from standing still.
     pub prev_lag: Option<i64>,
-    /// Recent (address, session) switches: two processes with one id.
+    /// Sources (session id, or the address of a standby that sends none)
+    /// this id was recently used from before the current one, with the time
+    /// each was last seen. A conflict is one of them coming back.
     #[serde(default)]
-    pub switches: Vec<DateTime<Utc>>,
+    pub earlier: Vec<(String, DateTime<Utc>)>,
     #[serde(default)]
     pub conflict_since: Option<DateTime<Utc>>,
     /// The standby reported "halted" with this reason (cleared when it
@@ -260,23 +262,39 @@ impl Tracker {
             user: s.user.to_string(),
             bootstrapping_since: None,
             prev_lag: None,
-            switches: Vec::new(),
+            earlier: Vec::new(),
             conflict_since: None,
             halted: None,
         });
         let window = Duration::seconds(cfg.offline_after_secs as i64);
         let mut new_conflict = false;
-        // Another process with the same id: the source switched while the
-        // previous one was still active. Two switches in the window (A, B,
-        // A) mean both are running; one switch is a restart or a move.
-        if (e.address.as_str(), e.session.as_str()) != (s.address, s.session)
-            && now - e.last_seen < window
-        {
-            e.switches.push(now);
-            e.switches.retain(|t| now - *t < window);
-            if e.switches.len() >= 2 && e.conflict_since.is_none_or(|c| now - c >= window) {
+        // Another process with the same id. A restart (or two quick ones)
+        // gives a new session each time and the old ones never return; two
+        // running processes alternate, so a session seen earlier comes
+        // back (A, B, A). Only that is a conflict.
+        let source = |address: &str, session: &str| {
+            if session.is_empty() {
+                format!("addr:{address}")
+            } else {
+                format!("session:{session}")
+            }
+        };
+        let (was, is) = (source(&e.address, &e.session), source(s.address, s.session));
+        e.earlier.retain(|(_, t)| now - *t < window);
+        if was != is {
+            let returned = e.earlier.iter().any(|(id, _)| *id == is);
+            e.earlier.retain(|(id, _)| *id != is && *id != was);
+            if now - e.last_seen < window {
+                e.earlier.push((was, e.last_seen));
+            }
+            // Bounded: a crash loop must not grow the entry.
+            let extra = e.earlier.len().saturating_sub(8);
+            e.earlier.drain(..extra);
+            if returned && e.conflict_since.is_none_or(|c| now - c >= window) {
                 e.conflict_since = Some(now);
                 new_conflict = true;
+            } else if returned {
+                e.conflict_since = e.conflict_since.or(Some(now));
             }
         }
         e.address = s.address.to_string();
@@ -459,10 +477,44 @@ mod tests {
         let (_, c1) = t.note(&seen("192.0.2.9", "x"), Report::Applied(1), 1, at(20), &c);
         let (_, c2) = t.note(&seen("192.0.2.2", "s2"), Report::Applied(1), 1, at(21), &c);
         assert!(c1 || c2);
+        assert!(!c1, "a new session alone is not a conflict");
+        assert!(c2, "the earlier session came back");
         assert!(st(&t, 1, at(22)).conflict);
         // The flag clears once the window passes without new switches.
         t.note(&seen("192.0.2.2", "s2"), Report::Applied(1), 1, at(90), &c);
         assert!(!st(&t, 1, at(90)).conflict);
+    }
+
+    /// F2: a standby restarted twice in a row has three sessions, none of
+    /// which returns: no conflict. (Seen on baba2 after two quick restarts.)
+    #[test]
+    fn two_quick_restarts_are_not_a_conflict() {
+        let t = Tracker::default();
+        let c = cfg();
+        t.note(&seen("192.0.2.2", "s1"), Report::Applied(1), 1, at(0), &c);
+        let (_, c1) = t.note(&seen("192.0.2.2", "s2"), Report::Applied(1), 1, at(3), &c);
+        let (_, c2) = t.note(&seen("192.0.2.2", "s3"), Report::Applied(1), 1, at(6), &c);
+        let (_, c3) = t.note(&seen("192.0.2.2", "s3"), Report::Applied(1), 1, at(7), &c);
+        assert!(!c1 && !c2 && !c3);
+        assert!(!st(&t, 1, at(8)).conflict);
+        // One session reached over two addresses (dual stack) is one process.
+        let (_, c4) = t.note(&seen("2001:db8::2", "s3"), Report::Applied(1), 1, at(9), &c);
+        let (_, c5) = t.note(&seen("192.0.2.2", "s3"), Report::Applied(1), 1, at(10), &c);
+        assert!(!c4 && !c5);
+        // A session that was replaced long ago (outside the window) and
+        // shows up again is not "at once".
+        let (_, c6) = t.note(&seen("192.0.2.2", "s1"), Report::Applied(1), 1, at(200), &c);
+        assert!(!c6);
+        // But s3 coming back now is: s1 and s3 both run.
+        let (_, c7) = t.note(&seen("192.0.2.2", "s3"), Report::Applied(1), 1, at(201), &c);
+        assert!(!c7, "s3 was last seen before the window");
+        let (_, c8) = t.note(&seen("192.0.2.2", "s1"), Report::Applied(1), 1, at(202), &c);
+        assert!(c8);
+        assert!(st(&t, 1, at(203)).conflict);
+        // Entries stored by the previous version (with `switches`) load.
+        let old = r#"{"instance":"dns2","applied_offset":1,"head_at_report":1,"last_seen":"2026-01-01T00:00:00Z","first_seen":"2026-01-01T00:00:00Z","last_caught_up":null,"address":"a","session":"s","version":"v","user":"u","bootstrapping_since":null,"prev_lag":0,"switches":["2026-01-01T00:00:00Z"],"conflict_since":null,"halted":null}"#;
+        let e: Entry = serde_json::from_str(old).unwrap();
+        assert!(e.earlier.is_empty());
     }
 
     #[test]

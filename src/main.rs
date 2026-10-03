@@ -361,6 +361,35 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A connection for `--check`: reads everything committed (also what is
+/// still in the WAL of a running server) and cannot change anything.
+fn open_for_check(path: &std::path::Path) -> anyhow::Result<rusqlite::Connection> {
+    use rusqlite::OpenFlags;
+    // No SQLITE_OPEN_CREATE: --check never creates a database.
+    let conn = rusqlite::Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.execute_batch("PRAGMA busy_timeout = 5000; PRAGMA query_only = ON;")?;
+    Ok(conn)
+}
+
+fn read_replication_state(
+    conn: &rusqlite::Connection,
+) -> anyhow::Result<std::collections::HashMap<String, String>> {
+    let has: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'replication_state')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has {
+        return Ok(Default::default());
+    }
+    let mut stmt = conn.prepare("SELECT key, value FROM replication_state")?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
 /// `--check`: what the database says about replication, if it can be read
 /// without changing it.
 fn replication_note(cfg: &config::Config) -> Option<String> {
@@ -368,17 +397,28 @@ fn replication_note(cfg: &config::Config) -> Option<String> {
     if !path.exists() {
         return None;
     }
-    let conn =
-        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .ok()?;
-    let mut stmt = conn
-        .prepare("SELECT key, value FROM replication_state")
-        .ok()?;
-    let st: std::collections::HashMap<String, String> = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-        .ok()?
-        .filter_map(|r| r.ok())
-        .collect();
+    // A normal (read-write capable) connection made read-only with
+    // `query_only`: a `SQLITE_OPEN_READ_ONLY` handle cannot always read
+    // what is still in the WAL (it may not be able to create or map the
+    // -shm file), and then a database full of data looked "fresh".
+    let conn = match open_for_check(path) {
+        Ok(c) => c,
+        Err(e) => {
+            return Some(format!(
+                "database {}: cannot be read ({e:#}); replication state unknown",
+                path.display()
+            ))
+        }
+    };
+    let st: std::collections::HashMap<String, String> = match read_replication_state(&conn) {
+        Ok(st) => st,
+        Err(e) => {
+            return Some(format!(
+                "database {}: replication state cannot be read ({e:#})",
+                path.display()
+            ))
+        }
+    };
     let mut out = format!(
         "database history id {}",
         st.get("history_id")
@@ -394,7 +434,16 @@ fn replication_note(cfg: &config::Config) -> Option<String> {
     if let Some(f) = &cfg.follow {
         let url = f.primary.trim().trim_end_matches('/');
         let same = st.get("following").map(|s| s.trim_end_matches('/')) == Some(url);
-        let data = replication::data::fresh_problems(&conn, &cfg.root.username).unwrap_or_default();
+        // An error is not "fresh": say so instead of guessing.
+        let data = match replication::data::fresh_problems(&conn, &cfg.root.username) {
+            Ok(d) => d,
+            Err(e) => {
+                out.push_str(&format!(
+                    "\nwarning: could not tell whether the database has data ({e:#})"
+                ));
+                return Some(out);
+            }
+        };
         if !same && !data.is_empty() {
             out.push_str(&format!(
                 "\nwarning: the database has data ({}) and is not a standby of {url}: following will be refused unless it is a copy of that primary's history. To discard the data on purpose (backed up first), run with the server stopped: rust-dns --prepare-standby --yes --config <this config>",
@@ -424,4 +473,65 @@ fn replication_note(cfg: &config::Config) -> Option<String> {
         _ => {}
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg_for(db: &std::path::Path) -> config::Config {
+        toml::from_str(&format!(
+            "[database]\npath = {:?}\n[root]\nusername = \"root\"\npassword = \"x\"\n[follow]\nprimary = \"https://primary.test\"\ninstance_id = \"s1\"\ntoken = \"rdns_x\"\n",
+            db.to_str().unwrap()
+        ))
+        .unwrap()
+    }
+
+    fn tmp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "rust-dns-check-{name}-{}-{}",
+            std::process::id(),
+            auth::random_token(4)
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// F1: data that is committed but still only in the WAL (a running
+    /// server holds the database open) must be seen by `--check`.
+    #[test]
+    fn check_sees_data_that_is_still_in_the_wal() {
+        let d = tmp("wal");
+        let db = d.join("rust-dns.db");
+        let s = storage::Storage::open(&db).unwrap();
+        s.exec_raw(
+            "PRAGMA wal_autocheckpoint = 0;
+             INSERT INTO zones (name, soa_mname, soa_rname, created_at, updated_at) VALUES ('a.test','n.','h.','t','t');",
+        )
+        .unwrap();
+        assert!(db.with_extension("db-wal").metadata().unwrap().len() > 0);
+        // The server (`s`) is still running: nothing is checkpointed.
+        let note = replication_note(&cfg_for(&db)).unwrap();
+        assert!(note.contains("1 zone"), "{note}");
+        assert!(!note.contains("is fresh"), "{note}");
+        // `--check` changed nothing and a really fresh database says so.
+        drop(s);
+        let fresh = d.join("fresh.db");
+        drop(storage::Storage::open(&fresh).unwrap());
+        let note = replication_note(&cfg_for(&fresh)).unwrap();
+        assert!(note.contains("is fresh"), "{note}");
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    /// F1: a database that cannot be read is never reported as fresh.
+    #[test]
+    fn check_does_not_call_an_unreadable_database_fresh() {
+        let d = tmp("bad");
+        let db = d.join("rust-dns.db");
+        std::fs::write(&db, b"this is not a sqlite database, not at all........").unwrap();
+        let note = replication_note(&cfg_for(&db)).unwrap();
+        assert!(!note.contains("is fresh"), "{note}");
+        assert!(note.contains("cannot be read"), "{note}");
+        std::fs::remove_dir_all(d).unwrap();
+    }
 }
