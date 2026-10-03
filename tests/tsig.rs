@@ -483,9 +483,32 @@ fn tsig_keys_transfers_and_notify() {
     // The BADTIME reply is signed with the key (verify the MAC directly).
     let s = tsig::find(&msgs[0]).unwrap().unwrap();
     tsig::verify(&msgs[0], &s, Some(&key), Chain::Response(&mac), now - 1000).unwrap();
-    // Inside the fudge: fine.
+    // Inside the fudge but older than this key's newest request: a replay
+    // (M3, RFC 8945 §5.2.3): BADTIME as well.
     let (req, _) = signed(&query_bytes(0x5656, ZONE, RecordType::SOA), &key, now - 200);
+    let resp = udp_exchange(dns, &req);
+    assert_eq!(tsig_of(&resp).error, tsig::BADTIME, "older than the newest");
+    // The same message twice: the second is refused; a different message
+    // signed in the same second passes (a secondary's SOA check + transfer).
+    let (req, _) = signed(&query_bytes(0x5858, ZONE, RecordType::SOA), &key, now);
     assert_eq!(rcode(&udp_exchange(dns, &req)), ResponseCode::NoError);
+    let resp = udp_exchange(dns, &req);
+    assert_eq!(tsig_of(&resp).error, tsig::BADTIME, "exact replay");
+    let (req, _) = signed(&query_bytes(0x5859, ZONE, RecordType::SOA), &key, now);
+    assert_eq!(rcode(&udp_exchange(dns, &req)), ResponseCode::NoError);
+    // Inside the fudge and new for its key: fine (another key, 200 s behind).
+    let scoped_key = Key {
+        name: "other-zone.".into(),
+        algorithm: Algorithm::HmacSha384,
+        secret: imported.to_vec(),
+    };
+    let (req, _) = signed(
+        &query_bytes(0x5a5a, "other.test", RecordType::SOA),
+        &scoped_key,
+        now - 200,
+    );
+    let resp = udp_exchange(dns, &req);
+    assert_eq!(tsig_of(&resp).error, 0, "accepted inside the fudge");
 
     // ---- a tampered request is never treated as unsigned ------------------------
     let (mut req, _) = signed(&query_bytes(0x5757, ZONE, RecordType::AXFR), &key, now);
@@ -640,6 +663,223 @@ fn tsig_keys_transfers_and_notify() {
         "secret in the log"
     );
 
+    drop(srv);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A BIND tool: `dig` is required with `REQUIRE_BIND_TOOLS=1`; `named` is
+/// optional (CI installs only the utilities).
+fn find_tool(name: &str, required: bool) -> Option<PathBuf> {
+    let mut dirs: Vec<PathBuf> = [
+        "/opt/homebrew/opt/bind/bin",
+        "/opt/homebrew/opt/bind/sbin",
+        "/usr/local/opt/bind/bin",
+        "/usr/local/opt/bind/sbin",
+        "/usr/bin",
+        "/usr/sbin",
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .collect();
+    if let Some(p) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&p));
+    }
+    let t = dirs.into_iter().map(|d| d.join(name)).find(|p| p.is_file());
+    if t.is_none() {
+        assert!(
+            !required || std::env::var("REQUIRE_BIND_TOOLS").is_err(),
+            "{name} not found"
+        );
+        eprintln!("tsig: {name} not found; skipping that interop check");
+    }
+    t
+}
+
+fn dig(dig: &Path, args: &[&str]) -> String {
+    let o = Command::new(dig).args(args).output().unwrap();
+    String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr)
+}
+
+/// M3 interop: TSIG replay protection does not get in BIND's way. `dig -y`
+/// sends several signed queries in quick succession (each its own MAC,
+/// often the same second): all answered. With `named` installed, a BIND
+/// secondary that uses the key follows the zone across several quick
+/// changes (each NOTIFY -> signed SOA check + signed transfer, usually
+/// within one second): it reaches every serial and the server logs no
+/// replay. A replayed `dig` message is refused (BADTIME).
+#[test]
+fn bind_interop_with_tsig_replay_protection() {
+    let Some(dig_bin) = find_tool("dig", true) else {
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!(
+        "rust-dns-tsig-bind-{}-{}",
+        std::process::id(),
+        rand_id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let named_bin = find_tool("named", false);
+    let (dns, web_port, named_port) = (free_port(), free_port(), free_port());
+    write_config(&dir, dns, web_port, named_port, false);
+    let srv = Server::start(dir.clone(), web_port);
+    let web = format!("http://127.0.0.1:{web_port}");
+    let root = login(&web, "root", "rootpass123");
+    let (s, k) = call(
+        &root,
+        "POST",
+        &format!("{web}/api/tsig/keys"),
+        Some(serde_json::json!({ "name": "hn-secondary." })),
+    );
+    assert_eq!(s, 201, "{k}");
+    let secret = k["secret"].as_str().unwrap().to_string();
+    let (s, v) = call(
+        &root,
+        "POST",
+        &format!("{web}/api/zones"),
+        Some(serde_json::json!({ "name": "bind.test" })),
+    );
+    assert_eq!(s, 201, "{v}");
+    let add = |name: &str, t: &str, value: &str| {
+        let (s, v) = call(
+            &root,
+            "POST",
+            &format!("{web}/api/zones/bind.test/records"),
+            Some(serde_json::json!({ "name": name, "type": t, "value": value })),
+        );
+        assert_eq!(s, 201, "{v}");
+    };
+    add("@", "NS", "ns1.bind.test.");
+    add("ns1", "A", "192.0.2.53");
+    let y = format!("hmac-sha256:hn-secondary.:{secret}");
+    let port = dns.to_string();
+    for i in 0..5 {
+        let out = dig(
+            &dig_bin,
+            &[
+                "@127.0.0.1",
+                "-p",
+                &port,
+                "-y",
+                &y,
+                "+tries=1",
+                "+time=3",
+                "bind.test",
+                "SOA",
+            ],
+        );
+        assert!(
+            out.contains("status: NOERROR") && !out.contains("tsig verify"),
+            "dig -y #{i}: {out}"
+        );
+    }
+    // The same signed message twice: the second is a replay.
+    let key = Key {
+        name: "hn-secondary.".into(),
+        algorithm: Algorithm::HmacSha256,
+        secret: b64(&secret),
+    };
+    let (req, _) = signed(
+        &query_bytes(0x0b0b, "bind.test", RecordType::SOA),
+        &key,
+        tsig::now(),
+    );
+    assert_eq!(rcode(&udp_exchange(dns, &req)), ResponseCode::NoError);
+    assert_eq!(tsig_of(&udp_exchange(dns, &req)).error, tsig::BADTIME);
+
+    if let Some(named) = named_bin {
+        let wd = dir.join("named");
+        std::fs::create_dir_all(&wd).unwrap();
+        let conf = format!(
+            r#"key "hn-secondary." {{ algorithm hmac-sha256; secret "{secret}"; }};
+options {{
+  directory "{wd}";
+  pid-file "{wd}/named.pid";
+  listen-on port {named_port} {{ 127.0.0.1; }};
+  listen-on-v6 {{ none; }};
+  recursion no;
+  notify no;
+  allow-query {{ 127.0.0.1; }};
+}};
+zone "bind.test" {{
+  type secondary;
+  primaries port {dns} {{ 127.0.0.1 key "hn-secondary."; }};
+  allow-notify {{ 127.0.0.1; }};
+  file "bind.test.db";
+}};
+"#,
+            wd = wd.display(),
+        );
+        std::fs::write(wd.join("named.conf"), conf).unwrap();
+        let mut child = Command::new(&named)
+            .args(["-g", "-c"])
+            .arg(wd.join("named.conf"))
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(wd.join("named.log")).unwrap())
+            .spawn()
+            .unwrap();
+        let np = named_port.to_string();
+        let serial_at = |p: &str| -> Option<u32> {
+            let out = dig(
+                &dig_bin,
+                &[
+                    "@127.0.0.1",
+                    "-p",
+                    p,
+                    "+short",
+                    "+tries=1",
+                    "+time=2",
+                    "bind.test",
+                    "SOA",
+                ],
+            );
+            out.split_whitespace().nth(2).and_then(|s| s.parse().ok())
+        };
+        let wait_same = |what: &str| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let (a, b) = (serial_at(&port), serial_at(&np));
+                if a.is_some() && a == b {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "{what}: named at {b:?}, rust-dns at {a:?}\n{}",
+                    std::fs::read_to_string(wd.join("named.log")).unwrap_or_default()
+                );
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        };
+        wait_same("initial transfer");
+        for i in 0..4 {
+            add(&format!("h{i}"), "A", &format!("192.0.2.{}", 10 + i));
+            wait_same(&format!("change {i}"));
+        }
+        let out = dig(
+            &dig_bin,
+            &["@127.0.0.1", "-p", &np, "+short", "h3.bind.test", "A"],
+        );
+        assert_eq!(out.trim(), "192.0.2.13");
+        let _ = child.kill();
+        let _ = child.wait();
+        let log = std::fs::read_to_string(wd.join("named.log")).unwrap_or_default();
+        assert!(
+            log.matches("Transfer status: success").count() >= 5,
+            "{log}"
+        );
+        for bad in [
+            "BADTIME",
+            "BADSIG",
+            "tsig verify failure",
+            "failed while receiving",
+        ] {
+            assert!(!log.contains(bad), "{bad}: {log}");
+        }
+    }
+    assert!(
+        srv.log().matches("replayed").count() == 1,
+        "only the deliberate replay was refused: {}",
+        srv.log()
+    );
     drop(srv);
     let _ = std::fs::remove_dir_all(&dir);
 }

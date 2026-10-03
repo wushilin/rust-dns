@@ -290,6 +290,8 @@ pub struct DnsServer {
     pub fwd_cache: fwdcache::ForwardCache,
     /// TSIG keys (from the database), swapped whole after every change.
     pub tsig_keys: ArcSwap<keyring::Keyring>,
+    /// M3: the newest Time Signed per key (replay protection, this server only).
+    pub tsig_replay: tsig::ReplayGuard,
     /// Forwarding settings set from the console/API; override the config file.
     forwarding_override: std::sync::RwLock<Option<ForwardingSettings>>,
     /// Resolver settings set from the console/API (defaults when unset).
@@ -342,6 +344,7 @@ impl DnsServer {
             cookies: cookies::CookieJar::new(),
             fwd_cache: fwdcache::ForwardCache::new(cfg.forwarding.cache_entries),
             tsig_keys: ArcSwap::from_pointee(keyring::Keyring::default()),
+            tsig_replay: tsig::ReplayGuard::default(),
             forwarding_override: std::sync::RwLock::new(None),
             resolver: std::sync::RwLock::new(ResolverSettings::default()),
             upstream_health: forward::Health::default(),

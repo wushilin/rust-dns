@@ -207,13 +207,27 @@ impl DnsServer {
         let ring = self.tsig_keys.load_full();
         let entry = ring.get(&signed.tsig.key_name).cloned();
         let now = tsig::now();
-        if let Err(e) = tsig::verify(
+        let verified = tsig::verify(
             req,
             &signed,
             entry.as_ref().map(|e| &e.key),
             Chain::Request,
             now,
-        ) {
+        )
+        .and_then(|()| {
+            // M3 (RFC 8945 §5.2.3): not older than the newest request of
+            // this key, and not the same message again.
+            if self
+                .tsig_replay
+                .accept(&signed.tsig.key_name, signed.tsig.time_signed, &signed.tsig.mac)
+            {
+                Ok(())
+            } else {
+                tracing::warn!(client = %client.ip(), key = %signed.tsig.key_name, time_signed = signed.tsig.time_signed, "TSIG request replayed or older than the newest of this key");
+                Err(VerifyError::BadTime)
+            }
+        });
+        if let Err(e) = verified {
             self.stats.tsig_errors.fetch_add(1, Relaxed);
             tracing::warn!(client = %client.ip(), key = %signed.tsig.key_name, algorithm = %signed.tsig.algorithm_name, error = e.as_str(), "rejected TSIG-signed request");
             if let VerifyError::FormErr(_) = e {

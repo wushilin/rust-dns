@@ -613,6 +613,48 @@ pub fn verify(
     Ok(())
 }
 
+/// Replay protection for signed requests (RFC 8945 §5.2.3), in memory,
+/// per server: per key the Time Signed of the newest verified request and
+/// the MACs seen at that second. A request is refused (BADTIME) when its
+/// Time Signed is older than that, or equal with a MAC already seen (the
+/// same message again). Several different requests signed in the same
+/// second all pass (a secondary's SOA query followed by its transfer, an
+/// `nsupdate` batch). Anything outside the fudge window was already
+/// refused by the time check, so this only has to remember one second
+/// per key.
+#[derive(Default)]
+pub struct ReplayGuard {
+    last: std::sync::Mutex<std::collections::HashMap<String, (u64, Vec<Vec<u8>>)>>,
+}
+
+/// MACs remembered for one key and second (more requests than this in one
+/// second: the oldest are forgotten).
+const REPLAY_MACS: usize = 1024;
+
+impl ReplayGuard {
+    /// Accept a request that verified with `key` (a fresh one is recorded),
+    /// or `false` for a replay.
+    pub fn accept(&self, key: &str, time_signed: u64, mac: &[u8]) -> bool {
+        let mut last = self.last.lock().unwrap_or_else(|p| p.into_inner());
+        let e = last
+            .entry(key.to_ascii_lowercase())
+            .or_insert_with(|| (0, Vec::new()));
+        if time_signed < e.0 {
+            return false;
+        }
+        if time_signed > e.0 {
+            *e = (time_signed, Vec::new());
+        } else if e.1.iter().any(|m| m == mac) {
+            return false;
+        }
+        if e.1.len() >= REPLAY_MACS {
+            e.1.remove(0);
+        }
+        e.1.push(mac.to_vec());
+        true
+    }
+}
+
 /// Seconds since the Unix epoch.
 pub fn now() -> u64 {
     std::time::SystemTime::now()
@@ -691,6 +733,34 @@ impl ResponseVerifier {
 
 #[cfg(test)]
 mod tests {
+
+    /// M3: per key, older than the newest refused; the same MAC in the same
+    /// second refused; other messages in the same second and other keys fine.
+    #[test]
+    fn replay_guard_refuses_old_and_repeated_requests() {
+        let g = ReplayGuard::default();
+        assert!(g.accept("k.", 100, b"a"));
+        assert!(
+            !g.accept("K.", 100, b"a"),
+            "same message (key name case-insensitive)"
+        );
+        assert!(g.accept("k.", 100, b"b"), "another message, same second");
+        assert!(!g.accept("k.", 99, b"c"), "older");
+        assert!(g.accept("other.", 50, b"a"), "keys are separate");
+        assert!(
+            g.accept("k.", 101, b"a"),
+            "newer: the old MAC no longer matters"
+        );
+        assert!(!g.accept("k.", 100, b"z"));
+        for i in 0..2000u32 {
+            assert!(g.accept("k.", 102, &i.to_be_bytes()));
+        }
+        assert!(
+            g.accept("k.", 102, &0u32.to_be_bytes()),
+            "forgotten beyond the cap"
+        );
+        assert!(!g.accept("k.", 102, &1999u32.to_be_bytes()));
+    }
     use super::*;
 
     fn h(s: &str) -> Vec<u8> {

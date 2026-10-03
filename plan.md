@@ -584,9 +584,37 @@ contract tests, typed changes that replicate, tests, AGENT.md rules):
   policies, migration test, `follow::a_zone_record_policy_replicates`
   (snapshot, change, removal; previous binary halts `diverged` at the
   first policy).
-- [ ] M3. TSIG replay protection (RFC 8945 §5.2.3): remember the last Time
+- [x] M3. TSIG replay protection (RFC 8945 §5.2.3): remember the last Time
   Signed per key, refuse an older-or-equal one within the fudge window
   (BADTIME), in memory per server. Interop with BIND still passes.
+  Done. `dns::tsig::ReplayGuard` (in `DnsServer`, per server, memory
+  only): per key (case-insensitive) the newest verified Time Signed and
+  the MACs seen in that second. After a request verifies (key, MAC, time
+  window, truncation), it is refused with a signed BADTIME when its Time
+  Signed is older than the key's newest, or equal with a MAC already seen
+  (the same message again). "Equal" is refined on purpose: refusing every
+  request signed in the same second as the previous one would break BIND
+  (a secondary sends its SOA check and the transfer within one second, as
+  do `nsupdate` batches and `dig` loops); different messages in the same
+  second have different MACs and pass, a replay of any of them does not.
+  Outside the fudge window the existing time check already refuses. At
+  most 1024 MACs per key and second are kept. Not replicated: a message
+  replayed to the other server of a pair is checked there separately
+  (its own window), as the owner specified. Logged as "TSIG request
+  replayed or older than the newest of this key".
+  Tests: unit `dns::tsig::tests::replay_guard_refuses_old_and_repeated_
+  requests`; `tests/tsig.rs` `tsig_keys_transfers_and_notify` (its old
+  step "200 s behind, inside the fudge: fine" now expects BADTIME for the
+  same key — it is older than that key's newest request; added: exact
+  replay refused, a different message in the same second accepted, a
+  request 200 s behind on another key accepted) and new
+  `bind_interop_with_tsig_replay_protection`: 5 quick `dig -y` queries
+  all answered, a replayed message refused, and (when `named` is
+  installed; here BIND 9.20.29) a BIND secondary with the key follows the
+  zone across 4 quick changes (NOTIFY -> signed SOA + transfer each), all
+  transfers successful, no TSIG error in its log, and the server refused
+  only the deliberate replay. Conformance 127/127; equivalence d32d67f vs
+  this build 0 differences (248 TSIG MACs verified).
 - [ ] M4. Automated console flows: a headless browser test (Playwright or
   similar via node, or Chrome headless with a small driver) for the main
   flows: sign in, create zone, add/edit/delete record, standby read-only
@@ -1268,3 +1296,5 @@ what the registrar's DS must match on the live zone; plan it separately.
 - 2026-10-04 (phase M): M1 done (token scopes; see M1 and Rollout).
 - 2026-10-04 (phase M): M2 done (zone record expiry policy, refuse not
   clamp; see M2 and Rollout).
+- 2026-10-04 (phase M): M3 done (TSIG replay protection; BIND secondary
+  interop test).
