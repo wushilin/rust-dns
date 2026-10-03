@@ -2176,3 +2176,179 @@ fn a_signed_zone_survives_a_mixed_version_pair_and_the_upgrade() {
         let _ = std::fs::remove_dir_all(&root_dir);
     }
 }
+
+/// `delv` each (name, type, expected first-line prefix) against `port`,
+/// trusting `dnskey` (skipped without BIND tools).
+fn delv_all(dir: &Path, dnskey: &str, zone: &str, port: u16, cases: &[(&str, &str, &str)]) {
+    let Some(delv) = bind_tool("delv") else {
+        return;
+    };
+    let f: Vec<&str> = dnskey.split_whitespace().collect();
+    let anchor = dir.join("delv-anchor.conf");
+    std::fs::write(
+        &anchor,
+        format!(
+            "trust-anchors {{ \"{}\" static-key {} {} {} \"{}\"; }};\n",
+            f[0], f[4], f[5], f[6], f[7]
+        ),
+    )
+    .unwrap();
+    for (name, t, want) in cases {
+        let out = Command::new(&delv)
+            .args([
+                "@127.0.0.1",
+                "-p",
+                &port.to_string(),
+                "-a",
+                anchor.to_str().unwrap(),
+                &format!("+root={zone}"),
+                name,
+                t,
+            ])
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).to_string()
+            + &String::from_utf8_lossy(&out.stderr);
+        assert!(
+            text.lines().any(|l| l.starts_with(want)),
+            "delv @{port} {name} {t}: {text}"
+        );
+    }
+}
+
+/// H3: a record stops being served at its expiry time on every node, by
+/// the node's own clock, without any commit: here on a standby cut off
+/// from its primary (which therefore never sends `record_expired`). The
+/// standby writes nothing; its signed zone stays valid (NSEC chain and
+/// signatures follow the served data).
+#[test]
+fn an_expired_record_stops_being_served_on_a_cut_off_standby() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root_dir = std::env::temp_dir().join(format!(
+        "rust-dns-follow-expiry-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root_dir).unwrap();
+    let mut p = Node::new(&root_dir, "primary", "rootpass-primary");
+    let mut s = Node::new(&root_dir, "standby", "rootpass-standby");
+    let transfer = "[transfer]\nallow = [\"127.0.0.0/8\"]\n";
+    p.configure(transfer);
+    p.start();
+    let pr = p.root();
+    let token = ok(
+        call(
+            &Auth::Session(&pr),
+            "POST",
+            &p.api("/tokens"),
+            Some(json!({ "name": "repl" })),
+        ),
+        "token",
+    )["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    ok(
+        call(
+            &Auth::Session(&pr),
+            "POST",
+            &p.api("/zones"),
+            Some(json!({ "name": "exp.test" })),
+        ),
+        "zone",
+    );
+    for (n, t, v) in [
+        ("@", "NS", "ns1.exp.test."),
+        ("ns1", "A", "192.0.2.53"),
+        ("www", "A", "192.0.2.1"),
+    ] {
+        ok(
+            call(
+                &Auth::Session(&pr),
+                "POST",
+                &p.api("/zones/exp.test/records"),
+                Some(json!({ "name": n, "type": t, "value": v })),
+            ),
+            "record",
+        );
+    }
+    let on = ok(
+        call(
+            &Auth::Session(&pr),
+            "PUT",
+            &p.api("/zones/exp.test/dnssec"),
+            Some(json!({ "enabled": true })),
+        ),
+        "enable DNSSEC",
+    );
+    let dnskey = on["key"]["dnskey"].as_str().unwrap().to_string();
+    s.configure(&format!("{transfer}{}", follow_cfg(&p, "dns2", &token)));
+    s.start();
+    let sr = s.root();
+    wait_for("standby has the zone", 15, || {
+        record_names(&s, &sr, "exp.test").len() == 3
+    });
+    // Two short-lived records: one alone at its name (the name goes), one
+    // beside a permanent record (only that RRset goes).
+    for (n, t, v) in [("tmp", "A", "192.0.2.9"), ("www", "TXT", "short-lived")] {
+        ok(
+            call(
+                &Auth::Session(&pr),
+                "POST",
+                &p.api("/zones/exp.test/records"),
+                Some(json!({ "name": n, "type": t, "value": v, "expires_in": 6 })),
+            ),
+            "short-lived record",
+        );
+    }
+    let expires = Instant::now() + Duration::from_secs(6);
+    wait_for("standby serves the short-lived records", 5, || {
+        answers(s.dns, "tmp.exp.test.", RecordType::A).1.len() == 1
+            && answers(s.dns, "www.exp.test.", RecordType::TXT).1.len() == 1
+    });
+    let serial = soa_serial(s.dns, "exp.test.");
+    let head = status(&s, &sr)["head"].clone();
+    verify_zone(&root_dir, s.dns, "exp.test", "standby before expiry");
+    // Cut off: the primary goes away before the expiry.
+    p.stop();
+    std::thread::sleep(expires.saturating_duration_since(Instant::now()));
+    wait_for("the standby stops serving them by its own clock", 3, || {
+        answers(s.dns, "tmp.exp.test.", RecordType::A).0 == ResponseCode::NXDomain
+            && answers(s.dns, "www.exp.test.", RecordType::TXT)
+                .1
+                .is_empty()
+    });
+    assert_eq!(
+        answers(s.dns, "www.exp.test.", RecordType::A).1.len(),
+        1,
+        "the permanent record at the same name stays"
+    );
+    assert_eq!(soa_serial(s.dns, "exp.test."), serial, "no serial bump");
+    let st = status(&s, &sr);
+    assert_eq!(st["head"], head, "the standby wrote nothing");
+    assert_eq!(
+        record_names(&s, &sr, "exp.test").len(),
+        5,
+        "still stored (the primary's record_expired has not arrived)"
+    );
+    verify_zone(&root_dir, s.dns, "exp.test", "cut-off standby after expiry");
+    delv_all(
+        &root_dir,
+        &dnskey,
+        "exp.test",
+        s.dns,
+        &[
+            ("www.exp.test", "A", "; fully validated"),
+            ("tmp.exp.test", "A", "; negative response, fully validated"),
+            (
+                "www.exp.test",
+                "TXT",
+                "; negative response, fully validated",
+            ),
+        ],
+    );
+    drop(s);
+    let _ = std::fs::remove_dir_all(&root_dir);
+}

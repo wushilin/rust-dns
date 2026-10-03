@@ -95,7 +95,7 @@ OpenAPI snapshot + validator, conformance (123), smoke-release, cargo-audit.
 - [x] G1. (found by the gate, 2026-10-03) `cargo audit` reports a second
   notice besides `paste`: `yoke-derive 0.8.3` was yanked. Lockfile bump to
   0.8.4 (`cargo update -p yoke-derive`; build-time derive crate under idna).
-- [ ] G2. (found by the gate) `tests/follow.rs`
+- [x] G2. (found by the gate) `tests/follow.rs`
   `primary_standby_failover_and_rejoin` failed once with a transport error
   from the test's HTTP client right after a server restart (`POST /zones:
   ... Error encountered in a header: Invalid argument (os error 22)`), and
@@ -103,7 +103,7 @@ OpenAPI snapshot + validator, conformance (123), smoke-release, cargo-audit.
   server bug; not investigated further. Make the test helper retry transport
   errors, or find the cause.
 
-- [ ] H1. (found in B3) `Mutator::import` is quadratic in the number of
+- [x] H1. (found in B3) `Mutator::import` is quadratic in the number of
   records of a zone: every record re-reads and re-checks the zone's records
   (`create_record` -> `records()` + `record_conflict`). Debug build: 1,500
   records 2.8 s, 6,000 records 44 s, all inside one write transaction (the
@@ -119,7 +119,7 @@ OpenAPI snapshot + validator, conformance (123), smoke-release, cargo-audit.
   catalog). Nothing reads `owner_id` from the catalog (permissions read
   storage), so no behaviour depends on it; make it a typed zone change or
   drop the field from the catalog's zone row.
-- [ ] H3. (found in D3) A record whose expiry time has passed stays in the
+- [x] H3. (found in D3) A record whose expiry time has passed stays in the
   catalog until the expiry sweeper processes it (primary) or the
   `record_expired` change arrives (standby). Before D3 any commit in any
   zone also dropped it as a side effect of the full rebuild. The sweeper
@@ -382,3 +382,58 @@ OpenAPI snapshot + validator, conformance (123), smoke-release, cargo-audit.
   the fix: checksum view differs). Also seen once: `tests/e2e.rs`
   `json_import_and_record_paging` panicked in ureq (response.rs:389)
   while run with default test threads; passed alone. Probably G2's class.
+- 2026-10-03: H3 done: every node (a standby too) stops serving a record
+  at its expiry time by its own clock, in memory, never writing.
+  `ZoneData::next_expiry` (earliest `expires_at` served); the task
+  `Mutator::spawn_expiry_watch` sleeps until the catalog's earliest
+  expiry (+1 ms; woken by every stored catalog, at least every minute)
+  and `drop_expired_in_memory` rebuilds just the zones that serve a due
+  record, incrementally under the mutator lock (the D3 rule). A signed
+  zone's NSEC chain and signatures follow the served data (signed by the
+  node, D2 reuse for the rest); the serial does not change until the
+  primary's `record_expired` + bump arrive (on a cut-off standby: never,
+  so its zone transfers carry the old serial with the record gone; that
+  is the served truth). The primary still records the expiry through its
+  sweeper as before. No storage, wire or protocol change. Tests:
+  `expired_records_leave_the_catalog_at_their_expiry_without_a_commit`
+  (gate closed, signed zone, equals a full build, other zones shared,
+  nothing written) and tests/follow.rs
+  `an_expired_record_stops_being_served_on_a_cut_off_standby` (real
+  primary + standby, signed zone, primary stopped before expiry: NXDOMAIN
+  / NODATA by its own clock, head and serial unchanged, `dnssec-verify`
+  of the AXFR and `delv` negative answers fully validated; fails without
+  the watch). follow/dnssec/dnssec_changes/e2e suites pass with BIND
+  tools and the 3884ba8 binary.
+- 2026-10-03: H1 done. Cause: every imported record read the zone's
+  whole record list (`records()`) twice (import's pre-check and
+  `create_record`) and cloned it in `record_conflict`. The record rules
+  and the duplicate check only look at the same name, so checks now read
+  `records_named(zone, name)` through a new index `records_zone_name ON
+  records(zone_id, name)` (created by the migration, `IF NOT EXISTS`;
+  local schema, not data: nothing replicated or checksummed changes; an
+  older binary ignores it). Still one transaction. Debug build: 6,000
+  records 44 s -> 0.63 s (again, all skipped: 0.08 s; replace: 0.87 s).
+  Test `a_large_import_is_linear` (bound 5 s each, CNAME rule still
+  applied inside an import). The B3 latency test now imports 15,000
+  records (1,500 took only 0.16 s, under its 400 ms floor) and its writer
+  check is relative (`>= half the import`), since post-commit work grows
+  with the import.
+- 2026-10-03: G2 done; cause found and fixed in the server. Reproduced
+  (about 7 in 400 POSTs, connection per request): when the API answers
+  before reading the request body (401 from auth, 403, the standby's /
+  fenced server's 409 `read_only_standby`, axum's 405), hyper closes the
+  connection with body bytes still arriving; the kernel answers those
+  with a TCP reset and the client can lose the response it was reading
+  (macOS: `EINVAL` "Error encountered in a header", or a ureq panic
+  "returning stream to pool" / "failed to read exact buffer"). That is
+  the failover test's case: POST /zones to a freshly restarted fenced or
+  standby server, asserting 409. Also explains the one-off
+  `json_import_and_record_paging` panic (its import-bind 404/405 check).
+  Fix: middleware `read_body_first` on /api (outermost) reads the whole
+  body (same 16 MiB limit as before, JSON 413 above it) before anything
+  answers; handlers buffered every body anyway and login is
+  unauthenticated already, so pre-auth buffering adds no exposure. Test
+  tests/e2e.rs `early_answers_reach_the_client_and_large_bodies_are_
+  refused` (400 pooled + 1,200 single-connection POSTs answered 401: none
+  lost; fails in about half the runs without the middleware, 8/8 passes
+  with it; 413 is JSON).

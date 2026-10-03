@@ -1236,3 +1236,59 @@ fn totp(secret_b32: &str) -> String {
         ));
     }
 }
+
+/// G2: an answer given before the request body was read (here 401 from
+/// the auth check; a standby's 409 is the same) used to make the server
+/// close with body bytes still arriving, and the client then sometimes
+/// lost the response (macOS: `EINVAL` while reading its headers; about 7
+/// in 400 requests). The API now reads the body first. Also: a body over
+/// the limit is refused with a JSON 413.
+#[test]
+fn early_answers_reach_the_client_and_large_bodies_are_refused() {
+    let srv = start();
+    let mut transport = Vec::new();
+    // A pooled agent first, then one connection per request (where it
+    // showed: the body's second segment arrives after the early answer).
+    for (n, pooled) in [(400, true), (1200, false)] {
+        let mut b = ureq::AgentBuilder::new().timeout(Duration::from_secs(5));
+        if !pooled {
+            b = b.max_idle_connections(0);
+        }
+        let a = b.build();
+        for i in 0..n {
+            let body = serde_json::json!({ "name": format!("z{i}.test"), "pad": "x".repeat(i % 50 * 100) });
+            match a
+                .post(&format!("{}/api/zones", srv.web))
+                .set("X-Requested-With", "rust-dns")
+                .send_json(body)
+            {
+                Err(ureq::Error::Status(401, r)) => {
+                    let _ = r.into_string();
+                }
+                Ok(r) => panic!("unexpected {}", r.status()),
+                Err(ureq::Error::Status(s, _)) => panic!("unexpected {s}"),
+                Err(e) => transport.push(e.to_string()),
+            }
+        }
+    }
+    let a = agent();
+    assert!(
+        transport.is_empty(),
+        "{} lost: {:?}",
+        transport.len(),
+        transport.first()
+    );
+    let big = "x".repeat(16 * 1024 * 1024 + 1);
+    match a
+        .post(&format!("{}/api/auth/login", srv.web))
+        .set("X-Requested-With", "rust-dns")
+        .set("Content-Type", "application/json")
+        .send_string(&big)
+    {
+        Err(ureq::Error::Status(413, r)) => {
+            let v: serde_json::Value = r.into_json().unwrap();
+            assert_eq!(v["code"], "invalid_request", "{v}");
+        }
+        other => panic!("expected 413, got {other:?}"),
+    }
+}

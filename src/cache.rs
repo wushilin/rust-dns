@@ -69,6 +69,10 @@ pub struct ZoneData {
     /// This zone's part of the automatic reverse index: (reverse name,
     /// owner) for every A / AAAA record, in record order.
     pub reverse: Vec<(String, String)>,
+    /// The earliest `expires_at` of the records served: at that time the
+    /// zone must be built again without it (every node does so in memory,
+    /// see `Mutator::spawn_expiry_watch`).
+    pub next_expiry: Option<String>,
 }
 
 impl ZoneData {
@@ -82,8 +86,14 @@ impl ZoneData {
         let mut existing: HashSet<String> = HashSet::new();
         let mut delegations = Vec::new();
         let mut reverse = Vec::new();
+        let mut next_expiry: Option<String> = None;
         existing.insert(apex.clone());
         for r in records.into_iter().filter(|r| !r.is_expired_at(now)) {
+            if let Some(e) = &r.expires_at {
+                if next_expiry.as_ref().is_none_or(|n| e < n) {
+                    next_expiry = Some(e.clone());
+                }
+            }
             let owner = r.owner(&zone);
             // Register the owner and every ancestor up to the apex as existing.
             let mut cur = owner.clone();
@@ -116,6 +126,7 @@ impl ZoneData {
             soa: None,
             apex_ns: Vec::new(),
             reverse,
+            next_expiry,
         };
         z.soa = crate::zones::build_soa(&z);
         z.apex_ns = crate::zones::build_apex_ns(&z);
@@ -315,6 +326,23 @@ impl Catalog {
         Self::assemble(out)
     }
 
+    /// The earliest expiry of any record served (see [`ZoneData::next_expiry`]).
+    pub fn next_expiry(&self) -> Option<&str> {
+        self.zones
+            .values()
+            .filter_map(|z| z.next_expiry.as_deref())
+            .min()
+    }
+
+    /// Zones serving a record whose expiry is at or before `now`.
+    pub fn zones_expiring_by(&self, now: &str) -> Vec<i64> {
+        self.zones
+            .values()
+            .filter(|z| z.next_expiry.as_deref().is_some_and(|e| e <= now))
+            .map(|z| z.zone.id)
+            .collect()
+    }
+
     /// Longest-suffix match: the zone that contains `qname` (fqdn, lower-case).
     pub fn find_zone(&self, qname: &str) -> Option<&Arc<ZoneData>> {
         let mut cur = qname;
@@ -412,6 +440,9 @@ pub struct Cache {
     next_ticket: std::sync::atomic::AtomicU64,
     /// Ticket of the catalog currently stored.
     stored_ticket: std::sync::Mutex<u64>,
+    /// Signalled whenever a new catalog is stored (the expiry watch
+    /// re-reads the next expiry).
+    stored: tokio::sync::Notify,
 }
 
 impl Cache {
@@ -420,11 +451,18 @@ impl Cache {
             inner: ArcSwap::from_pointee(catalog),
             next_ticket: std::sync::atomic::AtomicU64::new(1),
             stored_ticket: std::sync::Mutex::new(0),
+            stored: tokio::sync::Notify::new(),
         }
     }
 
     pub fn load(&self) -> Arc<Catalog> {
         self.inner.load_full()
+    }
+
+    /// Resolves after the next catalog is stored (or at once if one was
+    /// stored since the last call: one waiter, a stored permit).
+    pub async fn stored(&self) {
+        self.stored.notified().await
     }
 
     /// Take a build ticket. Call it BEFORE reading the database for a
@@ -445,6 +483,7 @@ impl Cache {
         }
         *stored = ticket;
         self.inner.store(Arc::new(catalog));
+        self.stored.notify_one();
         true
     }
 
@@ -483,6 +522,7 @@ impl Cache {
             }
             *stored = ticket;
             self.inner.store(Arc::new(next));
+            self.stored.notify_one();
             return true;
         }
     }

@@ -363,6 +363,12 @@ impl<'a> Tx<'a> {
         Ok(db::list_records(self.conn, zone_id)?)
     }
 
+    /// The zone's records at `name` (relative): all that the record rules
+    /// and the duplicate check look at (an index lookup, not a zone scan).
+    pub fn records_named(&self, zone_id: i64, name: &str) -> MResult<Vec<Record>> {
+        Ok(db::records_named(self.conn, zone_id, name)?)
+    }
+
     pub fn record_in(&self, zone: &Zone, id: i64) -> MResult<Record> {
         db::get_record(self.conn, id)?
             .filter(|r| r.zone_id == zone.id)
@@ -433,7 +439,9 @@ impl<'a> Tx<'a> {
         Ok(())
     }
 
-    /// Why a record may not be added / changed, if anything.
+    /// Why a record may not be added / changed, if anything. `existing`:
+    /// the zone's records, or just those at `name` (nothing else is
+    /// looked at).
     pub fn record_conflict(
         &self,
         existing: &[Record],
@@ -446,7 +454,7 @@ impl<'a> Tx<'a> {
         let now = now_rfc3339();
         let live: Vec<Record> = existing
             .iter()
-            .filter(|r| !r.is_expired_at(&now))
+            .filter(|r| r.name == name && !r.is_expired_at(&now))
             .cloned()
             .collect();
         let existing = &live[..];
@@ -476,7 +484,7 @@ impl<'a> Tx<'a> {
         ttl: Option<u32>,
         expires_at: Option<Option<String>>,
     ) -> MResult<(Record, bool)> {
-        let existing = self.records(zone.id)?;
+        let existing = self.records_named(zone.id, name)?;
         if let Some(same) = existing
             .iter()
             .find(|r| r.name == name && r.rtype == rtype && r.value == value)
@@ -520,7 +528,7 @@ impl<'a> Tx<'a> {
                 "ttl must be at least 1 (or empty for the zone default)".into(),
             ));
         }
-        let existing = self.records(zone.id)?;
+        let existing = self.records_named(zone.id, name)?;
         if let Some(e) = self.record_conflict(&existing, None, name, rtype, value) {
             return Err(e);
         }
@@ -563,7 +571,7 @@ impl<'a> Tx<'a> {
                 "ttl must be at least 1 (or empty for the zone default)".into(),
             ));
         }
-        let existing = self.records(zone.id)?;
+        let existing = self.records_named(zone.id, name)?;
         if let Some(e) = self.record_conflict(&existing, Some(before.id), name, rtype, value) {
             return Err(e);
         }
@@ -1695,6 +1703,80 @@ impl Mutator {
 
     // ---- expiry --------------------------------------------------------
 
+    /// Stop serving records whose expiry has passed, in memory: the zones
+    /// that serve one are built again as of `now` (expired records left
+    /// out, a signed zone's NSEC chain and signatures follow). Never a
+    /// write, so it runs on every node, a standby included. The primary's
+    /// sweeper then records `record_expired` (and the serial bump); until
+    /// that arrives, a standby serves the zone without the record at the
+    /// old serial. Returns the zones rebuilt.
+    pub async fn drop_expired_in_memory(&self, now: chrono::DateTime<chrono::Utc>) -> usize {
+        let now_s = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        if self.cache.load().zones_expiring_by(&now_s).is_empty() {
+            return 0; // the usual case: do not wait for the lock
+        }
+        // Incremental builds only under the mutator lock (see `Cache::apply`).
+        let _guard = self.lock.lock().await;
+        let ids = self.cache.load().zones_expiring_by(&now_s);
+        if ids.is_empty() {
+            return 0;
+        }
+        let n = ids.len();
+        let (s, g, c) = (
+            self.storage.clone(),
+            self.signer.clone(),
+            self.cache.clone(),
+        );
+        let built = tokio::task::spawn_blocking(move || update_catalog(&s, &g, &c, &ids)).await;
+        match built {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::error!(error = %e, "in-memory expiry rebuild failed; retrying"),
+            Err(e) => tracing::error!(error = %e, "in-memory expiry rebuild failed; retrying"),
+        }
+        n
+    }
+
+    /// Background task (every node): at the earliest expiry of a served
+    /// record, rebuild its zone in memory without it
+    /// ([`Mutator::drop_expired_in_memory`]). Wakes when a new catalog is
+    /// stored (new records, replicated changes) and at least every minute.
+    pub fn spawn_expiry_watch(self: &Arc<Self>) {
+        let m = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let now = chrono::Utc::now();
+                let n = m.drop_expired_in_memory(now).await;
+                if n > 0 {
+                    tracing::debug!(zones = n, "expired records dropped from the served catalog");
+                    let now_s = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                    if !m.cache.load().zones_expiring_by(&now_s).is_empty() {
+                        // The rebuild failed: retry, but do not spin.
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    }
+                }
+                let max = std::time::Duration::from_secs(60);
+                let wait = m
+                    .cache
+                    .load()
+                    .next_expiry()
+                    .and_then(|n| chrono::DateTime::parse_from_rfc3339(n).ok())
+                    .map(|next| {
+                        // 1 ms past it: expiry times have millisecond precision.
+                        (next.with_timezone(&chrono::Utc) - chrono::Utc::now()
+                            + chrono::Duration::milliseconds(1))
+                        .to_std()
+                        .unwrap_or_default()
+                        .min(max)
+                    })
+                    .unwrap_or(max);
+                tokio::select! {
+                    _ = tokio::time::sleep(wait) => {}
+                    _ = m.cache.stored() => {}
+                }
+            }
+        });
+    }
+
     fn system_actor() -> Actor {
         Actor {
             name: "system".into(),
@@ -1873,7 +1955,6 @@ impl Mutator {
                         summary.records_removed += 1;
                     }
                 }
-                let mut existing = t.records(zone.id)?;
                 let now = chrono::Utc::now();
                 for er in ez.records {
                     let rname = normalize_record_name(&er.name, &name)?;
@@ -1895,13 +1976,14 @@ impl Mutator {
                             }
                         },
                     };
-                    if t.record_conflict(&existing, None, &rname, er.rtype, &value)
+                    let same_name = t.records_named(zone.id, &rname)?;
+                    if t.record_conflict(&same_name, None, &rname, er.rtype, &value)
                         .is_some()
                     {
                         summary.records_skipped += 1;
                         continue;
                     }
-                    let rec = t.create_record(
+                    t.create_record(
                         &zone,
                         &rname,
                         er.rtype,
@@ -1909,7 +1991,6 @@ impl Mutator {
                         er.ttl.filter(|v| *v > 0),
                         expires_at,
                     )?;
-                    existing.push(rec);
                     summary.records_added += 1;
                 }
             }
@@ -2238,6 +2319,138 @@ mod tests {
         RecordInput {
             expires_in: Some(secs),
             ..rec(name, RecordType::A, v)
+        }
+    }
+
+    /// H3: at its expiry a record leaves the served catalog without any
+    /// commit (the watch rebuilds its zone in memory), here with the
+    /// write gate closed, as on a standby. Nothing is written; the signed
+    /// zone equals a full build at that time and its signatures verify;
+    /// zones without a due record are not rebuilt.
+    #[tokio::test]
+    async fn expired_records_leave_the_catalog_at_their_expiry_without_a_commit() {
+        let (s, m, _) = setup();
+        let m = Arc::new(m);
+        for z in ["e.test", "other.test"] {
+            m.create_zone(actor(), zone_input(z), None).await.unwrap();
+            m.create_record(actor(), z, rec("ns1", RecordType::A, "192.0.2.53"))
+                .await
+                .unwrap();
+        }
+        m.set_dnssec(actor(), "e.test", true, false).await.unwrap();
+        m.create_record(actor(), "e.test", expiring("tmp", "192.0.2.1", 1))
+            .await
+            .unwrap();
+        m.create_record(actor(), "e.test", expiring("later", "192.0.2.2", 3600))
+            .await
+            .unwrap();
+        let head = s.changelog_head().unwrap();
+        m.gate().close("standby");
+        let cat = m.cache.load();
+        assert!(cat.zones["e.test."].records_at("tmp.e.test.").is_some());
+        let other = cat.zones["other.test."].clone();
+        assert!(cat.next_expiry().is_some());
+        assert_eq!(m.drop_expired_in_memory(chrono::Utc::now()).await, 0);
+
+        m.spawn_expiry_watch();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while m.cache.load().zones["e.test."]
+            .records_at("tmp.e.test.")
+            .is_some()
+        {
+            assert!(std::time::Instant::now() < deadline, "still served");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let cat = m.cache.load();
+        assert!(cat.zones["e.test."].records_at("later.e.test.").is_some());
+        assert!(
+            Arc::ptr_eq(&cat.zones["other.test."], &other),
+            "other zones are shared, not rebuilt"
+        );
+        assert_eq!(s.changelog_head().unwrap(), head, "nothing written");
+        let stored = s.get_zone("e.test").unwrap().unwrap();
+        assert_eq!(s.list_records(stored.id).unwrap().len(), 3, "still stored");
+        assert_catalog_is_current(&s, &m, "after the in-memory expiry");
+        assert!(cat.verify_signatures() > 0);
+    }
+
+    /// H1: an import's record checks look at one name (an index lookup),
+    /// not the whole zone, so a large import is linear. 6,000 records took
+    /// 44 s in a debug build before, 0.6 s after; also importing them
+    /// again (all duplicates, skipped) and once more in replace mode.
+    #[tokio::test]
+    async fn a_large_import_is_linear() {
+        let (s, m, _) = setup();
+        let doc = |n: usize| ExportDoc {
+            version: 1,
+            exported_at: String::new(),
+            zones: vec![ExportZone {
+                name: "big.test".into(),
+                serial: None,
+                soa_mname: None,
+                soa_rname: None,
+                refresh: None,
+                retry: None,
+                expire: None,
+                minimum: None,
+                default_ttl: None,
+                owner: None,
+                records: (0..n)
+                    .map(|i| ExportRecord {
+                        // Two records per name: the per-name checks still apply.
+                        name: format!("h{}", i / 2),
+                        rtype: RecordType::A,
+                        value: format!("198.51.{}.{}", i / 250, i % 250 + 1),
+                        ttl: None,
+                        expires_at: None,
+                    })
+                    .collect(),
+            }],
+        };
+        let n = 6000;
+        let t = std::time::Instant::now();
+        let sum = m
+            .import(actor(), doc(n), ImportMode::Merge, None, None)
+            .await
+            .unwrap();
+        let first = t.elapsed();
+        assert_eq!((sum.records_added, sum.records_skipped), (n, 0));
+        let t = std::time::Instant::now();
+        let sum = m
+            .import(actor(), doc(n), ImportMode::Merge, None, None)
+            .await
+            .unwrap();
+        let again = t.elapsed();
+        assert_eq!((sum.records_added, sum.records_skipped), (0, n));
+        let t = std::time::Instant::now();
+        let sum = m
+            .import(actor(), doc(n), ImportMode::Replace, None, None)
+            .await
+            .unwrap();
+        let replace = t.elapsed();
+        assert_eq!((sum.records_removed, sum.records_added), (n, n));
+        eprintln!("H1: import of {n} records {first:?}, again {again:?}, replace {replace:?}");
+        let z = s.get_zone("big.test").unwrap().unwrap();
+        assert_eq!(s.list_records(z.id).unwrap().len(), n);
+        // Rules still hold inside an import: a CNAME beside an A is skipped.
+        let mut d = doc(2);
+        d.zones[0].records.push(ExportRecord {
+            name: "h0".into(),
+            rtype: RecordType::CNAME,
+            value: "x.example.".into(),
+            ttl: None,
+            expires_at: None,
+        });
+        let sum = m
+            .import(actor(), d, ImportMode::Merge, None, None)
+            .await
+            .unwrap();
+        assert_eq!(sum.records_skipped, 3);
+        for took in [first, again, replace] {
+            assert!(
+                took < std::time::Duration::from_secs(5),
+                "import of {n} records took {took:?}"
+            );
         }
     }
 

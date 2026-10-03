@@ -263,6 +263,7 @@ async fn main() -> anyhow::Result<()> {
     }
     // DNSSEC: re-sign due zones (primary), refresh signature windows (all).
     mutator.spawn_resigner();
+    mutator.spawn_expiry_watch();
     #[cfg(unix)]
     {
         let r = reloader.clone();

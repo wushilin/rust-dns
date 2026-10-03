@@ -682,8 +682,10 @@ async fn api_reads_and_dns_stay_fast_during_a_long_write() {
     read(h.clone()).await;
     dns(h.clone(), dns_req.clone()).await;
 
-    // The long write: one transaction importing many records.
-    let n = 1500;
+    // The long write: one transaction importing many records (since H1
+    // an import is linear: 15,000 records hold it about 1.5 s in a debug
+    // build; 1,500 did before).
+    let n = 15000;
     let doc = ExportDoc {
         version: 1,
         exported_at: String::new(),
@@ -752,7 +754,9 @@ async fn api_reads_and_dns_stay_fast_during_a_long_write() {
     );
     assert!(probes >= 10, "probes ran during the write: {probes}");
     assert!(
-        first_writer + Duration::from_millis(150) >= import_took,
+        // (The import's own time also covers the catalog build and the
+        // events after its commit, which grow with its size.)
+        first_writer >= import_took / 2,
         "the account writes waited for the import"
     );
     assert!(

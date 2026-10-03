@@ -374,6 +374,8 @@ fn migrate(conn: &Connection) -> Result<()> {
         }
     }
     conn.execute_batch("CREATE INDEX IF NOT EXISTS records_expiry ON records(expires_at) WHERE expires_at IS NOT NULL")?;
+    // Record checks look at one name of a zone (`records_named`).
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS records_zone_name ON records(zone_id, name)")?;
     ensure_history_id(conn)?;
     Ok(())
 }
@@ -1227,6 +1229,15 @@ pub fn list_records(c: &Connection, zone_id: i64) -> Result<Vec<Record>> {
         "SELECT {RECORD_COLS} FROM records WHERE zone_id = ?1 ORDER BY name, rtype, value"
     ))?;
     let rows = stmt.query_map(params![zone_id], row_to_record)?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+/// The records of a zone at one name (relative, as stored), in id order.
+pub fn records_named(c: &Connection, zone_id: i64, name: &str) -> Result<Vec<Record>> {
+    let mut stmt = c.prepare_cached(&format!(
+        "SELECT {RECORD_COLS} FROM records WHERE zone_id = ?1 AND name = ?2 ORDER BY id"
+    ))?;
+    let rows = stmt.query_map(params![zone_id, name], row_to_record)?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 

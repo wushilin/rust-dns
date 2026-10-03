@@ -177,6 +177,35 @@ async fn client_ip_layer(
 /// wrong field types, unknown enum values, unparsable path or query parameters,
 /// a missing JSON content type) come back as plain text with 400, 415 or 422.
 /// Turn them into the documented JSON error so every API error has one shape.
+/// Largest request body accepted (imports are the large ones).
+const MAX_BODY: usize = 16 * 1024 * 1024;
+
+/// Read the whole request body before anything answers. A response sent
+/// while part of the body is still unread (an early 401, 403 or the
+/// standby's 409) makes hyper close the connection, and body bytes that
+/// arrive after that get a TCP reset from the kernel: the client may then
+/// lose the response itself (seen on macOS as `EINVAL` while reading its
+/// headers; G2 in plan.md). The handlers buffer every body anyway, under
+/// the same limit (an unauthenticated route like login reads its body
+/// too), so reading it first costs nothing new.
+async fn read_body_first(req: Request, next: Next) -> Response {
+    let (parts, body) = req.into_parts();
+    match axum::body::to_bytes(body, MAX_BODY).await {
+        Ok(bytes) => {
+            next.run(Request::from_parts(parts, axum::body::Body::from(bytes)))
+                .await
+        }
+        Err(e) => (
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            axum::Json(error::ErrorBody {
+                error: format!("request body not accepted: {e}"),
+                code: Some(error::ErrorCode::InvalidRequest),
+            }),
+        )
+            .into_response(),
+    }
+}
+
 async fn json_errors(req: Request, next: Next) -> Response {
     let resp = next.run(req).await;
     let plain_text = resp
@@ -386,7 +415,8 @@ pub fn router(state: Arc<AppState>) -> Router {
                 .layer(middleware::from_fn_with_state(
                     state.clone(),
                     read_only_guard,
-                )),
+                ))
+                .layer(middleware::from_fn(read_body_first)),
         )
         .merge(root);
     if state.cfg.web_console.enabled {
@@ -401,7 +431,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         state.clone(),
         client_ip_layer,
     ))
-    .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024))
+    .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY))
     .with_state(state)
 }
 
