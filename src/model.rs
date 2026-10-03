@@ -949,8 +949,13 @@ pub struct QueryEvent {
     /// ("A 192.0.2.10", "CNAME www.example.com."), plus notes for referrals
     /// and truncation. Capped in length; empty for negative answers.
     pub result: Vec<String>,
-    /// auth | forward | refused | error
+    /// auth | forward | cache | transfer | refused | error
     pub source: &'static str,
+    /// The filter of the query pipeline that produced the answer (`edns`,
+    /// `request`, `special`, `transfer`, `authoritative`, `recursion`,
+    /// `open_resolver`, `forward`, ...); empty when the answer came before
+    /// the pipeline (a rejected TSIG signature).
+    pub filter: &'static str,
     pub duration_us: u64,
 }
 

@@ -2,11 +2,13 @@
 
 pub mod axfr;
 pub mod cookies;
+pub mod filters;
 pub mod forward;
 pub mod fwdcache;
 pub mod handler;
 pub mod keyring;
 pub mod notify;
+pub mod pipeline;
 pub mod tcp;
 pub mod tsig;
 pub mod udp;
@@ -157,6 +159,9 @@ pub struct Runtime {
     pub nsid: String,
     pub cookies: bool,
     pub cookies_required: bool,
+    /// The query pipeline's filter chain for this snapshot (see
+    /// [`pipeline::chain_for`]); replaced together with everything above.
+    pub chain: Vec<pipeline::Filter>,
 }
 
 impl Runtime {
@@ -185,7 +190,7 @@ impl Runtime {
         {
             forwarding.open_resolver = true;
         }
-        Runtime {
+        let mut rt = Runtime {
             forward_acl: crate::config::parse_cidrs(&forwarding.allowed_clients),
             forwarding,
             transfer_allow: crate::config::parse_cidrs(&cfg.transfer.allow),
@@ -197,7 +202,10 @@ impl Runtime {
             nsid: cfg.server.nsid.clone(),
             cookies: cfg.server.cookies,
             cookies_required: cfg.server.cookies_required,
-        }
+            chain: Vec::new(),
+        };
+        rt.chain = pipeline::chain_for(&rt);
+        rt
     }
 
     pub fn may_forward(&self, client: std::net::IpAddr) -> bool {
@@ -233,6 +241,8 @@ pub struct DnsServer {
     pub tcp_proxy_trust: Vec<Cidr>,
     pub runtime: ArcSwap<Runtime>,
     pub stats: Arc<Stats>,
+    /// Per-filter counters of the query pipeline.
+    pub filter_stats: pipeline::FilterStats,
     pub tcp_slots: Arc<tokio::sync::Semaphore>,
     /// Open TCP connections per client (IPv4 address / IPv6 /64).
     pub tcp_per_client: Arc<tcp::PerClient>,
@@ -276,6 +286,7 @@ impl DnsServer {
             tcp_proxy_trust: cfg.tcp_dns.trusted_cidrs(),
             runtime: ArcSwap::from_pointee(Runtime::from_config(cfg, None)),
             stats: Arc::new(Stats::default()),
+            filter_stats: pipeline::FilterStats::default(),
             tcp_slots,
             tcp_per_client: Arc::new(tcp::PerClient::default()),
             cookies: cookies::CookieJar::new(),

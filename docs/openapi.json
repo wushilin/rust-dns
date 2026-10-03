@@ -4923,6 +4923,55 @@
           }
         }
       },
+      "FilterStatus": {
+        "type": "object",
+        "description": "One filter of the chain in effect, with its counters since start.",
+        "required": [
+          "name",
+          "handled",
+          "answered",
+          "dropped",
+          "passed",
+          "panicked"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Filter name (`edns`, `request`, `special`, `transfer`,\n`authoritative`, `recursion`, `open_resolver`, `forward`, ...).",
+            "example": "authoritative"
+          },
+          "handled": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Queries this filter saw (answered + dropped + passed).",
+            "minimum": 0
+          },
+          "answered": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Queries this filter answered.",
+            "minimum": 0
+          },
+          "dropped": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Queries this filter dropped (no reply).",
+            "minimum": 0
+          },
+          "passed": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Queries passed to the next filter.",
+            "minimum": 0
+          },
+          "panicked": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Queries that made this filter panic (answered SERVFAIL).",
+            "minimum": 0
+          }
+        }
+      },
       "FollowStatus": {
         "type": "object",
         "description": "Standby side of `GET /replication/status`.",
@@ -6077,6 +6126,7 @@
           "answers",
           "result",
           "source",
+          "filter",
           "duration_us"
         ],
         "properties": {
@@ -6112,7 +6162,11 @@
           },
           "source": {
             "type": "string",
-            "description": "auth | forward | refused | error"
+            "description": "auth | forward | cache | transfer | refused | error"
+          },
+          "filter": {
+            "type": "string",
+            "description": "The filter of the query pipeline that produced the answer (`edns`,\n`request`, `special`, `transfer`, `authoritative`, `recursion`,\n`open_resolver`, `forward`, ...); empty when the answer came before\nthe pipeline (a rejected TSIG signature)."
           },
           "duration_us": {
             "type": "integer",
@@ -6818,6 +6872,7 @@
           "visible_zones",
           "changelog",
           "dns",
+          "pipeline",
           "forward_cache",
           "rate_limit",
           "listeners",
@@ -6856,6 +6911,13 @@
           },
           "dns": {
             "$ref": "#/components/schemas/DnsCounters"
+          },
+          "pipeline": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FilterStatus"
+            },
+            "description": "The query pipeline in effect: its filters in order, with counters."
           },
           "forward_cache": {
             "$ref": "#/components/schemas/ForwardCacheStatus"

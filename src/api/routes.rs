@@ -221,6 +221,7 @@ pub async fn status(State(s): St, caller: Caller) -> ApiResult<Json<ServerStatus
             retention_days: cfg.changelog.retention_days,
         },
         dns: s.dns.stats.snapshot(),
+        pipeline: s.dns.pipeline_status(),
         forward_cache: ForwardCacheStatus {
             entries: s.dns.fwd_cache.len(),
             capacity: rt.forwarding.cache_entries,
@@ -396,6 +397,19 @@ pub async fn metrics(State(s): St, _caller: Caller) -> ApiResult<Response> {
         "# HELP rustdns_forward_inflight Forwarded queries waiting for an upstream\n# TYPE rustdns_forward_inflight gauge\nrustdns_forward_inflight {}\n",
         d.forward_inflight.load(Relaxed)
     ));
+    out.push_str("# HELP rustdns_filter_queries_total Queries per filter of the query pipeline and outcome (answered, dropped, passed to the next filter, panicked)\n# TYPE rustdns_filter_queries_total counter\n");
+    for (name, c) in s.dns.filter_stats.snapshot() {
+        for (outcome, v) in [
+            ("answered", c.answered),
+            ("dropped", c.dropped),
+            ("passed", c.passed),
+            ("panicked", c.panicked),
+        ] {
+            out.push_str(&format!(
+                "rustdns_filter_queries_total{{filter=\"{name}\",outcome=\"{outcome}\"}} {v}\n"
+            ));
+        }
+    }
     out.push_str(&format!(
         "# HELP rustdns_open_resolver 1 while open resolver mode is in effect\n# TYPE rustdns_open_resolver gauge\nrustdns_open_resolver {}\n",
         u8::from(s.dns.runtime.load().open_resolver())

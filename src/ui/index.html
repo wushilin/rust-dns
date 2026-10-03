@@ -1596,13 +1596,13 @@ function viewQueries() {
   renderQueries();
 }
 const rcodeBadge = rc => `<span class="badge ${rc === 'No Error' || rc === 'NoError' ? 'ok' : rc === 'NXDomain' || rc === 'Non-Existent Domain' ? 'warn' : 'bad'}">${esc(rc)}</span>`;
-function queryRow(q) { return `<tr><td class="hint">${new Date(q.ts).toLocaleTimeString()}</td><td class="mono">${esc(q.client)}</td><td>${q.proto}</td><td class="mono">${esc(q.name)}</td><td><span class="badge muted">${esc(q.qtype)}</span></td><td>${rcodeBadge(q.rcode)}</td><td class="mono" style="font-size:12px;max-width:420px">${resultCell(q)}</td><td>${esc(q.source)}</td><td class="hint">${q.duration_us < 1000 ? q.duration_us + 'µs' : (q.duration_us/1000).toFixed(1) + 'ms'}</td></tr>`; }
+function queryRow(q) { return `<tr><td class="hint">${new Date(q.ts).toLocaleTimeString()}</td><td class="mono">${esc(q.client)}</td><td>${q.proto}</td><td class="mono">${esc(q.name)}</td><td><span class="badge muted">${esc(q.qtype)}</span></td><td>${rcodeBadge(q.rcode)}</td><td class="mono" style="font-size:12px;max-width:420px">${resultCell(q)}</td><td>${esc(q.source)}${q.filter && q.filter !== q.source ? `<div class="hint" title="Filter of the query pipeline that produced the answer">${esc(q.filter)}</div>` : ''}</td><td class="hint">${q.duration_us < 1000 ? q.duration_us + 'µs' : (q.duration_us/1000).toFixed(1) + 'ms'}</td></tr>`; }
 function resultCell(q) {
   const r = q.result || [];
   if (!r.length) return `<span class="hint">${q.rcode === 'No Error' || q.rcode === 'NoError' ? 'no records (NODATA)' : '–'}</span>`;
   return r.map(line => `<div style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${esc(line)}">${esc(line)}</div>`).join('');
 }
-function matchQ(q) { const f = S.filter.toLowerCase(); return !f || q.name.toLowerCase().includes(f) || q.client.includes(f) || q.qtype.toLowerCase() === f || q.rcode.toLowerCase().includes(f) || q.source.includes(f) || (q.result || []).some(l => l.toLowerCase().includes(f)); }
+function matchQ(q) { const f = S.filter.toLowerCase(); return !f || q.name.toLowerCase().includes(f) || q.client.includes(f) || q.qtype.toLowerCase() === f || q.rcode.toLowerCase().includes(f) || q.source.includes(f) || (q.filter || '').includes(f) || (q.result || []).some(l => l.toLowerCase().includes(f)); }
 function renderQueries() { const tb = $('#queries tbody'); if (!tb) return; const rows = S.queries.filter(matchQ).slice(0, 200); tb.innerHTML = rows.length ? rows.map(queryRow).join('') : '<tr><td colspan="9" class="empty">Waiting for queries…</td></tr>'; }
 function prependQueryRow(q) { const tb = $('#queries tbody'); if (!tb || !matchQ(q)) return; if (tb.querySelector('.empty')) tb.innerHTML = ''; tb.insertAdjacentHTML('afterbegin', queryRow(q)); while (tb.rows.length > 200) tb.deleteRow(-1); }
 

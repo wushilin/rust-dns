@@ -482,6 +482,8 @@ pub struct ServerStatus {
     pub visible_zones: usize,
     pub changelog: ChangelogStatus,
     pub dns: DnsCounters,
+    /// The query pipeline in effect: its filters in order, with counters.
+    pub pipeline: Vec<crate::dns::pipeline::FilterStatus>,
     pub forward_cache: ForwardCacheStatus,
     pub rate_limit: RateLimitStatus,
     pub listeners: ListenerStatus,

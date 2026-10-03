@@ -6,11 +6,8 @@ use super::Runtime;
 use super::{DnsServer, Proto, Reply};
 use crate::model::QueryEvent;
 use crate::ratelimit::Decision;
-use crate::zones::{lookup, lookup_dnssec, Lookup};
-use hickory_proto::op::{Edns, Message, MessageType, OpCode, ResponseCode};
-use hickory_proto::rr::rdata::opt::{EdnsCode, EdnsOption};
-use hickory_proto::rr::rdata::TXT;
-use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
+use hickory_proto::op::{Message, OpCode, ResponseCode};
+use hickory_proto::rr::{Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::BinDecodable;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering::Relaxed;
@@ -20,7 +17,7 @@ use std::time::Instant;
 pub const VERSION_STRING: &str = concat!("rust-dns ", env!("CARGO_PKG_VERSION"));
 
 /// Minimal header-only response for requests we cannot parse.
-fn header_only(id: u16, rcode: ResponseCode) -> Vec<u8> {
+pub(super) fn header_only(id: u16, rcode: ResponseCode) -> Vec<u8> {
     Message::error_msg(id, OpCode::Query, rcode)
         .to_vec()
         .unwrap_or_default()
@@ -29,7 +26,7 @@ fn header_only(id: u16, rcode: ResponseCode) -> Vec<u8> {
 /// Rate-limit "slip" answer: the request's header and question with QR and
 /// TC set and nothing else. Never larger than the request, so it cannot be
 /// used for amplification, and it tells a genuine client to retry over TCP.
-fn slip_reply(req: &[u8]) -> Option<Vec<u8>> {
+pub(super) fn slip_reply(req: &[u8]) -> Option<Vec<u8>> {
     if req.len() < 12 || req[2] & 0x80 != 0 {
         return None;
     }
@@ -44,10 +41,10 @@ fn slip_reply(req: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// One of the `[forwarding].max_inflight` slots; freed on drop.
-struct InflightSlot<'a>(&'a super::Stats);
+pub(super) struct InflightSlot<'a>(&'a super::Stats);
 
 impl<'a> InflightSlot<'a> {
-    fn take(stats: &'a super::Stats, max: usize) -> Option<Self> {
+    pub(super) fn take(stats: &'a super::Stats, max: usize) -> Option<Self> {
         let n = stats.forward_inflight.fetch_add(1, Relaxed);
         if n >= max.max(1) {
             stats.forward_inflight.fetch_sub(1, Relaxed);
@@ -63,28 +60,31 @@ impl Drop for InflightSlot<'_> {
     }
 }
 
-/// Per-request context threaded through the handler.
-struct Ctx {
-    client: SocketAddr,
-    proto: Proto,
-    started: Instant,
-    udp_limit: usize,
+/// Per-request facts the finish stage and the query event need.
+pub(super) struct Ctx {
+    pub(super) client: SocketAddr,
+    pub(super) proto: Proto,
+    pub(super) started: Instant,
+    pub(super) udp_limit: usize,
     /// Bytes kept free in UDP responses for the TSIG record added afterwards.
-    reserve: usize,
+    pub(super) reserve: usize,
     /// Open resolver mode lowered `udp_limit` from this value: truncation
     /// the client's own limit would not have needed is counted separately.
-    open_cap_from: Option<usize>,
+    pub(super) open_cap_from: Option<usize>,
     /// The query had the DO bit (RFC 3225).
-    dnssec_ok: bool,
+    pub(super) dnssec_ok: bool,
     /// Someone listens to the query feed (live view, query log), decided
     /// when the request arrived. Without a listener no query event is
     /// built: no answer summary, no name / type / rcode strings.
-    listening: bool,
+    pub(super) listening: bool,
+    /// The filter that produced the answer (query event); empty before
+    /// the query stage (TSIG errors).
+    pub(super) filter: &'static str,
 }
 
 /// A request whose TSIG signature verified.
-struct SignedBy {
-    entry: Arc<KeyEntry>,
+pub(super) struct SignedBy {
+    pub(super) entry: Arc<KeyEntry>,
 }
 
 impl DnsServer {
@@ -156,7 +156,10 @@ impl DnsServer {
         // TSIG (RFC 8945): a signed request is verified before anything else
         // and never falls back to being treated as unsigned.
         match tsig::find(req) {
-            Ok(None) => self.answer(req, client, proto, started, &rt, None).await,
+            Ok(None) => {
+                self.query_stage(req, client, proto, started, &rt, None)
+                    .await
+            }
             Ok(Some(_)) if req[2] & 0x80 != 0 => Reply::None, // a response
             Ok(Some(signed)) => {
                 self.answer_signed(req, signed, client, proto, started, &rt)
@@ -181,7 +184,7 @@ impl DnsServer {
         let rt = self.runtime.load_full();
         let client = SocketAddr::from(([127, 0, 0, 1], 0));
         match self
-            .answer(req, client, Proto::Tcp, Instant::now(), &rt, None)
+            .query_stage(req, client, Proto::Tcp, Instant::now(), &rt, None)
             .await
         {
             Reply::One(b) => Some(b),
@@ -226,6 +229,7 @@ impl DnsServer {
                 open_cap_from: None,
                 dnssec_ok: false,
                 listening: self.bus.has_query_subscribers(),
+                filter: "",
             };
             return Reply::One(self.tsig_error_reply(
                 req,
@@ -244,7 +248,7 @@ impl DnsServer {
             entry: entry.clone(),
         };
         let reply = self
-            .answer(&stripped, client, proto, started, rt, Some(&by))
+            .query_stage(&stripped, client, proto, started, rt, Some(&by))
             .await;
         let p = SignParams {
             time: now,
@@ -326,375 +330,8 @@ impl DnsServer {
         }
     }
 
-    /// Answer a request (unsigned, or with its verified TSIG record removed).
-    async fn answer(
-        &self,
-        req: &[u8],
-        client: SocketAddr,
-        proto: Proto,
-        started: Instant,
-        rt: &Runtime,
-        signed_by: Option<&SignedBy>,
-    ) -> Reply {
-        let id = u16::from_be_bytes([req[0], req[1]]);
-        let request = match Message::from_bytes(req) {
-            Ok(m) => m,
-            Err(e) => {
-                self.stats.errors.fetch_add(1, Relaxed);
-                tracing::debug!(client = %client, error = %e, "malformed query");
-                return Reply::One(header_only(id, ResponseCode::FormErr));
-            }
-        };
-        if request.metadata.message_type != MessageType::Query {
-            return Reply::None;
-        }
-        let dnssec_ok = request
-            .edns
-            .as_ref()
-            .map(|e| e.flags().dnssec_ok)
-            .unwrap_or(false);
-        let mut ctx = Ctx {
-            client,
-            proto,
-            started,
-            udp_limit: 512,
-            reserve: signed_by
-                .map(|b| tsig::record_len(&b.entry.key.name, b.entry.key.algorithm, 0))
-                .unwrap_or(0),
-            open_cap_from: None,
-            dnssec_ok,
-            listening: self.bus.has_query_subscribers(),
-        };
-
-        let mut resp = Message::response(id, request.metadata.op_code);
-        if request.metadata.op_code == OpCode::Query {
-            resp.metadata.recursion_desired = request.metadata.recursion_desired;
-            resp.metadata.recursion_available = rt.may_forward(client.ip());
-            for q in &request.queries {
-                resp.add_query(q.clone());
-            }
-        }
-
-        // EDNS (RFC 6891): echo an OPT with our payload size, NSID and cookies.
-        let mut cookie_valid = false;
-        if let Some(edns) = &request.edns {
-            let mut ours = Edns::new();
-            // RFC 3225 §3: the DO bit of the query is copied into the response.
-            ours.set_max_payload(rt.udp_max_payload)
-                .set_version(0)
-                .set_dnssec_ok(dnssec_ok);
-            ctx.udp_limit = (edns.max_payload() as usize).clamp(512, rt.udp_max_payload as usize);
-            if edns.version() != 0 {
-                resp.set_edns(ours);
-                resp.metadata.response_code = ResponseCode::BADVERS;
-                return Reply::One(self.finish(resp, &ctx, "error"));
-            }
-            if !rt.nsid.is_empty() && edns.options().get(EdnsCode::NSID).is_some() {
-                ours.options_mut()
-                    .insert(EdnsOption::Unknown(3, rt.nsid.as_bytes().to_vec()));
-            }
-            if rt.cookies {
-                if let Some(EdnsOption::Unknown(_, data)) = edns.options().get(EdnsCode::Cookie) {
-                    use super::cookies::CookieCheck;
-                    match self.cookies.check(data.as_slice(), client.ip()) {
-                        CookieCheck::Malformed => {
-                            resp.set_edns(ours);
-                            resp.metadata.response_code = ResponseCode::FormErr;
-                            return Reply::One(self.finish(resp, &ctx, "error"));
-                        }
-                        CookieCheck::Valid(c) => {
-                            cookie_valid = true;
-                            ours.options_mut().insert(EdnsOption::Unknown(10, c));
-                        }
-                        CookieCheck::Invalid(c) => {
-                            ours.options_mut().insert(EdnsOption::Unknown(10, c));
-                            if rt.cookies_required && proto == Proto::Udp {
-                                self.stats.bad_cookie.fetch_add(1, Relaxed);
-                                resp.set_edns(ours);
-                                resp.metadata.response_code = ResponseCode::BADCOOKIE;
-                                return Reply::One(self.finish(resp, &ctx, "error"));
-                            }
-                        }
-                    }
-                }
-            }
-            resp.set_edns(ours);
-        }
-        let _ = cookie_valid;
-
-        if request.metadata.op_code != OpCode::Query {
-            resp.metadata.response_code = ResponseCode::NotImp;
-            return Reply::One(self.finish(resp, &ctx, "error"));
-        }
-        if request.queries.len() != 1 {
-            resp.metadata.response_code = ResponseCode::FormErr;
-            return Reply::One(self.finish(resp, &ctx, "error"));
-        }
-        let q = &request.queries[0];
-        let qname = q.name().clone();
-        let qtype = q.query_type();
-
-        // CHAOS class: only version.bind is answered.
-        if q.query_class() == DNSClass::CH {
-            let lname = qname.to_ascii().to_ascii_lowercase();
-            if (qtype == RecordType::TXT || qtype == RecordType::ANY)
-                && (lname == "version.bind." || lname == "version.server.")
-            {
-                let mut r = Record::from_rdata(
-                    qname.clone(),
-                    0,
-                    RData::TXT(TXT::new(vec![VERSION_STRING.to_string()])),
-                );
-                r.dns_class = DNSClass::CH;
-                resp.add_answer(r);
-                resp.metadata.authoritative = true;
-            } else {
-                resp.metadata.response_code = ResponseCode::Refused;
-            }
-            return Reply::One(self.finish(resp, &ctx, "auth"));
-        }
-        if q.query_class() != DNSClass::IN && q.query_class() != DNSClass::ANY {
-            self.stats.refused.fetch_add(1, Relaxed);
-            resp.metadata.response_code = ResponseCode::Refused;
-            return Reply::One(self.finish(resp, &ctx, "refused"));
-        }
-
-        let catalog = self.cache.load();
-
-        // Zone transfers (RFC 5936 / 1995) for allowed secondaries.
-        // Policy: the client address must be in [transfer].allow AND, when
-        // signed, the key must cover the zone; unsigned requests are refused
-        // when [transfer].require_tsig is on.
-        if super::axfr::is_transfer(qtype) {
-            let key = crate::zones::key_of(&qname);
-            let zone = catalog.zones.get(&key);
-            let key_name = signed_by.map(|b| b.entry.key.name.as_str());
-            let refusal = match zone {
-                None => Some((false, "not a zone on this server")),
-                Some(_) if !rt.may_transfer(client.ip()) => {
-                    Some((false, "client address is not in [transfer].allow"))
-                }
-                Some(z) => match signed_by {
-                    Some(b) if !b.entry.allows_zone(&z.zone.name) => {
-                        Some((true, "the TSIG key is not allowed to transfer this zone"))
-                    }
-                    None if rt.require_tsig => {
-                        Some((true, "unsigned request and [transfer].require_tsig is on"))
-                    }
-                    _ => None,
-                },
-            };
-            if let Some((notable, why)) = refusal {
-                if notable {
-                    tracing::info!(client = %client.ip(), zone = %qname, key = ?key_name, why, "zone transfer refused");
-                } else {
-                    tracing::debug!(client = %client.ip(), zone = %qname, key = ?key_name, why, "zone transfer refused");
-                }
-                self.stats.refused.fetch_add(1, Relaxed);
-                resp.metadata.response_code = ResponseCode::Refused;
-                return Reply::One(self.finish(resp, &ctx, "refused"));
-            }
-            let z = zone.expect("refused above when missing");
-            self.stats.transfers.fetch_add(1, Relaxed);
-            tracing::info!(client = %client.ip(), zone = %z.zone.name, qtype = %qtype, proto = proto.as_str(), key = ?key_name, "zone transfer");
-            self.emit(
-                &ctx,
-                &qname,
-                qtype,
-                ResponseCode::NoError,
-                0,
-                vec![match key_name {
-                    Some(k) => format!("zone transfer of {} (TSIG {k})", z.zone.name),
-                    None => format!("zone transfer of {}", z.zone.name),
-                }],
-                "transfer",
-            );
-            return match proto {
-                Proto::Tcp => Reply::Many(super::axfr::build(z, id, q)),
-                Proto::Udp if qtype == RecordType::IXFR => super::axfr::soa_only(z, id, q)
-                    .map(Reply::One)
-                    .unwrap_or(Reply::None),
-                Proto::Udp => {
-                    resp.metadata.response_code = ResponseCode::Refused;
-                    Reply::One(self.finish(resp, &ctx, "refused"))
-                }
-            };
-        }
-        if qtype == RecordType::OPT {
-            resp.metadata.response_code = ResponseCode::FormErr;
-            return Reply::One(self.finish(resp, &ctx, "error"));
-        }
-
-        // RFC 8482: answer ANY with a synthesized HINFO instead of everything.
-        if qtype == RecordType::ANY && rt.minimal_any {
-            let key = crate::zones::key_of(&qname);
-            if let Some(z) = catalog.find_zone(&key) {
-                self.stats.authoritative.fetch_add(1, Relaxed);
-                if dnssec_ok && z.signed.is_some() {
-                    // Signed zone, DO query: a synthesized HINFO could not be
-                    // validated, so answer one real RRset with its RRSIG
-                    // (RFC 8482 §4.1), or the signed negative answer.
-                    if let Lookup::Answer(mut a) =
-                        lookup_dnssec(&catalog, &qname, RecordType::ANY, rt.auto_ptr, true)
-                    {
-                        a.keep_first_rrset();
-                        if a.rcode == ResponseCode::NXDomain {
-                            self.stats.nxdomain.fetch_add(1, Relaxed);
-                        }
-                        resp.metadata.authoritative = a.authoritative;
-                        resp.metadata.response_code = a.rcode;
-                        resp.insert_answers(a.answers);
-                        resp.insert_authorities(a.authority);
-                        resp.insert_additionals(a.additional);
-                        return Reply::One(self.finish(resp, &ctx, "auth"));
-                    }
-                }
-                resp.metadata.authoritative = true;
-                if z.existing.contains(&key) || z.records_at(&key).is_some() {
-                    let hinfo =
-                        hickory_proto::rr::rdata::HINFO::new("RFC8482".to_string(), String::new());
-                    resp.add_answer(Record::from_rdata(qname.clone(), 3789, RData::HINFO(hinfo)));
-                } else if let Lookup::Answer(a) =
-                    lookup(&catalog, &qname, RecordType::A, rt.auto_ptr)
-                {
-                    resp.metadata.response_code = a.rcode;
-                    resp.insert_authorities(a.authority);
-                }
-                return Reply::One(self.finish(resp, &ctx, "auth"));
-            }
-        }
-
-        match lookup_dnssec(&catalog, &qname, qtype, rt.auto_ptr, dnssec_ok) {
-            Lookup::Answer(a) => {
-                self.stats.authoritative.fetch_add(1, Relaxed);
-                if a.rcode == ResponseCode::NXDomain {
-                    self.stats.nxdomain.fetch_add(1, Relaxed);
-                }
-                resp.metadata.authoritative = a.authoritative;
-                resp.metadata.response_code = a.rcode;
-                resp.insert_answers(a.answers);
-                resp.insert_authorities(a.authority);
-                resp.insert_additionals(a.additional);
-                Reply::One(self.finish(resp, &ctx, "auth"))
-            }
-            Lookup::NotOurs => {
-                if !rt.may_forward(client.ip()) || !request.metadata.recursion_desired {
-                    self.stats.refused.fetch_add(1, Relaxed);
-                    resp.metadata.response_code = ResponseCode::Refused;
-                    return Reply::One(self.finish(resp, &ctx, "refused"));
-                }
-                if rt.open_resolver() {
-                    if let Some(reply) = self.open_resolver_guard(req, &resp, &mut ctx, rt, qtype) {
-                        return reply;
-                    }
-                }
-                let key = super::fwdcache::Key::new(&qname, qtype, q.query_class(), dnssec_ok);
-                if rt.forwarding.cache_entries > 0 {
-                    if let Some(mut cached) = self.fwd_cache.get(&key, rt.cache_caps()) {
-                        self.stats.cache_hits.fetch_add(1, Relaxed);
-                        cached.metadata.id = id;
-                        cached.metadata.recursion_desired = request.metadata.recursion_desired;
-                        cached.metadata.recursion_available = true;
-                        cached.queries = request.queries.clone();
-                        cached.edns = resp.edns.clone();
-                        return Reply::One(self.finish(cached, &ctx, "cache"));
-                    }
-                }
-                // Bounded: a slow or dead upstream must not pile up tasks and
-                // sockets without limit. Only forwarding takes a slot (the
-                // authoritative answer and the cache hit returned above),
-                // and a query over the cap is turned away at once rather
-                // than queued: UDP dropped (no amplification, the client
-                // retries), TCP SERVFAIL.
-                let Some(_slot) = InflightSlot::take(&self.stats, rt.forwarding.max_inflight)
-                else {
-                    self.stats.forward_overflow.fetch_add(1, Relaxed);
-                    // One warning a minute, not one per query.
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    let last = self.stats.forward_overflow_warned.load(Relaxed);
-                    if now >= last + 60
-                        && self
-                            .stats
-                            .forward_overflow_warned
-                            .compare_exchange(last, now, Relaxed, Relaxed)
-                            .is_ok()
-                    {
-                        tracing::warn!(max_inflight = rt.forwarding.max_inflight, "forwarding: [forwarding].max_inflight queries are waiting for upstreams; further queries are dropped (UDP) or answered SERVFAIL (TCP) until some finish");
-                    }
-                    return match proto {
-                        Proto::Udp => Reply::None,
-                        Proto::Tcp => {
-                            resp.metadata.response_code = ResponseCode::ServFail;
-                            Reply::One(self.finish(resp, &ctx, "error"))
-                        }
-                    };
-                };
-                match super::forward::forward(&rt.forwarding, req, proto).await {
-                    Ok(bytes) => {
-                        self.stats.forwarded.fetch_add(1, Relaxed);
-                        let parsed = Message::from_bytes(&bytes);
-                        let (rcode, answers, mut result) = match &parsed {
-                            Ok(m) => {
-                                if rt.forwarding.cache_entries > 0
-                                    && !m.metadata.truncation
-                                    && matches!(
-                                        m.metadata.response_code,
-                                        ResponseCode::NoError | ResponseCode::NXDomain
-                                    )
-                                {
-                                    self.fwd_cache.store(key, m, rt.cache_caps());
-                                }
-                                (
-                                    m.metadata.response_code,
-                                    m.answers.len(),
-                                    if ctx.listening {
-                                        summarize(m, &qname)
-                                    } else {
-                                        Vec::new()
-                                    },
-                                )
-                            }
-                            Err(_) => (
-                                ResponseCode::ServFail,
-                                0,
-                                vec!["unparseable upstream reply".into()],
-                            ),
-                        };
-                        // A reply fetched over TCP (after an upstream TC) can
-                        // exceed what this UDP client accepts: truncate it.
-                        let limit = ctx.udp_limit.saturating_sub(ctx.reserve);
-                        let bytes = match (&parsed, proto) {
-                            (Ok(m), Proto::Udp) if bytes.len() > limit => {
-                                self.stats.truncated.fetch_add(1, Relaxed);
-                                result.push(self.truncation_note(&ctx, bytes.len(), limit));
-                                m.truncate()
-                                    .to_vec()
-                                    .unwrap_or_else(|_| header_only(id, ResponseCode::ServFail))
-                            }
-                            (Err(_), Proto::Udp) if bytes.len() > limit => {
-                                header_only(id, ResponseCode::ServFail)
-                            }
-                            _ => bytes,
-                        };
-                        self.emit(&ctx, &qname, qtype, rcode, answers, result, "forward");
-                        Reply::One(bytes)
-                    }
-                    Err(e) => {
-                        self.stats.errors.fetch_add(1, Relaxed);
-                        tracing::warn!(name = %qname, error = %e, "forwarding failed");
-                        resp.metadata.response_code = ResponseCode::ServFail;
-                        Reply::One(self.finish(resp, &ctx, "error"))
-                    }
-                }
-            }
-        }
-    }
-
     /// Encode, truncate for UDP if needed, and emit the query event.
-    fn finish(&self, resp: Message, ctx: &Ctx, source: &'static str) -> Vec<u8> {
+    pub(super) fn finish(&self, resp: Message, ctx: &Ctx, source: &'static str) -> Vec<u8> {
         let (qname, qtype) = resp
             .queries
             .first()
@@ -752,7 +389,7 @@ impl DnsServer {
 
     /// Query-log note for a truncated UDP answer; counts the truncations
     /// only the open-resolver payload cap caused.
-    fn truncation_note(&self, ctx: &Ctx, full: usize, limit: usize) -> String {
+    pub(super) fn truncation_note(&self, ctx: &Ctx, full: usize, limit: usize) -> String {
         match ctx.open_cap_from {
             Some(orig) if full <= orig.saturating_sub(ctx.reserve) => {
                 self.stats.open_resolver_truncated.fetch_add(1, Relaxed);
@@ -762,60 +399,8 @@ impl DnsServer {
         }
     }
 
-    /// Open resolver safeguards for a query about to be forwarded: the
-    /// per-client forwarding limit, no forwarded ANY (RFC 8482 minimal
-    /// answer instead), and the UDP payload cap (lowers `ctx.udp_limit`).
-    /// Returns the reply when the query must not be forwarded.
-    fn open_resolver_guard(
-        &self,
-        req: &[u8],
-        resp: &Message,
-        ctx: &mut Ctx,
-        rt: &Runtime,
-        qtype: RecordType,
-    ) -> Option<Reply> {
-        match self.fwd_limiter.check(ctx.client.ip()) {
-            Decision::Allow => {}
-            d => {
-                self.stats.open_resolver_rate_limited.fetch_add(1, Relaxed);
-                if matches!(d, Decision::RejectFirst) {
-                    tracing::warn!(client = %ctx.client.ip(), limit = rt.forwarding.open_resolver_rate_per_second, "open resolver: per-client forwarding limit exceeded; dropping forwarded queries for this window");
-                }
-                // As the global limiter: UDP drop (or slip), TCP REFUSED.
-                return Some(match ctx.proto {
-                    Proto::Udp if d == Decision::Slip => {
-                        slip_reply(req).map(Reply::One).unwrap_or(Reply::None)
-                    }
-                    Proto::Udp => Reply::None,
-                    Proto::Tcp => {
-                        self.stats.refused.fetch_add(1, Relaxed);
-                        let mut r = resp.clone();
-                        r.metadata.response_code = ResponseCode::Refused;
-                        Reply::One(self.finish(r, ctx, "refused"))
-                    }
-                });
-            }
-        }
-        if qtype == RecordType::ANY {
-            // RFC 8482 §4.2: a synthesized HINFO, as the authoritative
-            // minimal-ANY path does; small, and never forwarded.
-            self.stats.open_resolver_any.fetch_add(1, Relaxed);
-            let q = resp.queries[0].name().clone();
-            let mut r = resp.clone();
-            let hinfo = hickory_proto::rr::rdata::HINFO::new("RFC8482".to_string(), String::new());
-            r.add_answer(Record::from_rdata(q, 3789, RData::HINFO(hinfo)));
-            return Some(Reply::One(self.finish(r, ctx, "forward")));
-        }
-        let cap = rt.forwarding.open_resolver_max_udp_payload as usize;
-        if ctx.proto == Proto::Udp && cap < ctx.udp_limit {
-            ctx.open_cap_from = Some(ctx.udp_limit);
-            ctx.udp_limit = cap.max(512);
-        }
-        None
-    }
-
     #[allow(clippy::too_many_arguments)]
-    fn emit(
+    pub(super) fn emit(
         &self,
         ctx: &Ctx,
         qname: &Name,
@@ -840,6 +425,7 @@ impl DnsServer {
             answers,
             result,
             source,
+            filter: ctx.filter,
             duration_us: us,
         });
     }
@@ -849,7 +435,7 @@ const RESULT_MAX_ITEMS: usize = 8;
 const RESULT_MAX_CHARS: usize = 160;
 
 /// Human-readable summary of a response for the live query feed and query log.
-fn summarize(m: &Message, qname: &Name) -> Vec<String> {
+pub(super) fn summarize(m: &Message, qname: &Name) -> Vec<String> {
     let qkey = crate::zones::key_of(qname);
     let mut out = Vec::new();
     let fmt = |r: &Record| {
@@ -923,6 +509,7 @@ fn summarize(m: &Message, qname: &Name) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hickory_proto::op::MessageType;
 
     #[test]
     fn summarize_formats_answers_referrals_and_svcb() {
