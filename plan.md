@@ -137,7 +137,16 @@ OpenAPI snapshot + validator, conformance (123), smoke-release, cargo-audit.
   `tests/dnssec/wushilin_net.rs` (a live `delv wushilin.net DNSKEY` check)
   in the working tree while this plan ran. Left untouched and NOT in these
   commits; the D2/D3 BIND cases went to a new file,
-  `tests/dnssec_changes.rs`, to stay out of its way.
+  `tests/dnssec_changes.rs`, to stay out of its way. Status 2026-10-03
+  (second session): `tests/dnssec.rs` is clean again; the working tree
+  instead has an uncommitted `Cargo.toml` `[[test]] compat_dnssec_
+  wushilin_net` pointing at the untracked `compat/dnssec/wushilin_net.rs`
+  (queries the live zone through Google's DNS-over-HTTPS). Not staged,
+  committed or deleted by this plan (see H5 for the one rustfmt pass over
+  it); the gate runs on a clean worktree of each commit, so it neither
+  builds nor runs that test. For the owner to decide: commit it (it needs
+  the network, so a plain `cargo test` then depends on dns.google), make
+  it `#[ignore]`d / opt-in, or drop it.
 
 ## Rollout (after everything above passes)
 
@@ -156,6 +165,17 @@ OpenAPI snapshot + validator, conformance (123), smoke-release, cargo-audit.
   would differ and the standby would halt.
 - After each host: config check must pass (script aborts otherwise), DNSSEC
   delv validation of all records against that host, replica `up_to_date`.
+
+- After E1-E2, G2, H1-H3 (this session; not deployed): still protocol
+  2, no new change kind, no new column, no data rewritten. New: index
+  `records_zone_name` (created at startup, `IF NOT EXISTS`, local schema:
+  an older binary ignores it, so a downgrade stays possible as far as
+  this is concerned); the expiry watch on every node (a cut-off standby
+  stops serving an expired record by its own clock, in memory); the API
+  reads request bodies before answering; deleting a user writes
+  `zone_updated` (owner cleared, no serial bump) and `member_removed`
+  before `user_deleted`. An old (3884ba8) standby replays those as
+  before. Upgrade order: either; standby (baba2) first still preferred.
 
 ## Log
 
@@ -474,3 +494,11 @@ OpenAPI snapshot + validator, conformance (123), smoke-release, cargo-audit.
   the family whose class its stored rows carry; error messages for an
   unknown kind and missing fields). No wire, storage or protocol change
   (replication protocol stays 2).
+- 2026-10-03: final gate on c9b252b (E2 HEAD; clean worktree of the
+  commit, `REQUIRE_BIND_TOOLS=1 REQUIRE_PREV_BIN=1`, 3884ba8 binary): all
+  steps pass; 192 unit tests, integration suites 5/3/1/5/5/8/10/8/7
+  (mixed-version follow test, cut-off standby expiry test and the G2
+  early-answer test included), UI, OpenAPI snapshot fresh, validator,
+  conformance 123, smoke, cargo-audit only `paste`. Open: H4 (owner's
+  decision), H5 (owner to look at compat/ after one rustfmt pass).
+  Nothing pushed, tagged or deployed.
