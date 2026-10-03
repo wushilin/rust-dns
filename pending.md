@@ -1,13 +1,15 @@
 # Pending work
 
-Status as of 2026-09-27. Deployed to dns-test (musl build, /opt/rust-dns) with everything below. Stages 1 to 3 (log rotation, DNS protocol completeness, console fixes) are implemented. The current workspace has additional Stage 4 changes in progress below.
+Status as of 2026-10-03 (phase L). Live on gate (dns1) and baba2 (dns2) since d32d67f; the work plan and its log are in plan.md. Items below are kept as a record; open ones are marked `[ ]`.
 
-## Console editability (2026-10-03, K1/K2 in plan.md)
+## Console editability and phase L (2026-10-03, K1-K3, L1 in plan.md)
 
 - [x] K1. Standby: default-deny of console write controls (`data-ro-ok` opt-in), client guard in `api()` from `GET /status` `replication.standby_writable`; blocklist download/test allowed on a standby.
 - [x] K2. Every write control declares its permission (`data-perm`/`data-zone`), decided from the caller's effective rights; state blocks (`data-block`) for own-account delete, root edit by non-root, DNSSEC off while a DS may be published. Test-enforced in `api::ui_tests` and `tests/ui/access.test.js`.
+- [x] K3 (phase L). A standby's changelog page was empty: a snapshot load starts the local changelog at the snapshot offset. The standby now copies the primary's earlier DNS rows (`GET /api/changelog`) into the local display-only table `changelog_history`. Test `follow::a_standby_shows_the_primarys_dns_changelog`.
+- [x] L1 (phase L, = J2). Interface addresses followed through netlink on Linux (polling elsewhere / as fallback); systemd units allow `AF_NETLINK`. Tests `dns::ifaces::tests::*`, Linux-only `tests/netlink.rs`.
 
-## DNSSEC online signing (2026-09-27, implemented, not committed)
+## DNSSEC online signing (2026-09-27, implemented, committed since)
 
 - [x] RFC 3225 fix (ships with signing off): the query's DO bit is copied into the response OPT (was always clear). Unit/e2e/conformance checks.
 - [x] Per-zone signing, off by default: `zones.dnssec` (Zone JSON field only when on; changed through `update_zone` -> `zone_updated` + serial bump), one CSK per zone (257, alg 13 ECDSA P-256, ring), NSEC. Key in `dnssec_keys` (registry: replicated), written only through `DnssecKeySet` / `DnssecKeyDeleted` account-class changes (acct_sql; source-scan test covers the table); never in the changelog API, websocket (Tx::finish now publishes only dns-class events), audit, logs; scrubbed after `account_retention_days`; in snapshots.
@@ -19,9 +21,9 @@ Status as of 2026-09-27. Deployed to dns-test (musl build, /opt/rust-dns) with e
 - [x] Mixed-version safety while signing is off: `zones.dnssec` is left out of the table checksum (covered by the per-zone checksum, where it appears only when on); an empty table unknown to an older primary is not a reconcile difference. Upgrade standbys before turning signing on.
 - [x] Tests: dnspython known-answer vectors + BIND DS (`src/dnssec/vectors.rs`, `scripts/dnssec-vectors.py`), unit tests (canonical order, bitmaps, key tag/DS RFC 4034 examples, chain/positions, window), mutation tests (enable/disable/key lifecycle, secrecy, re-sign, cache), randomized replay covers the new change kinds, replica snapshot/secrets tests, `tests/dnssec.rs` (dnssec-verify, dnssec-dsfromkey, delv x40 + negative control, validating named with AD, no-DO answers unchanged, truncation, re-sign, parent DS refusal with a second rust-dns as parent), `tests/follow.rs` (standby signs with the replicated key, delv + dnssec-verify against it, reconcile ok, no halt), conformance 86 -> 123.
 - [ ] Not done: automated key rollover (double-signature or CDS/CDNSKEY, RFC 7344/8078), NSEC3, other algorithms, signing auto-PTR answers, DS query at an apex whose parent zone is here but unsigned and has no DS keeps the child NODATA (pre-existing behaviour), wildcards whose `*` label is itself an empty non-terminal (records under `*.x`) are answered NXDOMAIN as before and their NSEC proof would not validate (unusual; not blocked in the editor).
-- [ ] Owner notes for deployment: build, deploy with signing off (no answer changes except the DO echo), upgrade baba2 before gate if possible (either order is safe while signing is off), then enable on wushilin.net, run the check, confirm baba2's DNSSEC tab shows the same key, publish the DS at the registrar, confirm with the parent lookup (needs a forwarding upstream on gate, else `dig +short DS wushilin.net`).
+- [x] Owner notes for deployment (done: deployed to baba2 then gate, signing on for wushilin.net, DS published, delv and public resolvers validate; see plan.md Rollout and Log, 2026-10-03): build, deploy with signing off (no answer changes except the DO echo), upgrade baba2 before gate if possible (either order is safe while signing is off), then enable on wushilin.net, run the check, confirm baba2's DNSSEC tab shows the same key, publish the DS at the registrar, confirm with the parent lookup (needs a forwarding upstream on gate, else `dig +short DS wushilin.net`).
 
-## Open resolver mode (2026-09-27, implemented, not committed)
+## Open resolver mode (2026-09-27, implemented, committed since)
 
 - [x] `[forwarding] open_resolver = false` (default), `open_resolver_max_udp_payload = 512` (512..4096), `open_resolver_rate_per_second = 20` (0 = no extra limit). The L10 guard stays the default; the flag skips it in `config::validate` and `mutation::settings::validate`. Empty `allowed_clients` still means nobody (the /0 entries must be listed). `--check` prints `WARNING:` lines; WARN at startup, on reload (notes too) and on every off->on transition. Reloadable.
 - [x] Console/API override: `ForwardingSettings.open_resolver: Option<bool>` (absent in old overrides = the file's value; new saves always store it explicitly). `ForwardingInput.open_resolver` (omitted = file value), `ForwardingView.open_resolver/_max_udp_payload/_rate_per_second`, `config.open_resolver`. Audited in `settings.forwarding.update` before/after; replicated as part of the `setting_set` JSON (replay test data, snapshot test, `tests/follow.rs`).
@@ -29,14 +31,14 @@ Status as of 2026-09-27. Deployed to dns-test (musl build, /opt/rust-dns) with e
 - [x] Visibility: gauge `rustdns_open_resolver`, counters `rustdns_open_resolver_{truncated,any,rate_limited}_total`, `/api/status` `forwarding.open_resolver` + `dns.open_resolver_*`; console badge on dashboard and Server settings, two-step in-dialog enable, turn-off dialog with a narrowed ACL.
 - [ ] Not done: exempting clients with a valid server cookie from the UDP cap (cookie proves the source address); per-mode limits configurable from the console (file only).
 
-## Replica tracking and halting (2026-09-27, implemented, not committed)
+## Replica tracking and halting (2026-09-27, implemented, committed since)
 
 - [x] `[follow].instance_id` required (host label); standby sends `X-Rust-DNS-Instance/Version/Session` on every replication request; data endpoints 400 without it.
 - [x] Primary tracks replicas (`replication::replicas`): applied offset (= `after`), lag changes/seconds, last seen, address, version, user; states up_to_date/catching_up/falling_behind/offline/bootstrapping/halted; conflict flag; `[replication]` thresholds (reloadable); local `replicas` table (registry: Local), pruned after `forget_after_days`; `GET /api/replication/replicas`, audited `DELETE .../{id}`; metrics per instance; console table.
 - [x] Halt (terminal until `--prepare-standby`): reconcile mismatch, apply failure, txn mismatch at head, ahead of primary. Report file `diverged-*.json`, state in `replication_state`, audit row `replication.halt`, log, metric `rustdns_replication_halted`, banner, status, `--check`; reported to the primary (`POST /api/replication/replicas/{id}/report`) at the halt and at each start.
 - [x] Root rename on a standby refused (would change a replicated row).
 
-## Account changes in the changelog (2026-09-27, implemented, not committed)
+## Account changes in the changelog (2026-09-27, implemented, committed since)
 
 - [x] `Change` gained the account family (user_created/updated/deleted, totp_step_accepted, recovery_codes_replaced, recovery_code_used, token_created/tags_set/revoked, tsig_key_set/deleted, setting_set/cleared): facts, applied by `mutation::acct_sql` (the only writer of those tables; source-scan test) on the primary through `AuditTx::record` and on a standby through the same `replay::apply` (local-root merge inside it).
 - [x] One changelog sequence; column `class` ('dns'|'account'); changelog API/websocket show `dns` only; account payloads scrubbed after `[changelog].account_retention_days` (default 3) -> gap -> snapshot.
@@ -45,7 +47,7 @@ Status as of 2026-09-27. Deployed to dns-test (musl build, /opt/rust-dns) with e
 - [x] Standby-local account writes (its root, TOTP steps / recovery codes used there) are applied but not changelogged (gate closed before the root sync at startup).
 - [x] Snapshot only when connecting (fresh database, or same-lineage gap); afterwards changelog only. Replay is idempotent (upserts, `INSERT OR REPLACE` of changelog rows), overlapping batches are accepted. Reconcile mismatch is reported (log, status, metric), no automatic reload.
 
-## Standby: follow only a fresh database (2026-09-27, implemented, not committed)
+## Standby: follow only a fresh database (2026-09-27, implemented, committed since)
 
 - [x] `[follow]` follows only when the database is in the primary's lineage (restart/reconnect; gap or reconcile re-bootstrap stays automatic) or fresh (`replication::data::fresh_problems`: no zones, records, members, TSIG keys, settings, tokens, users besides the config root). Otherwise state `refused`, read-only, error names the data and `--prepare-standby`; shown in status (`replication.problem` in `/api/status`), banner, Replication page, `--check`, log.
 - [x] `rust-dns --prepare-standby [--yes]` (server stopped; web port in use or DB locked = refused): dry run lists and exits 2; `--yes` writes `<db>.pre-standby-<time>` (online backup, integrity-checked), `divergent-<time>.json` when there are local changes the primary lacks, empties replicated tables and lineage, audit row `replication.prepare_standby`.
@@ -105,13 +107,13 @@ Status as of 2026-09-27. Deployed to dns-test (musl build, /opt/rust-dns) with e
 - [x] Collapsible sidebar with sections and icons; drawer on phones.
 - [x] SOA fields explained; Delegation tab with nameservers, glue and registrar steps (reverse zones explained separately).
 - [x] Dashboard "DNS listeners" card and per-zone dig commands (UDP/TCP, port, AXFR when allowed).
-- [ ] Live updates through a reverse proxy not exercised in the browser this round (websocket path unchanged).
+- [ ] Live updates through a reverse proxy not exercised in a browser (no nginx on the dev machine in phase L either). How to check it by hand is in README.md (Configuration, after the logging block); `examples/proxy/nginx.conf` and `haproxy.cfg` pass the upgrade.
 
-## In flight right now (uncommitted edits on disk)
+## Earlier in-flight notes (2026-09-27; all committed since)
 
 - [x] `src/ui/index.html`: zone page paging fix is built; the end-to-end `json_import_and_record_paging` test covers the server-side paging API.
 - [x] Zone page and record filter verified in the browser (2026-09-27).
-- [ ] Browser check still owed for: recovery-code modal after MFA enrollment, "New recovery codes" flow, users → "Sign this user out everywhere". In-app Browser is unavailable in this session.
+- [x] Browser check of the recovery-code modal after MFA enrollment, "New recovery codes", MFA disable, users → "Sign this user out everywhere" and the "Promoted" dialog: done in phase L (L2, plan.md), which also fixed the account page's recovery code count; repeatable API-level test `e2e::account_dialog_flows`.
 - [x] `scripts/conformance-local.sh` passes 85/85 (76 before TSIG); `RUN_COMPLIANCE=1 scripts/conformance-local.sh` builds and runs ISC genreport with every probe `ok`.
 - [x] `cargo fmt --all` and `cargo clippy --all-targets -- -D warnings` pass.
 - [x] `cargo test -- --test-threads=1` passes (34 unit + 3 end-to-end); serial run avoids an occasional collision in the tests' free-port helper.
@@ -179,12 +181,13 @@ Status as of 2026-09-27. Deployed to dns-test (musl build, /opt/rust-dns) with e
 ## DNS features not started
 
 - [x] DNSSEC signing (NSEC, CSK, DS publication): see above. NSEC3 and automated rollover remain.
-- [ ] TSIG for AXFR and NOTIFY. Transfers are currently restricted by client network only.
+- [x] TSIG for AXFR and NOTIFY: see "TSIG for zone transfers and NOTIFY" above (`src/dns/tsig.rs`, `tests/tsig.rs`, `[transfer]`).
 - [x] Changelog-based follower mode (standby mode, 2026-09-27).
 - [ ] Inbound NOTIFY / acting as a secondary for zones hosted elsewhere.
 - [ ] DNS over TLS / HTTPS (inbound and upstream). Deliberately deferred.
 - [ ] Response Rate Limiting per response tuple in addition to per-client limiting.
-- [ ] Per-zone settings: forwarding overrides, auto-PTR toggle, transfer ACL and NOTIFY targets.
+- [x] Per-zone forwarding: override zones (phase I, I6; README "Resolver features" -> Override zones).
+- [ ] Per-zone settings still missing: auto-PTR toggle, transfer ACL and NOTIFY targets.
 - [ ] Record types hickory-proto's text parser does not cover (LOC and others).
 
 ## Console and API
@@ -200,10 +203,11 @@ Status as of 2026-09-27. Deployed to dns-test (musl build, /opt/rust-dns) with e
 
 ## Packaging
 
-- [ ] Static musl build and multi-arch Docker image publish.
+- [x] Static musl build: `.github/workflows/release.yml` builds x86_64 and aarch64 `*-unknown-linux-musl` (plus macOS and Windows).
+- [ ] Multi-arch Docker image publish (`deploy/Dockerfile` exists; nothing publishes an image).
 - [ ] Debian package and Homebrew formula.
 - [ ] Windows service wrapper (untested platform).
-- [ ] Initialise the git repository and make the first commit (remote to be decided by the user).
+- [x] Git repository: private GitHub repository `wushilin/rust-dns` (CI in `.github/workflows/ci.yml`, releases in `release.yml`).
 
 ## Known limitations to document
 

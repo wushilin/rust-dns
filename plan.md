@@ -289,7 +289,7 @@ Order: I1-I4 first (core, ~2 days), then I5-I6, then I7, then the rest.
   (poll or netlink on Linux; poll elsewhere). Replaces the `run.sh` ens5/eth0
   rewrite. Tests: unit for the address diffing; integration where possible.
 
-- [ ] J2. (found in I11) Interfaces are polled (`interface_poll_secs`,
+- [x] J2 (done as L1). (found in I11) Interfaces are polled (`interface_poll_secs`,
   default 5 s), not followed through netlink: a new address is served
   within one interval. Netlink (Linux) would make it immediate.
 - [x] J3. (found by the P1 gate) The unit test `api::proxy::tests::
@@ -411,10 +411,16 @@ a router-sized footprint (a design property, not a feature).
   exercised; the manual check (console through the proxy, a change in a
   second tab appears at once, or a `curl` upgrade request answering 101)
   is in the README next to the proxy examples.
-- [ ] L3. pending.md cleanup: tick entries that are done (TSIG for
+- [x] L3. pending.md cleanup: tick entries that are done (TSIG for
   AXFR/NOTIFY, git repository, static musl build in the release workflow,
   deployment notes, per-zone forwarding via override zones) with a pointer
   to where; keep the rest accurate.
+  Done: those five ticked with pointers (the per-zone entry split: forwarding
+  done via override zones, auto-PTR toggle / transfer ACL / NOTIFY targets
+  still open; the musl entry split: Docker image publishing still open);
+  the browser debt ticked (L2) and the proxy entry pointed at the README
+  check; K3/L1 recorded; stale "not committed" / "in flight" headings and
+  the status line brought up to date.
 
 ## Rollout (after everything above passes)
 
@@ -1020,3 +1026,4 @@ a router-sized footprint (a design property, not a feature).
   promote notes asserted, `GET /me` `recovery_codes_left` (console bug),
   browser walk-through of the five dialogs, proxy check documented (no
   nginx here).
+- 2026-10-03 (phase L): L3 done (pending.md).
