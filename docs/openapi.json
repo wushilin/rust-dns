@@ -3179,9 +3179,6 @@
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
-          },
-          "409": {
-            "$ref": "#/components/responses/ReadOnly"
           }
         }
       }
@@ -3226,9 +3223,6 @@
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
-          },
-          "409": {
-            "$ref": "#/components/responses/ReadOnly"
           }
         }
       }
@@ -7569,6 +7563,13 @@
           "halted": {
             "type": "boolean",
             "description": "Replication halted because the data diverged (see the status)."
+          },
+          "standby_writable": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WritableRoute"
+            },
+            "description": "The non-GET operations this server accepts while it is read-only\n(method, path template under `/api`, `{x}` = one segment); every\nother non-GET operation is refused with 409 `read_only_standby`."
           }
         }
       },
@@ -9075,6 +9076,26 @@
             "username": "root"
           },
           "via": "session"
+        }
+      },
+      "WritableRoute": {
+        "type": "object",
+        "description": "One operation (method and path template under `/api`).",
+        "required": [
+          "method",
+          "path"
+        ],
+        "properties": {
+          "method": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          }
+        },
+        "example": {
+          "method": "POST",
+          "path": "/users/{id}/sessions/revoke"
         }
       },
       "Zone": {

@@ -594,6 +594,46 @@ fn path_templates_match_single_segments() {
     assert!(allowed_when_read_only("POST", "/auth/login"));
 }
 
+/// K1: `GET /status` publishes exactly [`STANDBY_WRITABLE`] (the console's
+/// client-side guard refuses every other write on a standby), on a primary
+/// and on a read-only server alike.
+#[tokio::test]
+async fn status_publishes_the_standby_allowlist() {
+    let h = Harness::new();
+    h.user("nora", "nora-password-1", None);
+    let cookie = h
+        .login("nora", "nora-password-1")
+        .await
+        .cookie
+        .expect("session");
+    let want: Vec<serde_json::Value> = STANDBY_WRITABLE
+        .iter()
+        .map(|(m, p)| serde_json::json!({ "method": m, "path": p }))
+        .collect();
+    for closed in [false, true] {
+        if closed {
+            h.state
+                .mutator
+                .gate()
+                .close("this server is a read-only standby of https://dns1.example.net:8053");
+        }
+        let r = h.call("GET", "/status", Some(&cookie), None).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.json);
+        assert_eq!(
+            r.json["replication"]["standby_writable"],
+            serde_json::Value::Array(want.clone()),
+            "read-only: {closed}"
+        );
+    }
+    for (m, p) in [
+        ("POST", "/blocklists/refresh"),
+        ("POST", "/blocklists/test"),
+    ] {
+        assert!(allowed_when_read_only(m, p), "{m} {p}");
+    }
+    assert!(!allowed_when_read_only("PUT", "/blocklists"));
+}
+
 /// B3: while a long write (a large import) holds the write connection, API
 /// reads and DNS answers stay fast, also when more account writes than
 /// runtime workers are waiting for it. Account writes are synchronous calls

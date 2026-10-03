@@ -435,6 +435,19 @@ pub struct ReplicationSummary {
     /// Replication halted because the data diverged (see the status).
     #[serde(default)]
     pub halted: bool,
+    /// The non-GET operations this server accepts while it is read-only
+    /// (method, path template under `/api`, `{x}` = one segment); every
+    /// other non-GET operation is refused with 409 `read_only_standby`.
+    #[serde(default)]
+    pub standby_writable: Vec<WritableRoute>,
+}
+
+/// One operation (method and path template under `/api`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(example = json!({ "method": "POST", "path": "/users/{id}/sessions/revoke" }))]
+pub struct WritableRoute {
+    pub method: String,
+    pub path: String,
 }
 
 /// `POST /replication/replicas/{id}/report`: a standby tells its primary

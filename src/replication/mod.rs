@@ -432,6 +432,7 @@ impl Replication {
             read_only_reason: self.read_only_reason(),
             problem,
             halted,
+            standby_writable: crate::api::standby_writable(),
         }
     }
 

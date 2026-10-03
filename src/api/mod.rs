@@ -16,6 +16,8 @@ pub mod settings;
 mod tests;
 pub mod tsig;
 pub mod types;
+#[cfg(test)]
+mod ui_tests;
 pub mod ws;
 
 use crate::cache::Cache;
@@ -64,7 +66,8 @@ pub struct AppState {
 /// Non-GET operations that still work on a read-only standby (method, path
 /// under `/api`): signing in and out, local sessions, reloading the local
 /// config, forwarding tests and cache flushes, TSIG reveals (a read with a
-/// local audit row) and promotion. Every other non-GET operation is refused
+/// local audit row), blocklist downloads and name tests (this server's
+/// in-memory lists only) and promotion. Every other non-GET operation is refused
 /// with 409 `read_only_standby` by [`read_only_guard`] and documented so by
 /// `openapi::finish` — a new route is read-only by default.
 pub const STANDBY_WRITABLE: &[(&str, &str)] = &[
@@ -78,9 +81,23 @@ pub const STANDBY_WRITABLE: &[(&str, &str)] = &[
     ("POST", "/admin/reload"),
     ("POST", "/settings/forwarding/test"),
     ("POST", "/settings/forwarding/cache/flush"),
+    ("POST", "/blocklists/refresh"),
+    ("POST", "/blocklists/test"),
     ("POST", "/tsig/keys/{name}/reveal"),
     ("POST", "/replication/promote"),
 ];
+
+/// [`STANDBY_WRITABLE`] as published in `GET /status` (`replication.standby_writable`),
+/// so the console refuses other writes on a standby before sending them.
+pub fn standby_writable() -> Vec<crate::replication::types::WritableRoute> {
+    STANDBY_WRITABLE
+        .iter()
+        .map(|(m, p)| crate::replication::types::WritableRoute {
+            method: (*m).to_string(),
+            path: (*p).to_string(),
+        })
+        .collect()
+}
 
 /// Whether `path` (concrete, under `/api`) matches `template` (`{x}` = one segment).
 pub fn path_matches(template: &str, path: &str) -> bool {

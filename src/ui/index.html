@@ -55,6 +55,10 @@ input:focus, select:focus, textarea:focus { border-color: var(--accent); box-sha
 .btn.sm { padding: 5px 10px; font-size: 12.5px; }
 .btn.ghost { border-color: transparent; }
 .btn:disabled { opacity: .5; cursor: default; }
+/* Denied by the access pass (permission, standby, object state): inputs of a dialog whose action is denied look inert. */
+.modal:has(.m-foot [data-denied]) .m-body :is(input, select, textarea), .modal:has(.m-body > .row [data-denied]) .m-body :is(input, select, textarea), .modal .m-body section:has(.foot [data-denied]) :is(input, select, textarea) { opacity: .6; pointer-events: none; }
+.linkbtn { background: none; border: 0; padding: 0; color: var(--accent); cursor: pointer; font: inherit; text-decoration: underline; }
+.linkbtn:disabled { color: var(--muted, inherit); opacity: .6; cursor: default; text-decoration: none; }
 .error { color: var(--danger); font-size: 13px; margin-top: 10px; min-height: 18px; }
 .hint { color: var(--muted); font-size: 12.5px; }
 .qr { width: 180px; height: 180px; border-radius: 8px; overflow: hidden; background: #fff; margin: 12px auto; }
@@ -464,6 +468,12 @@ function toast(msg, kind = '') {
 
 // `opts.full`: resolve to { status, data } instead of the body (e.g. 201 created vs 200 renewed).
 async function api(method, path, body, opts = {}) {
+  // Read-only standby: only what the server's allowlist accepts is sent.
+  const ro = accessCtx().ro;
+  if (!requestAllowed(method, path, ro)) {
+    const msg = roReason(ro); toast(msg, 'err');
+    const e = new Error(msg); e.status = 409; e.code = 'read_only_standby'; e.local = true; throw e;
+  }
   const opt = { method, headers: { 'x-requested-with': 'rust-dns' } };
   if (body !== undefined) { opt.headers['content-type'] = 'application/json'; opt.body = JSON.stringify(body); }
   const r = await fetch('/api' + path, opt);
@@ -535,9 +545,11 @@ document.addEventListener('keydown', e => {
   else if ($('#drawer-root').classList.contains('open')) closeDrawer();
   else $('#app').classList.remove('nav-open');
 });
-function confirmModal(title, text, okLabel = 'Delete') {
+// `from`: the control that asked; the confirm button inherits its declaration
+// (permission, zone, standby safety, state block).
+function confirmModal(title, text, okLabel = 'Delete', from = null) {
   return new Promise(res => {
-    openModal(`<h2>${esc(title)}</h2><p>${esc(text)}</p><div class="foot"><button class="btn" data-close>Cancel</button><button class="btn danger" id="cf-ok">${esc(okLabel)}</button></div>`);
+    openModal(`<h2>${esc(title)}</h2><p>${esc(text)}</p><div class="foot"><button class="btn" data-close>Cancel</button><button class="btn danger" id="cf-ok"${ctlAttrs(from)}>${esc(okLabel)}</button></div>`);
     $('#cf-ok').onclick = () => { closeModal(); res(true); };
     $$('[data-close]').forEach(b => b.addEventListener('click', () => res(false), { once: true }));
   });
@@ -578,7 +590,7 @@ const VALUE_HINT = { A: '10.0.0.1', AAAA: '2001:db8::1', CNAME: 'target.example.
 // login flow
 // ---------------------------------------------------------------------------
 function showLogin(step = 'password') {
-  closeModal(); disconnectWs();
+  closeModal(); disconnectWs(); S.rights = null;
   $('#app').classList.add('hidden'); $('#login').classList.remove('hidden');
   for (const s of ['password', 'mfa', 'enroll']) $('#login-step-' + s).classList.toggle('hidden', s !== step);
   $('#li-err').textContent = ''; $('#mfa-err').textContent = ''; $('#enroll-err').textContent = '';
@@ -590,7 +602,7 @@ function showEnroll(enroll) {
 function recoveryModal(codes, then) {
   openModal(`<h2>Recovery codes</h2><p class="hint">Each code signs you in once if you lose your authenticator. Store them somewhere safe; they will not be shown again.</p>
     <pre style="font-size:14px;line-height:1.8">${codes.map(esc).join('\n')}</pre>
-    <div class="foot"><button class="btn" id="rc-copy">Copy</button><button class="btn primary" data-close>I saved them</button></div>`, m => {
+    <div class="foot"><button class="btn" id="rc-copy" data-ro-ok>Copy</button><button class="btn primary" data-close>I saved them</button></div>`, m => {
     $('#rc-copy').onclick = () => { navigator.clipboard?.writeText(codes.join('\n')); toast('Copied', 'ok'); };
     if (then) $$('[data-close]', m).forEach(b => b.addEventListener('click', then, { once: true }));
   });
@@ -638,17 +650,113 @@ async function enterApp() {
 }
 
 // ---------------------------------------------------------------------------
-// standby (read-only) mode: banner on every page, write controls disabled
+// access: which controls may be used. Default-deny, decided from the server's
+// own data, never from rules re-implemented here:
+//  - the caller's effective rights (GET /users/{me}/rights, generated from the
+//    permission table every API check uses),
+//  - the standby allowlist published in GET /status
+//    (replication.standby_writable, generated from STANDBY_WRITABLE),
+//  - object state the page knows (data-block="why").
+// Every button / submit / [data-action] / [data-perm] in the page body,
+// dialogs and the slide-over declares itself:
+//   data-perm="<perm>" [data-zone="<zone>|*"]  a write; needs that permission
+//   data-ro-ok                                works on a read-only standby
+//                                             (views, filters, tests, ...)
+//   data-close / data-dclose / data-copy      closing and copying (safe)
+//   data-block="reason"                       refused in this state
+// An undeclared control is disabled, so a new button cannot slip through.
+// tests/ui/access.test.js tests the pure part (between the markers);
+// src/api/ui_tests.rs checks the declarations and the API call sites.
 // ---------------------------------------------------------------------------
-const WRITE_SEL = '#sec-on,#sec-off,#z-new,#z-edit,#z-del,#u-new,#tk-new,#tk-save,#tk-del,#t-new,#soa-edit,#rf-save,#r-add,#m-add,#im-go,#fw-save,#fw-reset,#pw-btn,#mfa-on,#mfa-off,#mfa-regen,[data-edit],[data-del],[data-rm],[data-rev],[data-tab="import"]';
-function applyReadOnly() {
-  if (!S.readOnly) return;
-  $$(WRITE_SEL).forEach(b => { if (!b.disabled) { b.disabled = true; b.dataset.ro = '1'; b.title = 'Read-only: make changes on the primary'; } });
+/*ACCESS-BEGIN*/
+const SAFE_METHODS = ['GET', 'HEAD', 'OPTIONS'];
+// `template` under /api with {x} = one non-empty segment; query strings ignored.
+function pathMatches(template, path) {
+  const t = String(template).split('?')[0].replace(/\/+$/, '').split('/');
+  const p = String(path).split('?')[0].replace(/\/+$/, '').split('/');
+  return t.length === p.length && t.every((a, i) => (a.startsWith('{') && a.endsWith('}') && p[i] !== '') || a === p[i]);
 }
-new MutationObserver(applyReadOnly).observe(document.body, { childList: true, subtree: true });
+// May this request be sent? `ro`: null while the server accepts writes, else
+// { primary, allow: [{ method, path }] } from GET /status.
+function requestAllowed(method, path, ro) {
+  const m = String(method).toUpperCase();
+  if (!ro || SAFE_METHODS.includes(m)) return true;
+  return (ro.allow || []).some(r => r.method === m && pathMatches(r.path, path));
+}
+const roReason = ro => `Read-only standby: make changes on the primary${ro && ro.primary ? ` (${ro.primary})` : ''}`;
+// The rights document of GET /users/{id}/rights, indexed.
+function rightsIndex(r) {
+  const global = {}, zones = {}, legend = {};
+  for (const g of r.global || []) global[g.perm] = g;
+  for (const z of r.zones || []) zones[z.zone] = { role: z.role, perms: z.permissions || [] };
+  for (const p of r.zone_permissions || []) legend[p.perm] = p;
+  return { global, zones, legend };
+}
+// ctl: { safe, perm, zone, block }; ctx: { rights (rightsIndex or null), ro }.
+// Returns { ok, reason }.
+function decide(ctl, ctx) {
+  const rt = ctx.rights;
+  if (ctl.perm) {
+    if (!rt) return { ok: false, reason: 'Checking your permissions…' };
+    const g = rt.global[ctl.perm], zp = rt.legend[ctl.perm];
+    if (g) {
+      if (!g.allowed) return { ok: false, reason: `Not allowed: ${g.label} (${g.reason || 'not permitted'})` };
+    } else if (zp) {
+      if (!ctl.zone) return { ok: false, reason: `This control needs ${ctl.perm} but names no zone` };
+      const has = ctl.zone === '*'
+        ? Object.values(rt.zones).some(z => z.perms.includes(ctl.perm))
+        : !!rt.zones[ctl.zone] && rt.zones[ctl.zone].perms.includes(ctl.perm);
+      if (!has) {
+        const z = ctl.zone === '*' ? null : rt.zones[ctl.zone];
+        return { ok: false, reason: `Not allowed: ${zp.label} needs the ${zp.min_role} role${ctl.zone === '*' ? ' on a zone' : ` on ${ctl.zone}; you are ${z ? z.role : 'not a member'}`}` };
+      }
+    } else return { ok: false, reason: `Unknown permission "${ctl.perm}"` };
+  } else if (!ctl.safe) return { ok: false, reason: 'This control declares no permission' };
+  if (ctx.ro && !ctl.safe) return { ok: false, reason: roReason(ctx.ro) };
+  if (ctl.block) return { ok: false, reason: ctl.block };
+  return { ok: true, reason: '' };
+}
+/*ACCESS-END*/
+const CTL_SEL = 'button,input[type=submit],input[type=button],[data-action],[data-perm]';
+const SAFE_SEL = '[data-ro-ok],[data-close],[data-dclose],[data-copy]';
+const describeCtl = el => ({ safe: el.matches(SAFE_SEL), perm: el.dataset.perm || null, zone: el.dataset.zone ?? null, block: el.dataset.block || null });
+// Attributes for a control that acts for another one (a confirm button).
+const ctlAttrs = from => !from ? '' : ['perm', 'zone', 'block'].filter(k => from.dataset[k] != null).map(k => ` data-${k}="${esc(from.dataset[k])}"`).join('') + (from.matches(SAFE_SEL) ? ' data-ro-ok' : '');
+const blockAttr = why => why ? ` data-block="${esc(why)}"` : '';
+function accessCtx() {
+  return { rights: S.rights || null, ro: S.readOnly ? { primary: (S.repl && S.repl.primary) || '', allow: (S.repl && S.repl.standby_writable) || [] } : null };
+}
+function applyAccess() {
+  const ctx = accessCtx();
+  for (const root of ['#main', '#modal', '#drawer']) for (const el of $(root).querySelectorAll(CTL_SEL)) {
+    const d = decide(describeCtl(el), ctx);
+    if (!d.ok) {
+      if (!('denied' in el.dataset)) { el.dataset.denied = el.disabled ? 'was' : ''; el.dataset.title0 = el.title || ''; }
+      if (!el.disabled) el.disabled = true;
+      if (!(el instanceof HTMLButtonElement || el instanceof HTMLInputElement)) el.setAttribute('aria-disabled', 'true');
+      if (el.title !== d.reason) el.title = d.reason;
+    } else if ('denied' in el.dataset) {
+      el.disabled = el.dataset.denied === 'was'; el.title = el.dataset.title0; el.removeAttribute('aria-disabled');
+      delete el.dataset.denied; delete el.dataset.title0;
+    }
+  }
+}
+new MutationObserver(applyAccess).observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['disabled', 'data-block', 'data-perm', 'data-zone'] });
+// A denied control never acts, even when clicked by script.
+document.addEventListener('click', e => {
+  const el = e.target.closest && e.target.closest('[data-denied]'); if (!el) return;
+  e.preventDefault(); e.stopImmediatePropagation(); toast(el.title || 'Not allowed', 'err');
+}, true);
+async function loadRights() {
+  if (!S.user) return;
+  try { S.rights = rightsIndex(await GET(`/users/${S.user.id}/rights`)); } catch (e) { if (e.code === 'login_required') throw e; }
+  applyAccess();
+}
+
 async function pollRepl() {
   if (!S.user) return;
   try { const st = await GET('/status'); S.status = st; renderBanner(st.replication); } catch {}
+  applyAccess();
 }
 function renderBanner(r) {
   const b = $('#repl-banner'), was = S.readOnly;
@@ -670,7 +778,7 @@ function renderBanner(r) {
     b.className = 'bad';
     b.innerHTML = `${ico('warn', 's')}<span><b>Read-only:</b> ${esc(r.read_only_reason || 'this server does not accept changes')}</span>${link}`;
   }
-  if (!was) applyReadOnly();
+  applyAccess();
 }
 window.addEventListener('hashchange', route);
 async function route() {
@@ -684,7 +792,7 @@ async function route() {
   const v = views[page] || viewDashboard;
   try { await v(); } catch (e) { if (e.code !== 'login_required') { $('#main').innerHTML = `<div class="empty">${esc(e.message)}</div>`; } }
 }
-async function refreshZones() { S.zones = (await GET('/zones')).zones; }
+async function refreshZones() { S.zones = (await GET('/zones')).zones; await loadRights(); }
 
 // ---------------------------------------------------------------------------
 // websocket (realtime)
@@ -841,8 +949,8 @@ async function viewZones() {
   S.zone = null;
   $('#main').innerHTML = `
     <div class="topbar"><h1>Zones</h1><div class="actions">
-      <button class="btn" id="z-io">Import / Export</button>
-      ${S.user.is_admin ? '<button class="btn primary" id="z-new">New zone</button>' : ''}
+      <button class="btn" id="z-io" data-ro-ok>Import / Export</button>
+      ${S.user.is_admin ? '<button class="btn primary" id="z-new" data-perm="create_zones">New zone</button>' : ''}
     </div></div>
     <div class="row toolbar"><input type="text" id="z-filter" placeholder="Filter zones…"></div>
     <div class="card" id="z-table"></div>`;
@@ -883,7 +991,7 @@ function overrideFields(o) {
 function readOverride(m) { return { mode: m.querySelector('#ov-mode').value, upstreams: m.querySelector('#ov-up').value.split('\n').map(x => x.trim()).filter(Boolean) }; }
 function overrideModal(z) {
   openModal(`<h2>Override zone ${esc(z.name)}</h2>${overrideFields(z.override)}<div class="error" id="m-err"></div>
-    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="m-ok">Save</button></div>`, m => {
+    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="m-ok" data-perm="edit_settings" data-zone="${esc(z.name)}">Save</button></div>`, m => {
     m.querySelector('#m-ok').onclick = async () => { try { await PUT('/zones/' + encodeURIComponent(z.name), { override: readOverride(m) }); closeModal(); toast('Override settings saved', 'ok'); reloadZone(); } catch (e) { m.querySelector('#m-err').textContent = e.message; } };
   });
 }
@@ -898,7 +1006,7 @@ function newZoneModal() {
     <p class="hint">Leave the SOA fields empty to use the server defaults.</p>
     ${zoneForm({ soa_mname: '', soa_rname: '' })}
     <div class="error" id="m-err"></div>
-    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="m-ok">Create</button></div>`, m => {
+    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="m-ok" data-perm="create_zones">Create</button></div>`, m => {
     m.querySelectorAll('[name=default_ttl],[name=minimum],[name=refresh],[name=retry],[name=expire]').forEach(i => i.value = '');
     m.querySelector('#nz-type').onchange = e => m.querySelector('#nz-ov').classList.toggle('hidden', e.target.value !== 'override');
     $('#m-ok').onclick = async () => { try { const body = readForm(m); if (m.querySelector('#nz-type').value === 'override') body.override = readOverride(m); const z = await POST('/zones', body); closeModal(); await refreshZones(); location.hash = '#/zones/' + encodeURIComponent(z.name); toast(`Zone ${z.name} created`, 'ok'); } catch (e) { $('#m-err').textContent = e.message; } };
@@ -924,17 +1032,17 @@ function renderZone(keepFilter) {
       <div class="topbar">
         <h1 class="mono zname">${esc(z.fqdn)}</h1>
         <div class="actions">
-          <button class="btn" id="z-io">Import / Export</button>
-          ${isOwner && z.override ? '<button class="btn" id="z-ov">Override settings</button>' : ''}
-          ${isOwner ? '<button class="btn" id="z-edit">Settings</button><button class="btn danger" id="z-del">Delete zone</button>' : ''}
+          <button class="btn" id="z-io" data-ro-ok>Import / Export</button>
+          ${isOwner && z.override ? `<button class="btn" id="z-ov" data-perm="edit_settings" data-zone="${esc(z.name)}">Override settings</button>` : ''}
+          ${isOwner ? `<button class="btn" id="z-edit" data-perm="edit_settings" data-zone="${esc(z.name)}">Settings</button><button class="btn danger" id="z-del" data-perm="delete_zone" data-zone="${esc(z.name)}">Delete zone</button>` : ''}
         </div>
       </div>
       <div class="chips">
-        <button class="chip-btn" data-panel="soa" title="Start of authority: serial, timers, contacts">${ico('info', 's')} SOA <span class="sub mono">serial ${z.serial}</span></button>
-        ${z.override ? '' : `<button class="chip-btn${delegWarn ? ' warn' : ''}" data-panel="deleg" title="${dl.reverse ? 'How reverse delegation works' : 'Nameservers and glue for your registrar'}">${ico(delegWarn ? 'warn' : 'deleg', 's')} ${dl.reverse ? 'Reverse delegation' : 'Delegation'} <span class="sub">${dl.ns.length} NS</span></button>`}
-        <button class="chip-btn" data-panel="dig" title="Commands to query this zone">${ico('term', 's')} Test with dig</button>
-        ${z.override ? `<span class="badge warn" title="Answered only for clients allowed to use forwarding; never AA, AD, signed or transferred">Override zone · not authoritative · ${z.override.mode === 'static' ? 'static' : 'transparent'}${z.override.upstreams.length ? ' → ' + esc(z.override.upstreams.join(', ')) : ''}</span>` : `<button class="chip-btn" data-panel="dnssec" title="DNSSEC signing: status, DS record for the registrar, checks">${ico('shield', 's')} DNSSEC <span class="sub">${z.dnssec ? 'signing' : 'off'}</span></button>`}
-        ${isOwner ? `<button class="chip-btn" data-panel="access" title="Who can see and edit this zone">${ico('lock', 's')} Access <span class="sub">${z.members.length}</span></button>` : ''}
+        <button class="chip-btn" data-ro-ok data-panel="soa" title="Start of authority: serial, timers, contacts">${ico('info', 's')} SOA <span class="sub mono">serial ${z.serial}</span></button>
+        ${z.override ? '' : `<button class="chip-btn${delegWarn ? ' warn' : ''}" data-ro-ok data-panel="deleg" title="${dl.reverse ? 'How reverse delegation works' : 'Nameservers and glue for your registrar'}">${ico(delegWarn ? 'warn' : 'deleg', 's')} ${dl.reverse ? 'Reverse delegation' : 'Delegation'} <span class="sub">${dl.ns.length} NS</span></button>`}
+        <button class="chip-btn" data-ro-ok data-panel="dig" title="Commands to query this zone">${ico('term', 's')} Test with dig</button>
+        ${z.override ? `<span class="badge warn" title="Answered only for clients allowed to use forwarding; never AA, AD, signed or transferred">Override zone · not authoritative · ${z.override.mode === 'static' ? 'static' : 'transparent'}${z.override.upstreams.length ? ' → ' + esc(z.override.upstreams.join(', ')) : ''}</span>` : `<button class="chip-btn" data-ro-ok data-panel="dnssec" title="DNSSEC signing: status, DS record for the registrar, checks">${ico('shield', 's')} DNSSEC <span class="sub">${z.dnssec ? 'signing' : 'off'}</span></button>`}
+        ${isOwner ? `<button class="chip-btn" data-ro-ok data-panel="access" title="Who can see and edit this zone">${ico('lock', 's')} Access <span class="sub">${z.members.length}</span></button>` : ''}
         <span class="meta">owner <b>${esc(z.owner || '–')}</b> · you are <span class="badge">${esc(z.role)}</span> · default TTL ${z.default_ttl}s</span>
       </div>
     </div>
@@ -942,7 +1050,7 @@ function renderZone(keepFilter) {
       <div class="rtool">
         <h2>Records <span class="badge muted" id="r-count">${z.record_total ?? z.records.length}</span></h2>
         <div class="search">${ico('search', 's')}<input type="search" id="r-filter" placeholder="Filter by name, type or value…" value="${esc(filter)}" aria-label="Filter records"></div>
-        ${canEdit ? `<button class="btn primary" id="r-add">${ico('plus', 's')} Add record</button>` : ''}
+        ${canEdit ? `<button class="btn primary" id="r-add" data-perm="edit_records" data-zone="${esc(z.name)}">${ico('plus', 's')} Add record</button>` : ''}
       </div>
       <div id="r-table"></div>
     </div>`;
@@ -953,7 +1061,7 @@ function renderZone(keepFilter) {
   $('#z-io').onclick = () => ioModal(z.name);
   if ($('#z-edit')) $('#z-edit').onclick = zoneSettingsModal;
   if ($('#z-ov')) $('#z-ov').onclick = () => overrideModal(z);
-  if ($('#z-del')) $('#z-del').onclick = async () => { if (await confirmModal('Delete zone', `Delete ${z.name} and all ${z.records.length} records? This cannot be undone.`)) { try { await DEL('/zones/' + encodeURIComponent(z.name)); toast('Zone deleted', 'ok'); closeDrawer(); await refreshZones(); location.hash = '#/zones'; } catch (e) { toast(e.message, 'err'); } } };
+  if ($('#z-del')) $('#z-del').onclick = async () => { if (await confirmModal('Delete zone', `Delete ${z.name} and all ${z.records.length} records? This cannot be undone.`, 'Delete', $('#z-del'))) { try { await DEL('/zones/' + encodeURIComponent(z.name)); toast('Zone deleted', 'ok'); closeDrawer(); await refreshZones(); location.hash = '#/zones'; } catch (e) { toast(e.message, 'err'); } } };
   $$('[data-panel]').forEach(b => b.onclick = () => openZonePanel(b.dataset.panel));
   renderRecords();
   if (S.panel && S.panel.zone === z.name) {
@@ -963,7 +1071,7 @@ function renderZone(keepFilter) {
 }
 function renderMembers() {
   const z = S.zone; const el = $('#members'); if (!el) return;
-  el.innerHTML = z.members.length ? `<table><tbody>${z.members.map(m => `<tr><td>${esc(m.username)}</td><td><span class="badge">${esc(m.role)}</span></td><td class="actions"><button class="btn sm ghost danger" data-rm="${esc(m.username)}">Revoke</button></td></tr>`).join('')}</tbody></table>` : '<div class="hint">Only the owner and administrators have access.</div>';
+  el.innerHTML = z.members.length ? `<table><tbody>${z.members.map(m => `<tr><td>${esc(m.username)}</td><td><span class="badge">${esc(m.role)}</span></td><td class="actions"><button class="btn sm ghost danger" data-rm="${esc(m.username)}" data-perm="manage_access" data-zone="${esc(z.name)}">Revoke</button></td></tr>`).join('')}</tbody></table>` : '<div class="hint">Only the owner and administrators have access.</div>';
   el.querySelectorAll('[data-rm]').forEach(b => b.onclick = async () => { try { await DEL(`/zones/${encodeURIComponent(z.name)}/members/${encodeURIComponent(b.dataset.rm)}`); toast(`Revoked ${b.dataset.rm}`, 'ok'); reloadZone(); } catch (e) { toast(e.message, 'err'); } });
 }
 async function serverSearch() {
@@ -987,15 +1095,15 @@ function renderRecords() {
   $('#r-count').textContent = f ? `${num(recs.length)} of ${num(total)}` : num(large ? total : z.records.length);
   $('#r-table').innerHTML = `<table class="records" id="records"><thead><tr><th style="width:20%">Name</th><th style="width:8%">Type</th><th>Value</th><th style="width:9%" title="How long resolvers may cache this record">TTL (s)</th><th style="width:15%" title="When the record stops answering: a duration from now (1m, 1h, 1d, 6d12h14s) or a date-time">Expires</th>${canEdit ? '<th style="width:1%"></th>' : ''}</tr></thead><tbody>
     ${recs.length ? recs.map(r => recordRow(r, canEdit)).join('') : `<tr><td colspan="6" class="empty">${z.records.length ? 'No records match' : 'No records yet'}</td></tr>`}
-  </tbody></table>${large && total > z.records.length ? `<div style="padding:10px;text-align:center"><button class="btn sm" id="r-more">Load more (${num(z.records.length)} of ${num(total)})</button></div>` : ''}`;
+  </tbody></table>${large && total > z.records.length ? `<div style="padding:10px;text-align:center"><button class="btn sm" id="r-more" data-ro-ok>Load more (${num(z.records.length)} of ${num(total)})</button></div>` : ''}`;
   if ($('#r-more')) $('#r-more').onclick = loadMore;
 
   if (canEdit) $('#records').querySelectorAll('[data-edit]').forEach(b => b.onclick = () => recordModal(Number(b.dataset.edit)));
-  if (canEdit) $('#records').querySelectorAll('[data-del]').forEach(b => b.onclick = async () => { const r = z.records.find(x => x.id === Number(b.dataset.del)); if (await confirmModal('Delete record', `Delete ${r.name} ${r.type} ${r.value}?`)) { try { await DEL(`/zones/${encodeURIComponent(z.name)}/records/${r.id}`); toast('Record deleted', 'ok'); reloadZone(); } catch (e) { toast(e.message, 'err'); } } });
+  if (canEdit) $('#records').querySelectorAll('[data-del]').forEach(b => b.onclick = async () => { const r = z.records.find(x => x.id === Number(b.dataset.del)); if (await confirmModal('Delete record', `Delete ${r.name} ${r.type} ${r.value}?`, 'Delete', b)) { try { await DEL(`/zones/${encodeURIComponent(z.name)}/records/${r.id}`); toast('Record deleted', 'ok'); reloadZone(); } catch (e) { toast(e.message, 'err'); } } });
 }
 function recordRow(r, canEdit) {
   const expired = r.expires_at && new Date(r.expires_at) <= new Date();
-  return `<tr data-id="${r.id}"${expired ? ' style="opacity:.5" title="Expired: no longer served; deleted after the retention period"' : ''}><td class="mono c-name">${esc(r.name)}</td><td class="c-type"><span class="badge">${esc(r.type)}</span></td><td class="c-val"><div class="mono clamp" style="word-break:break-all" data-toggle-open title="${r.value.length > 80 ? 'Click to expand' : ''}">${esc(r.value)}</div></td><td class="hint c-ttl">${r.ttl ?? '<i>default</i>'}</td><td class="c-exp">${expiryCell(r)}</td>${canEdit ? `<td class="actions c-act"><button class="btn sm ghost" data-edit="${r.id}">Edit</button><button class="btn sm ghost danger" data-del="${r.id}">Delete</button></td>` : ''}</tr>`;
+  return `<tr data-id="${r.id}"${expired ? ' style="opacity:.5" title="Expired: no longer served; deleted after the retention period"' : ''}><td class="mono c-name">${esc(r.name)}</td><td class="c-type"><span class="badge">${esc(r.type)}</span></td><td class="c-val"><div class="mono clamp" style="word-break:break-all" data-toggle-open title="${r.value.length > 80 ? 'Click to expand' : ''}">${esc(r.value)}</div></td><td class="hint c-ttl">${r.ttl ?? '<i>default</i>'}</td><td class="c-exp">${expiryCell(r)}</td>${canEdit ? `<td class="actions c-act"><button class="btn sm ghost" data-edit="${r.id}" data-perm="edit_records" data-zone="${esc(S.zone.name)}">Edit</button><button class="btn sm ghost danger" data-del="${r.id}" data-perm="edit_records" data-zone="${esc(S.zone.name)}">Delete</button></td>` : ''}</tr>`;
 }
 // Expiry: shown relative, edited as "30m", "24h", "7d", a date-time, or blank for never.
 // ---- durations: "1m", "1h", "1d", "6d12h14s" ---------------------------------
@@ -1101,12 +1209,12 @@ function recordModal(id) {
     <div class="cols">
       <div class="field"><label for="rf-ttl">TTL (seconds)</label><input type="text" id="rf-ttl" name="ttl" inputmode="numeric" value="${r.ttl ?? ''}" placeholder="zone default (${z.default_ttl})" autocomplete="off"><div class="hint" id="rf-ttlhint"></div></div>
       <div class="field"><label for="rf-exp">Expires</label><input type="text" id="rf-exp" name="expires" value="${esc(orig)}" data-orig="${esc(orig)}" placeholder="never, 1h, 1d, 6d12h14s" autocomplete="off" spellcheck="false" autocapitalize="off">
-        <div class="quick" id="rf-quick">${['never', '1h', '1d', '7d', '30d'].map(q => `<button type="button" data-q="${q}">${q}</button>`).join('')}</div>
+        <div class="quick" id="rf-quick">${['never', '1h', '1d', '7d', '30d'].map(q => `<button type="button" data-q="${q}" data-perm="edit_records" data-zone="${esc(z.name)}">${q}</button>`).join('')}</div>
         <div class="hint" id="rf-exphint"></div></div>
     </div>
     <p class="hint" style="margin:12px 0 0">Expires: blank = never. A duration from now uses d, h, m, s, largest first, each once (1m, 1h, 1d, 6d12h14s), or give a date-time (2026-10-01T00:00:00Z). Expired records stop answering and are deleted after the retention period.</p>
     <div class="error" id="rf-err"></div>
-    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="rf-save">${isNew ? 'Add record' : 'Save changes'}</button></div>`, m => {
+    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="rf-save" data-perm="edit_records" data-zone="${esc(z.name)}">${isNew ? 'Add record' : 'Save changes'}</button></div>`, m => {
     const nameIn = $('#rf-name'), typeSel = $('#rf-type'), wrap = $('#rf-vwrap'), ttlIn = $('#rf-ttl'), ex = $('#rf-exp');
     const useArea = (type, v) => type === 'TXT' || v.length > 60 || v.includes('\n');
     const renderValue = (type, v) => {
@@ -1238,7 +1346,7 @@ async function openZonePanel(tab) {
   const tabs = [['soa', 'SOA'], ['deleg', dl.reverse ? 'Reverse delegation' : 'Delegation'], ['dig', 'Test with dig'], ['dnssec', 'DNSSEC']].concat(isOwner ? [['access', 'Access']] : []);
   const body = tab === 'soa' ? soaHtml(z) : tab === 'deleg' ? delegHtml(z, dl) : tab === 'dig' ? digHtml(z) : tab === 'dnssec' ? dnssecHtml(z) : accessHtml(z);
   openDrawer(`<div class="d-head"><div class="d-title"><h2 class="mono">${esc(z.fqdn)}</h2><button type="button" class="icon-btn" data-dclose title="Close (Esc)" aria-label="Close">${ico('close')}</button></div>
-    <div class="tabs" role="tablist">${tabs.map(([k, l]) => `<button type="button" role="tab" data-dtab="${k}" class="${k === tab ? 'on' : ''}">${l}</button>`).join('')}</div></div>
+    <div class="tabs" role="tablist">${tabs.map(([k, l]) => `<button type="button" role="tab" data-ro-ok data-dtab="${k}" class="${k === tab ? 'on' : ''}">${l}</button>`).join('')}</div></div>
     <div class="d-body">${body}</div>`);
   const d = $('#drawer'); $('.d-body', d).scrollTop = keep;
   $('[data-dclose]', d).onclick = closeDrawer;
@@ -1248,7 +1356,7 @@ async function openZonePanel(tab) {
     renderMembers();
     const grant = async () => { const u = $('#m-user').value.trim(); if (!u) { $('#m-user').focus(); return; } try { await PUT(`/zones/${encodeURIComponent(z.name)}/members/${encodeURIComponent(u)}`, { role: $('#m-role').value }); $('#m-user').value = ''; toast(`Granted ${u}`, 'ok'); reloadZone(); } catch (e) { toast(e.message, 'err'); } };
     $('#m-add').onclick = grant;
-    $('#m-user').addEventListener('keydown', e => { if (e.key === 'Enter') grant(); });
+    $('#m-user').addEventListener('keydown', e => { if (e.key === 'Enter') $('#m-add').click(); });
     if (!same) setTimeout(() => $('#m-user') && $('#m-user').focus(), 40);
   }
   if (tab === 'dnssec') wireDnssec(z, d);
@@ -1282,7 +1390,7 @@ function soaHtml(z) {
       ${fact('Owner', '', esc(z.owner || '–'), '')}
       ${fact('Your role', '', `<span class="badge">${esc(z.role)}</span>`, '')}
     </div>
-    ${z.role === 'owner' ? '<div class="row" style="margin-top:14px"><button class="btn" id="soa-edit">Edit SOA settings</button></div>' : ''}`;
+    ${z.role === 'owner' ? `<div class="row" style="margin-top:14px"><button class="btn" id="soa-edit" data-perm="edit_settings" data-zone="${esc(z.name)}">Edit SOA settings</button></div>` : ''}`;
 }
 function delegHtml(z, dl) {
   const t = dnsTarget(S.status), zn = noDot(z.fqdn);
@@ -1395,15 +1503,15 @@ function dnssecHtml(z) {
     ${st.enabled ? `<h3>Before you publish the DS</h3>
       <ol class="steps">
         <li><b>Check this server's answers</b>: queries this server with the DO bit and validates every signature and denial-of-existence proof with the key.
-          <div class="row" style="margin-top:6px"><button class="btn" id="sec-check">Check before adding DS</button></div><div id="sec-check-out">${checkHtml(d.check)}</div></li>
+          <div class="row" style="margin-top:6px"><button class="btn" id="sec-check" data-ro-ok>Check before adding DS</button></div><div id="sec-check-out">${checkHtml(d.check)}</div></li>
         <li><b>Every nameserver of the zone must serve it signed.</b> Standbys sign by themselves; secondaries get DNSKEY, RRSIG and NSEC with the zone transfer. A nameserver that still serves the zone unsigned makes it fail for validating resolvers.</li>
         <li><b>Publish the DS</b> (above) at your registrar.</li>
         <li><b>Is the DS published at the parent?</b>
-          <div class="row" style="margin-top:6px"><button class="btn" id="sec-parent">Look up the DS at the parent</button></div><div id="sec-parent-out">${parentHtml(d.parent, st)}</div></li>
+          <div class="row" style="margin-top:6px"><button class="btn" id="sec-parent" data-ro-ok>Look up the DS at the parent</button></div><div id="sec-parent-out">${parentHtml(d.parent, st)}</div></li>
       </ol>` : `<h3>Is a DS published at the parent?</h3><p class="hint">With signing off the parent must not publish a DS for this zone.</p>
-      <div class="row"><button class="btn" id="sec-parent">Look up the DS at the parent</button></div><div id="sec-parent-out">${parentHtml(d.parent, st)}</div>`}
+      <div class="row"><button class="btn" id="sec-parent" data-ro-ok>Look up the DS at the parent</button></div><div id="sec-parent-out">${parentHtml(d.parent, st)}</div>`}
     ${owner && !st.standby ? `<h3>${st.enabled ? 'Turn signing off' : 'Turn signing on'}</h3>
-      <div class="row">${st.enabled ? '<button class="btn danger" id="sec-off">Turn off signing…</button>' : '<button class="btn primary" id="sec-on">Turn on signing…</button>'}</div>` : ''}
+      <div class="row">${st.enabled ? `<button class="btn danger" id="sec-off" data-perm="edit_settings" data-zone="${esc(z.name)}">Turn off signing…</button>` : `<button class="btn primary" id="sec-on" data-perm="edit_settings" data-zone="${esc(z.name)}">Turn on signing…</button>`}</div>` : ''}
     <p class="hint" style="margin-top:14px">Signed zones do not synthesize automatic PTR answers. To replace the key: remove the DS at the registrar, wait for its TTL, turn signing off, then on again with a new key (see the README).</p>`;
 }
 function wireDnssec(z, d) {
@@ -1446,7 +1554,7 @@ function dnssecOnModal(z, st) {
       ${st.key ? `<label style="display:flex;gap:8px;align-items:center;margin-top:10px"><input type="checkbox" id="so-new"> Use a new key instead of key ${st.key.key_tag} (its DS changes; only when no DS of the old key is published)</label>` : ''}
     </div>
     <div class="error" id="so-err"></div>
-    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn" id="so-next" disabled>Continue</button><button class="btn primary hidden" id="so-ok">Turn on signing</button></div>`, m => {
+    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn" id="so-next" disabled data-perm="edit_settings" data-zone="${esc(z.name)}">Continue</button><button class="btn primary hidden" id="so-ok" data-perm="edit_settings" data-zone="${esc(z.name)}">Turn on signing</button></div>`, m => {
     const ack = m.querySelector('#so-ack'), next = m.querySelector('#so-next'), ok = m.querySelector('#so-ok');
     ack.onchange = () => { next.disabled = !ack.checked; };
     next.onclick = () => { m.querySelector('#so-step1').classList.add('hidden'); m.querySelector('#so-step2').classList.remove('hidden'); next.classList.add('hidden'); ok.classList.remove('hidden'); };
@@ -1466,9 +1574,16 @@ function dnssecOffModal(z) {
     <p class="hint">The key is kept: turning signing on again reuses it.</p>
     <label style="display:flex;gap:8px;align-items:center;margin-top:10px"><input type="checkbox" id="sf-ack"> The DS is removed at the registrar and its TTL has passed</label>
     <div class="error" id="sf-err" style="word-break:break-word"></div>
-    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn danger" id="sf-ok" disabled>Turn off signing</button></div>`, m => {
+    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn danger" id="sf-ok" disabled data-perm="edit_settings" data-zone="${esc(z.name)}" data-block="Checking the parent zone for a DS record…">Turn off signing</button></div>`, m => {
     const ack = m.querySelector('#sf-ack'), ok = m.querySelector('#sf-ok');
     ack.onchange = () => { ok.disabled = !ack.checked; };
+    // The server refuses while the parent publishes a DS or one cannot be ruled out (409 ds_published): ask first.
+    GET(`/zones/${encodeURIComponent(z.name)}/dnssec/parent`).then(p => {
+      ok.dataset.block = p.state === 'absent' ? '' : p.state === 'unknown'
+        ? `Could not confirm that the parent publishes no DS record (${p.detail || 'lookup failed'}); the server refuses until it can`
+        : `The parent zone still publishes a DS record for ${zn}: remove it at the registrar and wait for its TTL first`;
+      if (!ok.dataset.block) delete ok.dataset.block;
+    }).catch(e => { ok.dataset.block = `Could not check the parent zone: ${e.message}`; });
     ok.onclick = async () => {
       ok.disabled = true; m.querySelector('#sf-err').textContent = '';
       try { const r = await PUT(`/zones/${encodeURIComponent(z.name)}/dnssec`, { enabled: false }); closeModal(); toast(`Signing is off for ${zn}`, 'ok'); afterDnssecChange(z, r); }
@@ -1480,7 +1595,7 @@ function accessHtml(z) {
   return `<p class="hint">Editors can change records. Viewers can only read. Ownership is set in Settings by an administrator.</p>
     <h3>Members</h3><div id="members"></div>
     <h3>Grant access</h3>
-    <div class="row"><input type="text" id="m-user" placeholder="username" style="flex:1 1 160px;width:auto" autocomplete="off"><select id="m-role" style="width:auto"><option value="editor">editor</option><option value="viewer">viewer</option></select><button class="btn" id="m-add">Grant</button></div>`;
+    <div class="row"><input type="text" id="m-user" placeholder="username" style="flex:1 1 160px;width:auto" autocomplete="off"><select id="m-role" style="width:auto"><option value="editor">editor</option><option value="viewer">viewer</option></select><button class="btn" id="m-add" data-perm="manage_access" data-zone="${esc(z.name)}">Grant</button></div>`;
 }
 // ---------------------------------------------------------------------------
 // Import / Export (one dialog; zone page: that zone, zones list: all zones)
@@ -1493,11 +1608,11 @@ function ioModal(zoneName) {
     ? `<option value="${esc(zoneName)}">${esc(zoneName)}</option>`
     : `<option value="">All zones (${S.zones.length})</option>` + S.zones.map(z => `<option value="${esc(z.name)}">${esc(z.name)}</option>`).join('');
   openModal(`<h2>Import / Export${zoneName ? ` · <span class="mono">${esc(zoneName)}</span>` : ''}</h2>
-    <div class="tabs"><button data-tab="export" class="on">Export</button>${canImport ? '<button data-tab="import">Import</button><button data-tab="hosts">Hosts file</button>' : ''}</div>
+    <div class="tabs"><button data-tab="export" data-ro-ok class="on">Export</button>${canImport ? '<button data-tab="import" data-ro-ok>Import</button><button data-tab="hosts" data-ro-ok>Hosts file</button>' : ''}</div>
     <section data-pane="export">
       <div class="field"><label>Zone</label><select id="ex-scope">${scopeOptions}</select></div>
       <p class="hint" id="ex-hint"></p>
-      <div class="foot"><button class="btn" data-close>Close</button><button class="btn primary" id="ex-go">Download JSON</button></div>
+      <div class="foot"><button class="btn" data-close>Close</button><button class="btn primary" id="ex-go" data-ro-ok>Download JSON</button></div>
     </section>
     ${canImport ? `<section data-pane="import" class="hidden">
       <div class="field"><label>File</label><input type="file" id="im-file" accept=".json,application/json"></div>
@@ -1507,7 +1622,7 @@ function ioModal(zoneName) {
         <label><input type="radio" name="im-mode" value="merge" checked>Merge</label><label><input type="radio" name="im-mode" value="replace">Replace</label></div>
         <span class="hint" id="im-mode-hint"></span></div>
       <div class="io-summary" id="im-preview">Choose a file or paste its contents.</div>
-      <div class="foot"><button class="btn" data-close>Close</button><button class="btn primary" id="im-go" disabled>Import</button></div>
+      <div class="foot"><button class="btn" data-close>Close</button><button class="btn primary" id="im-go" disabled data-perm="import" data-zone="${esc(zoneName || '*')}">Import</button></div>
     </section>
     <section data-pane="hosts" class="hidden">
       <div class="field"><label>Zone</label><select id="ho-zone">${(zoneName ? [zoneName] : ownedZones.concat(S.user.is_admin ? S.zones.map(z => z.name).filter(n => !ownedZones.includes(n)) : [])).map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join('')}</select></div>
@@ -1517,7 +1632,7 @@ function ioModal(zoneName) {
       <div class="field"><label>Mode</label><div class="seg">
         <label><input type="radio" name="ho-mode" value="merge" checked>Merge</label><label><input type="radio" name="ho-mode" value="replace">Replace all records</label></div></div>
       <div class="io-summary" id="ho-preview">Paste or choose a hosts file, then preview.</div>
-      <div class="foot"><button class="btn" data-close>Close</button><button class="btn" id="ho-prev">Preview</button><button class="btn primary" id="ho-go" disabled>Import</button></div>
+      <div class="foot"><button class="btn" data-close>Close</button><button class="btn" id="ho-prev" data-perm="import" data-zone="${esc(zoneName || '*')}">Preview</button><button class="btn primary" id="ho-go" disabled data-perm="import" data-zone="${esc(zoneName || '*')}">Import</button></div>
     </section>` : ''}`, m => {
     const val = name => (m.querySelector(`[name=${name}]:checked`) || {}).value;
     // tabs
@@ -1537,7 +1652,6 @@ function ioModal(zoneName) {
     // ---- hosts file (I8): preview, then import in one transaction
     if (m.querySelector('#ho-text')) {
       const hoBody = preview => ({ text: $('#ho-text').value, mode: val('ho-mode'), preview });
-      const hoUrl = () => '/zones/' + encodeURIComponent($('#ho-zone').value) + '/import/hosts';
       const hoShow = (r, done) => {
         const box = $('#ho-preview'); box.classList.remove('bad');
         const recs = r.records.slice(0, 50).map(x => `<div class="mono">${esc(x.name)} ${x.type} ${esc(x.value)}</div>`).join('') + (r.records.length > 50 ? `<div class="hint">… ${r.records.length - 50} more</div>` : '');
@@ -1547,12 +1661,12 @@ function ioModal(zoneName) {
       $('#ho-file').onchange = async e => { const f = e.target.files[0]; if (f) { $('#ho-text').value = await f.text(); $('#ho-go').disabled = true; } };
       $('#ho-text').oninput = () => { $('#ho-go').disabled = true; };
       $('#ho-prev').onclick = async () => {
-        try { const r = await POST(hoUrl(), hoBody(true)); hoShow(r, false); $('#ho-go').disabled = !r.records.length; }
+        try { const r = await POST('/zones/' + encodeURIComponent($('#ho-zone').value) + '/import/hosts', hoBody(true)); hoShow(r, false); $('#ho-go').disabled = !r.records.length; }
         catch (e) { const b = $('#ho-preview'); b.classList.add('bad'); b.textContent = e.message; }
       };
       $('#ho-go').onclick = async () => {
         $('#ho-go').disabled = true;
-        try { const r = await POST(hoUrl(), hoBody(false)); hoShow(r, true); toast('Hosts file imported', 'ok'); if (S.zone && S.zone.name === $('#ho-zone').value) reloadZone(); }
+        try { const r = await POST('/zones/' + encodeURIComponent($('#ho-zone').value) + '/import/hosts', hoBody(false)); hoShow(r, true); toast('Hosts file imported', 'ok'); if (S.zone && S.zone.name === $('#ho-zone').value) reloadZone(); }
         catch (e) { const b = $('#ho-preview'); b.classList.add('bad'); b.textContent = e.message; }
       };
     }
@@ -1590,7 +1704,7 @@ function ioModal(zoneName) {
         target.value = prev !== '' && zones[prev] ? prev : String(same >= 0 ? same : 0);
         target.parentElement.classList.toggle('hidden', zones.length === 1);
         const src = zones[Number(target.value)];
-        plan = { path: `/import?mode=${mode}`, body: { version: doc.version || 1, exported_at: doc.exported_at || '', zones: [{ ...src, name: zoneName }] } };
+        plan = { mode, body: { version: doc.version || 1, exported_at: doc.exported_at || '', zones: [{ ...src, name: zoneName }] } };
         const renamed = (src.name || '').replace(/\.$/, '') !== zoneName;
         setPreview(mode === 'replace' ? 'warn' : '', `Imports <b>${count(src)}</b> record${count(src) === 1 ? '' : 's'} into <span class="mono">${esc(zoneName)}</span>${renamed ? ` (from <span class="mono">${esc(src.name)}</span> in the file)` : ''}.`
           + ` The zone's SOA settings are also taken from the file.${mode === 'replace' ? ` <b>All ${S.zone ? S.zone.record_total : ''} existing records are deleted first.</b>` : ''}`);
@@ -1599,7 +1713,7 @@ function ioModal(zoneName) {
         const known = new Set(S.zones.map(z => z.name));
         const denied = S.user.is_admin ? [] : zones.filter(z => zoneRole((z.name || '').replace(/\.$/, '')) !== 'owner');
         if (denied.length) { setPreview('bad', `You can only import into zones you own. Not allowed: ${denied.map(z => `<span class="mono">${esc(z.name)}</span>`).join(', ')}.`); return; }
-        plan = { path: `/import?mode=${mode}`, body: doc };
+        plan = { mode, body: doc };
         setPreview(mode === 'replace' ? 'warn' : '', `<b>${zones.length}</b> zone${zones.length === 1 ? '' : 's'}, <b>${zones.reduce((n, z) => n + count(z), 0)}</b> record${zones.reduce((n, z) => n + count(z), 0) === 1 ? '' : 's'}: `
           + zones.map(z => `<span class="mono">${esc(z.name)}</span> (${count(z)}${known.has((z.name || '').replace(/\.$/, '')) ? '' : ', new zone'})`).join(', ')
           + `.${mode === 'replace' ? ' <b>Existing records of these zones are deleted first.</b>' : ''}`);
@@ -1624,7 +1738,7 @@ function ioModal(zoneName) {
       }
       go.disabled = true; go.textContent = 'Importing…';
       try {
-        const r = await POST(plan.path, plan.body);
+        const r = await POST(`/import?mode=${plan.mode}`, plan.body);
         setPreview('', `<b>Imported.</b> ${r.zones_created ? `${r.zones_created} zone(s) created, ` : ''}${r.records_added} record(s) added`
           + `${r.records_removed ? `, ${r.records_removed} removed (replace)` : ''}${r.records_skipped ? `, ${r.records_skipped} already present or not allowed (skipped)` : ''}.`);
         await refreshZones();
@@ -1641,7 +1755,7 @@ function ioModal(zoneName) {
 function zoneSettingsModal() {
   const z = S.zone;
   openModal(`<h2>Zone settings · <span class="mono">${esc(z.name)}</span></h2>${zoneForm(z)}<div class="error" id="m-err"></div>
-    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="m-ok">Save</button></div>`, m => {
+    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="m-ok" data-perm="edit_settings" data-zone="${esc(z.name)}">Save</button></div>`, m => {
     $('#m-ok').onclick = async () => { try { const b = readForm(m); if (S.user.is_admin && !b.owner) b.owner = ''; await PUT('/zones/' + encodeURIComponent(z.name), b); closeModal(); toast('Zone updated', 'ok'); reloadZone(); } catch (e) { $('#m-err').textContent = e.message; } };
   });
 }
@@ -1651,7 +1765,7 @@ function zoneSettingsModal() {
 // ---------------------------------------------------------------------------
 function viewQueries() {
   $('#main').innerHTML = `
-    <div class="topbar"><h1>Live queries</h1><div class="actions"><input type="text" id="q-filter" placeholder="Filter by name, client, type…" value="${esc(S.filter)}"><button class="btn" id="q-pause">${S.paused ? 'Resume' : 'Pause'}</button><button class="btn" id="q-clear">Clear</button></div></div>
+    <div class="topbar"><h1>Live queries</h1><div class="actions"><input type="text" id="q-filter" placeholder="Filter by name, client, type…" value="${esc(S.filter)}"><button class="btn" id="q-pause" data-ro-ok>${S.paused ? 'Resume' : 'Pause'}</button><button class="btn" id="q-clear" data-ro-ok>Clear</button></div></div>
     <div class="card"><table id="queries"><thead><tr><th>Time</th><th>Client</th><th>Proto</th><th>Name</th><th>Type</th><th>Status</th><th>Result</th><th>Source</th><th>Latency</th></tr></thead><tbody></tbody></table></div>
     <p class="hint" style="margin-top:8px">Type is what the client asked for: A = IPv4 address, AAAA = IPv6 address, HTTPS = browser capability lookup (HTTP/3, encrypted hello), PTR = reverse lookup. Result shows the records returned. Streams every query the server answers, newest first. Only zone owners and administrators receive this feed. Nothing is stored.</p>`;
   $('#q-filter').oninput = e => { S.filter = e.target.value; renderQueries(); };
@@ -1679,7 +1793,7 @@ async function viewChangelog() {
   $('#main').innerHTML = `<div class="topbar"><h1>Changelog</h1><span class="hint" id="cl-info"></span></div>
     <p class="hint" style="margin:-8px 0 12px">Every change to zones and records. Click a row to see the full entry.</p>
     <div class="card"><div class="tw"><table id="cl"><thead><tr><th>Offset</th><th>Time</th><th>Actor</th><th>From</th><th>Operation</th><th>Action</th><th>Entity</th><th>Zone</th><th>Details</th></tr></thead><tbody></tbody></table></div>
-    <div style="padding:10px;text-align:center"><button class="btn sm" id="cl-more">Load older</button></div></div>`;
+    <div style="padding:10px;text-align:center"><button class="btn sm" id="cl-more" data-ro-ok>Load older</button></div></div>`;
   const cl = await GET('/changelog?limit=100');
   $('#cl-info').textContent = `retained offsets ${cl.oldest_offset ?? '–'} … ${cl.latest_offset ?? '–'}`;
   const tb = $('#cl tbody'); tb.innerHTML = cl.entries.slice().reverse().map(changeRow).join('') || '<tr><td colspan="9" class="empty">No changes recorded</td></tr>';
@@ -1687,7 +1801,7 @@ async function viewChangelog() {
   bindDetails(tb);
   $('#cl-more').onclick = async () => { if (clOldest == null) return; const older = await GET(`/changelog?after=${Math.max(0, clOldest - 101)}&limit=100`); const rows = older.entries.filter(e => e.offset < clOldest); if (!rows.length) { toast('No older entries retained'); return; } tb.insertAdjacentHTML('beforeend', rows.slice().reverse().map(changeRow).join('')); clOldest = rows[0].offset; bindDetails(tb); };
 }
-function changeRow(e) { clEntries.set(e.offset, e); return `<tr class="clickable" data-off="${e.offset}"><td class="mono">${e.offset}</td><td class="hint" style="white-space:nowrap">${fmtTime(e.ts)}</td><td><b>${esc(e.actor)}</b></td><td class="mono hint">${esc(e.actor_ip)}</td><td class="hint" title="transaction ${esc(e.txn || '')}">${esc((e.command || '').replace(/_/g, ' '))}</td><td><span class="badge ${e.action === 'delete' ? 'bad' : e.action === 'create' ? 'ok' : ''}">${esc(e.action)}</span></td><td>${esc(e.entity)}</td><td><a class="mono" href="#/zones/${encodeURIComponent(e.zone)}">${esc(e.zone)}</a></td><td><button class="btn sm ghost" data-view>view</button></td></tr>`; }
+function changeRow(e) { clEntries.set(e.offset, e); return `<tr class="clickable" data-off="${e.offset}"><td class="mono">${e.offset}</td><td class="hint" style="white-space:nowrap">${fmtTime(e.ts)}</td><td><b>${esc(e.actor)}</b></td><td class="mono hint">${esc(e.actor_ip)}</td><td class="hint" title="transaction ${esc(e.txn || '')}">${esc((e.command || '').replace(/_/g, ' '))}</td><td><span class="badge ${e.action === 'delete' ? 'bad' : e.action === 'create' ? 'ok' : ''}">${esc(e.action)}</span></td><td>${esc(e.entity)}</td><td><a class="mono" href="#/zones/${encodeURIComponent(e.zone)}">${esc(e.zone)}</a></td><td><button class="btn sm ghost" data-view data-ro-ok>view</button></td></tr>`; }
 // One delegated handler per table body: a click anywhere on a row (except a link) opens it.
 function bindDetails(tb) {
   if (tb.dataset.bound) return; tb.dataset.bound = '1';
@@ -1784,7 +1898,7 @@ async function viewServer() {
       <div class="card panel" style="max-width:820px"><h2>Forwarding</h2>
         <div class="note warn">${ico('warn', 's')}<span>Could not load the forwarding settings: <b>${esc(e.message)}</b>.${e.status === 404 ? ' This server version does not offer console-managed forwarding yet; forwarding is configured in the configuration file.' : ''}</span></div>
         ${S.status ? `<p class="hint" style="margin-top:12px">Current upstreams: <span class="mono">${S.status.forwarding.upstreams.length ? esc(S.status.forwarding.upstreams.join(', ')) : 'none (foreign names are refused)'}</span></p>` : ''}
-        <div class="row" style="margin-top:12px"><button class="btn" id="fw-retry">Retry</button></div></div>`;
+        <div class="row" style="margin-top:12px"><button class="btn" id="fw-retry" data-ro-ok>Retry</button></div></div>`;
     $('#fw-retry').onclick = viewServer;
     return;
   }
@@ -1818,21 +1932,21 @@ async function viewServer() {
               Safeguards: forwarded UDP answers over ${f.open_resolver_max_udp_payload} bytes are sent truncated (the client retries over TCP), ANY queries for foreign names get a minimal RFC 8482 answer instead of being forwarded,
               and each client (IPv4 address / IPv6 /64) may forward ${f.open_resolver_rate_per_second ? f.open_resolver_rate_per_second + ' queries per second' : 'without an extra limit'}.
               ${f.config.open_resolver ? 'Set in the config file (<code>[forwarding].open_resolver</code>).' : ''}</span></div>
-             <div class="row" style="margin-top:8px"><button class="btn danger" id="fw-open-off">Turn off open resolver mode…</button></div>`
+             <div class="row" style="margin-top:8px"><button class="btn danger" id="fw-open-off" data-perm="server_admin">Turn off open resolver mode…</button></div>`
           : `<span class="hint">Off: allowed clients are limited to your own networks. Turning it on lets anyone in the allowed networks, possibly the whole internet, resolve through this server.</span>
-             <div class="row" style="margin-top:8px"><button class="btn" id="fw-open-on">Turn on open resolver mode…</button></div>`}
+             <div class="row" style="margin-top:8px"><button class="btn" id="fw-open-on" data-perm="server_admin">Turn on open resolver mode…</button></div>`}
       </div>
       <div class="error" id="fw-err"></div>
       <div id="fw-test" class="io-summary hidden"></div>
       <div class="row" style="margin-top:12px">
-        <button class="btn" id="fw-testbtn">Test upstreams</button>
-        <button class="btn primary" id="fw-save">Save and apply</button>
-        ${f.source === 'console' ? '<button class="btn" id="fw-reset">Reset to config file</button>' : ''}
+        <button class="btn" id="fw-testbtn" data-perm="server_admin" data-ro-ok>Test upstreams</button>
+        <button class="btn primary" id="fw-save" data-perm="server_admin">Save and apply</button>
+        ${f.source === 'console' ? '<button class="btn" id="fw-reset" data-perm="server_admin">Reset to config file</button>' : ''}
       </div>
       ${f.source === 'console' ? `<p class="hint" style="margin-top:12px">Config file values: upstreams ${f.config.upstreams.length ? f.config.upstreams.map(esc).join(', ') : '<i>none</i>'}; timeout ${f.config.timeout_ms} ms.</p>` : ''}
     </div>
     <div class="card panel" style="max-width:820px;margin-top:16px"><div class="row between"><h2>Forwarding cache</h2>
-      <button class="btn sm" id="fc-flush"${f.cache.entries ? '' : ' disabled'}>Flush cache</button></div>
+      <button class="btn sm" id="fc-flush" data-perm="server_admin" data-ro-ok${f.cache.entries ? '' : ' disabled'}>Flush cache</button></div>
       ${f.cache.enabled ? `<div class="kv"><span class="k">Entries</span><span>${num(f.cache.entries)} / ${num(f.cache.capacity)}</span>
         <span class="k">Hits</span><span>${num(f.cache.hits)}</span><span class="k">Misses</span><span>${num(f.cache.misses)}</span>
         <span class="k">Hit rate</span><span>${(f.cache.hit_rate * 100).toFixed(1)}%</span></div>` : '<p class="hint">The cache is off (<code>[forwarding].cache_entries = 0</code>).</p>'}
@@ -1920,7 +2034,7 @@ async function renderResolver() {
       <div class="field"><label>IPv6 prefix length</label><input type="text" inputmode="numeric" id="rs-e6" value="${s.ecs_ipv6_prefix}"></div></div>
     ${chk('rs-ep', s.ecs_private_clients, 'Also for clients in private ranges', 'Off: clients with private addresses are forwarded without a subnet.')}
     <div class="error" id="rs-err"></div>
-    <div class="row" style="margin-top:12px"><button class="btn primary" id="rs-save">Save and apply</button>${r.source === 'console' ? '<button class="btn" id="rs-reset">Reset to defaults</button>' : ''}</div>
+    <div class="row" style="margin-top:12px"><button class="btn primary" id="rs-save" data-perm="server_admin">Save and apply</button>${r.source === 'console' ? '<button class="btn" id="rs-reset" data-perm="server_admin">Reset to defaults</button>' : ''}</div>
   </div>`;
   $('#rs-save').onclick = async () => {
     $('#rs-err').textContent = '';
@@ -1951,12 +2065,12 @@ async function viewBlocklists() {
   S.blLists = s.lists.map(l => ({ ...l }));
   const st = url => b.lists.find(x => x.url === url) || {};
   const rows = () => S.blLists.length ? S.blLists.map((l, i) => { const x = st(l.url); return `<tr>
-      <td><input type="checkbox" data-bl-on="${i}"${l.enabled ? ' checked' : ''} aria-label="Enabled"></td>
+      <td><input type="checkbox" data-bl-on="${i}" data-perm="server_admin"${l.enabled ? ' checked' : ''} aria-label="Enabled"></td>
       <td><b>${esc(l.name)}</b><div class="hint mono" style="word-break:break-all">${esc(l.url)}</div></td>
       <td>${x.loaded_at ? num(x.entries) + (x.capped ? ' <span class="badge warn">capped</span>' : '') : '<span class="hint">not loaded</span>'}</td>
       <td class="hint">${x.loaded_at ? ago(x.loaded_at) : '–'}${x.error ? `<div style="color:var(--danger);word-break:break-word;max-width:320px">${esc(x.error)}${x.attempted_at ? ' · ' + ago(x.attempted_at) : ''}</div>` : ''}</td>
       <td>${num(x.blocked || 0)}</td>
-      <td><button class="btn sm" data-bl-del="${i}">Remove</button></td></tr>`; }).join('') : '<tr><td colspan="6" class="empty">No lists yet.</td></tr>';
+      <td><button class="btn sm" data-bl-del="${i}" data-perm="server_admin">Remove</button></td></tr>`; }).join('') : '<tr><td colspan="6" class="empty">No lists yet.</td></tr>';
   $('#main').innerHTML = `<div class="topbar"><h1>Blocklists</h1></div>
     <div class="card panel" id="bl-main" style="max-width:900px">
       <p class="hint">Forwarded queries for names on these lists (and names below them) are blocked. Own zones and override zones always win. The configuration is copied to standbys; every server downloads the lists itself and keeps the last good copy when a download fails.
@@ -1964,7 +2078,7 @@ async function viewBlocklists() {
       <div class="tw"><table class="mini"><thead><tr><th>On</th><th>List</th><th>Entries</th><th>Last download</th><th>Blocked</th><th></th></tr></thead><tbody id="bl-rows">${rows()}</tbody></table></div>
       <div class="grid two" style="gap:0 16px">
         <div class="field"><label>Add a list: URL</label><input type="text" id="bl-url" placeholder="https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"></div>
-        <div class="field"><label>Name</label><div class="row"><input type="text" id="bl-name" placeholder="StevenBlack"><button class="btn" id="bl-add">Add</button></div></div></div>
+        <div class="field"><label>Name</label><div class="row"><input type="text" id="bl-name" placeholder="StevenBlack"><button class="btn" id="bl-add" data-perm="server_admin">Add</button></div></div></div>
       <p class="hint">Formats, detected per line: hosts files (<span class="mono">0.0.0.0 ads.example.com</span>), plain domains, Adblock (<span class="mono">||ads.example.com^</span>).</p>
       <h3>Settings</h3>
       <div class="grid two" style="gap:0 16px">
@@ -1974,9 +2088,9 @@ async function viewBlocklists() {
         <div class="field"><label>Download every (hours)</label><input type="text" inputmode="numeric" id="bl-hours" value="${s.refresh_hours}"></div></div>
       <div class="field"><label>Never block (allowlist, one domain per line, includes subdomains)</label><textarea id="bl-allow" rows="4" spellcheck="false">${esc(s.allow.join('\n'))}</textarea></div>
       <div class="error" id="bl-err"></div>
-      <div class="row" style="margin-top:12px"><button class="btn primary" id="bl-save">Save and apply</button><button class="btn" id="bl-refresh">Download now</button></div>
+      <div class="row" style="margin-top:12px"><button class="btn primary" id="bl-save" data-perm="server_admin">Save and apply</button><button class="btn" id="bl-refresh" data-perm="server_admin" data-ro-ok>Download now</button></div>
       <h3>Test a name</h3>
-      <div class="row"><input type="text" id="bl-test" placeholder="ads.example.com" style="max-width:360px"><button class="btn" id="bl-testbtn">Test</button></div>
+      <div class="row"><input type="text" id="bl-test" placeholder="ads.example.com" style="max-width:360px"><button class="btn" id="bl-testbtn" data-perm="server_admin" data-ro-ok>Test</button></div>
       <div id="bl-testout" class="io-summary hidden"></div>
     </div>`;
   const redraw = () => { $('#bl-rows').innerHTML = rows(); wire(); };
@@ -2034,7 +2148,7 @@ function openResolverOn(f, body) {
       <p class="hint">Unticked, the allowed clients in the form are kept (an empty list means nobody).</p>
     </div>
     <div class="error" id="or-err"></div>
-    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn" id="or-next" disabled>Continue</button><button class="btn danger hidden" id="or-ok">Turn on open resolver</button></div>`, m => {
+    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn" id="or-next" disabled data-perm="server_admin">Continue</button><button class="btn danger hidden" id="or-ok" data-perm="server_admin">Turn on open resolver</button></div>`, m => {
     const ack = m.querySelector('#or-ack'), next = m.querySelector('#or-next'), ok = m.querySelector('#or-ok');
     ack.onchange = () => { next.disabled = !ack.checked; };
     next.onclick = () => { m.querySelector('#or-step1').classList.add('hidden'); m.querySelector('#or-step2').classList.remove('hidden'); next.classList.add('hidden'); ok.classList.remove('hidden'); };
@@ -2057,7 +2171,7 @@ function openResolverOff(f, body) {
       <textarea id="or-acl" rows="6" spellcheck="false">${esc(acl.join('\n'))}</textarea></div>
     ${f.config.open_resolver ? '<p class="hint">The config file also turns it on (<code>[forwarding].open_resolver = true</code>); this saves a console override that turns it off.</p>' : ''}
     <div class="error" id="or-err"></div>
-    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="or-ok">Turn off</button></div>`, m => {
+    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="or-ok" data-perm="server_admin">Turn off</button></div>`, m => {
     m.querySelector('#or-ok').onclick = async () => {
       const b = body(); b.open_resolver = false;
       b.allowed_clients = m.querySelector('#or-acl').value.split('\n').map(x => x.trim()).filter(Boolean);
@@ -2138,7 +2252,7 @@ async function viewReplication() {
   const when = t => t ? `<span title="${esc(fmtTime(t))}">${ago(t)}</span>` : '<span class="hint">never</span>';
   const opt = v => v == null || v === '' ? '<span class="hint">–</span>' : esc(v);
   const stateBadge = s => ({ following: '<span class="badge ok">following</span>', bootstrapping: '<span class="badge warn">loading snapshot</span>', connecting: '<span class="badge warn">connecting</span>', starting: '<span class="badge warn">starting</span>', refused: '<span class="badge bad">refused</span>', error: '<span class="badge bad">error</span>', stopped: '<span class="badge muted">stopped</span>', halted: '<span class="badge bad">halted</span>' }[s] || `<span class="badge">${esc(s)}</span>`);
-  $('#main').innerHTML = `<div class="topbar"><h1>Replication</h1>${r.role === 'standby' ? '<button class="btn danger" id="rp-promote">Promote to primary…</button>' : ''}</div>
+  $('#main').innerHTML = `<div class="topbar"><h1>Replication</h1>${r.role === 'standby' ? '<button class="btn danger" id="rp-promote" data-perm="replicate" data-ro-ok>Promote to primary…</button>' : ''}</div>
     ${r.warning ? `<div class="note warn" style="max-width:900px">${ico('warn', 's')}<span>${esc(r.warning)}</span></div>` : ''}
     <div class="grid two" style="max-width:1100px">
       <div class="card panel"><h2>This server</h2><div class="kv">
@@ -2163,7 +2277,7 @@ async function viewReplication() {
         <span class="k">Last snapshot</span><span>${when(f.last_snapshot_at)}${f.last_snapshot_result ? ` · ${opt(f.last_snapshot_result)}` : ''}</span>
         <span class="k">Last reconcile</span><span>${when(f.last_reconcile_at)}${f.last_reconcile_result ? ` · ${opt(f.last_reconcile_result)}` : ''}</span>
         <span class="k">Reconnects / snapshots</span><span>${num(f.reconnects)} / ${num(f.rebootstraps)}</span>
-      </div></div>` : `<div class="card panel"><h2>Replicas</h2>${r.replicas.length ? `<div class="tw"><table><thead><tr><th>Instance</th><th>State</th><th>Applied</th><th>Lag</th><th>Last seen</th><th>Address</th><th>Version</th><th></th></tr></thead><tbody>${r.replicas.map(x => `<tr><td><b class="mono">${esc(x.instance)}</b></td><td>${REPLICA_BADGE[x.state] || esc(x.state)}${x.conflict ? ' <span class="badge bad" title="Two processes use this instance id">conflict</span>' : ''}${x.halted_reason ? `<div class="hint" style="color:var(--danger)">${esc(x.halted_reason)}</div>` : ''}</td><td>${num(x.applied_offset)}</td><td>${x.lag_changes ? `${num(x.lag_changes)} changes · ${num(x.lag_seconds)} s` : '<span class="hint">none</span>'}</td><td>${when(x.last_seen_at)}</td><td class="mono">${esc(x.address)}</td><td class="mono">${esc(x.version)}</td><td class="actions"><button class="btn sm ghost danger" data-forget="${esc(x.instance)}" title="Remove from this list (a running standby reappears)">Forget</button></td></tr>`).join('')}</tbody></table></div>` : '<p class="hint">No standby has followed this server yet.</p>'}
+      </div></div>` : `<div class="card panel"><h2>Replicas</h2>${r.replicas.length ? `<div class="tw"><table><thead><tr><th>Instance</th><th>State</th><th>Applied</th><th>Lag</th><th>Last seen</th><th>Address</th><th>Version</th><th></th></tr></thead><tbody>${r.replicas.map(x => `<tr><td><b class="mono">${esc(x.instance)}</b></td><td>${REPLICA_BADGE[x.state] || esc(x.state)}${x.conflict ? ' <span class="badge bad" title="Two processes use this instance id">conflict</span>' : ''}${x.halted_reason ? `<div class="hint" style="color:var(--danger)">${esc(x.halted_reason)}</div>` : ''}</td><td>${num(x.applied_offset)}</td><td>${x.lag_changes ? `${num(x.lag_changes)} changes · ${num(x.lag_seconds)} s` : '<span class="hint">none</span>'}</td><td>${when(x.last_seen_at)}</td><td class="mono">${esc(x.address)}</td><td class="mono">${esc(x.version)}</td><td class="actions"><button class="btn sm ghost danger" data-forget="${esc(x.instance)}" data-perm="replicate" title="Remove from this list (a running standby reappears)">Forget</button></td></tr>`).join('')}</tbody></table></div>` : '<p class="hint">No standby has followed this server yet.</p>'}
         ${r.peer ? `<div class="kv" style="margin-top:12px"><span class="k">[peer]</span><span class="mono">${esc(r.peer.url)}</span><span class="k">Last check</span><span>${when(r.peer.last_check_at)}${r.peer.last_result ? ` · ${esc(r.peer.last_result)}` : ''}</span></div>` : ''}</div>`}
     </div>
     ${r.role === 'standby' ? `<div class="card panel" style="margin-top:14px;max-width:1100px"><h2>What promotion does</h2>
@@ -2193,7 +2307,7 @@ function promoteModal(r) {
     ${reachable ? `<div class="note warn">${ico('warn', 's')}<span>The primary is <b>reachable right now</b>. Promoting makes two writable servers until the old primary is stopped or fenced. Only continue if you are replacing it on purpose.</span></div>
       <label style="display:flex;gap:8px;align-items:center;margin-top:10px"><input type="checkbox" id="pr-force"> Promote anyway; I will stop the old primary</label>` : `<p class="hint">The primary has not been reachable${r.follow.disconnected_since ? ' since ' + esc(fmtTime(r.follow.disconnected_since)) : ''}. ${r.follow.lag_changes ? `This standby was ${num(r.follow.lag_changes)} change(s) behind at the last contact; those are not here.` : ''}</p>`}
     <div class="error" id="m-err"></div>
-    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="rp-go">Promote</button></div>`, m => {
+    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="rp-go" data-perm="replicate" data-ro-ok>Promote</button></div>`, m => {
     const go = $('#rp-go');
     const disarm = () => { delete go.dataset.armed; go.classList.remove('danger'); go.classList.add('primary'); go.textContent = 'Promote'; };
     if (reachable) $('#pr-force').onchange = disarm;
@@ -2219,11 +2333,11 @@ async function viewTsig() {
   const [{ keys }, pol] = await Promise.all([GET('/tsig/keys'), GET('/settings/transfer')]);
   const algBadge = a => a === 'hmac-sha1' ? `<span class="badge warn" title="Legacy: use hmac-sha256 or stronger where the secondary supports it">${esc(a)} · legacy</span>` : `<span class="badge">${esc(a)}</span>`;
   const notifyRows = pol.notify.length ? pol.notify.map(n => `<div><span class="mono">${esc(n.address)}</span> ${n.key ? `signed with <span class="mono">${esc(n.key)}</span>${n.key_exists ? '' : ' <span class="badge bad">key missing: not sent</span>'}` : '<span class="badge muted">unsigned</span>'}</div>`).join('') : '<span class="hint">none</span>';
-  $('#main').innerHTML = `<div class="topbar"><h1>TSIG keys</h1><button class="btn primary" id="tk-new">New key</button></div>
+  $('#main').innerHTML = `<div class="topbar"><h1>TSIG keys</h1><button class="btn primary" id="tk-new" data-perm="server_admin">New key</button></div>
     <p class="hint" style="margin:-4px 0 12px;max-width:820px">Shared-secret keys (RFC 8945) that authenticate zone transfers (AXFR) and NOTIFY between this server and its secondaries. Give each secondary its own key.</p>
     <div class="card"><div class="tw"><table><thead><tr><th>Name</th><th>Algorithm</th><th>Zones</th><th>Created</th><th></th></tr></thead><tbody>
     ${keys.length ? keys.map(k => `<tr><td><b class="mono">${esc(k.name)}</b></td><td>${algBadge(k.algorithm)}</td><td>${zoneScope(k.zones)}</td><td class="hint"><span title="${esc(fmtTime(k.created_at))}">${ago(k.created_at)}</span> by ${esc(k.created_by)}</td>
-      <td class="actions"><button class="btn sm ghost" data-tk-open="${esc(k.name)}">Manage</button></td></tr>`).join('') : '<tr><td colspan="5" class="empty">No keys yet. Create one for each secondary.</td></tr>'}
+      <td class="actions"><button class="btn sm ghost" data-ro-ok data-tk-open="${esc(k.name)}">Manage</button></td></tr>`).join('') : '<tr><td colspan="5" class="empty">No keys yet. Create one for each secondary.</td></tr>'}
     </tbody></table></div></div>
     <div class="card panel" style="margin-top:14px;max-width:820px"><div class="row between"><h2>Transfer policy</h2><span class="badge muted">from the config file</span></div>
       <div class="kv">
@@ -2248,7 +2362,7 @@ function tsigCreateModal(pol) {
       <span class="hint" id="tk-mode-hint">A random secret as long as the hash is generated and shown once.</span></div>
     ${zonePicker([])}
     <div class="error" id="m-err"></div>
-    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="m-ok">Create key</button></div>`, m => {
+    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="m-ok" data-perm="server_admin">Create key</button></div>`, m => {
     const getZones = wireZonePicker(m);
     m.querySelectorAll('[name=mode]').forEach(r => r.onchange = () => {
       const imp = m.querySelector('[name=mode]:checked').value === 'import';
@@ -2270,12 +2384,12 @@ function tsigManageModal(k, pol) {
   openModal(`<h2>TSIG key · <span class="mono">${esc(k.name)}</span></h2>
     <div class="kv"><span class="k">Algorithm</span><span>${esc(k.algorithm)}</span><span class="k">Created</span><span>${esc(fmtTime(k.created_at))} by ${esc(k.created_by)}</span>${uses ? `<span class="k">NOTIFY</span><span>signs NOTIFY to ${uses} target${uses === 1 ? '' : 's'}</span>` : ''}</div>
     ${zonePicker(k.zones)}
-    <div class="row"><button class="btn" id="tk-save">Save zones</button></div>
+    <div class="row"><button class="btn" id="tk-save" data-perm="server_admin">Save zones</button></div>
     <h3 style="margin-top:18px">Secret</h3>
     <p class="hint">Needed to configure another secondary. Showing it is recorded in the audit log.</p>
-    <div class="row"><button class="btn" id="tk-reveal">${ico('lock', 's')} Show secret and snippets</button></div>
+    <div class="row"><button class="btn" id="tk-reveal" data-perm="server_admin" data-ro-ok>${ico('lock', 's')} Show secret and snippets</button></div>
     <div class="error" id="m-err"></div>
-    <div class="foot"><button class="btn danger" id="tk-del">Delete key</button><span style="flex:1"></span><button class="btn" data-close>Close</button></div>`, m => {
+    <div class="foot"><button class="btn danger" id="tk-del" data-perm="server_admin">Delete key</button><span style="flex:1"></span><button class="btn" data-close>Close</button></div>`, m => {
     const getZones = wireZonePicker(m);
     $('#tk-save').onclick = async () => {
       const zones = getZones();
@@ -2341,14 +2455,14 @@ async function viewAudit() {
 async function viewUsers() {
   if (!S.user.is_admin) { location.hash = '#/dashboard'; return; }
   const { users } = await GET('/users');
-  $('#main').innerHTML = `<div class="topbar"><h1>Users</h1><button class="btn primary" id="u-new">New user</button></div>
+  $('#main').innerHTML = `<div class="topbar"><h1>Users</h1><button class="btn primary" id="u-new" data-perm="manage_users">New user</button></div>
     <div class="card"><table><thead><tr><th>Username</th><th>Name</th><th>Role</th><th>MFA</th><th>Status</th><th>Created</th><th></th></tr></thead><tbody>
-    ${users.map(u => `<tr><td><b>${esc(u.username)}</b>${u.is_root ? ' <span class="badge muted">root</span>' : ''}</td><td>${esc(u.display_name)}</td><td>${u.is_admin ? '<span class="badge">admin</span>' : 'user'}</td><td>${u.mfa_enrolled ? '<span class="badge ok">enrolled</span>' : u.mfa_required ? '<span class="badge warn">pending</span>' : '<span class="badge muted">off</span>'}</td><td>${u.disabled_at ? '<span class="badge bad">disabled</span>' : '<span class="badge ok">active</span>'}</td><td class="hint">${ago(u.created_at)}</td><td class="actions"><button class="btn sm ghost" data-rights="${u.id}">Rights</button><button class="btn sm ghost" data-edit="${u.id}">Edit</button>${u.is_root ? '' : `<button class="btn sm ghost danger" data-del="${u.id}">Delete</button>`}</td></tr>`).join('')}
+    ${users.map(u => `<tr><td><b>${esc(u.username)}</b>${u.is_root ? ' <span class="badge muted">root</span>' : ''}</td><td>${esc(u.display_name)}</td><td>${u.is_admin ? '<span class="badge">admin</span>' : 'user'}</td><td>${u.mfa_enrolled ? '<span class="badge ok">enrolled</span>' : u.mfa_required ? '<span class="badge warn">pending</span>' : '<span class="badge muted">off</span>'}</td><td>${u.disabled_at ? '<span class="badge bad">disabled</span>' : '<span class="badge ok">active</span>'}</td><td class="hint">${ago(u.created_at)}</td><td class="actions"><button class="btn sm ghost" data-rights="${u.id}" data-ro-ok>Rights</button><button class="btn sm ghost" data-edit="${u.id}" data-perm="manage_users"${blockAttr(u.is_root && !S.user.is_root && 'Only root can change the root account')}>Edit</button>${u.is_root ? '' : `<button class="btn sm ghost danger" data-del="${u.id}" data-perm="manage_users"${blockAttr(u.id === S.user.id && 'You cannot delete your own account')}>Delete</button>`}</td></tr>`).join('')}
     </tbody></table></div>`;
   $('#u-new').onclick = () => userModal(null);
   $$('[data-rights]').forEach(b => b.onclick = () => rightsModal(Number(b.dataset.rights), 'session'));
   $$('[data-edit]').forEach(b => b.onclick = () => userModal(users.find(u => u.id === Number(b.dataset.edit))));
-  $$('[data-del]').forEach(b => b.onclick = async () => { const u = users.find(x => x.id === Number(b.dataset.del)); if (await confirmModal('Delete user', `Delete ${u.username}? Their zones keep existing without an owner.`)) { try { await DEL('/users/' + u.id); toast('User deleted', 'ok'); viewUsers(); } catch (e) { toast(e.message, 'err'); } } });
+  $$('[data-del]').forEach(b => b.onclick = async () => { const u = users.find(x => x.id === Number(b.dataset.del)); if (await confirmModal('Delete user', `Delete ${u.username}? Their zones keep existing without an owner.`, 'Delete', b)) { try { await DEL('/users/' + u.id); toast('User deleted', 'ok'); viewUsers(); } catch (e) { toast(e.message, 'err'); } } });
 }
 function userModal(u) {
   const isNew = !u; u = u || {};
@@ -2361,11 +2475,11 @@ function userModal(u) {
       <label><input type="checkbox" name="mfa_required" ${u.mfa_required ? 'checked' : ''}> Require MFA</label>
       ${isNew || u.is_root ? '' : `<label><input type="checkbox" name="disabled" ${u.disabled_at ? 'checked' : ''}> Disabled</label>`}
     </div>
-    ${!isNew && u.mfa_enrolled ? '<p class="hint" style="margin-top:12px">MFA is enrolled. <a href="#" id="u-reset-mfa">Reset MFA</a> to force re-enrollment (all sessions are signed out).</p>' : ''}
-    ${!isNew ? '<p class="hint" style="margin-top:6px"><a href="#" id="u-signout">Sign this user out everywhere</a></p>' : ''}
+    ${!isNew && u.mfa_enrolled ? '<p class="hint" style="margin-top:12px">MFA is enrolled. <button type="button" class="linkbtn" id="u-reset-mfa" data-perm="manage_users">Reset MFA</button> to force re-enrollment (all sessions are signed out).</p>' : ''}
+    ${!isNew ? '<p class="hint" style="margin-top:6px"><button type="button" class="linkbtn" id="u-signout" data-perm="manage_users" data-ro-ok>Sign this user out everywhere</button></p>' : ''}
     <p class="hint" style="margin-top:10px">When MFA is required, the user must enroll an authenticator on their next sign-in.</p>
     <div class="error" id="m-err"></div>
-    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="m-ok">${isNew ? 'Create' : 'Save'}</button></div>`, m => {
+    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="m-ok" data-perm="manage_users">${isNew ? 'Create' : 'Save'}</button></div>`, m => {
     if ($('#u-signout')) $('#u-signout').onclick = async e => { e.preventDefault(); try { const r = await POST(`/users/${u.id}/sessions/revoke`); toast(`Revoked ${r.revoked} session(s)`, 'ok'); } catch (e) { $('#m-err').textContent = e.message; } };
     if ($('#u-reset-mfa')) $('#u-reset-mfa').onclick = async e => { e.preventDefault(); try { await POST(`/users/${u.id}/reset-mfa`); closeModal(); toast('MFA reset', 'ok'); viewUsers(); } catch (e) { $('#m-err').textContent = e.message; } };
     $('#m-ok').onclick = async () => {
@@ -2385,7 +2499,7 @@ function tagInput(host, initial) {
   const tags = [...initial];
   host.innerHTML = `<div class="tag-input"><span class="tag-list"></span><input type="text" placeholder="add tag…" autocomplete="off" spellcheck="false"></div><div class="hint tag-msg">Letters, digits, <code>_</code> and <code>-</code> (case matters); up to ${MAX_TAGS} tags of 256 characters.</div>`;
   const list = host.querySelector('.tag-list'), inp = host.querySelector('input'), msg = host.querySelector('.tag-msg');
-  const draw = () => { list.innerHTML = tags.map((t, i) => `<span class="tag">${esc(t)}<button type="button" data-rm="${i}" aria-label="Remove ${esc(t)}">×</button></span>`).join(''); };
+  const draw = () => { list.innerHTML = tags.map((t, i) => `<span class="tag">${esc(t)}<button type="button" data-rm="${i}" data-perm="manage_own_tokens" aria-label="Remove ${esc(t)}">×</button></span>`).join(''); };
   const say = (text, bad) => { msg.textContent = text; msg.classList.toggle('error', !!bad); };
   const add = () => {
     const v = inp.value.trim().replace(/,$/, '');
@@ -2418,13 +2532,13 @@ async function viewTokens() {
       ${showOwner ? `<td><a href="#" data-rights="${t.user_id}" data-token="${esc(t.name)}" title="Show what this token can do">${esc(t.username || '?')}</a></td>` : ''}
       <td class="hint">${fmtTime(t.created_at)}</td>
       <td>${t.last_used_at ? `<span title="${esc(t.last_used_at)} (updated at most once a minute per address)">${ago(t.last_used_at)}</span>` : '<span class="hint">never</span>'}<div class="mono hint">${esc(t.last_used_ip || '—')}</div></td>
-      <td class="actions"><button class="btn sm ghost" data-edit="${t.id}">Edit tags</button><button class="btn sm ghost danger" data-rev="${t.id}">Revoke</button></td></tr>`;
+      <td class="actions"><button class="btn sm ghost" data-edit="${t.id}" data-perm="manage_own_tokens">Edit tags</button><button class="btn sm ghost danger" data-rev="${t.id}" data-perm="manage_own_tokens">Revoke</button></td></tr>`;
   const cols = showOwner ? 5 : 4;
-  $('#main').innerHTML = `<div class="topbar"><h1>API tokens</h1><button class="btn primary" id="t-new">New token</button></div>
+  $('#main').innerHTML = `<div class="topbar"><h1>API tokens</h1><button class="btn primary" id="t-new" data-perm="manage_own_tokens">New token</button></div>
     <div class="card"><div class="toolbar row" style="padding:12px 14px 0">
       <label class="hint" for="t-tag">Tag</label>
       <select id="t-tag" style="width:auto;max-width:240px"><option value="">all tokens</option>${[...new Set([...known, ...(tag ? [tag] : [])])].sort().map(g => `<option ${g === tag ? 'selected' : ''}>${esc(g)}</option>`).join('')}</select>
-      ${tag ? `<span class="tag on">${esc(tag)}<button type="button" id="t-clear" aria-label="Clear filter">×</button></span>` : ''}
+      ${tag ? `<span class="tag on">${esc(tag)}<button type="button" id="t-clear" data-ro-ok aria-label="Clear filter">×</button></span>` : ''}
       <span class="hint" style="margin-left:auto">${tokens.length} token${tokens.length === 1 ? '' : 's'}${tag ? ' tagged ' + esc(tag) : ''}</span>
     </div>
     <div class="tw"><table><thead><tr><th>Name / tags</th>${showOwner ? '<th>Owner</th>' : ''}<th>Created</th><th title="Updated at most once a minute, immediately when the address changes">Last used</th><th></th></tr></thead><tbody>
@@ -2440,7 +2554,7 @@ curl -H "Authorization: Bearer rdns_…" -H "content-type: application/json" \\
   $$('[data-filter]').forEach(c => c.onclick = () => setTag(c.dataset.filter));
   $('#t-new').onclick = () => openModal(`<h2>New API token</h2><div class="field"><label>Name</label><input type="text" name="name" placeholder="ci, ansible, home-assistant…"></div>
     <div class="field"><label>Tags <span class="hint">(optional)</span></label><div id="m-tags"></div></div><div class="error" id="m-err"></div>
-    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="m-ok">Create</button></div>`, m => {
+    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="m-ok" data-perm="manage_own_tokens">Create</button></div>`, m => {
     const getTags = tagInput($('#m-tags'), tag ? [tag] : []);
     m.querySelector('[name=name]').focus();
     $('#m-ok').onclick = async () => {
@@ -2452,7 +2566,7 @@ curl -H "Authorization: Bearer rdns_…" -H "content-type: application/json" \\
   $$('[data-edit]').forEach(b => b.onclick = () => {
     const t = tokens.find(x => String(x.id) === b.dataset.edit);
     openModal(`<h2>Tags for <span class="mono">${esc(t.name)}</span></h2><div class="field"><div id="m-tags"></div></div><div class="error" id="m-err"></div>
-      <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="m-ok">Save</button></div>`, () => {
+      <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="m-ok" data-perm="manage_own_tokens">Save</button></div>`, () => {
       const getTags = tagInput($('#m-tags'), t.tags);
       $('#m-tags input').focus();
       $('#m-ok').onclick = async () => {
@@ -2463,7 +2577,7 @@ curl -H "Authorization: Bearer rdns_…" -H "content-type: application/json" \\
     });
   });
   $$('[data-rights]').forEach(a => a.onclick = e => { e.preventDefault(); rightsModal(Number(a.dataset.rights), 'token', a.dataset.token); });
-  $$('[data-rev]').forEach(b => b.onclick = async () => { if (await confirmModal('Revoke token', 'Anything using this token will stop working.', 'Revoke')) { try { await DEL('/tokens/' + b.dataset.rev); toast('Token revoked', 'ok'); viewTokens(); } catch (e) { toast(e.message, 'err'); } } });
+  $$('[data-rev]').forEach(b => b.onclick = async () => { if (await confirmModal('Revoke token', 'Anything using this token will stop working.', 'Revoke', b)) { try { await DEL('/tokens/' + b.dataset.rev); toast('Token revoked', 'ok'); viewTokens(); } catch (e) { toast(e.message, 'err'); } } });
 }
 
 // ---------------------------------------------------------------------------
@@ -2482,26 +2596,26 @@ async function viewAccount() {
       ${u.is_root ? '<p class="hint" style="margin-top:12px">The root password lives in the configuration file.</p>' : `<h3 style="margin-top:18px">Change password</h3>
         <div class="field"><label>Current password</label><input type="password" id="pw-cur" autocomplete="current-password"></div>
         <div class="field"><label>New password</label><input type="password" id="pw-new" autocomplete="new-password"></div>
-        <div class="error" id="pw-err"></div><button class="btn" id="pw-btn">Update password</button>`}
+        <div class="error" id="pw-err"></div><button class="btn" id="pw-btn" data-perm="change_own_password">Update password</button>`}
       </div>
       <div class="grid">
       <div class="card panel"><h2>Two-factor authentication</h2>
         <p class="hint">${u.mfa_enrolled ? `Enrolled ${ago(u.totp_enrolled_at)}. Codes are required at every sign-in. ${me.recovery_codes_left} recovery code${me.recovery_codes_left === 1 ? '' : 's'} left.` : 'Not enrolled. Add an authenticator app to protect this account.'}${u.mfa_required ? ' MFA is required for this account.' : ''}</p>
-        <div id="mfa-box" class="row">${u.mfa_enrolled ? `<button class="btn" id="mfa-regen">New recovery codes</button>${u.mfa_required ? '' : '<button class="btn danger" id="mfa-off">Disable MFA</button>'}` : '<button class="btn primary" id="mfa-on">Enable MFA</button>'}</div>
+        <div id="mfa-box" class="row">${u.mfa_enrolled ? `<button class="btn" id="mfa-regen" data-perm="manage_own_mfa">New recovery codes</button>${u.mfa_required ? '' : '<button class="btn danger" id="mfa-off" data-perm="manage_own_mfa">Disable MFA</button>'}` : '<button class="btn primary" id="mfa-on" data-perm="manage_own_mfa">Enable MFA</button>'}</div>
       </div>
-      <div class="card panel"><div class="row between"><h2>Sessions</h2><button class="btn sm danger" id="sess-others">Sign out other sessions</button></div><div id="sessions" class="tw"></div></div>
+      <div class="card panel"><div class="row between"><h2>Sessions</h2><button class="btn sm danger" id="sess-others" data-perm="manage_own_sessions" data-ro-ok>Sign out other sessions</button></div><div id="sessions" class="tw"></div></div>
       </div>
     </div>`;
   $('#my-rights').onclick = e => { e.preventDefault(); rightsModal(u.id, me.via === 'token' ? 'token' : 'session'); };
   const renderSessions = async () => {
     const { sessions } = await GET('/me/sessions');
-    $('#sessions').innerHTML = `<table><thead><tr><th>Where</th><th>Client</th><th>Last seen</th><th></th></tr></thead><tbody>${sessions.map(x => `<tr><td class="mono">${esc(x.ip)}${x.current ? ' <span class="badge ok">this session</span>' : ''}</td><td class="hint" style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(x.user_agent)}">${esc(x.user_agent || '–')}</td><td class="hint">${ago(x.last_seen_at)}</td><td class="actions">${x.current ? '' : `<button class="btn sm ghost danger" data-sess="${x.id}">Revoke</button>`}</td></tr>`).join('')}</tbody></table>`;
+    $('#sessions').innerHTML = `<table><thead><tr><th>Where</th><th>Client</th><th>Last seen</th><th></th></tr></thead><tbody>${sessions.map(x => `<tr><td class="mono">${esc(x.ip)}${x.current ? ' <span class="badge ok">this session</span>' : ''}</td><td class="hint" style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(x.user_agent)}">${esc(x.user_agent || '–')}</td><td class="hint">${ago(x.last_seen_at)}</td><td class="actions">${x.current ? '' : `<button class="btn sm ghost danger" data-sess="${x.id}" data-perm="manage_own_sessions" data-ro-ok>Revoke</button>`}</td></tr>`).join('')}</tbody></table>`;
     $$('[data-sess]').forEach(b => b.onclick = async () => { await DEL('/me/sessions/' + b.dataset.sess); toast('Session revoked', 'ok'); renderSessions(); });
   };
   renderSessions();
   $('#sess-others').onclick = async () => { const r = await POST('/me/sessions/revoke-others'); toast(`Revoked ${r.revoked} session${r.revoked === 1 ? '' : 's'}`, 'ok'); renderSessions(); };
   if ($('#mfa-regen')) $('#mfa-regen').onclick = () => openModal(`<h2>New recovery codes</h2><p class="hint">This replaces all existing recovery codes. Enter a current authenticator code to confirm.</p><div class="field"><label>Code</label><input type="text" name="code" inputmode="numeric" maxlength="6"></div><div class="error" id="m-err"></div>
-    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="m-ok">Generate</button></div>`, m => {
+    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="m-ok" data-perm="manage_own_mfa">Generate</button></div>`, m => {
     $('#m-ok').onclick = async () => { try { const r = await POST('/me/mfa/recovery', { code: m.querySelector('[name=code]').value }); recoveryModal(r.recovery_codes, viewAccount); } catch (e) { $('#m-err').textContent = e.message; } };
   });
   if ($('#pw-btn')) $('#pw-btn').onclick = async () => { $('#pw-err').textContent = ''; try { await PUT('/me/password', { current_password: $('#pw-cur').value, new_password: $('#pw-new').value }); toast('Password updated', 'ok'); $('#pw-cur').value = $('#pw-new').value = ''; } catch (e) { $('#pw-err').textContent = e.message; } };
@@ -2509,12 +2623,12 @@ async function viewAccount() {
     const e = await POST('/me/mfa/start');
     openModal(`<h2>Enable two-factor authentication</h2><p class="hint">Scan with your authenticator app, then enter the code it shows.</p><div class="qr">${e.qr_svg}</div><div class="hint">Manual entry: <code>${esc(e.secret)}</code></div>
       <div class="field"><label>Code</label><input type="text" name="code" inputmode="numeric" maxlength="6"></div><div class="error" id="m-err"></div>
-      <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="m-ok">Activate</button></div>`, m => {
+      <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="m-ok" data-perm="manage_own_mfa">Activate</button></div>`, m => {
       $('#m-ok').onclick = async () => { try { const r = await POST('/me/mfa/confirm', { code: m.querySelector('[name=code]').value }); toast('MFA enabled', 'ok'); recoveryModal(r.recovery_codes, viewAccount); } catch (e) { $('#m-err').textContent = e.message; } };
     });
   };
   if ($('#mfa-off')) $('#mfa-off').onclick = () => openModal(`<h2>Disable MFA</h2><p class="hint">Enter a current code to confirm.</p><div class="field"><label>Code</label><input type="text" name="code" inputmode="numeric" maxlength="6"></div><div class="error" id="m-err"></div>
-    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn danger" id="m-ok">Disable</button></div>`, m => {
+    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn danger" id="m-ok" data-perm="manage_own_mfa">Disable</button></div>`, m => {
     $('#m-ok').onclick = async () => { try { await POST('/me/mfa/disable', { code: m.querySelector('[name=code]').value }); closeModal(); toast('MFA disabled', 'ok'); viewAccount(); } catch (e) { $('#m-err').textContent = e.message; } };
   });
 }

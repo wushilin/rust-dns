@@ -592,6 +592,23 @@ snapshot (used to start, and after a gap) is the same kind of facts
 (`user_created`, `zone_created`, `record_created`, ...) loaded through the
 same replay code, so its format does not depend on the storage engine.
 
+**The console on a standby (and everywhere else).** Every button and form
+action in the console declares the permission it needs or that it is safe on
+a read-only server; anything undeclared is disabled, so a new control cannot
+slip through (a test fails the build otherwise). A control is enabled only
+when the server would accept it: the signed-in user's effective rights come
+from `GET /api/users/{id}/rights` (the same permission table every API check
+uses), the standby allowlist from `GET /api/status`
+(`replication.standby_writable`), and object state the page knows (your own
+account, the root account, a DS still published at the parent). Disabled
+controls say why in their tooltip; on a standby that is "Read-only standby:
+make changes on the primary (<primary url>)". Per-server actions still work
+there: test upstreams, flush the forwarding cache, download blocklists now,
+test a name against the blocklists, show a TSIG secret, sign sessions out,
+promote. As a second line, the console's API wrapper refuses any other write
+on a standby before sending it; the server refuses it anyway (409
+`read_only_standby`).
+
 Account changes carry password hashes, TOTP and TSIG secrets. They never
 appear in `GET /api/changelog` or the websocket (not even for
 administrators), only in the admin-only replication API, and their payloads

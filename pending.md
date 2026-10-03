@@ -2,6 +2,11 @@
 
 Status as of 2026-09-27. Deployed to dns-test (musl build, /opt/rust-dns) with everything below. Stages 1 to 3 (log rotation, DNS protocol completeness, console fixes) are implemented. The current workspace has additional Stage 4 changes in progress below.
 
+## Console editability (2026-10-03, K1/K2 in plan.md)
+
+- [x] K1. Standby: default-deny of console write controls (`data-ro-ok` opt-in), client guard in `api()` from `GET /status` `replication.standby_writable`; blocklist download/test allowed on a standby.
+- [x] K2. Every write control declares its permission (`data-perm`/`data-zone`), decided from the caller's effective rights; state blocks (`data-block`) for own-account delete, root edit by non-root, DNSSEC off while a DS may be published. Test-enforced in `api::ui_tests` and `tests/ui/access.test.js`.
+
 ## DNSSEC online signing (2026-09-27, implemented, not committed)
 
 - [x] RFC 3225 fix (ships with signing off): the query's DO bit is copied into the response OPT (was always clear). Unit/e2e/conformance checks.

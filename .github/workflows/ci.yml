@@ -26,6 +26,7 @@ jobs:
         env:
           REQUIRE_BIND_TOOLS: "1"
       - run: node tests/ui/duration.test.js
+      - run: node tests/ui/access.test.js
       - run: cargo build
       - run: scripts/conformance-local.sh target/debug/rust-dns
       - name: UDP load probe (Linux)

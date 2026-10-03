@@ -304,6 +304,29 @@ Order: I1-I4 first (core, ~2 days), then I5-I6, then I7, then the rest.
   port and then TCP on the same number, which another process had; the
   helper now retries with another port.
 
+## Phase K: console editability (owner, 2026-10-03)
+
+- [x] K1. (found on baba2) The standby's Blocklists "Save and apply" looked
+  savable: write controls were disabled by a hand-kept selector list
+  (`WRITE_SEL`) that phase I buttons never joined (the server refused, no
+  data risk). Now structural: default-deny for every button / submit /
+  `[data-action]` / `[data-perm]` in the page, dialogs and slide-over; a
+  control works on a standby only when marked `data-ro-ok` (or is a close /
+  copy control). `api()` refuses on a standby any non-GET request not in the
+  server's allowlist, published as `GET /status`
+  `replication.standby_writable` (from `STANDBY_WRITABLE`). Allowlist +
+  `POST /blocklists/refresh` and `POST /blocklists/test` (in-memory, this
+  server only). Tests: `api::ui_tests::*`, `api::tests::
+  status_publishes_the_standby_allowlist`, `tests/ui/access.test.js`.
+- [x] K2. Editability follows every reason the server refuses: each write
+  control declares its permission (`data-perm` + `data-zone`), decided from
+  the caller's `GET /users/{me}/rights` (the server's permission table);
+  object state via `data-block` (own account delete, root account edit by a
+  non-root admin, DNSSEC off while a DS is published or cannot be ruled
+  out). Test-enforced: every button declares its access, every non-GET call
+  site is a real route behind a declared control whose standby flag matches
+  `STANDBY_WRITABLE`.
+
 Considered and NOT planned (owner may revisit): validating DNSSEC on
 forwarded answers ourselves (several days, subtle; upstreams already
 validate), `ipset`/`nftset` (Linux-only, needs CAP_NET_ADMIN, conflicts with
@@ -866,3 +889,18 @@ a router-sized footprint (a design property, not a feature).
   locally (I2 default on), forwarding works. No override zones created yet
   (safe now that both run this version). Next: watch the first automatic
   re-sign (due ~2026-10-04) on the new code.
+
+- 2026-10-03: K1 + K2 done (console editability). Browser walk-through on a
+  local primary + standby pair (localhost, throwaway configs, high ports):
+  standby admin sees every write control disabled with "Read-only standby:
+  make changes on the primary (http://127.0.0.1:18611)", while filters, tabs,
+  copy, export, view details, pause, test upstreams, download now, test a
+  name, TSIG reveal, session revoke and promote work; forced clicks on
+  disabled buttons and `api('PUT', ...)` / `DEL` / `POST reset-mfa` from the
+  page console were refused locally with no request sent (network log shows
+  only GETs and the allowlisted POSTs). Primary checked as admin, owner,
+  editor, viewer, no-access user and root; each enabled control matched
+  what the server accepts (sampled 200/201) and each disabled one what it
+  refuses (sampled 403/400/409). One mismatch found and fixed during the
+  walk: the SOA "Edit" button's zone was in a quoted string (`'${...}'`),
+  so it was denied for owners; a test now rejects `${` in quoted strings.
