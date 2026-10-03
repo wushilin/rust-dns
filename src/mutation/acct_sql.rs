@@ -227,7 +227,19 @@ fn put_user(c: &Connection, ctx: &Ctx, u: &ReplUser) -> Result<()> {
 
 fn delete_user(c: &Connection, ctx: &Ctx, user_id: i64, username: &str) -> Result<()> {
     if ctx.local_root == Some(username) {
-        return Ok(()); // our root stays (as a local-only account)
+        // Our root stays (as a local-only account), but the replicated
+        // rows that the primary's foreign keys removed with the account
+        // go here too, or the tables' checksums would differ and the
+        // standby halt: its API tokens, and (written by a version without
+        // `Mutator::release_user`) zone memberships and ownership.
+        for sql in [
+            "DELETE FROM api_tokens WHERE user_id = ?1",
+            "DELETE FROM zone_members WHERE user_id = ?1",
+            "UPDATE zones SET owner_id = NULL WHERE owner_id = ?1",
+        ] {
+            c.execute(sql, params![user_id])?;
+        }
+        return Ok(());
     }
     c.execute(
         "DELETE FROM users WHERE id = ?1 AND username = ?2",

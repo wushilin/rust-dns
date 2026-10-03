@@ -111,7 +111,7 @@ OpenAPI snapshot + validator, conformance (123), smoke-release, cargo-audit.
   wait, other writes still do). Fix: validate against an in-memory index
   kept for the transaction.
 
-- [ ] H2. (found in D3) Deleting a user clears `zones.owner_id` through the
+- [x] H2. (found in D3) Deleting a user clears `zones.owner_id` through the
   foreign key (`ON DELETE SET NULL`) with no zone change, on the primary
   and, by the same cascade, on a standby replaying `user_deleted`. The
   catalog's copy of the zone row keeps the old `owner_id` until that zone
@@ -127,6 +127,12 @@ OpenAPI snapshot + validator, conformance (123), smoke-release, cargo-audit.
   standby cut off from its primary keeps serving such records (it already
   did while no change arrived). Decide whether a standby should drop them
   by its own clock in memory.
+- [ ] H5. (found in H2) `cargo fmt --all` formats every target in
+  Cargo.toml, so with the other session's uncommitted `[[test]]` entry it
+  also ran over `compat/dnssec/wushilin_net.rs` once (2026-10-03 13:22,
+  this session; mtime changed, rustfmt only rewrites whitespace, the file
+  is rustfmt-clean now). From then on this session formats its own files
+  by name. Owner: check that file is as intended.
 - [ ] H4. Another session edited `tests/dnssec.rs` and added
   `tests/dnssec/wushilin_net.rs` (a live `delv wushilin.net DNSKEY` check)
   in the working tree while this plan ran. Left untouched and NOT in these
@@ -354,3 +360,25 @@ OpenAPI snapshot + validator, conformance (123), smoke-release, cargo-audit.
   `REQUIRE_PREV_BIN=1`), conformance 123, cargo-audit only `paste`.
   An operator note follows from the same fact: backdating or editing
   `updated_at` by hand no longer triggers a re-sign.
+- 2026-10-03 (second session): H2 done, as typed changes. Findings: (1)
+  the zones checksum covers `owner_id`, and primary and standby normally
+  agree (same cascade on `user_deleted`); (2) but a standby whose config
+  root has the name of an ordinary primary user keeps that account on
+  `user_deleted` (local root) and so kept its tokens, memberships and
+  owned zones: tables `api_tokens`, `zone_members`, `zones` differed and
+  reconcile would halt (reproduced in a test). Fix: `DELETE /users/{id}`
+  first runs `Mutator::release_user` (one DNS transaction: per owned zone
+  a `zone_updated` that only clears `owner_id`, no serial bump,
+  `updated_at` and signing window kept; per membership a
+  `member_removed`), then the account transaction. The catalog follows
+  (the changes name the zone), the changelog API shows them. Two
+  transactions: if the second fails the user stays without zones. And
+  `acct_sql` `user_deleted` on a standby that keeps the account as its
+  root now removes what the primary's foreign keys removed (its tokens,
+  memberships, ownership), so a delete written by an older primary (no
+  release) does not halt it either. No new change kind, no wire change.
+  Tests `deleting_a_user_releases_its_zones_as_changes`,
+  `a_namesake_root_follows_a_delete_without_release` (both fail without
+  the fix: checksum view differs). Also seen once: `tests/e2e.rs`
+  `json_import_and_record_paging` panicked in ureq (response.rs:389)
+  while run with default test threads; passed alone. Probably G2's class.

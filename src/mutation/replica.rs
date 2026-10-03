@@ -914,6 +914,110 @@ mod tests {
         );
     }
 
+    /// A primary (root "admin") with an ordinary user "root" (the standby's
+    /// root's namesake) that owns a signed zone, is a member of another and
+    /// has a token; a standby bootstrapped from it.
+    async fn namesake_pair() -> (
+        (Arc<Storage>, Mutator, Accounts),
+        (Arc<Storage>, Mutator, Accounts),
+        User,
+    ) {
+        let (ps, pm, pa) = node();
+        pa.sync_root("admin", PRIMARY_ROOT_HASH, false).unwrap();
+        // An ordinary user on the primary named like the standby's root.
+        let carol = pa
+            .create_user(
+                &actor(),
+                &NewUser {
+                    username: "root".into(),
+                    password_hash: "$argon2id$x".into(),
+                    display_name: String::new(),
+                    is_admin: false,
+                    mfa_required: false,
+                },
+            )
+            .unwrap();
+        pa.create_token(&actor(), &carol, "ci", "token-hash-carol", &[])
+            .unwrap();
+        pm.create_zone(actor(), zone_input("a.test"), Some(carol.id))
+            .await
+            .unwrap();
+        pm.create_zone(actor(), zone_input("b.test"), None)
+            .await
+            .unwrap();
+        pm.set_dnssec(actor(), "a.test", true, false).await.unwrap();
+        pm.set_member(actor(), "b.test", carol.id, ZoneRole::Editor)
+            .await
+            .unwrap();
+        let (ss, sm, _sa) = standby_node();
+        sm.replica_bootstrap(snapshot(&ps), standby_root(), "https://p".into())
+            .await
+            .unwrap();
+        assert_eq!(replicated(&ss), replicated(&ps));
+        ((ps, pm, pa), (ss, sm, _sa), carol)
+    }
+
+    /// H2: deleting a user releases its zones and memberships as DNS
+    /// changes (no serial bump, window kept), the catalog follows, and a
+    /// standby that keeps the account (its local root has the same name)
+    /// still ends with the primary's zone rows.
+    #[tokio::test]
+    async fn deleting_a_user_releases_its_zones_as_changes() {
+        let ((ps, pm, pa), (ss, sm, _sa), carol) = namesake_pair().await;
+        let a_before = ps.get_zone("a.test").unwrap().unwrap();
+        let head = ps.changelog_head().unwrap();
+
+        let released = pm.release_user(actor(), carol.id).await.unwrap();
+        assert_eq!(released, (1, 1));
+        pa.run(&actor(), "delete_user", |t| t.delete_user(&carol))
+            .unwrap();
+        let a_after = ps.get_zone("a.test").unwrap().unwrap();
+        assert_eq!(a_after.owner_id, None);
+        assert_eq!(
+            (a_after.serial, &a_after.updated_at, &a_after.signed_at),
+            (a_before.serial, &a_before.updated_at, &a_before.signed_at),
+            "no serial bump, same signature window"
+        );
+        assert_eq!(
+            pm.cache.load().zones["a.test."].zone.owner_id,
+            None,
+            "the catalog's zone row follows"
+        );
+        let kinds: Vec<String> = ps
+            .read_tx(|c| data::changelog_tail(c, head))
+            .unwrap()
+            .iter()
+            .map(|e| e.payload["kind"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(kinds, ["zone_updated", "member_removed", "user_deleted"]);
+
+        tail(&ps, &ss, &sm).await;
+        assert!(
+            ss.get_user_by_name("root").unwrap().is_some(),
+            "the standby keeps its local root"
+        );
+        assert_eq!(
+            replicated(&ss),
+            replicated(&ps),
+            "zone rows and tokens converge"
+        );
+        assert_eq!(sm.cache.load().describe(), pm.cache.load().describe());
+        assert_eq!(sm.cache.load().zones["a.test."].zone.owner_id, None);
+    }
+
+    /// A primary of an older version deletes the user without releasing
+    /// its zones first (the foreign keys clear them): a standby that keeps
+    /// the account as its root clears the same rows, so it does not halt.
+    #[tokio::test]
+    async fn a_namesake_root_follows_a_delete_without_release() {
+        let ((ps, _pm, pa), (ss, sm, _sa), carol) = namesake_pair().await;
+        pa.run(&actor(), "delete_user", |t| t.delete_user(&carol))
+            .unwrap();
+        tail(&ps, &ss, &sm).await;
+        assert!(ss.get_user_by_name("root").unwrap().is_some());
+        assert_eq!(replicated(&ss), replicated(&ps));
+    }
+
     #[tokio::test]
     async fn local_root_without_a_namesake_moves_out_of_the_way() {
         let (ps, _pm, pa) = node();

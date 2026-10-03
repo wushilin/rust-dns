@@ -342,9 +342,11 @@ impl Catalog {
 
 /// Test support: everything a catalog holds, in a comparable form
 /// (signature bytes left out: they are randomised and are verified
-/// instead). `owner_id` of the zone row is left out: deleting a user
-/// clears it in the database without a zone change, and nothing reads it
-/// from the catalog.
+/// instead). `owner_id` of the zone row is left out: the API releases a
+/// user's zones as changes before deleting it (`Mutator::release_user`),
+/// but an account transaction that deletes a user directly (tests, or
+/// changes written by an older primary) still clears it through the
+/// foreign key only, and nothing reads it from the catalog.
 #[cfg(test)]
 impl Catalog {
     pub(crate) fn describe(&self) -> serde_json::Value {

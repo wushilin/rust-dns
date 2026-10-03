@@ -1721,6 +1721,10 @@ pub async fn delete_user(
     if u.is_root {
         return Err(ApiError::bad_request("root cannot be deleted"));
     }
+    // First its zones and memberships, as DNS changes (see
+    // `Mutator::release_user`); then the account. Two transactions: if the
+    // second fails, the user stays without zones, which deleting it meant.
+    s.mutator.release_user(caller.actor(), u.id).await?;
     s.accounts
         .run(&caller.actor(), "delete_user", |t| t.delete_user(&u))?;
     Ok(Json(StatusResponse::deleted()))

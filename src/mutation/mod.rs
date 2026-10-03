@@ -379,6 +379,10 @@ impl<'a> Tx<'a> {
         Ok(db::list_members(self.conn, zone_id)?)
     }
 
+    pub fn zones(&self) -> MResult<Vec<Zone>> {
+        Ok(db::list_zones(self.conn)?)
+    }
+
     // ---- writes: each one records its Change ----------------------------
 
     pub fn create_zone(&mut self, z: Zone) -> MResult<Zone> {
@@ -643,6 +647,23 @@ impl<'a> Tx<'a> {
             created_at,
         });
         Ok(())
+    }
+
+    /// The zone loses its owner (the owner account is being deleted).
+    /// Recorded as a `ZoneUpdated` whose rows differ only in `owner_id`:
+    /// `updated_at` is kept and the serial is not bumped, because nothing
+    /// the zone serves changes (and a signed zone keeps its window).
+    pub fn clear_owner(&mut self, zone: &Zone) -> MResult<Zone> {
+        let after = Zone {
+            owner_id: None,
+            ..zone.clone()
+        };
+        let after = sql::update_zone(self.conn, &after)?;
+        self.changes.push(Change::ZoneUpdated {
+            before: zone.clone(),
+            after: after.clone(),
+        });
+        Ok(after)
     }
 
     pub fn remove_member(&mut self, zone: &Zone, user_id: i64) -> MResult<()> {
@@ -1462,6 +1483,34 @@ impl Mutator {
         self.execute(actor, "remove_member", move |t| {
             let z = t.require_zone(&normalize_zone_name(&zone_name)?)?;
             t.remove_member(&z, user_id)
+        })
+        .await
+    }
+
+    /// Before a user account is deleted: every zone it owns loses its
+    /// owner and every membership it has is removed, as DNS changes of
+    /// their own. Without this the foreign keys (`ON DELETE SET NULL` /
+    /// `CASCADE`) would do the same silently: no change in the
+    /// changelog API, and the catalog's copy of the zone row would keep
+    /// the old owner until the zone next changed. A standby replays these
+    /// changes before `user_deleted`, so its rows follow even when it
+    /// keeps the account (its local root of the same name). Returns the
+    /// number of zones and memberships released.
+    pub async fn release_user(&self, actor: Actor, user_id: i64) -> MResult<(usize, usize)> {
+        self.execute(actor, "delete_user", move |t| {
+            let mut owned = 0;
+            let mut memberships = 0;
+            for z in t.zones()? {
+                if z.owner_id == Some(user_id) {
+                    t.clear_owner(&z)?;
+                    owned += 1;
+                }
+                if t.members(z.id)?.iter().any(|m| m.user_id == user_id) {
+                    t.remove_member(&z, user_id)?;
+                    memberships += 1;
+                }
+            }
+            Ok((owned, memberships))
         })
         .await
     }
