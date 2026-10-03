@@ -942,14 +942,15 @@ fn resign_bumps_the_serial_and_keeps_validating() {
     );
     assert_eq!(st, 200);
     let serial = soa_serial(s.dns);
-    // Pretend the last change was 8 days ago (server stopped): the re-sign
-    // is due (validity 14, re-sign 7 days before expiry).
+    // Pretend the zone was signed 8 days ago (server stopped): the re-sign
+    // is due (validity 14, re-sign 7 days before expiry). The window comes
+    // from the signing epoch (`signed_at`), not from the last change.
     s.stop();
     let eight_days_ago = (chrono::Utc::now() - chrono::Duration::days(8))
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let db = rusqlite::Connection::open(dir.join("t.db")).unwrap();
     db.execute(
-        "UPDATE zones SET updated_at = ?1 WHERE name = ?2",
+        "UPDATE zones SET updated_at = ?1, signed_at = ?1 WHERE name = ?2",
         rusqlite::params![eight_days_ago, ZONE],
     )
     .unwrap();
