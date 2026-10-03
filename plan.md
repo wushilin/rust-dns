@@ -425,12 +425,34 @@ a router-sized footprint (a design property, not a feature).
 ## Phase M: pre-deploy checks, then the next features (owner, 2026-10-04)
 
 Pre-deploy (must pass before the next deploy):
-- [ ] M0a. Mixed-version against the DEPLOYED binary: dns1/dns2 run d32d67f,
+- [x] M0a. Mixed-version against the DEPLOYED binary: dns1/dns2 run d32d67f,
   not 3884ba8. Build d32d67f, run the mixed-version follow tests with
   `RUST_DNS_PREV_BIN=<d32d67f binary>` (both directions: new standby/old
   primary and old standby/new primary), plus the equivalence script between
   d32d67f and HEAD (answers unchanged except documented changes). Keep the
   3884ba8 run too.
+  Done. Two tests hard-coded 3884ba8 behaviour and failed against d32d67f
+  (correctly: d32d67f already has D1 and phase I). They now detect what
+  the previous binary has: `a_signed_zone_survives_a_mixed_version_pair_
+  and_the_upgrade` (D1 signing epoch: `signed_at` in the zone row; with it
+  both servers keep the window in both orders) and `an_old_standby_cannot_
+  represent_an_override_zone` (phase I: `GET /settings/resolver`; with it
+  the old standby follows the override zone, reconcile ok, answers
+  non-authoritatively). New test `a_new_standby_follows_an_old_primary_
+  and_copies_its_changelog`: old primary with a DNSSEC-signed zone and
+  interleaved DNS/account changes; new standby bootstraps, copies the old
+  primary's earlier DNS changelog (K3; identical rows, never an account
+  row), publishes `replication.standby_writable` itself (the old primary
+  has none) and `GET /me` `recovery_codes_left`; dnssec-verify + delv of
+  the standby; primary upgraded in place (nothing copied twice); then an
+  old standby bootstraps from and follows the upgraded primary (reconcile
+  ok, signed zone validates on all three). Results: with d32d67f and with
+  3884ba8 all 4 mixed-version tests pass (`phase_i_settings_keep_an_old_
+  standby_following` unchanged). Equivalence d32d67f vs HEAD
+  (`scripts/equivalence-local.sh`): 20,743 cases, 0 differences
+  (normalised: RRSIG signatures 1984, server cookies 2313, TSIG 18,
+  forwarded TTL +-1 1) — nothing between d32d67f and HEAD changes an
+  answer, as expected (K/L are console, changelog display, netlink).
 - [ ] M0b. Review the diff d32d67f..HEAD (K1/K2, K3, L1, L2, L3, AGENT.md)
   as a principal engineer: correctness, AGENT.md changelog rules, standby
   never writes replicated data, secrets, permissions, compatibility. Fix
@@ -1084,3 +1106,8 @@ what the registrar's DS must match on the live zone; plan it separately.
   Phase M added: M0a/M0b pre-deploy checks (mixed-version vs the deployed
   d32d67f; review of d32d67f..HEAD), then M1-M5. Deploy waits for M0 and the
   owner's go-ahead.
+- 2026-10-04 (phase M): M0a done (see M0a): d32d67f built in a scratch
+  worktree; mixed-version follow tests parametrized by what the previous
+  binary has, plus `a_new_standby_follows_an_old_primary_and_copies_its_
+  changelog`; 4/4 pass with d32d67f and with 3884ba8; equivalence
+  d32d67f vs HEAD 0 differences.

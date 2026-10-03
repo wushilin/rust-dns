@@ -2053,6 +2053,15 @@ fn a_signed_zone_survives_a_mixed_version_pair_and_the_upgrade() {
         s.start();
         let sr = s.root();
         wait_reconciled(&p, &pr, &s, &sr, &format!("{tag}: both previous"));
+        // A previous release with D1 (d32d67f and later) keeps the window
+        // itself; an older one (3884ba8) moves it with every change.
+        let prev_keeps_window = ok(
+            call(&Auth::Session(&pr), "GET", &p.api("/zones/mix.test"), None),
+            "zone",
+        )
+        .get("signed_at")
+        .is_some();
+        eprintln!("{tag}: previous release keeps the signing window: {prev_keeps_window}");
         let inception0 = dnssec_status(&p, &pr, "mix.test")["signatures"]["inception"].clone();
         assert!(inception0.is_string());
         assert_eq!(
@@ -2090,7 +2099,11 @@ fn a_signed_zone_survives_a_mixed_version_pair_and_the_upgrade() {
         wait_reconciled(&p, &pr, &s, &sr, &format!("{tag}: mixed, after a change"));
         let p_inc = dnssec_status(&p, &pr, "mix.test")["signatures"]["inception"].clone();
         let s_inc = dnssec_status(&s, &sr, "mix.test")["signatures"]["inception"].clone();
-        if first_is_primary {
+        if prev_keeps_window {
+            // Both versions keep the window and carry the epoch.
+            assert_eq!(p_inc, inception0, "{tag}");
+            assert_eq!(s_inc, inception0, "{tag}");
+        } else if first_is_primary {
             // The upgraded primary keeps its window; the old standby signs
             // by the old rule (from the change time). Both validate.
             assert_eq!(p_inc, inception0, "{tag}");
@@ -2542,6 +2555,8 @@ fn phase_i_settings_keep_an_old_standby_following() {
 /// zone as an ordinary authoritative zone, the per-zone checksum differs
 /// and the standby HALTS (diverged), as for any divergence. Recorded in
 /// plan.md (Rollout): upgrade the standby before creating override zones.
+/// A previous release that has override zones (d32d67f, phase I) follows
+/// one instead: reconcile ok, served non-authoritatively.
 #[test]
 fn an_old_standby_cannot_represent_an_override_zone() {
     let Some(prev) = prev_bin() else { return };
@@ -2576,6 +2591,16 @@ fn an_old_standby_cannot_represent_an_override_zone() {
     s.start();
     let sr = s.root();
     wait_reconciled(&p, &pr, &s, &sr, "old standby");
+    // A previous release with phase I (d32d67f and later) has override
+    // zones: it follows one like the current version.
+    let prev_has_overrides = call(
+        &Auth::Session(&sr),
+        "GET",
+        &s.api("/settings/resolver"),
+        None,
+    )
+    .0 == 200;
+    eprintln!("previous release has override zones: {prev_has_overrides}");
     ok(
         call(
             &Auth::Session(&pr),
@@ -2585,6 +2610,25 @@ fn an_old_standby_cannot_represent_an_override_zone() {
         ),
         "override zone",
     );
+    if prev_has_overrides {
+        ok(
+            call(
+                &Auth::Session(&pr),
+                "POST",
+                &p.api("/zones/corp.test/records"),
+                Some(json!({ "name": "gw", "type": "A", "value": "10.8.0.1" })),
+            ),
+            "override record",
+        );
+        wait_reconciled(&p, &pr, &s, &sr, "old standby with phase I, override zone");
+        let m = query(s.dns, "gw.corp.test.", RecordType::A);
+        assert!(!m.metadata.authoritative, "served as an override zone");
+        assert_eq!(m.answers.len(), 1);
+        drop(p);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&root_dir);
+        return;
+    }
     let head = status(&p, &pr)["head"].clone();
     let mut last = Value::Null;
     wait_for("the old standby reconciles at the new head", 30, || {
@@ -2753,6 +2797,196 @@ fn a_standby_shows_the_primarys_dns_changelog() {
     same(&p, &pr, &s, "after an in-place upgrade");
     let st = status(&s, &s.root());
     assert!(st["follow"]["halted"].is_null(), "{st}");
+    drop(s);
+    drop(p);
+    let _ = std::fs::remove_dir_all(&root_dir);
+}
+
+/// M0a, mixed versions with K3/K1/L2: a standby of this version follows a
+/// primary on the previous release (`RUST_DNS_PREV_BIN`) holding a signed
+/// zone, copies the old primary's earlier DNS changelog through its
+/// `/api/changelog` (the same rows, never an account row), publishes the
+/// new status fields itself, and serves the signed zone. Then the primary
+/// is upgraded in place (nothing copied twice), and a standby on the
+/// previous release bootstraps from and follows the upgraded primary.
+#[test]
+fn a_new_standby_follows_an_old_primary_and_copies_its_changelog() {
+    let Some(prev) = prev_bin() else { return };
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root_dir = std::env::temp_dir().join(format!(
+        "rust-dns-follow-m0a-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root_dir).unwrap();
+    let mut p = Node::new(&root_dir, "primary", "rootpass-primary");
+    let mut s = Node::new(&root_dir, "standby", "rootpass-standby");
+    let mut old = Node::new(&root_dir, "oldstandby", "rootpass-old");
+    let new_bin = p.bin.clone();
+    p.bin = prev.clone();
+    old.bin = prev.clone();
+    let transfer = "[transfer]\nallow = [\"127.0.0.0/8\"]\n";
+    p.configure(transfer);
+    p.start();
+    let pr = p.root();
+    fn post(n: &Node, a: &ureq::Agent, path: &str, body: Value) -> Value {
+        ok(
+            call(&Auth::Session(a), "POST", &n.api(path), Some(body)),
+            path,
+        )
+    }
+    // DNS and account changes interleaved, before the standby exists.
+    post(
+        &p,
+        &pr,
+        "/users",
+        json!({ "username": "alice", "password": "alice-pass-1" }),
+    );
+    post(
+        &p,
+        &pr,
+        "/zones",
+        json!({ "name": "old.test", "owner": "alice" }),
+    );
+    for (n, t, v) in [
+        ("@", "NS", "ns1.old.test."),
+        ("ns1", "A", "192.0.2.53"),
+        ("www", "A", "192.0.2.1"),
+    ] {
+        post(
+            &p,
+            &pr,
+            "/zones/old.test/records",
+            json!({ "name": n, "type": t, "value": v }),
+        );
+        post(&p, &pr, "/tokens", json!({ "name": format!("t-{n}") }));
+    }
+    let on = ok(
+        call(
+            &Auth::Session(&pr),
+            "PUT",
+            &p.api("/zones/old.test/dnssec"),
+            Some(json!({ "enabled": true })),
+        ),
+        "enable DNSSEC",
+    );
+    let dnskey = on["key"]["dnskey"].as_str().unwrap().to_string();
+    let token = post(&p, &pr, "/tokens", json!({ "name": "repl" }))["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    s.configure(&format!("{transfer}{}", follow_cfg(&p, "dns2", &token)));
+    s.start();
+    let sr = s.root();
+    wait_reconciled(&p, &pr, &s, &sr, "new standby of an old primary");
+    // And after the snapshot.
+    post(
+        &p,
+        &pr,
+        "/zones/old.test/records",
+        json!({ "name": "late", "type": "A", "value": "192.0.2.3" }),
+    );
+    post(
+        &p,
+        &pr,
+        "/users",
+        json!({ "username": "bob", "password": "bob-pass-12" }),
+    );
+    let same = |p: &Node, pr: &ureq::Agent, s: &Node, what: &str| {
+        let sr = s.root();
+        let want = changelog_rows(p, pr);
+        wait_for(what, 15, || changelog_rows(s, &sr) == want);
+        assert!(want.len() >= 6, "{what}: {want:?}");
+        for e in &want {
+            let kind = e["payload"]["kind"].as_str().unwrap();
+            assert!(DNS_KINDS.contains(&kind), "{what}: account row {e}");
+        }
+    };
+    same(
+        &p,
+        &pr,
+        &s,
+        "the new standby shows the old primary's changelog",
+    );
+    wait_reconciled(&p, &pr, &s, &sr, "new standby, after changes");
+    // The new fields are this server's own (the old primary has none).
+    let server_status = |n: &Node, a: &ureq::Agent| {
+        ok(
+            call(&Auth::Session(a), "GET", &n.api("/status"), None),
+            "status",
+        )
+    };
+    let st = server_status(&s, &sr);
+    let allow = st["replication"]["standby_writable"].as_array().unwrap();
+    assert!(
+        allow.contains(&json!({ "method": "POST", "path": "/replication/promote" })),
+        "{st}"
+    );
+    assert!(server_status(&p, &pr)["replication"]
+        .get("standby_writable")
+        .is_none());
+    let me = ok(call(&Auth::Session(&sr), "GET", &s.api("/me"), None), "me");
+    assert_eq!(me["recovery_codes_left"], 0, "{me}");
+    let cases = [
+        ("www.old.test", "A", "; fully validated"),
+        ("late.old.test", "A", "; fully validated"),
+        ("nope.old.test", "A", "; negative response, fully validated"),
+    ];
+    verify_zone(&root_dir, s.dns, "old.test", "new standby of old primary");
+    delv_all(&root_dir, &dnskey, "old.test", s.dns, &cases);
+
+    // Upgrade the primary in place: the standby keeps following, its
+    // history is not copied twice.
+    p.stop();
+    p.bin = new_bin.clone();
+    p.start();
+    let pr = p.root();
+    s.stop();
+    s.start();
+    let sr = s.root();
+    std::thread::sleep(Duration::from_millis(1100));
+    post(
+        &p,
+        &pr,
+        "/zones/old.test/records",
+        json!({ "name": "upgraded", "type": "A", "value": "192.0.2.4" }),
+    );
+    wait_reconciled(&p, &pr, &s, &sr, "both new");
+    same(&p, &pr, &s, "both new");
+
+    // A standby on the previous release bootstraps from the new primary.
+    old.configure(&format!("{transfer}{}", follow_cfg(&p, "dns3", &token)));
+    old.start();
+    let or = old.root();
+    wait_reconciled(&p, &pr, &old, &or, "old standby of the new primary");
+    std::thread::sleep(Duration::from_millis(1100));
+    post(
+        &p,
+        &pr,
+        "/zones/old.test/records",
+        json!({ "name": "last", "type": "A", "value": "192.0.2.5" }),
+    );
+    wait_reconciled(&p, &pr, &old, &or, "old standby, after a change");
+    wait_reconciled(&p, &pr, &s, &sr, "new standby, after a change");
+    for (n, port) in [
+        ("old standby", old.dns),
+        ("new standby", s.dns),
+        ("primary", p.dns),
+    ] {
+        verify_zone(&root_dir, port, "old.test", &format!("final {n}"));
+        delv_all(
+            &root_dir,
+            &dnskey,
+            "old.test",
+            port,
+            &[("last.old.test", "A", "; fully validated")],
+        );
+    }
+    let st = status(&old, &or);
+    assert_eq!(st["follow"]["state"], "following", "{st}");
+    drop(old);
     drop(s);
     drop(p);
     let _ = std::fs::remove_dir_all(&root_dir);
