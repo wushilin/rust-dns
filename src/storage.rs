@@ -138,6 +138,24 @@ CREATE TABLE IF NOT EXISTS changelog (
     class       TEXT NOT NULL DEFAULT 'dns'
 );
 CREATE INDEX IF NOT EXISTS changelog_ts ON changelog(ts);
+-- A standby's copy of the primary's DNS changelog rows from before its
+-- snapshot (a snapshot starts `changelog` empty at the snapshot offset).
+-- Shown with `changelog` by the changelog API and websocket; never served
+-- to standbys (its offsets have holes where account rows were).
+CREATE TABLE IF NOT EXISTS changelog_history (
+    offset      INTEGER PRIMARY KEY,
+    ts          TEXT NOT NULL,
+    actor       TEXT NOT NULL,
+    actor_ip    TEXT NOT NULL,
+    action      TEXT NOT NULL,
+    entity      TEXT NOT NULL,
+    zone        TEXT NOT NULL,
+    entity_id   INTEGER,
+    payload     TEXT NOT NULL,
+    txn         TEXT NOT NULL DEFAULT '',
+    command     TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS changelog_history_ts ON changelog_history(ts);
 CREATE TABLE IF NOT EXISTS audit_log (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     ts              TEXT NOT NULL,
@@ -674,35 +692,66 @@ impl Storage {
 
     // ---- changelog -----------------------------------------------------
 
+    /// DNS changelog rows after `after`: the standby's copy of the primary's
+    /// history from before its snapshot (`changelog_history`, all below the
+    /// first `changelog` row) followed by `changelog` itself.
     pub fn changelog_after(&self, after: i64, limit: usize) -> Result<Vec<ChangeEvent>> {
         self.with_read(|c| {
-            let mut stmt = c.prepare(
-                "SELECT offset, ts, actor, actor_ip, action, entity, zone, entity_id, payload, txn, command
-                 FROM changelog WHERE offset > ?1 AND class = 'dns' ORDER BY offset ASC LIMIT ?2",
-            )?;
-            let rows = stmt.query_map(params![after, limit as i64], row_to_change)?;
-            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            let mut stmt = c.prepare(&format!(
+                "SELECT {CHANGE_COLS} FROM changelog_history
+                 WHERE offset > ?1 AND offset < {HISTORY_FLOOR} ORDER BY offset ASC LIMIT ?2"
+            ))?;
+            let mut v = stmt
+                .query_map(params![after, limit as i64], row_to_change)?
+                .collect::<Result<Vec<_>, _>>()?;
+            let rest = limit.saturating_sub(v.len()) as i64;
+            if rest > 0 {
+                let mut stmt = c.prepare(&format!(
+                    "SELECT {CHANGE_COLS} FROM changelog
+                     WHERE offset > ?1 AND class = 'dns' ORDER BY offset ASC LIMIT ?2"
+                ))?;
+                for r in stmt.query_map(params![after, rest], row_to_change)? {
+                    v.push(r?);
+                }
+            }
+            Ok(v)
         })
     }
 
     pub fn changelog_recent(&self, limit: usize) -> Result<Vec<ChangeEvent>> {
         self.with_read(|c| {
-            let mut stmt = c.prepare(
-                "SELECT offset, ts, actor, actor_ip, action, entity, zone, entity_id, payload, txn, command
-                 FROM changelog WHERE class = 'dns' ORDER BY offset DESC LIMIT ?1",
-            )?;
-            let rows = stmt.query_map(params![limit as i64], row_to_change)?;
-            let mut v = rows.collect::<Result<Vec<_>, _>>()?;
+            let mut stmt = c.prepare(&format!(
+                "SELECT {CHANGE_COLS} FROM changelog WHERE class = 'dns' ORDER BY offset DESC LIMIT ?1"
+            ))?;
+            let mut v = stmt
+                .query_map(params![limit as i64], row_to_change)?
+                .collect::<Result<Vec<_>, _>>()?;
+            let rest = limit.saturating_sub(v.len()) as i64;
+            if rest > 0 {
+                let mut stmt = c.prepare(&format!(
+                    "SELECT {CHANGE_COLS} FROM changelog_history
+                     WHERE offset < {HISTORY_FLOOR} ORDER BY offset DESC LIMIT ?1"
+                ))?;
+                for r in stmt.query_map(params![rest], row_to_change)? {
+                    v.push(r?);
+                }
+            }
             v.reverse();
             Ok(v)
         })
     }
 
-    /// `(oldest_retained_offset, latest_offset)`; both `None` when empty.
+    /// `(oldest_retained_offset, latest_offset)` of the DNS changelog
+    /// (history included); both `None` when empty.
     pub fn changelog_bounds(&self) -> Result<(Option<i64>, Option<i64>)> {
         self.with_read(|c| {
             let r: (Option<i64>, Option<i64>) = c.query_row(
-                "SELECT MIN(offset), MAX(offset) FROM changelog WHERE class = 'dns'",
+                &format!(
+                    "SELECT MIN(o), MAX(o) FROM (
+                       SELECT offset AS o FROM changelog WHERE class = 'dns'
+                       UNION ALL
+                       SELECT offset FROM changelog_history WHERE offset < {HISTORY_FLOOR})"
+                ),
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
@@ -743,6 +792,10 @@ impl Storage {
         let cutoff = older_than.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         self.bookkeeping(|c| {
             let n = c.execute("DELETE FROM changelog WHERE ts < ?1", params![cutoff])?;
+            c.execute(
+                "DELETE FROM changelog_history WHERE ts < ?1",
+                params![cutoff],
+            )?;
             Ok(n)
         })
     }
@@ -1184,6 +1237,13 @@ fn row_to_audit(r: &Row<'_>) -> rusqlite::Result<crate::mutation::accounts::Audi
         detail: serde_json::from_str(&detail).unwrap_or(serde_json::Value::Null),
     })
 }
+
+const CHANGE_COLS: &str =
+    "offset, ts, actor, actor_ip, action, entity, zone, entity_id, payload, txn, command";
+
+/// History rows are shown only below the first `changelog` row (never twice).
+pub(crate) const HISTORY_FLOOR: &str =
+    "(SELECT IFNULL(MIN(offset), 9223372036854775807) FROM changelog)";
 
 fn row_to_change(r: &Row<'_>) -> rusqlite::Result<ChangeEvent> {
     let payload: String = r.get(8)?;

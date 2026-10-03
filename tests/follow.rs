@@ -2605,3 +2605,146 @@ fn an_old_standby_cannot_represent_an_override_zone() {
     drop(s);
     let _ = std::fs::remove_dir_all(&root_dir);
 }
+
+/// Every DNS changelog row of one node (`/api/changelog`, paged).
+fn changelog_rows(node: &Node, a: &ureq::Agent) -> Vec<Value> {
+    let mut out = Vec::new();
+    let mut after = 0;
+    loop {
+        let page = ok(
+            call(
+                &Auth::Session(a),
+                "GET",
+                &node.api(&format!("/changelog?after={after}&limit=3")),
+                None,
+            ),
+            "changelog",
+        );
+        let e = page["entries"].as_array().unwrap().clone();
+        if e.is_empty() {
+            return out;
+        }
+        after = e.last().unwrap()["offset"].as_i64().unwrap();
+        out.extend(e);
+    }
+}
+
+const DNS_KINDS: [&str; 12] = [
+    "zone_created",
+    "zone_updated",
+    "zone_deleted",
+    "record_created",
+    "record_updated",
+    "record_expired",
+    "record_reaped",
+    "record_deleted",
+    "serial_bumped",
+    "member_set",
+    "member_removed",
+    "zone_resigned",
+];
+
+/// K3: a standby starts from a snapshot, which starts its own changelog
+/// empty at the snapshot offset. It copies the primary's earlier DNS rows,
+/// so its changelog page shows the same history as the primary's (paged,
+/// recent, bounds), after a restart, after an in-place upgrade from a
+/// version without the copy, and never an account row on either.
+#[test]
+fn a_standby_shows_the_primarys_dns_changelog() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root_dir = std::env::temp_dir().join(format!(
+        "rust-dns-follow-changelog-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root_dir).unwrap();
+    let mut p = Node::new(&root_dir, "primary", "rootpass-primary");
+    let mut s = Node::new(&root_dir, "standby", "rootpass-standby");
+    p.configure("");
+    p.start();
+    let pr = p.root();
+    let post = |path: &str, body: Value| {
+        ok(
+            call(&Auth::Session(&pr), "POST", &p.api(path), Some(body)),
+            path,
+        )
+    };
+    // DNS and account changes interleaved, before the standby exists.
+    post(
+        "/users",
+        json!({ "username": "alice", "password": "alice-pass-1" }),
+    );
+    post("/zones", json!({ "name": "hist.test", "owner": "alice" }));
+    for (n, v) in [("www", "192.0.2.1"), ("mail", "192.0.2.2")] {
+        post(
+            "/zones/hist.test/records",
+            json!({ "name": n, "type": "A", "value": v }),
+        );
+        post("/tokens", json!({ "name": format!("t-{n}") }));
+    }
+    let token = post("/tokens", json!({ "name": "repl" }))["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    s.configure(&follow_cfg(&p, "dns2", &token));
+    s.start();
+    let sr = s.root();
+    wait_for("standby has the zone", 15, || {
+        record_names(&s, &sr, "hist.test").len() == 2
+    });
+    // And after the snapshot.
+    post(
+        "/zones/hist.test/records",
+        json!({ "name": "late", "type": "A", "value": "192.0.2.3" }),
+    );
+    post(
+        "/users",
+        json!({ "username": "bob", "password": "bob-pass-12" }),
+    );
+    fn same(p: &Node, pr: &ureq::Agent, s: &Node, what: &str) {
+        let sr = s.root();
+        let want = changelog_rows(p, pr);
+        wait_for(what, 15, || changelog_rows(s, &sr) == want);
+        // 3 + 2 * 2 rows from before the standby's snapshot, 2 after.
+        assert_eq!(want.len(), 7, "{what}: {want:?}");
+        assert_eq!(want[0]["payload"]["kind"], "zone_created", "{what}");
+        for e in &want {
+            let kind = e["payload"]["kind"].as_str().unwrap();
+            assert!(DNS_KINDS.contains(&kind), "{what}: account row {e}");
+        }
+        let page = |n: &Node, a: &ureq::Agent| {
+            let v = ok(
+                call(&Auth::Session(a), "GET", &n.api("/changelog?limit=4"), None),
+                "recent",
+            );
+            (
+                v["entries"].clone(),
+                v["oldest_offset"].clone(),
+                v["latest_offset"].clone(),
+            )
+        };
+        assert_eq!(page(s, &sr), page(p, pr), "{what}: recent page");
+    }
+    same(&p, &pr, &s, "the standby shows the primary's changelog");
+    // Restart: nothing copied twice.
+    s.stop();
+    s.start();
+    same(&p, &pr, &s, "after a restart");
+    // A standby upgraded in place from a version without the copy.
+    s.stop();
+    let c = rusqlite::Connection::open(s.dir.join("data.db")).unwrap();
+    assert!(
+        c.execute("DELETE FROM changelog_history", []).unwrap() > 0,
+        "the copy was stored"
+    );
+    drop(c);
+    s.start();
+    same(&p, &pr, &s, "after an in-place upgrade");
+    let st = status(&s, &s.root());
+    assert!(st["follow"]["halted"].is_null(), "{st}");
+    drop(s);
+    drop(p);
+    let _ = std::fs::remove_dir_all(&root_dir);
+}

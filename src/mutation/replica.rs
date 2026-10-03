@@ -321,7 +321,7 @@ pub fn prepare_standby(
         // Replicated tables per the registry; then the local stream and state.
         crate::replication::tables::delete_replicated(c, root_username)?;
         c.execute_batch(
-            "DELETE FROM changelog; DELETE FROM sessions; DELETE FROM replication_state;",
+            "DELETE FROM changelog; DELETE FROM changelog_history; DELETE FROM sessions; DELETE FROM replication_state;",
         )?;
         set_state(c, K_HISTORY, Some(&crate::auth::random_token(12)))?;
         let mut t = AuditTx::begin(c);
@@ -448,7 +448,9 @@ impl Mutator {
     ) -> MResult<BootstrapSummary> {
         self.replica_write("replication_bootstrap", system("bootstrap"), move |c, t| {
             let sum = load_snapshot(c, &snap, &root.username)?;
-            c.execute("DELETE FROM changelog", [])?;
+            // The history before the snapshot is fetched again afterwards
+            // (`replica_store_history`), from this primary.
+            c.execute_batch("DELETE FROM changelog; DELETE FROM changelog_history;")?;
             set_changelog_seq(c, snap.offset)?;
             set_history(c, &snap.history)?;
             set_state(c, K_FOLLOWING, Some(&source))?;
@@ -461,6 +463,63 @@ impl Mutator {
             Ok((sum, Vec::new(), Rebuild::Full))
         })
         .await
+    }
+
+    /// Standby: keep a copy of the primary's DNS changelog rows from before
+    /// the snapshot (the snapshot started `changelog` empty), for the
+    /// changelog page only: rows at or above the first local `changelog`
+    /// row (or the head) are ignored, and DNS rows only (the primary's
+    /// changelog API never returns account rows). Not applied, not
+    /// replicated, never served to standbys. Returns the rows added.
+    pub async fn replica_store_history(&self, rows: Vec<ChangeEvent>) -> MResult<usize> {
+        self.replica_write("replication_history", system("history"), move |c, _t| {
+            let floor: i64 = c.query_row(
+                "SELECT IFNULL(MIN(offset), (SELECT IFNULL(MAX(seq), 0) + 1 FROM sqlite_sequence WHERE name = 'changelog')) FROM changelog",
+                [],
+                |r| r.get(0),
+            )?;
+            let mut n = 0;
+            for ev in rows.iter().filter(|e| e.offset < floor) {
+                let change: Change = serde_json::from_value(ev.payload.clone())
+                    .with_context(|| format!("offset {} is not a structured change", ev.offset))?;
+                if !matches!(change, Change::Dns(_)) {
+                    continue;
+                }
+                n += c.execute(
+                    "INSERT OR IGNORE INTO changelog_history (offset, ts, actor, actor_ip, action, entity, zone, entity_id, payload, txn, command)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    params![
+                        ev.offset,
+                        ev.ts,
+                        ev.actor,
+                        ev.actor_ip,
+                        ev.action,
+                        ev.entity,
+                        ev.zone,
+                        ev.entity_id,
+                        serde_json::to_string(&ev.payload)?,
+                        ev.txn,
+                        ev.command,
+                    ],
+                )?;
+            }
+            Ok((n, Vec::new(), Rebuild::Zones(Vec::new())))
+        })
+        .await
+    }
+
+    /// Where the standby's history copy continues: `(after, floor)`, fetch
+    /// rows with `after < offset < floor`.
+    pub fn history_window(&self) -> MResult<(i64, i64)> {
+        Ok(self.storage.read_tx(|c| {
+            Ok(c.query_row(
+                "SELECT (SELECT IFNULL(MAX(offset), 0) FROM changelog_history),
+                        IFNULL((SELECT MIN(offset) FROM changelog),
+                               (SELECT IFNULL(MAX(seq), 0) + 1 FROM sqlite_sequence WHERE name = 'changelog'))",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?)
+        })?)
     }
 
     /// Standby: stop replicating for good (until `--prepare-standby`): the

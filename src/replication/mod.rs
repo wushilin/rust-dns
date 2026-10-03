@@ -889,6 +889,17 @@ impl Replication {
                 history_id = self.bootstrap(&base, &token, &reason).await?;
             }
         }
+        // Display only: a failure here never stops following.
+        match self.fetch_history(&base, &token, timeout).await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(
+                rows = n,
+                "replication: copied the primary's earlier DNS changelog"
+            ),
+            Err(e) => {
+                tracing::warn!(error = %e, "replication: could not copy the primary's earlier DNS changelog (the changelog page starts at the snapshot)")
+            }
+        }
         let mut last_reconcile = Instant::now();
         self.update(|s| s.state = "following".into());
         loop {
@@ -965,6 +976,51 @@ impl Replication {
         tracing::debug!(changes = n, head, "replication: applied");
         self.update(|s| s.last_applied_at = Some(now_rfc3339()));
         Ok(())
+    }
+
+    /// Copy the primary's DNS changelog rows older than our first own row
+    /// (a snapshot starts the local changelog empty) through its changelog
+    /// API, the one the console reads: DNS rows only, any version.
+    async fn fetch_history(
+        &self,
+        base: &str,
+        token: &str,
+        timeout: Duration,
+    ) -> std::result::Result<usize, CallError> {
+        #[derive(serde::Deserialize)]
+        struct Page {
+            entries: Vec<crate::model::ChangeEvent>,
+        }
+        const PAGE: usize = 2000;
+        let (mut after, floor) = self
+            .mutator
+            .history_window()
+            .map_err(|e| CallError::Other(e.to_string()))?;
+        let mut added = 0;
+        while after + 1 < floor {
+            let page: Page = self
+                .get(
+                    base,
+                    Some(token),
+                    &format!("/api/changelog?after={after}&limit={PAGE}"),
+                    timeout,
+                )
+                .await?;
+            let Some(last) = page.entries.last().map(|e| e.offset) else {
+                break;
+            };
+            let full = page.entries.len() >= PAGE;
+            added += self
+                .mutator
+                .replica_store_history(page.entries)
+                .await
+                .map_err(|e| CallError::Other(e.to_string()))?;
+            if !full || last <= after {
+                break;
+            }
+            after = last;
+        }
+        Ok(added)
     }
 
     fn local_view(&self) -> Result<LocalView> {

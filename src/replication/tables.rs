@@ -137,6 +137,9 @@ pub const TABLES: &[Table] = &[
     local("audit_log"),
     // The stream itself: copied row by row with the primary's offsets.
     local("changelog"),
+    // A standby's copy of the primary's DNS rows from before its snapshot
+    // (display only).
+    local("changelog_history"),
     // History id, lineage and standby bookkeeping.
     local("replication_state"),
     // Primary side: the standbys that follow this server.

@@ -335,12 +335,26 @@ a router-sized footprint (a design property, not a feature).
 
 ## Phase L: queued follow-ups (owner, 2026-10-03)
 
-- [ ] K3. (found in K1's walk-through) The changelog page on a standby is
+- [x] K3. (found in K1's walk-through) The changelog page on a standby is
   empty: `GET /api/changelog` returns 0 entries there although the standby
   holds the replicated DNS changelog rows. Find out why (row class, the
   visible-zones filter, offsets copied with the primary's ids, or the
   query), fix, test on a local pair (the standby must show the same DNS
   history as the primary; account rows still never shown), browser check.
+  Root cause: none of the four. A standby starts from a snapshot, and
+  loading it empties `changelog` and continues at the snapshot offset; only
+  changes made after that arrive as rows. Class, filter and query were
+  right: a standby showed exactly the rows committed after its snapshot
+  (baba2: none since its last `--prepare-standby`). Fix: new local table
+  `changelog_history` (DNS rows only, display only); at every follow
+  session start the standby copies the primary's DNS rows below its first
+  own row through the primary's `GET /api/changelog` (paged, idempotent,
+  failure only logged); the changelog API, websocket catch-up and status
+  bounds read both (history only below the first `changelog` row).
+  Replication never reads it (its offsets have holes where account rows
+  were, so a promoted standby still sends a snapshot to a standby behind
+  its own first row). Cleared by a snapshot load and `--prepare-standby`;
+  pruned with the changelog retention.
 - [ ] L1 (= J2). Watch interface address changes through netlink on Linux
   instead of polling every `interface_poll_secs`; keep polling as the
   fallback elsewhere. Tests: address diffing unit tests; Linux integration
@@ -932,3 +946,14 @@ a router-sized footprint (a design property, not a feature).
   Not deployed (console change; needs a deploy to reach dns1/dns2). Phase L
   queued: K3 (standby changelog empty), L1 (= J2 netlink), L2 (test debt),
   L3 (pending.md cleanup).
+- 2026-10-03 (phase L): K3 done. Reproduced on a local pair: primary 9
+  DNS rows, standby 0; after one more change the standby showed exactly
+  the 2 new rows. Fixed (see K3); the pair then showed identical pages for
+  root and for a viewer, and the standby's changelog page in Chrome listed
+  offsets 7-19 and took live rows 20/21 from the primary. Test
+  `follow::a_standby_shows_the_primarys_dns_changelog` (paged rows, recent
+  page and bounds identical; only DNS kinds; after a restart; after an
+  in-place upgrade simulated by emptying the copy). Compatibility: no
+  protocol or wire change; new local table created at startup (an older
+  binary ignores it); works against a 3884ba8 primary (its
+  `/api/changelog` is the same).
