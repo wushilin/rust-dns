@@ -215,6 +215,7 @@ pub(crate) async fn random_dns_op(
                     default_ttl: None,
                     owner: None,
                     overrides: None,
+                    record_policy: None,
                     records: recs,
                 }],
             };

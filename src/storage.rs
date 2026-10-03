@@ -97,7 +97,9 @@ CREATE TABLE IF NOT EXISTS zones (
     signed_at   TEXT,
     -- Override zone (I1): JSON of model::ZoneOverride; NULL for an
     -- ordinary authoritative zone.
-    override_spec TEXT
+    override_spec TEXT,
+    -- M2: JSON of model::RecordPolicy; NULL = no record expiry policy.
+    record_policy TEXT
 );
 CREATE TABLE IF NOT EXISTS records (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -385,6 +387,10 @@ fn migrate(conn: &Connection) -> Result<()> {
     // is rewritten.
     if !zcols.is_empty() && !zcols.iter().any(|c| c == "override_spec") {
         conn.execute_batch("ALTER TABLE zones ADD COLUMN override_spec TEXT")?;
+    }
+    // M2: NULL for every existing zone (no policy); nothing rewritten.
+    if !zcols.is_empty() && !zcols.iter().any(|c| c == "record_policy") {
+        conn.execute_batch("ALTER TABLE zones ADD COLUMN record_policy TEXT")?;
     }
     let rcols: Vec<String> = conn
         .prepare("SELECT name FROM pragma_table_info('records')")?
@@ -1117,11 +1123,14 @@ fn row_to_zone(r: &Row<'_>) -> rusqlite::Result<Zone> {
             .get::<_, Option<String>>(15)?
             .and_then(|j| serde_json::from_str(&j).ok())
             .map(Box::new),
+        record_policy: r
+            .get::<_, Option<String>>(16)?
+            .and_then(|j| serde_json::from_str(&j).ok()),
     })
 }
 
 const ZONE_COLS: &str =
-    "id, name, serial, soa_mname, soa_rname, refresh, retry, expire, minimum, default_ttl, created_at, updated_at, owner_id, dnssec, signed_at, override_spec";
+    "id, name, serial, soa_mname, soa_rname, refresh, retry, expire, minimum, default_ttl, created_at, updated_at, owner_id, dnssec, signed_at, override_spec, record_policy";
 
 pub(crate) const USER_COLS: &str =
     "id, username, password_hash, display_name, is_admin, is_root, mfa_required, totp_secret, totp_enrolled_at, disabled_at, created_at, updated_at";
@@ -1573,9 +1582,17 @@ mod tests {
         migrate(&conn).unwrap(); // idempotent
         let c = cols(&conn);
         assert_eq!(
-            &c[c.len() - 2..],
-            &["signed_at".to_string(), "override_spec".to_string()],
+            &c[c.len() - 3..],
+            &[
+                "signed_at".to_string(),
+                "override_spec".to_string(),
+                "record_policy".to_string()
+            ],
             "added at the end, in the order of the fresh schema"
+        );
+        assert_eq!(
+            get_zone(&conn, "old.test").unwrap().unwrap().record_policy,
+            None
         );
         let z = get_zone(&conn, "old.test").unwrap().unwrap();
         assert!(z.dnssec);

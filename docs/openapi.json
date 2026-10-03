@@ -5460,6 +5460,10 @@
             "$ref": "#/components/schemas/ZoneOverride",
             "description": "An override zone's settings (I1). On import they apply to a zone\nthe import creates; an existing zone keeps its type."
           },
+          "record_policy": {
+            "$ref": "#/components/schemas/RecordPolicy",
+            "description": "The zone's record expiry policy (M2). On import it applies to a\nzone the import creates (before its records are added); an existing\nzone keeps its own."
+          },
           "records": {
             "type": "array",
             "items": {
@@ -7212,6 +7216,36 @@
             }
           ],
           "total": 1
+        }
+      },
+      "RecordPolicy": {
+        "type": "object",
+        "description": "A zone's record expiry policy (M2). Applies to every record created or\nchanged below the apex (`@` records, e.g. NS, are exempt): one without\nan expiry gets `default_expiry_secs` (or, when only the maximum is set,\nthe maximum); one whose expiry is later than now + `max_expiry_secs` is\nREFUSED (400), never silently shortened, so a client always knows when\nits record goes. Existing records are not touched when the policy is\nset; a record whose expiry an update leaves unchanged is not checked.",
+        "properties": {
+          "default_expiry_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Lifetime of a record created without an expiry, seconds.",
+            "example": 86400,
+            "minimum": 1
+          },
+          "max_expiry_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Longest lifetime a record may be given, seconds.",
+            "example": 604800,
+            "minimum": 1
+          }
+        },
+        "example": {
+          "default_expiry_secs": 86400,
+          "max_expiry_secs": 604800
         }
       },
       "RecordType": {
@@ -9336,6 +9370,10 @@
           "override": {
             "$ref": "#/components/schemas/ZoneOverride",
             "description": "Present for an override zone (I1): not authoritative, answered only\nfor clients allowed to use forwarding, names it does not define go\nto its upstreams (`transparent`) or get NXDOMAIN (`static`). Absent\nfor an ordinary authoritative zone."
+          },
+          "record_policy": {
+            "$ref": "#/components/schemas/RecordPolicy",
+            "description": "Expiry policy for records below the apex (M2, self-registration\nzones); absent: none."
           }
         }
       },
@@ -9546,6 +9584,17 @@
           "override": {
             "$ref": "#/components/schemas/ZoneOverrideInput",
             "description": "Create: makes an override zone (I1) instead of an authoritative\none. Update: changes the mode or upstreams of an override zone (the\ntype itself is chosen at creation and cannot change)."
+          },
+          "record_policy": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RecordPolicy",
+                "description": "Record expiry policy (M2). Absent: unchanged; `null` or `{}`:\nremoved; an object: replaces the policy."
+              }
+            ]
           }
         }
       },

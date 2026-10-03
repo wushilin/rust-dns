@@ -552,10 +552,38 @@ contract tests, typed changes that replicate, tests, AGENT.md rules):
   previous binary: an old standby halts `diverged` at the first scoped
   token), `openapi_spec` updated (tags optional on update, scope
   documented).
-- [ ] M2. Zone-level record expiry policy: default expiry for new records
+- [x] M2. Zone-level record expiry policy: default expiry for new records
   and a maximum expiry (records created without an expiry get the default;
   longer ones are clamped or refused — choose and document). For
   self-registration zones. Console on the zone settings dialog.
+  Done. Chosen: REFUSED (400 naming the limit), never clamped — a client
+  then always knows when its record goes. `model::RecordPolicy
+  { default_expiry_secs?, max_expiry_secs? }` on the zone row
+  (`record_policy`, in the zone JSON only when set). Rules: applies to
+  records below the apex (`@` exempt, so NS/MX/... at the apex stay
+  permanent); no expiry (or explicit `null`) -> the default, or the
+  maximum when only that is set; an expiry beyond now + max -> refused;
+  an update that leaves a record's expiry unchanged is not re-checked
+  (records from before the policy stay as they are; moving a record off
+  the apex applies it). Validation: 1 s .. 100 years, default <= max;
+  `{}`/`null` removes it. Enforced in `Tx::create_record` /
+  `Tx::update_record`, i.e. inside the transaction for every path (API
+  create, renewal, update, JSON import, hosts import). Export carries the
+  policy; an import that creates a zone takes it before adding records.
+  API: `record_policy` in `ZoneInput` (absent = unchanged), shown on
+  zones (`EditSettings`, owner role). Storage: nullable
+  `zones.record_policy` (migration adds NULL), `compat_columns` (covered
+  by the per-zone checksum). Replication: no new kind; travels in the
+  zone row (`zone_created` / `zone_updated`, snapshots). Console: zone
+  settings dialog "Record expiry policy" (default, maximum, durations
+  shown), "expiry policy" badge on the zone page.
+  Tests: `mutation::ops::tests::the_zone_record_policy_gives_defaults_and_
+  refuses_long_expiries`, `api::tests::zone_record_policy_through_the_
+  api` (editor cannot set it, 400 on bad policy and on a too-long
+  expiry, default applied, removal), replay test sets/changes/removes
+  policies, migration test, `follow::a_zone_record_policy_replicates`
+  (snapshot, change, removal; previous binary halts `diverged` at the
+  first policy).
 - [ ] M3. TSIG replay protection (RFC 8945 §5.2.3): remember the last Time
   Signed per key, refuse an older-or-equal one within the fudge window
   (BADTIME), in memory per server. Interop with BIND still passes.
@@ -652,6 +680,12 @@ what the registrar's DS must match on the live zone; plan it separately.
   the standby (baba2) first, then the primary (gate); create scoped
   tokens only after both run this version. Do not downgrade once a scoped
   token exists (the old binary would ignore the scope).
+- After phase M (M2): new nullable column `zones.record_policy`
+  (`compat_columns`; in the zone row JSON only when set). An older standby
+  follows while no zone has a policy; the first policy makes it halt
+  (per-zone checksum; test `a_zone_record_policy_replicates`). Same order:
+  standby first, set policies only after both run this version; no
+  downgrade once a policy exists.
 
 ## Log
 
@@ -1232,3 +1266,5 @@ what the registrar's DS must match on the live zone; plan it separately.
   change; standby baba2 first as usual). Not deployed; owner's go-ahead.
   Continuing with M1.
 - 2026-10-04 (phase M): M1 done (token scopes; see M1 and Rollout).
+- 2026-10-04 (phase M): M2 done (zone record expiry policy, refuse not
+  clamp; see M2 and Rollout).

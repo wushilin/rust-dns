@@ -43,6 +43,13 @@ pub(super) fn apply_zone_input(z: &mut Zone, input: &ZoneInput) -> Result<(), In
         }
         z.default_ttl = v;
     }
+    if let Some(p) = &input.record_policy {
+        let p = p.clone().filter(|p| !p.is_empty());
+        if let Some(p) = &p {
+            p.validate()?;
+        }
+        z.record_policy = p;
+    }
     Ok(())
 }
 
@@ -151,6 +158,7 @@ pub(super) fn default_zone(name: &str, owner_id: Option<i64>) -> Zone {
         dnssec: false,
         signed_at: None,
         overrides: None,
+        record_policy: None,
     }
 }
 
@@ -463,5 +471,179 @@ mod tests {
             )
             .await
             .is_ok());
+    }
+
+    /// M2: a zone's record expiry policy, enforced inside the transaction
+    /// on every create/update/import path; the apex is exempt; a too-long
+    /// expiry is refused, never shortened.
+    #[tokio::test]
+    async fn the_zone_record_policy_gives_defaults_and_refuses_long_expiries() {
+        let (s, m, _) = setup();
+        m.create_zone(actor(), zone_input("dyn.test"), None)
+            .await
+            .unwrap();
+        // A permanent record from before the policy.
+        let (old, _) = m
+            .create_record(actor(), "dyn.test", rec("old", RecordType::A, "192.0.2.1"))
+            .await
+            .unwrap();
+        let bad = |p: RecordPolicy| ZoneInput {
+            record_policy: Some(Some(p)),
+            ..Default::default()
+        };
+        for p in [
+            RecordPolicy {
+                default_expiry_secs: Some(7200),
+                max_expiry_secs: Some(3600),
+            },
+            RecordPolicy {
+                default_expiry_secs: Some(0),
+                max_expiry_secs: None,
+            },
+        ] {
+            assert!(matches!(
+                m.update_zone(actor(), "dyn.test", bad(p), None).await,
+                Err(MutationError::Invalid(_))
+            ));
+        }
+        let z = m
+            .update_zone(
+                actor(),
+                "dyn.test",
+                bad(RecordPolicy {
+                    default_expiry_secs: Some(3600),
+                    max_expiry_secs: Some(86_400),
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            z.record_policy.as_ref().unwrap().max_expiry_secs,
+            Some(86_400)
+        );
+        let hour = |r: &Record| {
+            let at = chrono::DateTime::parse_from_rfc3339(r.expires_at.as_deref().unwrap())
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+            (at - chrono::Utc::now()).num_seconds()
+        };
+        // No expiry: the default.
+        let (a, _) = m
+            .create_record(actor(), "dyn.test", rec("a", RecordType::A, "192.0.2.2"))
+            .await
+            .unwrap();
+        assert!((3590..=3600).contains(&hour(&a)), "{:?}", a.expires_at);
+        // Explicit "never" too.
+        let never = RecordInput {
+            expires_at: Some(None),
+            ..rec("b", RecordType::A, "192.0.2.3")
+        };
+        let (b, _) = m.create_record(actor(), "dyn.test", never).await.unwrap();
+        assert!(b.expires_at.is_some());
+        // Within the maximum: kept as asked.
+        let (c, _) = m
+            .create_record(actor(), "dyn.test", expiring("c", "192.0.2.4", 600))
+            .await
+            .unwrap();
+        assert!((590..=600).contains(&hour(&c)));
+        // Longer: refused (create, renew, update).
+        for input in [
+            expiring("d", "192.0.2.5", 2 * 86_400),
+            expiring("c", "192.0.2.4", 2 * 86_400),
+        ] {
+            assert!(matches!(
+                m.create_record(actor(), "dyn.test", input).await,
+                Err(MutationError::Invalid(_))
+            ));
+        }
+        let longer = RecordInput {
+            expires_in: Some(2 * 86_400),
+            ..Default::default()
+        };
+        assert!(matches!(
+            m.update_record(actor(), "dyn.test", c.id, longer).await,
+            Err(MutationError::Invalid(_))
+        ));
+        // The apex is exempt (NS and friends stay permanent).
+        let (ns, _) = m
+            .create_record(
+                actor(),
+                "dyn.test",
+                rec("@", RecordType::NS, "ns1.dyn.test."),
+            )
+            .await
+            .unwrap();
+        assert!(ns.expires_at.is_none());
+        // An update that leaves the expiry alone keeps the old record
+        // permanent; moving it off the apex applies the policy.
+        let v = RecordInput {
+            value: Some("192.0.2.9".into()),
+            ..Default::default()
+        };
+        let o = m
+            .update_record(actor(), "dyn.test", old.id, v)
+            .await
+            .unwrap();
+        assert!(o.expires_at.is_none());
+        // Import: records without an expiry get the default; a zone the
+        // import creates takes the document's policy first.
+        let mut doc = m.export_all(Some(&["dyn.test".to_string()])).unwrap();
+        doc.zones[0].name = "dyn2.test".into();
+        doc.zones[0].records = vec![ExportRecord {
+            name: "imp".into(),
+            rtype: RecordType::A,
+            value: "192.0.2.10".into(),
+            ttl: None,
+            expires_at: None,
+        }];
+        m.import(actor(), doc, ImportMode::Merge, None, None)
+            .await
+            .unwrap();
+        let z2 = s.get_zone("dyn2.test").unwrap().unwrap();
+        assert_eq!(z2.record_policy, z.record_policy);
+        let imp = s
+            .all_records()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.name == "imp")
+            .unwrap();
+        assert!(imp.expires_at.is_some(), "imported with the default");
+        // Max only: the maximum is the default.
+        m.update_zone(
+            actor(),
+            "dyn.test",
+            bad(RecordPolicy {
+                default_expiry_secs: None,
+                max_expiry_secs: Some(600),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+        let (e, _) = m
+            .create_record(actor(), "dyn.test", rec("e", RecordType::A, "192.0.2.6"))
+            .await
+            .unwrap();
+        assert!((590..=600).contains(&hour(&e)));
+        // Removed: records may be permanent again.
+        let z = m
+            .update_zone(
+                actor(),
+                "dyn.test",
+                ZoneInput {
+                    record_policy: Some(None),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(z.record_policy.is_none());
+        let (f, _) = m
+            .create_record(actor(), "dyn.test", rec("f", RecordType::A, "192.0.2.7"))
+            .await
+            .unwrap();
+        assert!(f.expires_at.is_none());
     }
 }

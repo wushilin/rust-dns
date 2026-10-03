@@ -88,7 +88,8 @@ pub const TABLES: &[Table] = &[
         // checksum (the zone row as JSON, where `override` appears only for
         // an override zone), so a version without the column computes the
         // same table checksum while no override zone exists.
-        compat_columns: &["dnssec", "signed_at", "override_spec"],
+        // `record_policy` (M2) likewise: in the zone row JSON only when set.
+        compat_columns: &["dnssec", "signed_at", "override_spec", "record_policy"],
         ..replicated("zones", "id", ("zone", "zones"))
     },
     replicated("records", "id", ("record", "records")),

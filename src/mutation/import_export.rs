@@ -54,6 +54,12 @@ pub struct ExportZone {
     #[serde(rename = "override", default, skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub overrides: Option<ZoneOverride>,
+    /// The zone's record expiry policy (M2). On import it applies to a
+    /// zone the import creates (before its records are added); an existing
+    /// zone keeps its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub record_policy: Option<RecordPolicy>,
     #[serde(default)]
     #[schema(default = json!([]))]
     pub records: Vec<ExportRecord>,
@@ -229,6 +235,7 @@ impl Mutator {
                 default_ttl: None,
                 owner: None,
                 overrides: None,
+                record_policy: None,
                 records: records
                     .iter()
                     .map(|r| ExportRecord {
@@ -283,6 +290,7 @@ impl Mutator {
                         mode: Some(o.mode),
                         upstreams: Some(o.upstreams.iter().map(|u| u.to_string()).collect()),
                     }),
+                    record_policy: None,
                 };
                 let zone = match t.zone(&name)? {
                     Some(before) => {
@@ -298,6 +306,10 @@ impl Mutator {
                     None => {
                         let mut z = new_zone(&defaults, &name, owner_id);
                         apply_zone_input(&mut z, &input)?;
+                        if let Some(p) = ez.record_policy.as_ref().filter(|p| !p.is_empty()) {
+                            p.validate()?;
+                            z.record_policy = Some(p.clone());
+                        }
                         apply_override(&mut z, &input, true)?;
                         if let Some(s) = ez.serial {
                             z.serial = s;
@@ -404,6 +416,7 @@ pub fn export_zone(zd: &crate::cache::ZoneData) -> ExportZone {
         default_ttl: Some(z.default_ttl),
         owner: None,
         overrides: z.overrides.as_deref().cloned(),
+        record_policy: z.record_policy.clone(),
         records,
     }
 }
@@ -538,6 +551,7 @@ not-an-ip   x.home.test
                 default_ttl: None,
                 owner: None,
                 overrides: None,
+                record_policy: None,
                 records: (0..n)
                     .map(|i| ExportRecord {
                         // Two records per name: the per-name checks still apply.

@@ -567,6 +567,7 @@ mod tests {
             dnssec: false,
             signed_at: None,
             overrides: None,
+            record_policy: None,
         }
     }
     fn rec(id: i64, zone_id: i64, name: &str, t: RecordType, v: &str) -> Record {

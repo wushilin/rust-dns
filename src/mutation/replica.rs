@@ -1161,6 +1161,7 @@ mod tests {
                 default_ttl: None,
                 owner: None,
                 overrides: None,
+                record_policy: None,
                 records: (0..20)
                     .map(|i| ExportRecord {
                         name: format!("h{i}"),

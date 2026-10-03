@@ -1044,7 +1044,7 @@ function renderZone(keepFilter) {
         <button class="chip-btn" data-ro-ok data-panel="dig" title="Commands to query this zone">${ico('term', 's')} Test with dig</button>
         ${z.override ? `<span class="badge warn" title="Answered only for clients allowed to use forwarding; never AA, AD, signed or transferred">Override zone · not authoritative · ${z.override.mode === 'static' ? 'static' : 'transparent'}${z.override.upstreams.length ? ' → ' + esc(z.override.upstreams.join(', ')) : ''}</span>` : `<button class="chip-btn" data-ro-ok data-panel="dnssec" title="DNSSEC signing: status, DS record for the registrar, checks">${ico('shield', 's')} DNSSEC <span class="sub">${z.dnssec ? 'signing' : 'off'}</span></button>`}
         ${isOwner ? `<button class="chip-btn" data-ro-ok data-panel="access" title="Who can see and edit this zone">${ico('lock', 's')} Access <span class="sub">${z.members.length}</span></button>` : ''}
-        <span class="meta">owner <b>${esc(z.owner || '–')}</b> · you are <span class="badge">${esc(z.role)}</span> · default TTL ${z.default_ttl}s</span>
+        <span class="meta">owner <b>${esc(z.owner || '–')}</b> · you are <span class="badge">${esc(z.role)}</span> · default TTL ${z.default_ttl}s${z.record_policy ? ` · <span class="badge muted" title="Records below the apex: default lifetime ${z.record_policy.default_expiry_secs ?? z.record_policy.max_expiry_secs}s, at most ${z.record_policy.max_expiry_secs ?? '∞'}s (zone settings)">expiry policy</span>` : ''}</span>
       </div>
     </div>
     <div class="card">
@@ -1755,9 +1755,21 @@ function ioModal(zoneName) {
 
 function zoneSettingsModal() {
   const z = S.zone;
-  openModal(`<h2>Zone settings · <span class="mono">${esc(z.name)}</span></h2>${zoneForm(z)}<div class="error" id="m-err"></div>
+  const rp = z.record_policy || {};
+  openModal(`<h2>Zone settings · <span class="mono">${esc(z.name)}</span></h2>${zoneForm(z)}
+    <h3>Record expiry policy</h3>
+    <p class="hint">For self-registration zones. Applies to records created or changed below the apex (apex records such as NS are exempt): a record without an expiry gets the default; one asking to live longer than the maximum is refused (not shortened). Existing records are not changed. Blank: no limit.</p>
+    <div class="cols"><div class="field"><label for="rp-def">Default lifetime (seconds)</label><input type="number" id="rp-def" min="1" value="${rp.default_expiry_secs ?? ''}" placeholder="none"><div class="hint" id="rp-def-h"></div></div>
+      <div class="field"><label for="rp-max">Maximum lifetime (seconds)</label><input type="number" id="rp-max" min="1" value="${rp.max_expiry_secs ?? ''}" placeholder="none"><div class="hint" id="rp-max-h"></div></div></div>
+    <div class="error" id="m-err"></div>
     <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="m-ok" data-perm="edit_settings" data-zone="${esc(z.name)}">Save</button></div>`, m => {
-    $('#m-ok').onclick = async () => { try { const b = readForm(m); if (S.user.is_admin && !b.owner) b.owner = ''; await PUT('/zones/' + encodeURIComponent(z.name), b); closeModal(); toast('Zone updated', 'ok'); reloadZone(); } catch (e) { $('#m-err').textContent = e.message; } };
+    const hint = (i, h) => { const show = () => { const v = Number(m.querySelector(i).value); m.querySelector(h).textContent = v >= 60 ? '= ' + formatDuration(v, 3) : ''; }; m.querySelector(i).oninput = show; show(); };
+    hint('#rp-def', '#rp-def-h'); hint('#rp-max', '#rp-max-h');
+    $('#m-ok').onclick = async () => { try {
+      const b = readForm(m); if (S.user.is_admin && !b.owner) b.owner = '';
+      const d = m.querySelector('#rp-def').value, x = m.querySelector('#rp-max').value;
+      b.record_policy = d === '' && x === '' ? null : { ...(d === '' ? {} : { default_expiry_secs: Number(d) }), ...(x === '' ? {} : { max_expiry_secs: Number(x) }) };
+      await PUT('/zones/' + encodeURIComponent(z.name), b); closeModal(); toast('Zone updated', 'ok'); reloadZone(); } catch (e) { $('#m-err').textContent = e.message; } };
   });
 }
 

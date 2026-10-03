@@ -744,6 +744,7 @@ async fn api_reads_and_dns_stay_fast_during_a_long_write() {
             default_ttl: None,
             owner: None,
             overrides: None,
+            record_policy: None,
             records: (0..n)
                 .map(|i| ExportRecord {
                     name: format!("h{i}"),
@@ -1164,4 +1165,98 @@ async fn scoped_tokens_never_exceed_their_owner() {
     // Audited with before/after.
     let r = h.call("GET", "/audit", Some(&root_c), None).await;
     assert!(r.json.to_string().contains("\"scope\""), "{}", r.json);
+}
+
+/// M2: the record expiry policy through the API: set by zone owners only
+/// (EditSettings), shown on the zone, a too-long expiry is a 400 naming the
+/// limit, a record without one gets the default.
+#[tokio::test]
+async fn zone_record_policy_through_the_api() {
+    use serde_json::json;
+    let h = Harness::new();
+    h.state
+        .accounts
+        .sync_root(
+            "root",
+            &crate::auth::hash_password("root-password-1").unwrap(),
+            false,
+        )
+        .unwrap();
+    h.user("ed", "ed-password-11", None);
+    let root = h
+        .login("root", "root-password-1")
+        .await
+        .cookie
+        .expect("root");
+    let ed = h.login("ed", "ed-password-11").await.cookie.expect("ed");
+    let r = h
+        .call(
+            "POST",
+            "/zones",
+            Some(&root),
+            Some(json!({ "name": "dyn.test" })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED);
+    let r = h
+        .call(
+            "PUT",
+            "/zones/dyn.test/members/ed",
+            Some(&root),
+            Some(json!({ "role": "editor" })),
+        )
+        .await;
+    assert!(r.status.is_success(), "{}", r.json);
+    let policy =
+        json!({ "record_policy": { "default_expiry_secs": 3600, "max_expiry_secs": 86400 } });
+    let r = h
+        .call("PUT", "/zones/dyn.test", Some(&ed), Some(policy.clone()))
+        .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "an editor cannot set it");
+    let r = h
+        .call(
+            "PUT",
+            "/zones/dyn.test",
+            Some(&root),
+            Some(json!({ "record_policy": { "default_expiry_secs": 9, "max_expiry_secs": 8 } })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.json);
+    let r = h
+        .call("PUT", "/zones/dyn.test", Some(&root), Some(policy))
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.json);
+    assert_eq!(r.json["record_policy"]["max_expiry_secs"], 86400);
+    let r = h.call("GET", "/zones/dyn.test", Some(&ed), None).await;
+    assert_eq!(r.json["record_policy"]["default_expiry_secs"], 3600);
+    let r = h
+        .call(
+            "POST",
+            "/zones/dyn.test/records",
+            Some(&ed),
+            Some(json!({ "name": "pc", "type": "A", "value": "192.0.2.1", "expires_in": 172800 })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.json);
+    assert!(r.json.to_string().contains("86400"), "{}", r.json);
+    let r = h
+        .call(
+            "POST",
+            "/zones/dyn.test/records",
+            Some(&ed),
+            Some(json!({ "name": "pc", "type": "A", "value": "192.0.2.1" })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.json);
+    assert!(r.json["expires_at"].is_string(), "{}", r.json);
+    let r = h
+        .call(
+            "PUT",
+            "/zones/dyn.test",
+            Some(&root),
+            Some(json!({ "record_policy": null })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.json);
+    assert!(r.json.get("record_policy").is_none(), "{}", r.json);
 }

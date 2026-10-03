@@ -166,6 +166,94 @@ pub struct Zone {
     #[serde(rename = "override", default, skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub overrides: Option<Box<ZoneOverride>>,
+    /// Expiry policy for records below the apex (M2, self-registration
+    /// zones); absent: none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub record_policy: Option<RecordPolicy>,
+}
+
+/// Longest record lifetime a policy may name (100 years, as `expires_in`).
+pub const MAX_POLICY_SECS: u64 = 100 * 365 * 86_400;
+
+/// A zone's record expiry policy (M2). Applies to every record created or
+/// changed below the apex (`@` records, e.g. NS, are exempt): one without
+/// an expiry gets `default_expiry_secs` (or, when only the maximum is set,
+/// the maximum); one whose expiry is later than now + `max_expiry_secs` is
+/// REFUSED (400), never silently shortened, so a client always knows when
+/// its record goes. Existing records are not touched when the policy is
+/// set; a record whose expiry an update leaves unchanged is not checked.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(example = json!({ "default_expiry_secs": 86400, "max_expiry_secs": 604800 }))]
+pub struct RecordPolicy {
+    /// Lifetime of a record created without an expiry, seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(minimum = 1, example = 86400)]
+    pub default_expiry_secs: Option<u64>,
+    /// Longest lifetime a record may be given, seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(minimum = 1, example = 604800)]
+    pub max_expiry_secs: Option<u64>,
+}
+
+impl RecordPolicy {
+    pub fn is_empty(&self) -> bool {
+        self.default_expiry_secs.is_none() && self.max_expiry_secs.is_none()
+    }
+
+    /// Checked when a policy is saved.
+    pub fn validate(&self) -> Result<(), Invalid> {
+        for (what, v) in [
+            ("default_expiry_secs", self.default_expiry_secs),
+            ("max_expiry_secs", self.max_expiry_secs),
+        ] {
+            if let Some(v) = v {
+                if v == 0 || v > MAX_POLICY_SECS {
+                    return invalid(&format!("{what} must be between 1 second and 100 years"));
+                }
+            }
+        }
+        if let (Some(d), Some(m)) = (self.default_expiry_secs, self.max_expiry_secs) {
+            if d > m {
+                return invalid("default_expiry_secs must not exceed max_expiry_secs");
+            }
+        }
+        Ok(())
+    }
+
+    /// The expiry a record named `name` gets under this policy, given the
+    /// expiry it asked for (`None` = never), or why it is refused.
+    pub fn apply(
+        &self,
+        name: &str,
+        expires_at: Option<String>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<String>, Invalid> {
+        if name == "@" || name.is_empty() {
+            return Ok(expires_at);
+        }
+        let fmt = |t: chrono::DateTime<chrono::Utc>| {
+            t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        };
+        let secs = |s: u64| chrono::Duration::seconds(s as i64);
+        match expires_at {
+            None => Ok(self
+                .default_expiry_secs
+                .or(self.max_expiry_secs)
+                .map(|s| fmt(now + secs(s)))),
+            Some(at) => {
+                if let Some(max) = self.max_expiry_secs {
+                    let limit = fmt(now + secs(max));
+                    if at > limit {
+                        return Err(Invalid(format!(
+                            "this zone allows records to live at most {max} seconds (expiry by {limit}); {at} is later"
+                        )));
+                    }
+                }
+                Ok(Some(at))
+            }
+        }
+    }
 }
 
 /// How an override zone treats names it does not define itself.
@@ -247,6 +335,15 @@ pub struct ZoneInput {
     #[serde(rename = "override", default)]
     #[schema(nullable = false, example = json!({ "mode": "transparent", "upstreams": ["10.8.0.1"] }))]
     pub overrides: Option<ZoneOverrideInput>,
+    /// Record expiry policy (M2). Absent: unchanged; `null` or `{}`:
+    /// removed; an object: replaces the policy.
+    #[serde(
+        default,
+        deserialize_with = "present_or_null",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schema(value_type = Option<RecordPolicy>)]
+    pub record_policy: Option<Option<RecordPolicy>>,
 }
 
 /// Override settings as entered (I1).

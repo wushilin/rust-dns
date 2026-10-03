@@ -592,6 +592,12 @@ impl<'a> Tx<'a> {
                 "ttl must be at least 1 (or empty for the zone default)".into(),
             ));
         }
+        // M2: the zone's expiry policy, inside the transaction (every
+        // create path: API, renewal, JSON and hosts imports).
+        let expires_at = match &zone.record_policy {
+            Some(p) => p.apply(name, expires_at, chrono::Utc::now())?,
+            None => expires_at,
+        };
         let existing = self.records_named(zone.id, name)?;
         if let Some(e) = self.record_conflict(&existing, None, name, rtype, value) {
             return Err(e);
@@ -635,6 +641,14 @@ impl<'a> Tx<'a> {
                 "ttl must be at least 1 (or empty for the zone default)".into(),
             ));
         }
+        // M2: an expiry the update sets (or a record moved off the apex)
+        // follows the zone's policy; one it leaves alone is not re-checked.
+        let expires_at = match &zone.record_policy {
+            Some(p) if expires_at != before.expires_at || (before.name == "@" && name != "@") => {
+                p.apply(name, expires_at, chrono::Utc::now())?
+            }
+            _ => expires_at,
+        };
         let existing = self.records_named(zone.id, name)?;
         if let Some(e) = self.record_conflict(&existing, Some(before.id), name, rtype, value) {
             return Err(e);
@@ -952,6 +966,7 @@ mod tests {
                     default_ttl: None,
                     owner: None,
                     overrides: None,
+                    record_policy: None,
                     records: vec![ExportRecord {
                         name: "ok".into(),
                         rtype: RecordType::A,
@@ -972,6 +987,7 @@ mod tests {
                     default_ttl: None,
                     owner: None,
                     overrides: None,
+                    record_policy: None,
                     records: vec![ExportRecord {
                         name: "bad".into(),
                         rtype: RecordType::AAAA,
@@ -1003,6 +1019,7 @@ mod tests {
                     default_ttl: None,
                     owner: None,
                     overrides: None,
+                    record_policy: None,
                     records: vec![],
                 },
                 ExportZone {
@@ -1017,6 +1034,7 @@ mod tests {
                     default_ttl: None,
                     owner: None,
                     overrides: None,
+                    record_policy: None,
                     records: vec![],
                 },
             ],
@@ -1231,6 +1249,15 @@ mod tests {
                         z,
                         ZoneInput {
                             refresh: Some(rng.random_range(60..9000)),
+                            // M2: a record expiry policy set, changed or removed.
+                            record_policy: match rng.random_range(0..4) {
+                                0 => Some(None),
+                                1 => Some(Some(crate::model::RecordPolicy {
+                                    default_expiry_secs: Some(rng.random_range(60..3600)),
+                                    max_expiry_secs: Some(86_400),
+                                })),
+                                _ => None,
+                            },
                             ..Default::default()
                         },
                         None,
@@ -1354,6 +1381,7 @@ mod tests {
                             default_ttl: None,
                             owner: None,
                             overrides: None,
+                            record_policy: None,
                             records: recs,
                         }],
                     };

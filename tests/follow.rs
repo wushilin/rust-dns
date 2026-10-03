@@ -3131,3 +3131,98 @@ fn token_scopes_replicate_and_are_enforced_on_the_standby() {
     drop(p);
     let _ = std::fs::remove_dir_all(&root_dir);
 }
+
+/// M2: a zone's record expiry policy is part of the zone row: it reaches
+/// the standby (snapshot and `zone_updated`), reconcile stays ok. With the
+/// previous release as standby: no policy, it follows; the first policy
+/// makes it halt (the per-zone checksum covers the zone row) — recorded in
+/// plan.md (Rollout): upgrade the standby first.
+#[test]
+fn a_zone_record_policy_replicates() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root_dir = std::env::temp_dir().join(format!(
+        "rust-dns-follow-policy-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root_dir).unwrap();
+    let mut p = Node::new(&root_dir, "primary", "rootpass-primary");
+    let mut s = Node::new(&root_dir, "standby", "rootpass-standby");
+    p.configure("");
+    p.start();
+    let pr = p.root();
+    let req = |m: &str, path: &str, body: Value| {
+        ok(call(&Auth::Session(&pr), m, &p.api(path), Some(body)), path)
+    };
+    req("POST", "/zones", json!({ "name": "dyn.test" }));
+    req("POST", "/zones", json!({ "name": "late.test" }));
+    req(
+        "PUT",
+        "/zones/dyn.test",
+        json!({ "record_policy": { "default_expiry_secs": 3600, "max_expiry_secs": 86400 } }),
+    );
+    let repl = req("POST", "/tokens", json!({ "name": "repl" }))["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    s.configure(&follow_cfg(&p, "dns2", &repl));
+    s.start();
+    let sr = s.root();
+    wait_reconciled(&p, &pr, &s, &sr, "policy in the snapshot");
+    let policy = |n: &Node, a: &ureq::Agent, z: &str| {
+        ok(
+            call(
+                &Auth::Session(a),
+                "GET",
+                &n.api(&format!("/zones/{z}")),
+                None,
+            ),
+            "zone",
+        )["record_policy"]
+            .clone()
+    };
+    assert_eq!(policy(&s, &sr, "dyn.test")["max_expiry_secs"], 86400);
+    req(
+        "PUT",
+        "/zones/late.test",
+        json!({ "record_policy": { "max_expiry_secs": 600 } }),
+    );
+    req("PUT", "/zones/dyn.test", json!({ "record_policy": null }));
+    wait_reconciled(&p, &pr, &s, &sr, "policy changed while following");
+    assert_eq!(
+        policy(&s, &sr, "late.test"),
+        json!({ "max_expiry_secs": 600 })
+    );
+    assert!(policy(&s, &sr, "dyn.test").is_null());
+    drop(s);
+
+    let Some(prev) = prev_bin() else {
+        drop(p);
+        let _ = std::fs::remove_dir_all(&root_dir);
+        return;
+    };
+    req("PUT", "/zones/late.test", json!({ "record_policy": null }));
+    let mut old = Node::new(&root_dir, "old", "rootpass-old");
+    old.bin = prev;
+    old.configure(&follow_cfg(&p, "dns3", &repl));
+    old.start();
+    let or = old.root();
+    wait_reconciled(&p, &pr, &old, &or, "old standby, no policy");
+    req(
+        "PUT",
+        "/zones/dyn.test",
+        json!({ "record_policy": { "max_expiry_secs": 600 } }),
+    );
+    let mut last = Value::Null;
+    wait_for("the old standby halts on the policy", 30, || {
+        last = status(&old, &or);
+        !last["follow"]["halted"].is_null()
+    });
+    assert_eq!(last["follow"]["halted"]["reason"], "diverged", "{last}");
+    eprintln!("old standby with a record policy: {last}");
+    drop(old);
+    drop(p);
+    let _ = std::fs::remove_dir_all(&root_dir);
+}

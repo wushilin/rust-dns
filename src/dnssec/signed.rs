@@ -536,6 +536,7 @@ mod tests {
             dnssec: true,
             signed_at: None,
             overrides: None,
+            record_policy: None,
         }
     }
 
