@@ -148,6 +148,53 @@ OpenAPI snapshot + validator, conformance (123), smoke-release, cargo-audit.
   the network, so a plain `cargo test` then depends on dns.google), make
   it `#[ignore]`d / opt-in, or drop it.
 
+## Phase P: query pipeline (owner, 2026-10-03; do before phase I)
+
+The owner wants a servlet-filter-style serving layer: handlers chain, and each
+can answer, abort (drop/refuse, with logging) or pass to the next one, and can
+inspect or rewrite the response on the way back. Phase I features become
+filters instead of branches in `dns/handler.rs`.
+
+- [ ] P1. Design and build the pipeline; move today's behaviour into filters
+  with NO change in answers.
+  - Two stages, because admission must stay before decoding (C2):
+    - Raw stage (bytes only, synchronous, no allocation on the reject path):
+      admission/rate limit (C2), then TSIG verification (needs raw bytes).
+      Outcome: continue, or reply/drop immediately.
+    - Query stage (decoded request in a `QueryCtx`: client, proto, EDNS,
+      cookies, TSIG identity, runtime snapshot, stats, a per-query log/trace
+      record): an ordered chain of `Filter`s. A filter gets `ctx` and `next`;
+      it may return its own response (answer / NXDOMAIN / REFUSED /
+      SERVFAIL), drop the query (UDP: no reply), or call `next` and then
+      inspect or replace the response (post-processing: truncation, DO/RRSIG
+      handling, rebinding checks, serve-stale on upstream failure).
+  - Initial chain, reproducing today: cookies/ACL checks → special queries
+    (version.bind/NSID/minimal ANY) → authoritative zones (incl. DNSSEC,
+    auto-PTR, AXFR/IXFR routing) → forwarding (cache, open-resolver
+    safeguards, in-flight cap C1, upstream) with response finishing
+    (EDNS/DO echo, truncation) as an outer filter. The exact order is
+    decided from the current code and documented in one place.
+  - The chain is built from config at startup and rebuilt atomically on
+    reload/settings changes (ArcSwap), so filters can be switched on/off from
+    the console without a restart.
+  - Every filter has a name; per-filter counters (handled / answered /
+    dropped / passed) in `/metrics`; the live query event records which
+    filter produced the answer ("source"), which the console shows.
+  - Performance: no per-filter heap allocation on the hot path (static
+    dispatch or a pre-boxed chain; measure). Authoritative answers must not
+    get slower: benchmark before/after (TCP queries/s locally, release build,
+    plus a criterion-style micro bench of handle() if cheap) and record the
+    numbers here.
+  - Tests: the whole existing suite unchanged (answers byte-identical; reuse
+    the D-phase approach: compare a large query matrix between the previous
+    binary and the new one, UDP and TCP, with and without EDNS/DO, signed
+    and unsigned zones, forwarding via a fake upstream); unit tests for chain
+    semantics (answer / drop / pass / post-process, ordering, a filter that
+    panics does not take down the server — the query gets SERVFAIL and the
+    panic is logged).
+- [ ] P2. Write the Phase I items as filters on this pipeline (each I item's
+  text below stays the spec; "filter" is the implementation shape).
+
 ## Phase I: dnsmasq-style resolver features (owner, 2026-10-03)
 
 Goal: close the useful gaps to dnsmasq (DHCP excluded), configured from the
@@ -610,3 +657,8 @@ a router-sized footprint (a design property, not a feature).
   features (DHCP excluded), configured from the web console where possible.
   Order: I1-I4, I5-I6, I7, then I8-I11. Not started. H4/H5 still await the
   owner; deployment of the finished work is a separate decision.
+- 2026-10-03: Owner's order of work: finish the work (phase P, then all of
+  phase I), add unit tests and make sure everything works as intended, and
+  only then deploy (expects compatibility; still verify mixed-version with the
+  3884ba8 and 6d7e5a2 binaries before deploying). Phase P (query pipeline,
+  servlet-filter style) added before phase I.
