@@ -237,7 +237,7 @@
         "operationId": "whoami",
         "responses": {
           "200": {
-            "description": "Caller.",
+            "description": "Caller, with the number of unused MFA recovery codes (shown on the account page).",
             "content": {
               "application/json": {
                 "schema": {
@@ -9047,7 +9047,8 @@
         "required": [
           "user",
           "ip",
-          "via"
+          "via",
+          "recovery_codes_left"
         ],
         "properties": {
           "user": {
@@ -9059,10 +9060,17 @@
           },
           "via": {
             "$ref": "#/components/schemas/AuthVia"
+          },
+          "recovery_codes_left": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unused MFA recovery codes (0 when MFA is not enrolled).",
+            "example": 0
           }
         },
         "example": {
           "ip": "192.0.2.1",
+          "recovery_codes_left": 0,
           "user": {
             "created_at": "2026-01-15T09:30:00.000Z",
             "disabled_at": null,

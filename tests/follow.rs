@@ -1055,6 +1055,15 @@ fn primary_standby_failover_and_rejoin() {
     assert_eq!(r["history"]["parent_history_id"], old_history.as_str());
     assert_ne!(r["history"]["history_id"], old_history.as_str());
     assert_eq!(r["config_updated"], true);
+    // The console's "Promoted" dialog lists these notes.
+    let notes = r["notes"].as_array().expect("notes");
+    assert!(
+        !notes.is_empty()
+            && notes
+                .iter()
+                .all(|n| n.as_str().is_some_and(|t| !t.is_empty())),
+        "{r}"
+    );
     let cfg_text = std::fs::read_to_string(s.config_path()).unwrap();
     assert!(!cfg_text.contains("\n[follow]"), "{cfg_text}");
     assert!(

@@ -456,16 +456,22 @@ pub async fn openapi() -> Response {
     operation_id = "whoami",
     summary = "Current user, client IP and auth method",
     responses(
-        (status = 200, description = "Caller.", body = WhoAmI),
+        (status = 200, description = "Caller, with the number of unused MFA recovery codes (shown on the account page).", body = WhoAmI),
         (status = 401, response = Unauthorized),
     ),
 )]
-pub async fn whoami(caller: Caller) -> Json<WhoAmI> {
-    Json(WhoAmI {
+pub async fn whoami(State(s): St, caller: Caller) -> ApiResult<Json<WhoAmI>> {
+    let recovery_codes_left = if caller.user.mfa_enrolled() {
+        s.storage.recovery_codes_left(caller.user.id)?
+    } else {
+        0
+    };
+    Ok(Json(WhoAmI {
         user: public_user(&caller.user),
         ip: caller.ip,
         via: caller.via,
-    })
+        recovery_codes_left,
+    }))
 }
 
 // ---- zones -----------------------------------------------------------------

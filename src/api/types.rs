@@ -136,13 +136,16 @@ pub struct UserWithRecoveryCodes {
 
 /// The caller.
 #[derive(Debug, Serialize, ToSchema)]
-#[schema(example = json!({ "user": { "id": 1, "username": "root", "display_name": "", "is_admin": true, "is_root": true, "mfa_required": false, "mfa_enrolled": false, "totp_enrolled_at": null, "disabled_at": null, "created_at": "2026-01-15T09:30:00.000Z" }, "ip": "192.0.2.1", "via": "session" }))]
+#[schema(example = json!({ "user": { "id": 1, "username": "root", "display_name": "", "is_admin": true, "is_root": true, "mfa_required": false, "mfa_enrolled": false, "totp_enrolled_at": null, "disabled_at": null, "created_at": "2026-01-15T09:30:00.000Z" }, "ip": "192.0.2.1", "via": "session", "recovery_codes_left": 0 }))]
 pub struct WhoAmI {
     pub user: PublicUser,
     /// Client IP as resolved by the server (proxy aware).
     #[schema(value_type = String)]
     pub ip: std::net::IpAddr,
     pub via: AuthVia,
+    /// Unused MFA recovery codes (0 when MFA is not enrolled).
+    #[schema(example = 0)]
+    pub recovery_codes_left: i64,
 }
 
 /// TOTP enrollment data.

@@ -1292,3 +1292,161 @@ fn early_answers_reach_the_client_and_large_bodies_are_refused() {
         other => panic!("expected 413, got {other:?}"),
     }
 }
+
+/// L2: what the console's account dialogs and "Sign this user out
+/// everywhere" do, step by step through the same calls: enable MFA (start,
+/// confirm -> recovery codes dialog), "New recovery codes" (old codes stop
+/// working), the account page's counts (`GET /me`), disable MFA, and an
+/// administrator signing one user out of every session (not others').
+#[test]
+fn account_dialog_flows() {
+    let srv = start();
+    let web = srv.web.clone();
+    let a = agent();
+    login(&a, &web);
+    let me = |ag: &ureq::Agent| -> serde_json::Value {
+        ag.get(&format!("{web}/api/me"))
+            .call()
+            .unwrap()
+            .into_json()
+            .unwrap()
+    };
+    let (s, _) = post(
+        &a,
+        &format!("{web}/api/users"),
+        serde_json::json!({ "username": "carol", "password": "carolpass1" }),
+    );
+    assert_eq!(s, 201);
+    let carol_login = || {
+        let c = agent();
+        let (s, v) = post(
+            &c,
+            &format!("{web}/api/auth/login"),
+            serde_json::json!({ "username": "carol", "password": "carolpass1" }),
+        );
+        assert_eq!(s, 200, "{v}");
+        (c, v)
+    };
+    let (c, v) = carol_login();
+    assert_eq!(v["status"], "ok");
+    let m = me(&c);
+    assert_eq!(m["user"]["mfa_enrolled"], false);
+    assert_eq!(m["recovery_codes_left"], 0, "{m}");
+
+    // Enable: start (no factor yet), confirm -> the recovery codes dialog.
+    let (s, e) = post(
+        &c,
+        &format!("{web}/api/me/mfa/start"),
+        serde_json::json!({}),
+    );
+    assert_eq!(s, 200, "{e}");
+    let secret = e["secret"].as_str().unwrap().to_string();
+    assert!(e["qr_svg"].as_str().unwrap().starts_with("<svg"));
+    let (s, v) = post(
+        &c,
+        &format!("{web}/api/me/mfa/confirm"),
+        serde_json::json!({ "code": "000000" }),
+    );
+    assert_eq!(s, 401, "wrong code: {v}");
+    let (s, v) = post(
+        &c,
+        &format!("{web}/api/me/mfa/confirm"),
+        serde_json::json!({ "code": totp(&secret) }),
+    );
+    assert_eq!(s, 200, "{v}");
+    let codes = |v: &serde_json::Value| -> Vec<String> {
+        v["recovery_codes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c.as_str().unwrap().to_string())
+            .collect()
+    };
+    let first = codes(&v);
+    assert_eq!(first.len(), 8);
+    let uniq: std::collections::BTreeSet<_> = first.iter().collect();
+    assert_eq!(uniq.len(), 8, "distinct codes");
+    let m = me(&c);
+    assert_eq!(m["user"]["mfa_enrolled"], true);
+    assert_eq!(m["recovery_codes_left"], 8, "the account page's count");
+
+    // "New recovery codes": needs a current code; replaces all of them.
+    let (s, _) = post(
+        &c,
+        &format!("{web}/api/me/mfa/recovery"),
+        serde_json::json!({ "code": "000000" }),
+    );
+    assert_eq!(s, 401);
+    let (s, v) = post(
+        &c,
+        &format!("{web}/api/me/mfa/recovery"),
+        serde_json::json!({ "code": totp(&secret) }),
+    );
+    assert_eq!(s, 200, "{v}");
+    let second = codes(&v);
+    assert_eq!(second.len(), 8);
+    assert!(second.iter().all(|c| !first.contains(c)), "all new");
+    let (c2, v) = carol_login();
+    assert_eq!(v["status"], "mfa_required");
+    let (s, _) = post(
+        &c2,
+        &format!("{web}/api/auth/mfa"),
+        serde_json::json!({ "code": first[0] }),
+    );
+    assert_eq!(s, 401, "a replaced recovery code no longer works");
+    let (s, v) = post(
+        &c2,
+        &format!("{web}/api/auth/mfa"),
+        serde_json::json!({ "code": second[0] }),
+    );
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["used_recovery_code"], true);
+    assert_eq!(v["recovery_codes_left"], 7);
+    assert_eq!(me(&c)["recovery_codes_left"], 7);
+
+    // Disable: needs a current code; afterwards sign-in is one step.
+    let (s, _) = post(
+        &c,
+        &format!("{web}/api/me/mfa/disable"),
+        serde_json::json!({ "code": "000000" }),
+    );
+    assert_eq!(s, 401);
+    let (s, v) = post(
+        &c,
+        &format!("{web}/api/me/mfa/disable"),
+        serde_json::json!({ "code": totp(&secret) }),
+    );
+    assert_eq!(s, 200, "{v}");
+    let m = me(&c);
+    assert_eq!(m["user"]["mfa_enrolled"], false);
+    assert_eq!(m["recovery_codes_left"], 0);
+    let (c3, v) = carol_login();
+    assert_eq!(v["status"], "ok", "no second step after disabling");
+
+    // "Sign this user out everywhere": carol's sessions (c, c2, c3) end,
+    // root's does not.
+    let carol = me(&c)["user"]["id"].as_i64().unwrap();
+    let (s, v) = post(
+        &a,
+        &format!("{web}/api/users/{carol}/sessions/revoke"),
+        serde_json::json!({}),
+    );
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["revoked"], 3, "{v}");
+    for (n, ag) in [("c", &c), ("c2", &c2), ("c3", &c3)] {
+        assert!(
+            matches!(
+                ag.get(&format!("{web}/api/me")).call(),
+                Err(ureq::Error::Status(401, _))
+            ),
+            "{n} signed out"
+        );
+    }
+    assert!(
+        a.get(&format!("{web}/api/me")).call().is_ok(),
+        "root still in"
+    );
+    let (c4, v) = carol_login();
+    assert_eq!(v["status"], "ok", "carol can sign in again");
+    assert!(c4.get(&format!("{web}/api/me")).call().is_ok());
+}

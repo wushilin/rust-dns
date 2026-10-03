@@ -379,12 +379,38 @@ a router-sized footprint (a design property, not a feature).
   unshare -n`; `interface_poll_secs = 3600`; an address added to and
   removed from `lo` must be bound and released within 3 s). CI sets
   `REQUIRE_NETLINK_TEST=1` so a skip fails there.
-- [ ] L2. Test debt from pending.md, made repeatable where possible:
+- [x] L2. Test debt from pending.md, made repeatable where possible:
   recovery-code dialog after MFA enrollment, "New recovery codes", users ->
   "Sign this user out everywhere", the MFA enable/disable/regenerate dialogs
   and the "Promoted" result dialog (not covered in K2), live updates through
   a reverse proxy (local nginx in front of the websocket, if nginx is
   available; otherwise document how to check it).
+  Repeatable: `e2e::account_dialog_flows` (the calls each dialog makes:
+  enable = start + confirm -> 8 distinct codes; "New recovery codes" needs
+  a current code, returns 8 new ones, the replaced ones are refused at
+  sign-in and a new one works; disable needs a code, sign-in is one step
+  afterwards; "Sign this user out everywhere" revokes exactly that user's
+  3 sessions, root's stays, the user can sign in again);
+  `follow::primary_standby_failover_and_rejoin` now also checks the
+  promote result's `notes` (the "Promoted" dialog's list); the contract
+  test already validates every response shape strictly.
+  Found in the browser walk-through and fixed: the account page said
+  "undefined recovery codes left" (it read `recovery_codes_left` from
+  `GET /me`, which never had it). `GET /me` now returns
+  `recovery_codes_left` (0 when not enrolled); additive OpenAPI change,
+  snapshot regenerated.
+  Browser (Chrome, local pair, throwaway configs): Enable MFA dialog (QR,
+  manual entry, code) -> recovery codes dialog -> account page "8 recovery
+  codes left"; "New recovery codes" -> new codes dialog; Disable MFA:
+  wrong code shows "invalid code", a valid one disables; Users -> Edit ->
+  "Sign this user out everywhere" -> "Revoked 3 session(s)"; standby ->
+  Promote (two-click, force while the cached status said reachable) ->
+  "Promoted" dialog with 4 notes; the promoted node's changelog still
+  shows the copied history (K3). No console errors.
+  Reverse proxy: nginx is not installed here (no Homebrew nginx), so not
+  exercised; the manual check (console through the proxy, a change in a
+  second tab appears at once, or a `curl` upgrade request answering 101)
+  is in the README next to the proxy examples.
 - [ ] L3. pending.md cleanup: tick entries that are done (TSIG for
   AXFR/NOTIFY, git repository, static musl build in the release workflow,
   deployment notes, per-zone forwarding via override zones) with a pointer
@@ -981,9 +1007,16 @@ a router-sized footprint (a design property, not a feature).
   parts; compiled and run in LXD container `home:alma8-rust` (x86_64, cargo
   1.92, sources + `cargo vendor` pushed, offline build; `home:dns-test` had
   no toolchain, so it was started, found without cargo, and stopped
-  again): ifaces unit tests 6/6, `tests/netlink.rs` passed 5 runs (as root,
-  `unshare -n`). Negative control in the container (netlink open forced to
+  again): ifaces unit tests 6/6, `tests/netlink.rs` passed 4 of 4 runs
+  after one fix (as root, `unshare -n`; the first version waited only 5 s
+  for a slow debug-build start in the container, so the address could be
+  added before the follower's first read; it now waits for the netlink
+  line and the first bind, up to 180 s, before changing anything). Negative control in the container (netlink open forced to
   fail -> polling): the integration test fails as intended (address never
   bound within 3 s). Not run: the `unshare -rn` (unprivileged) and `sudo
   -n` paths, and clippy with the CI toolchain on Linux (the container's
   clippy 1.92 flags 3 pre-existing lints elsewhere; none in the new code).
+- 2026-10-03 (phase L): L2 done (see L2): test `e2e::account_dialog_flows`,
+  promote notes asserted, `GET /me` `recovery_codes_left` (console bug),
+  browser walk-through of the five dialogs, proxy check documented (no
+  nginx here).

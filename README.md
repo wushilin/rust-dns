@@ -175,7 +175,17 @@ max_files = 10
 compress = true              # gzip rotated files
 ```
 
-Put the console behind a TLS reverse proxy for anything beyond localhost.
+Put the console behind a TLS reverse proxy for anything beyond localhost
+(`examples/proxy/nginx.conf`, `examples/proxy/haproxy.cfg`). The live console
+(sidebar shows "live", changelog and live queries update without reloading)
+needs the proxy to pass the websocket at `/api/ws` (`Upgrade` / `Connection`
+headers, long read timeout). To check a proxy: open the console through it,
+change a record in a second tab, and the first tab's changelog shows the new
+row at once; or `curl -i -N -H 'Connection: Upgrade' -H 'Upgrade: websocket'
+-H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGVzdHRlc3R0ZXN0dGVzdA=='
+-H 'Origin: https://<console host>' -b '<session cookie>' https://<console host>/api/ws`
+answers `101 Switching Protocols` (a `400`/`426` or a closed connection means
+the proxy dropped the upgrade).
 `rust-dns --check --config rust-dns.toml` parses and validates a config without
 starting listeners or changing the file.
 Scheduled backups use SQLite's online backup API; the configured number of
