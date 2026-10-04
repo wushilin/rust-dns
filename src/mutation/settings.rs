@@ -480,6 +480,8 @@ impl RateLimitSettings {
             exempt_valid_cookies: self
                 .exempt_valid_cookies
                 .unwrap_or(file.exempt_valid_cookies),
+            // O26: RRL is the file's only (per server, not a console setting).
+            rrl: file.rrl.clone(),
         }
     }
 }

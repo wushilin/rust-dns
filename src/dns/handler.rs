@@ -168,8 +168,14 @@ impl DnsServer {
         // and never falls back to being treated as unsigned.
         match tsig::find(req) {
             Ok(None) => {
-                self.query_stage(req, client, proto, started, &rt, None)
-                    .await
+                let reply = self
+                    .query_stage(req, client, proto, started, &rt, None)
+                    .await;
+                if proto == Proto::Udp {
+                    self.response_rate_limit(req, client.ip(), reply)
+                } else {
+                    reply
+                }
             }
             Ok(Some(_)) if req[2] & 0x80 != 0 => Reply::None, // a response
             Ok(Some(signed)) => {
@@ -185,6 +191,34 @@ impl DnsServer {
                 tracing::debug!(client = %client, error = e.0, "malformed TSIG record");
                 Reply::One(header_only(id, ResponseCode::FormErr))
             }
+        }
+    }
+
+    /// O26: response rate limiting of one UDP answer (see [`super::rrl`]).
+    /// Off, an exempt network or a valid server cookie: sent as is.
+    /// Otherwise the answer is classified and counted; over the limit it
+    /// is dropped or replaced by the slip answer (TC=1, header and
+    /// question only). TCP and TSIG-signed answers never come here.
+    fn response_rate_limit(&self, req: &[u8], ip: std::net::IpAddr, reply: Reply) -> Reply {
+        let Reply::One(bytes) = &reply else {
+            return reply;
+        };
+        if !self.rrl.enabled() || self.rrl.exempt(ip) {
+            return reply;
+        }
+        if super::cookies::find_option(req).is_some_and(|c| self.cookies.is_valid(c, ip)) {
+            return reply;
+        }
+        let Some(tuple) = Message::from_vec(bytes)
+            .ok()
+            .and_then(|m| super::rrl::classify(&m))
+        else {
+            return reply;
+        };
+        match self.rrl.check(ip, &tuple) {
+            super::rrl::Verdict::Send => reply,
+            super::rrl::Verdict::Slip => slip_reply(req).map(Reply::One).unwrap_or(Reply::None),
+            super::rrl::Verdict::Drop => Reply::None,
         }
     }
 

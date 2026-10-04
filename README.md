@@ -35,6 +35,16 @@ Single static binary, one SQLite file, one TOML config. Zero JavaScript build.
   in a fixed-size counter table: memory is bounded and a flood from many
   (spoofed) sources cannot reset a limited client. Every Nth limited UDP query
   gets an empty truncated answer ("slip") so real clients can retry over TCP.
+- Response rate limiting (RRL, off by default): identical UDP answers to one
+  client network (IPv4 /24, IPv6 /56) per second, against reflection attacks
+  that spoof a victim's address. Same answer (name and type), same NXDOMAIN
+  per zone (random names count together), same referral, or any error;
+  over the limit an answer is dropped or, every `slip`th, replaced by an
+  empty TC=1 answer. TCP, TSIG-signed queries, a valid server cookie and
+  `exempt` networks are never limited. Counting is per one-second window
+  in a bounded table; answers synthesized from a wildcard are counted per
+  query name (BIND counts them per wildcard). `/metrics`:
+  `rustdns_rrl_dropped_total`, `rustdns_rrl_slipped_total`.
 - DNS over TCP with per-read and per-write timeouts, per-connection query and
   age limits, and a per-client connection cap.
 - PROXY protocol v1/v2 for DNS-over-TCP behind HAProxy or a cloud NLB.
@@ -134,6 +144,15 @@ max_inflight = 1024           # forwarded queries waiting for an upstream at onc
 max_resolutions_per_second_per_address = 500   # per IPv4 address / IPv6 /64
 max_tracked_addresses = 10000                  # fixed table size
 slip = 2                      # every 2nd limited UDP query gets an empty TC=1 answer; 0 = drop
+
+[rate_limit.rrl]              # response rate limiting (RRL); per server, file only
+responses_per_second = 0      # identical answers/s per client /24 (/56); 0 = off (default)
+# nxdomains_per_second = 5    # NXDOMAIN per zone; default responses_per_second; 0 = no limit
+# errors_per_second = 5       # REFUSED, SERVFAIL, ...; default responses_per_second
+slip = 2                      # every 2nd limited answer is an empty TC=1 answer; 1 = all; 0 = drop all
+ipv4_prefix_length = 24
+ipv6_prefix_length = 56
+exempt = []                   # client networks never limited (CIDR)
 
 [tcp_dns]                     # PROXY protocol for DNS over TCP (UDP has none)
 proxy_on = false
@@ -1218,8 +1237,7 @@ ceiling is the OS loopback path, not the server. Resident memory stays around
   above needs the DS change done by hand), algorithms other than 13 and 15,
   automated algorithm rollovers (13 <-> 15, see DNSSEC).
 - Inbound NOTIFY / acting as a secondary for zones hosted elsewhere; automatic failover.
-- DNS over TLS/HTTPS, response tuple rate limiting (RRL by answer), and per-zone forwarding,
-  reverse-zone, transfer ACL, and NOTIFY overrides.
+- DNS over TLS/HTTPS.
 - Console sorting and bulk record tools, WebAuthn, static musl multi-arch
   publishing, Debian packaging, and a Homebrew formula.
 

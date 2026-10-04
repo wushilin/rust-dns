@@ -8228,7 +8228,8 @@
           "updated_by",
           "updated_at",
           "rate_limited",
-          "cookie_exempt"
+          "cookie_exempt",
+          "rrl"
         ],
         "properties": {
           "settings": {
@@ -8270,6 +8271,10 @@
             "format": "int64",
             "description": "Over-limit UDP queries answered because of a valid server cookie.",
             "minimum": 0
+          },
+          "rrl": {
+            "$ref": "#/components/schemas/RrlView",
+            "description": "O26: response rate limiting, from `[rate_limit.rrl]` (file only)."
           }
         }
       },
@@ -9425,6 +9430,81 @@
               "type": "string"
             },
             "description": "Standbys that cannot follow a rollover (older versions): starting\nis refused until they are upgraded (or removed from the list)."
+          }
+        }
+      },
+      "RrlView": {
+        "type": "object",
+        "description": "O26: response rate limiting in effect on this server (`[rate_limit.rrl]`\nof its config file; per server, not a console setting).",
+        "required": [
+          "enabled",
+          "responses_per_second",
+          "nxdomains_per_second",
+          "errors_per_second",
+          "slip",
+          "ipv4_prefix_length",
+          "ipv6_prefix_length",
+          "exempt",
+          "dropped",
+          "slipped"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "`responses_per_second` is above 0."
+          },
+          "responses_per_second": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Identical answers (also NODATA, referrals) per second to one client\nnetwork (0: off).",
+            "minimum": 0
+          },
+          "nxdomains_per_second": {
+            "type": "integer",
+            "format": "int32",
+            "description": "NXDOMAIN answers per second for one zone to one client network.",
+            "minimum": 0
+          },
+          "errors_per_second": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Error answers per second to one client network.",
+            "minimum": 0
+          },
+          "slip": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Every Nth limited answer is an empty TC=1 answer (0: all dropped).",
+            "minimum": 0
+          },
+          "ipv4_prefix_length": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "ipv6_prefix_length": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "exempt": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Networks never limited."
+          },
+          "dropped": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Answers dropped since start.",
+            "minimum": 0
+          },
+          "slipped": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Answers replaced by a TC=1 answer since start.",
+            "minimum": 0
           }
         }
       },

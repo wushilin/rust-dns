@@ -360,6 +360,58 @@ pub struct RateLimitConfig {
     /// O15: UDP queries with a valid server cookie (the client's address is
     /// proven) are answered even over the limit. Needs `[server].cookies`.
     pub exempt_valid_cookies: bool,
+    /// O26: response rate limiting (`[rate_limit.rrl]`), off by default.
+    /// Per server, from this file only (not a console setting, not
+    /// replicated). An older binary ignores the table (`[rate_limit]`
+    /// accepts unknown keys).
+    pub rrl: RrlConfig,
+}
+
+/// O26: response rate limiting (RRL, after BIND's `rate-limit`): identical
+/// UDP responses to one client network are limited per second; see
+/// `dns::rrl`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RrlConfig {
+    /// Identical non-empty answers, NODATA answers and referrals per second
+    /// to one client network. 0 = RRL off (the default).
+    pub responses_per_second: u32,
+    /// NXDOMAIN answers per second for one zone to one client network
+    /// (random names count together). Default: `responses_per_second`;
+    /// 0 = not limited.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nxdomains_per_second: Option<u32>,
+    /// Error answers (REFUSED, SERVFAIL, FORMERR, ...) per second to one
+    /// client network. Default: `responses_per_second`; 0 = not limited.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub errors_per_second: Option<u32>,
+    /// Every Nth limited response is sent as an empty truncated (TC=1)
+    /// answer instead of being dropped (the client retries over TCP);
+    /// 0 = drop all, 1 = truncate all. Default 2.
+    pub slip: u32,
+    /// The client network responses are counted for: IPv4 prefix length
+    /// (default 24) and IPv6 prefix length (default 56).
+    pub ipv4_prefix_length: u8,
+    pub ipv6_prefix_length: u8,
+    /// Counter table size (bounded memory, as `max_tracked_addresses`).
+    pub max_tracked: usize,
+    /// Client networks (CIDR) never limited, e.g. your own resolvers.
+    pub exempt: Vec<String>,
+}
+
+impl Default for RrlConfig {
+    fn default() -> Self {
+        RrlConfig {
+            responses_per_second: 0,
+            nxdomains_per_second: None,
+            errors_per_second: None,
+            slip: 2,
+            ipv4_prefix_length: 24,
+            ipv6_prefix_length: 56,
+            max_tracked: 20_000,
+            exempt: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -660,6 +712,7 @@ impl Default for RateLimitConfig {
             max_tracked_addresses: 10_000,
             slip: 2,
             exempt_valid_cookies: false,
+            rrl: RrlConfig::default(),
         }
     }
 }
@@ -770,6 +823,17 @@ max_resolutions_per_second_per_address = 500   # per IPv4 address / IPv6 /64
 max_tracked_addresses = 10000
 slip = 2                 # every 2nd limited UDP query gets an empty TC=1 answer; 0 = drop all
 exempt_valid_cookies = false  # answer UDP queries with a valid server cookie even over the limit
+
+# Response rate limiting (RRL): identical UDP answers to one client network
+# (IPv4 /24, IPv6 /56) per second; against reflection attacks. Off when 0.
+[rate_limit.rrl]
+responses_per_second = 0 # e.g. 10 on a public authoritative server
+# nxdomains_per_second = 10   # per zone (random names count together); default: responses_per_second
+# errors_per_second = 10      # default: responses_per_second
+slip = 2                 # every 2nd limited answer is an empty TC=1 answer (retry over TCP); 0 = drop all
+ipv4_prefix_length = 24
+ipv6_prefix_length = 56
+exempt = []              # networks never limited, e.g. ["192.0.2.0/24"]
 
 [database]
 path = "rust-dns.db"
@@ -1120,6 +1184,19 @@ pub fn validate(cfg: &Config) -> Result<()> {
             ));
         }
     }
+
+    // [rate_limit.rrl] (O26)
+    let rrl = &cfg.rate_limit.rrl;
+    if rrl.ipv4_prefix_length > 32 {
+        errs.push("[rate_limit.rrl].ipv4_prefix_length must be at most 32 (default 24)".into());
+    }
+    if rrl.ipv6_prefix_length > 128 {
+        errs.push("[rate_limit.rrl].ipv6_prefix_length must be at most 128 (default 56)".into());
+    }
+    if rrl.max_tracked == 0 {
+        errs.push("[rate_limit.rrl].max_tracked must be at least 1 (default 20000)".into());
+    }
+    check_cidrs("[rate_limit.rrl].exempt", &rrl.exempt, &mut errs);
 
     // [forwarding]
     check_cidrs(

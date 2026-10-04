@@ -360,6 +360,16 @@ pub async fn metrics(State(s): St, _caller: Caller) -> ApiResult<Response> {
         d.rate_limit_cookie_exempt.load(Relaxed),
     );
     m(
+        "rustdns_rrl_dropped_total",
+        "UDP answers dropped by response rate limiting (RRL)",
+        s.dns.rrl.dropped.load(Relaxed),
+    );
+    m(
+        "rustdns_rrl_slipped_total",
+        "UDP answers replaced by an empty truncated answer by RRL",
+        s.dns.rrl.slipped.load(Relaxed),
+    );
+    m(
         "rustdns_bad_cookie_total",
         "DNS requests with invalid or malformed cookies",
         d.bad_cookie.load(Relaxed),

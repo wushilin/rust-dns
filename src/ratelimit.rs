@@ -143,12 +143,21 @@ impl RateLimiter {
     }
 
     pub fn check_at(&self, ip: IpAddr, now: Instant) -> Decision {
-        let limit = self.limit();
+        self.check_key_at(client_key(ip), self.limit(), now)
+    }
+
+    /// O26: count one event for an arbitrary `key` against `limit` (the
+    /// response rate limiter counts response tuples, not clients). The
+    /// limiter's own limit is not used; its slip is.
+    pub fn check_key(&self, key: u128, limit: u32) -> Decision {
+        self.check_key_at(key, limit, Instant::now())
+    }
+
+    fn check_key_at(&self, key: u128, limit: u32, now: Instant) -> Decision {
         if limit == 0 {
             return Decision::Allow;
         }
         let window = self.window_of(now);
-        let key = client_key(ip);
         let estimate = {
             let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             let mut min = u32::MAX;

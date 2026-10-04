@@ -883,3 +883,246 @@ fn pages_carry_a_strict_content_security_policy() {
         );
     }
 }
+
+/// UDP exchange: `None` when nothing came back within `ms`.
+fn udp_ask(sock: &std::net::UdpSocket, port: u16, msg: &[u8], ms: u64) -> Option<Vec<u8>> {
+    sock.set_read_timeout(Some(Duration::from_millis(ms)))
+        .unwrap();
+    sock.send_to(msg, ("127.0.0.1", port)).unwrap();
+    let mut buf = [0u8; 4096];
+    loop {
+        match sock.recv_from(&mut buf) {
+            Ok((n, _)) if buf[..2] == msg[..2] => return Some(buf[..n].to_vec()),
+            Ok(_) => continue, // a late answer to an earlier query
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Send `queries` over one UDP socket at once, then collect answers for
+/// a second: (full answers, slip answers (TC=1, no records), NXDOMAIN
+/// among the full ones, unanswered).
+fn blast(port: u16, queries: &[Vec<u8>]) -> (u32, u32, u32, u32) {
+    let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    for q in queries {
+        sock.send_to(q, ("127.0.0.1", port)).unwrap();
+    }
+    sock.set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut seen = std::collections::HashSet::new();
+    let (mut full, mut slip, mut nx) = (0, 0, 0);
+    let mut buf = [0u8; 4096];
+    while Instant::now() < deadline && seen.len() < queries.len() {
+        let Ok((n, _)) = sock.recv_from(&mut buf) else {
+            continue;
+        };
+        let r = &buf[..n];
+        if !seen.insert([r[0], r[1]]) {
+            continue;
+        }
+        if r[2] & 0x02 != 0 && r[6..12] == [0, 0, 0, 0, 0, 0] {
+            slip += 1;
+        } else {
+            full += 1;
+            if r[3] & 0x0f == 3 {
+                nx += 1;
+            }
+        }
+    }
+    (full, slip, nx, queries.len() as u32 - seen.len() as u32)
+}
+
+/// `n` identical queries.
+fn same(n: u16, name: &str, qtype: u16) -> Vec<Vec<u8>> {
+    (0..n).map(|i| query_wire(1000 + i, name, qtype)).collect()
+}
+
+/// O26: response rate limiting. Off by default: a burst of identical
+/// queries is answered in full. On (`[rate_limit.rrl]`, 5 identical
+/// responses a second per /24, slip 2): a reflection pattern (one name,
+/// one type, many times to one address) gets about 5 answers a second, and
+/// of the rest every second one is an empty truncated answer (the
+/// genuine client retries over TCP) and the others are dropped; NXDOMAIN
+/// for random names counts per zone, so random subdomains do not escape.
+/// Legitimate traffic is unaffected: different names stay under their own
+/// limit, TCP is never limited, an exempt network and a client with a
+/// valid server cookie get every answer.
+#[test]
+fn response_rate_limiting_limits_reflection_and_spares_legitimate_traffic() {
+    // Default: off.
+    let s = Server::start("rrl-off", "", "", "");
+    let a = login(&s.web, "root", "rootpass123");
+    let (st, v) = call(
+        &a,
+        "POST",
+        &format!("{}/api/zones", s.web),
+        Some(serde_json::json!({ "name": "rrl.test" })),
+    );
+    assert!(st == 200 || st == 201, "{v}");
+    for i in 0..5 {
+        let (st, v) = call(
+            &a,
+            "POST",
+            &format!("{}/api/zones/rrl.test/records", s.web),
+            Some(
+                serde_json::json!({ "name": format!("h{i}"), "type": "A", "value": format!("192.0.2.{i}") }),
+            ),
+        );
+        assert!(st == 200 || st == 201, "{v}");
+    }
+    assert_eq!(
+        blast(s.dns, &same(60, "h0.rrl.test", 1)),
+        (60, 0, 0, 0),
+        "RRL off by default"
+    );
+    let (_, v) = call(
+        &a,
+        "GET",
+        &format!("{}/api/settings/rate-limit", s.web),
+        None,
+    );
+    assert_eq!(v["rrl"]["enabled"], false, "{v}");
+    drop(s);
+
+    let s = Server::start(
+        "rrl-on",
+        "cookies = true",
+        "",
+        "[rate_limit.rrl]\nresponses_per_second = 5\nslip = 2\n",
+    );
+    let a = login(&s.web, "root", "rootpass123");
+    let (st, v) = call(
+        &a,
+        "POST",
+        &format!("{}/api/zones", s.web),
+        Some(serde_json::json!({ "name": "rrl.test" })),
+    );
+    assert!(st == 200 || st == 201, "{v}");
+    for i in 0..5 {
+        let (st, v) = call(
+            &a,
+            "POST",
+            &format!("{}/api/zones/rrl.test/records", s.web),
+            Some(
+                serde_json::json!({ "name": format!("h{i}"), "type": "A", "value": format!("192.0.2.{i}") }),
+            ),
+        );
+        assert!(st == 200 || st == 201, "{v}");
+    }
+    // The reflection pattern: 60 identical queries at once. They may
+    // span a window boundary: at most two windows' worth of answers.
+    let (full, slip, _, none) = blast(s.dns, &same(60, "h0.rrl.test", 1));
+    assert!((5..=10).contains(&full), "answers: {full} {slip} {none}");
+    assert!(
+        slip >= 20 && none >= 20,
+        "slip every second limited one: {full} {slip} {none}"
+    );
+    // Random names under the zone: NXDOMAIN counted per zone.
+    let random: Vec<Vec<u8>> = (0..40u16)
+        .map(|i| query_wire(3000 + i, &format!("r{i}x.rrl.test"), 1))
+        .collect();
+    let (_, _, nx, _) = blast(s.dns, &random);
+    assert!(
+        (5..=10).contains(&nx),
+        "random-subdomain NXDOMAINs are limited per zone: {nx}"
+    );
+    // Legitimate: five different names (NODATA for AAAA), three each, and
+    // other A names: every answer arrives in full.
+    std::thread::sleep(Duration::from_millis(1100));
+    let legit: Vec<Vec<u8>> = (0..15u16)
+        .map(|i| query_wire(4000 + i, &format!("h{}.rrl.test", i % 5), 28))
+        .chain((1..5u16).map(|i| query_wire(4100 + i, &format!("h{i}.rrl.test"), 1)))
+        .collect();
+    assert_eq!(blast(s.dns, &legit), (19, 0, 0, 0), "legitimate traffic");
+    // TCP is never limited.
+    for _ in 0..20 {
+        let r = tcp_query(s.dns, "h0.rrl.test", 1).expect("TCP answer");
+        assert_eq!(r[3] & 0x0f, 0);
+        assert_eq!(u16::from_be_bytes([r[6], r[7]]), 1);
+    }
+    // A client with a valid server cookie is never limited: get a cookie,
+    // then 40 identical queries carrying it, all answered.
+    let csock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let client_cookie = [7u8; 8];
+    let with_cookie = |id: u16, server: &[u8]| {
+        let mut q = query_wire(id, "h1.rrl.test", 1);
+        q[11] = 1; // ARCOUNT
+        let mut opt = client_cookie.to_vec();
+        opt.extend_from_slice(server);
+        q.extend_from_slice(&[0, 0, 41, 0x10, 0, 0, 0, 0, 0]);
+        let rdlen = 4 + opt.len() as u16;
+        q.extend_from_slice(&rdlen.to_be_bytes());
+        q.extend_from_slice(&[0, 10]);
+        q.extend_from_slice(&(opt.len() as u16).to_be_bytes());
+        q.extend_from_slice(&opt);
+        q
+    };
+    let first = udp_ask(&csock, s.dns, &with_cookie(5000, &[]), 1000).expect("cookie answer");
+    let server_cookie = find_server_cookie(&first).expect("server cookie in the answer");
+    let mut answered = 0;
+    for i in 0..40u16 {
+        if let Some(r) = udp_ask(&csock, s.dns, &with_cookie(5001 + i, &server_cookie), 300) {
+            if u16::from_be_bytes([r[6], r[7]]) == 1 {
+                answered += 1;
+            }
+        }
+    }
+    assert_eq!(answered, 40, "valid server cookie: exempt");
+    let (_, v) = call(
+        &a,
+        "GET",
+        &format!("{}/api/settings/rate-limit", s.web),
+        None,
+    );
+    assert_eq!(v["rrl"]["enabled"], true, "{v}");
+    assert_eq!(v["rrl"]["responses_per_second"], 5, "{v}");
+    assert!(v["rrl"]["dropped"].as_u64().unwrap() >= 20, "{v}");
+    assert!(v["rrl"]["slipped"].as_u64().unwrap() >= 20, "{v}");
+    let metrics = a
+        .get(&format!("{}/metrics", s.web))
+        .call()
+        .unwrap()
+        .into_string()
+        .unwrap();
+    assert!(metrics.contains("rustdns_rrl_dropped_total"), "metrics");
+    drop(s);
+
+    // An exempt network gets every answer.
+    let s = Server::start(
+        "rrl-exempt",
+        "",
+        "",
+        "[rate_limit.rrl]\nresponses_per_second = 5\nexempt = [\"127.0.0.0/8\"]\n",
+    );
+    let a = login(&s.web, "root", "rootpass123");
+    let (st, v) = call(
+        &a,
+        "POST",
+        &format!("{}/api/zones", s.web),
+        Some(serde_json::json!({ "name": "rrl.test" })),
+    );
+    assert!(st == 200 || st == 201, "{v}");
+    assert_eq!(
+        blast(s.dns, &same(60, "rrl.test", 6)),
+        (60, 0, 0, 0),
+        "exempt network"
+    );
+}
+
+/// The server cookie of an answer's COOKIE option (bytes after the
+/// 8-byte client cookie), found by scanning the OPT record.
+fn find_server_cookie(m: &[u8]) -> Option<Vec<u8>> {
+    // OPT is the last record; its RDATA holds options. Scan for code 10.
+    let mut i = m.len().checked_sub(4)?;
+    while i > 12 {
+        if m[i..i + 2] == [0, 10] {
+            let len = u16::from_be_bytes([m[i + 2], m[i + 3]]) as usize;
+            if (16..=40).contains(&len) && i + 4 + len == m.len() {
+                return Some(m[i + 4 + 8..i + 4 + len].to_vec());
+            }
+        }
+        i -= 1;
+    }
+    None
+}

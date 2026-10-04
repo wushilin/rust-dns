@@ -10,6 +10,7 @@ pub mod ifaces;
 pub mod keyring;
 pub mod notify;
 pub mod pipeline;
+pub mod rrl;
 pub mod tcp;
 pub mod tsig;
 pub mod udp;
@@ -286,6 +287,8 @@ pub struct DnsServer {
     rate_limit: std::sync::RwLock<crate::mutation::settings::RateLimitSettings>,
     /// Open resolver mode: per-client limit on forwarded queries.
     pub fwd_limiter: RateLimiter,
+    /// O26: response rate limiting (`[rate_limit.rrl]`, off by default).
+    pub rrl: rrl::Rrl,
     /// Listener settings (fixed for the process lifetime).
     pub listen: ServerConfig,
     pub tcp_proxy: ProxyConfig,
@@ -339,6 +342,7 @@ impl DnsServer {
                 cfg.rate_limit.exempt_valid_cookies && cfg.server.cookies,
             ),
             rate_limit: std::sync::RwLock::new(Default::default()),
+            rrl: rrl::Rrl::new(&cfg.rate_limit.rrl),
             fwd_limiter: {
                 let l = RateLimiter::new(
                     cfg.forwarding.open_resolver_rate_per_second,
@@ -534,6 +538,7 @@ impl DnsServer {
             rl.max_tracked_addresses,
         );
         self.limiter.set_slip(rl.slip);
+        self.rrl.configure(&cfg.rate_limit.rrl);
     }
 
     /// Loud warnings while open resolver mode is in effect (startup, reload).

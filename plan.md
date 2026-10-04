@@ -937,7 +937,7 @@ Group 6: DNS protocol depth (all OFF by default; live zone not switched)
   per-zone choice; independent validation with BIND/dnspython.
 - [x] O25. Ed25519 (algorithm 15) as a per-zone choice for new keys and for
   the rollover wizard (algorithm rollover documented, not automated).
-- [ ] O26. Response rate limiting per response tuple (RRL with slip),
+- [x] O26. Response rate limiting per response tuple (RRL with slip),
   alongside per-client limits.
 - [ ] O27. Acting as a secondary for zones hosted elsewhere (AXFR/IXFR in,
   NOTIFY in, TSIG, refresh/retry/expire timers, served read-only).
@@ -1138,6 +1138,17 @@ Final
   start with `ca_file` set: add it only after the upgrade, and remove it
   before a downgrade. gate and baba2 use the system trust store today:
   nothing to change.
+
+- After phase O, O26 (RRL; this session; not deployed): no replication,
+  data or console-setting change. New optional `[rate_limit.rrl]` table in
+  the config file (per server, read at startup and on reload; off unless
+  `responses_per_second` > 0). `[rate_limit]` accepts unknown keys, so an
+  older binary starts with the table and ignores it (nothing to remove
+  before a downgrade). New fields `rrl` in `GET /settings/rate-limit` and
+  metrics `rustdns_rrl_dropped_total` / `rustdns_rrl_slipped_total`.
+  Either upgrade order. gate and baba2: nothing to change; if RRL is
+  wanted on the public servers later, start at about 10 answers/s with
+  slip 2 and watch the counters.
 
 - After O13a (this session; not deployed): no replication, data or config
   change. The Linux release binaries (static musl) allocate with mimalloc
@@ -2398,3 +2409,36 @@ Final
   step ("policy error shown"); the two reruns passed: noted as a flake.
   Also removed two stray `</content></invoke>` lines from the Rollout
   section (an editing accident of an earlier session).
+- 2026-10-04 (phase O): O26 done. Response rate limiting (RRL, after
+  BIND's `rate-limit`), off by default, `[rate_limit.rrl]` in the file
+  (per server, not a console setting, not replicated): identical UDP
+  answers to one client network (IPv4 /24, IPv6 /56, configurable) are
+  counted per one-second window in the per-client limiter's bounded
+  count-min sketch (`RateLimiter::check_key`), keyed by the response
+  tuple (`dns::rrl::classify`): answer = (name, type), NODATA = (name,
+  type), NXDOMAIN = the zone (SOA owner of the proof: random names count
+  together), referral = the delegated name, any error = one bucket.
+  `responses_per_second`, `nxdomains_per_second`, `errors_per_second`
+  (default: responses), `slip` (default 2; 1 truncates every limited
+  answer, 0 drops all), `exempt` CIDRs, `max_tracked`. Over the limit an
+  answer is dropped or replaced by the existing slip answer (header and
+  question, TC=1, never larger than the query). Never limited: TCP,
+  TSIG-signed requests (verified before answering), a valid server cookie
+  (the address is proven), exempt networks. Applied after the answer is
+  built (it needs the response class), only to unsigned UDP answers, so
+  the per-client admission limiter (C2) still runs first. One warning a
+  minute at most. Limitation (README): wildcard-synthesized answers are
+  counted per query name. Console: one read-only line on the rate-limit
+  card. Tests: unit `dns::rrl::tests::{responses_are_classified_by_tuple,
+  networks_are_masked, identical_responses_are_limited_with_slip_and_
+  others_are_not}` (off by default, the exact drop/slip sequence for slip
+  2, 1 and 0, /24 grouping, other networks / names / types unaffected,
+  exempt, runtime reconfigure); hardening `response_rate_limiting_limits_
+  reflection_and_spares_legitimate_traffic` (real server: off by default
+  60 of 60 identical queries answered; on at 5/s: 60 identical queries at
+  once get 5-10 full answers, >= 20 slips and >= 20 drops; 40 random
+  names of the zone get 5-10 NXDOMAINs; 19 legitimate queries (five names
+  NODATA x3, four other names) all answered in full; 20 TCP queries all
+  answered; 40 queries with a valid server cookie all answered; the API
+  view and `/metrics` counters; an exempt network gets 60 of 60); OpenAPI
+  snapshot.

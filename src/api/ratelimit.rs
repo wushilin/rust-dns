@@ -53,6 +53,33 @@ pub struct RateLimitView {
     pub rate_limited: u64,
     /// Over-limit UDP queries answered because of a valid server cookie.
     pub cookie_exempt: u64,
+    /// O26: response rate limiting, from `[rate_limit.rrl]` (file only).
+    pub rrl: RrlView,
+}
+
+/// O26: response rate limiting in effect on this server (`[rate_limit.rrl]`
+/// of its config file; per server, not a console setting).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RrlView {
+    /// `responses_per_second` is above 0.
+    pub enabled: bool,
+    /// Identical answers (also NODATA, referrals) per second to one client
+    /// network (0: off).
+    pub responses_per_second: u32,
+    /// NXDOMAIN answers per second for one zone to one client network.
+    pub nxdomains_per_second: u32,
+    /// Error answers per second to one client network.
+    pub errors_per_second: u32,
+    /// Every Nth limited answer is an empty TC=1 answer (0: all dropped).
+    pub slip: u32,
+    pub ipv4_prefix_length: u8,
+    pub ipv6_prefix_length: u8,
+    /// Networks never limited.
+    pub exempt: Vec<String>,
+    /// Answers dropped since start.
+    pub dropped: u64,
+    /// Answers replaced by a TC=1 answer since start.
+    pub slipped: u64,
 }
 
 fn view(s: &AppState) -> ApiResult<RateLimitView> {
@@ -96,6 +123,21 @@ fn view(s: &AppState) -> ApiResult<RateLimitView> {
         updated_at: at,
         rate_limited: counters.rate_limited,
         cookie_exempt: counters.rate_limit_cookie_exempt,
+        rrl: {
+            let r = &cfg.rate_limit.rrl;
+            RrlView {
+                enabled: r.responses_per_second > 0,
+                responses_per_second: r.responses_per_second,
+                nxdomains_per_second: r.nxdomains_per_second.unwrap_or(r.responses_per_second),
+                errors_per_second: r.errors_per_second.unwrap_or(r.responses_per_second),
+                slip: r.slip,
+                ipv4_prefix_length: r.ipv4_prefix_length,
+                ipv6_prefix_length: r.ipv6_prefix_length,
+                exempt: r.exempt.clone(),
+                dropped: s.dns.rrl.dropped.load(std::sync::atomic::Ordering::Relaxed),
+                slipped: s.dns.rrl.slipped.load(std::sync::atomic::Ordering::Relaxed),
+            }
+        },
     })
 }
 
