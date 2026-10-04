@@ -2239,6 +2239,90 @@
         }
       }
     },
+    "/audit/sign-ins": {
+      "get": {
+        "tags": [
+          "Change log"
+        ],
+        "summary": "Sign-in log (admin)",
+        "description": "Passwords accepted and refused, second factors (TOTP, recovery codes, enrollment), sessions ended after too many wrong codes, and sign-outs, newest first, from this server's audit log. Filter by `user`, `ip` and `result`. Needs `view_audit`.",
+        "operationId": "get_sign_ins",
+        "parameters": [
+          {
+            "name": "user",
+            "in": "query",
+            "description": "Only this account (exact username, also one that does not exist).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "alice"
+          },
+          {
+            "name": "ip",
+            "in": "query",
+            "description": "Only this client address.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "192.0.2.10"
+          },
+          {
+            "name": "result",
+            "in": "query",
+            "description": "Only successes or only failures.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/SignInResult"
+            }
+          },
+          {
+            "name": "before",
+            "in": "query",
+            "description": "Entries older than this entry id (paging).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Max entries (1-1000).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 200,
+              "maximum": 1000,
+              "minimum": 1
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Entries, newest first.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SignInPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
     "/ws": {
       "get": {
         "tags": [
@@ -8701,6 +8785,95 @@
         "enum": [
           "config",
           "console"
+        ]
+      },
+      "SignInEvent": {
+        "type": "object",
+        "description": "O4: one entry of the sign-in log (from the audit log).",
+        "required": [
+          "id",
+          "ts",
+          "username",
+          "ip",
+          "step",
+          "result",
+          "detail"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The audit entry's id (page with `before`)."
+          },
+          "ts": {
+            "type": "string",
+            "format": "date-time",
+            "example": "2026-01-15T10:02:11.482Z"
+          },
+          "username": {
+            "type": "string",
+            "description": "The account signed in, or tried (also names that do not exist)."
+          },
+          "ip": {
+            "type": "string",
+            "description": "Client address."
+          },
+          "step": {
+            "$ref": "#/components/schemas/SignInStep"
+          },
+          "result": {
+            "$ref": "#/components/schemas/SignInResult"
+          },
+          "detail": {
+            "type": "object",
+            "description": "The audit entry's detail (never a password or code)."
+          }
+        },
+        "example": {
+          "detail": {
+            "disabled": false,
+            "known_user": true
+          },
+          "id": 31,
+          "ip": "192.0.2.10",
+          "result": "failure",
+          "step": "password",
+          "ts": "2026-01-15T10:02:11.482Z",
+          "username": "alice"
+        }
+      },
+      "SignInPage": {
+        "type": "object",
+        "required": [
+          "entries"
+        ],
+        "properties": {
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SignInEvent"
+            },
+            "description": "Newest first."
+          }
+        }
+      },
+      "SignInResult": {
+        "type": "string",
+        "enum": [
+          "success",
+          "failure"
+        ]
+      },
+      "SignInStep": {
+        "type": "string",
+        "description": "O4: what a sign-in log entry records.",
+        "enum": [
+          "password",
+          "mfa",
+          "recovery_code",
+          "mfa_enroll",
+          "too_many_codes",
+          "sign_out"
         ]
       },
       "SignatureInfo": {

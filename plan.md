@@ -774,7 +774,7 @@ Group 1: security and accounts
   re-check as a backstop).
 - [x] O3. Login back-off counters survive restarts (local table, classified
   Local, pruned).
-- [ ] O4. Login audit view in the console (sign-ins, failures, MFA, from the
+- [x] O4. Login audit view in the console (sign-ins, failures, MFA, from the
   audit log; filter by user/IP/result).
 - [ ] O5. Admin-initiated MFA enrollment (L13): admin sets "MFA required" and
   generates a one-time enrollment link/QR shown once to the admin, delivered
@@ -1608,3 +1608,16 @@ Final
   `api::guard::tests::backoff_survives_a_restart`,
   `hardening::login_backoff_survives_a_restart`,
   `replication::tables::tests::every_table_is_classified`.
+- 2026-10-04 (phase O): O4 done. Failed passwords (`login.failure`: the
+  name tried, its user id when it exists, `known_user`, `disabled`) and
+  failed codes (`mfa.failure`: session id and state) are now audited
+  (local audit log; never the secret; bounded by the per-client sign-in
+  rate limit). `GET /audit/sign-ins` (`view_audit`) selects the sign-in
+  rows of the audit log (password accepted, TOTP / recovery code /
+  enrollment, too many codes, sign-out, failures), newest first, filters
+  `user`, `ip`, `result`, paging `before`. Console: Audit log -> "Sign-in
+  log" (`#/audit/sign-ins`) with user / address / result filters. Tests:
+  `api::tests::sign_in_log_lists_successes_and_failures` (incl. no
+  secrets, admins only), contract test (new operation `get_sign_ins`),
+  browser flow "O4: sign-in log shows the failed password for the
+  filtered user".

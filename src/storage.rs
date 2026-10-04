@@ -279,6 +279,17 @@ pub struct TokenInfo {
     pub scope: Option<crate::model::TokenScope>,
 }
 
+/// O4: the audit rows of the sign-in log: password accepted (a new
+/// session), a second factor accepted or enrolled, recovery codes used,
+/// sign-outs, failed passwords and codes, sessions ended after too many
+/// wrong codes.
+const SIGN_IN_ROWS: &str = "(operation = 'login' AND action = 'session.create')
+    OR action IN ('login.failure', 'mfa.failure')
+    OR (operation IN ('mfa_verify', 'mfa_enroll') AND action IN ('session.update', 'recovery_code.use'))
+    OR (operation IN ('logout', 'code_attempts_exceeded') AND action = 'session.delete')";
+const SIGN_IN_FAILURE: &str =
+    "action IN ('login.failure', 'mfa.failure') OR operation = 'code_attempts_exceeded'";
+
 /// O3: one stored failed sign-in counter (see `api::guard`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoginFailureRow {
@@ -913,6 +924,34 @@ impl Storage {
                  FROM audit_log WHERE id > ?1 ORDER BY id ASC LIMIT ?2",
             )?;
             let rows = stmt.query_map(params![after, limit as i64], row_to_audit)?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+    }
+
+    /// O4: sign-in related audit rows (see `SIGN_IN_ROWS`), newest first,
+    /// filtered by user (the audit target), client IP, result
+    /// (`success` / `failure`) and `before` (an audit id, for paging).
+    pub fn audit_sign_ins(
+        &self,
+        user: Option<&str>,
+        ip: Option<&str>,
+        result: Option<&str>,
+        before: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<crate::mutation::accounts::AuditRecord>> {
+        self.with_read(|c| {
+            let mut stmt = c.prepare(&format!(
+                "SELECT id, ts, txn, operation, actor, actor_ip, action, target_user_id, target, detail
+                 FROM audit_log WHERE ({SIGN_IN_ROWS})
+                   AND (?1 IS NULL OR target = ?1) AND (?2 IS NULL OR actor_ip = ?2)
+                   AND (?3 IS NULL OR (CASE WHEN {SIGN_IN_FAILURE} THEN 'failure' ELSE 'success' END) = ?3)
+                   AND (?4 IS NULL OR id < ?4)
+                 ORDER BY id DESC LIMIT ?5"
+            ))?;
+            let rows = stmt.query_map(
+                params![user, ip, result, before, limit as i64],
+                row_to_audit,
+            )?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         })
     }

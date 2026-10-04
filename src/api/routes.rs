@@ -1580,6 +1580,85 @@ pub async fn audit(
     Ok(Json(AuditPage { entries }))
 }
 
+/// O4: filters of the sign-in log.
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct SignInQuery {
+    /// Only this account (exact username, also one that does not exist).
+    #[param(example = "alice")]
+    pub user: Option<String>,
+    /// Only this client address.
+    #[param(example = "192.0.2.10")]
+    pub ip: Option<String>,
+    /// Only successes or only failures.
+    pub result: Option<SignInResult>,
+    /// Entries older than this entry id (paging).
+    pub before: Option<i64>,
+    /// Max entries (1-1000).
+    #[param(minimum = 1, maximum = 1000, default = 200)]
+    pub limit: Option<usize>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/audit/sign-ins",
+    tag = "Change log",
+    operation_id = "get_sign_ins",
+    summary = "Sign-in log (admin)",
+    description = "Passwords accepted and refused, second factors (TOTP, recovery codes, enrollment), sessions ended after too many wrong codes, and sign-outs, newest first, from this server's audit log. Filter by `user`, `ip` and `result`. Needs `view_audit`.",
+    params(SignInQuery),
+    responses(
+        (status = 200, description = "Entries, newest first.", body = SignInPage),
+        (status = 400, response = InvalidRequest),
+        (status = 401, response = Unauthorized),
+        (status = 403, response = Forbidden),
+    ),
+)]
+pub async fn sign_ins(
+    State(s): St,
+    caller: Caller,
+    Query(q): Query<SignInQuery>,
+) -> ApiResult<Json<SignInPage>> {
+    s.require(&caller, GlobalPerm::ViewAudit)?;
+    let limit = q.limit.unwrap_or(200).clamp(1, 1000);
+    let result = q.result.map(|r| match r {
+        SignInResult::Success => "success",
+        SignInResult::Failure => "failure",
+    });
+    let user = q.user.as_deref().map(|u| u.trim().to_ascii_lowercase());
+    let ip = q.ip.as_deref().map(str::trim);
+    let rows = s
+        .storage
+        .audit_sign_ins(user.as_deref(), ip, result, q.before, limit)?;
+    let entries = rows.into_iter().map(sign_in_event).collect();
+    Ok(Json(SignInPage { entries }))
+}
+
+/// The sign-in view of one audit row selected by `audit_sign_ins`.
+fn sign_in_event(r: crate::mutation::accounts::AuditRecord) -> SignInEvent {
+    use SignInResult::*;
+    use SignInStep::*;
+    let (step, result) = match (r.operation.as_str(), r.action.as_str()) {
+        (_, "login.failure") => (Password, Failure),
+        (_, "mfa.failure") => (Mfa, Failure),
+        ("code_attempts_exceeded", _) => (TooManyCodes, Failure),
+        ("logout", _) => (SignOut, Success),
+        (_, "recovery_code.use") => (RecoveryCode, Success),
+        ("mfa_enroll", _) => (MfaEnroll, Success),
+        ("mfa_verify", _) => (Mfa, Success),
+        _ => (Password, Success),
+    };
+    SignInEvent {
+        id: r.id,
+        ts: r.ts,
+        username: r.target,
+        ip: r.actor_ip,
+        step,
+        result,
+        detail: r.detail,
+    }
+}
+
 #[utoipa::path(
     get,
     path = "/changelog",

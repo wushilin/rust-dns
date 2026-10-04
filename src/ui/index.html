@@ -789,7 +789,7 @@ async function route() {
   $$('#side nav a').forEach(a => a.classList.toggle('active', a.dataset.nav === page));
   $('#app').classList.remove('nav-open');
   if (S.panel && !(page === 'zones' && arg === S.panel.zone)) closeDrawer();
-  const views = { dashboard: viewDashboard, zones: arg ? () => viewZone(arg) : viewZones, queries: viewQueries, changelog: viewChangelog, audit: viewAudit, server: viewServer, blocklists: viewBlocklists, tsig: viewTsig, replication: viewReplication, api: viewApi, users: viewUsers, tokens: viewTokens, account: viewAccount };
+  const views = { dashboard: viewDashboard, zones: arg ? () => viewZone(arg) : viewZones, queries: viewQueries, changelog: viewChangelog, audit: arg === 'sign-ins' ? viewSignIns : viewAudit, server: viewServer, blocklists: viewBlocklists, tsig: viewTsig, replication: viewReplication, api: viewApi, users: viewUsers, tokens: viewTokens, account: viewAccount };
   const v = views[page] || viewDashboard;
   try { await v(); } catch (e) { if (e.code !== 'login_required') { $('#main').innerHTML = `<div class="empty">${esc(e.message)}</div>`; } }
 }
@@ -2483,7 +2483,7 @@ async function viewAudit() {
   if (!S.user.is_admin) { location.hash = '#/dashboard'; return; }
   const { entries } = await GET('/audit?limit=300');
   const rows = entries.slice().reverse();
-  $('#main').innerHTML = `<div class="topbar"><h1>Audit log</h1><span class="hint">Sign-ins, users, MFA, sessions and API tokens. Written in the same transaction as the change.</span></div>
+  $('#main').innerHTML = `<div class="topbar"><h1>Audit log</h1><span class="hint">Sign-ins, users, MFA, sessions and API tokens. Written in the same transaction as the change.</span><a class="btn ghost" id="au-signins" href="#/audit/sign-ins">Sign-in log</a></div>
     <div class="row toolbar"><input type="search" id="au-filter" placeholder="Filter by user, action, address…"><span class="hint">Click a row to see the full entry.</span></div>
     <div class="card"><div class="tw"><table><thead><tr><th>Time</th><th>Actor</th><th>From</th><th>Operation</th><th>Action</th><th>Target</th><th>Details</th></tr></thead><tbody id="au-body"></tbody></table></div></div>`;
   const summary = d => d && typeof d === 'object' ? Object.entries(d).map(([k, v]) => `${k}: ${typeof v === 'object' && v !== null ? JSON.stringify(v) : v}`).join(' · ') : JSON.stringify(d);
@@ -2509,6 +2509,26 @@ async function viewAudit() {
     ], e.detail, 'Details');
   };
   $('#au-filter').oninput = render; render();
+}
+
+// O4: sign-ins, failures and second factors from the audit log, filtered on the server.
+async function viewSignIns() {
+  if (!S.user.is_admin) { location.hash = '#/dashboard'; return; }
+  $('#main').innerHTML = `<div class="topbar"><h1>Sign-in log</h1><span class="hint">Passwords, second factors and sign-outs on this server, newest first.</span><a class="btn ghost" href="#/audit">Full audit log</a></div>
+    <div class="row toolbar"><input type="search" id="si-user" placeholder="User"><input type="search" id="si-ip" placeholder="Address"><select id="si-result"><option value="">Any result</option><option value="success">Success</option><option value="failure">Failure</option></select><button class="btn" id="si-go" data-ro-ok>Filter</button></div>
+    <div class="card"><div class="tw"><table><thead><tr><th>Time</th><th>User</th><th>From</th><th>Step</th><th>Result</th><th>Details</th></tr></thead><tbody id="si-body"><tr><td colspan="6" class="empty">Loading…</td></tr></tbody></table></div></div>`;
+  const steps = { password: 'password', mfa: 'TOTP code', recovery_code: 'recovery code', mfa_enroll: 'MFA enrolled', too_many_codes: 'too many wrong codes', sign_out: 'signed out' };
+  const load = async () => {
+    const q = new URLSearchParams();
+    for (const [k, id] of [['user', '#si-user'], ['ip', '#si-ip'], ['result', '#si-result']]) { const v = $(id).value.trim(); if (v) q.set(k, v); }
+    q.set('limit', '500');
+    const { entries } = await GET('/audit/sign-ins?' + q);
+    $('#si-body').innerHTML = entries.length ? entries.map(e => `<tr><td class="hint" style="white-space:nowrap">${fmtTime(e.ts)}</td><td><b>${esc(e.username)}</b></td><td class="mono hint">${esc(e.ip)}</td><td>${esc(steps[e.step] || e.step)}</td><td><span class="badge ${e.result === 'failure' ? 'bad' : 'ok'}">${esc(e.result)}</span></td><td class="hint" style="font-size:12px"><div class="ellip">${esc(Object.entries(e.detail || {}).filter(([k]) => !['user_agent', 'expires_at', 'session_id'].includes(k)).map(([k, v]) => `${k}: ${typeof v === 'object' ? JSON.stringify(v) : v}`).join(' · '))}</div></td></tr>`).join('') : '<tr><td colspan="6" class="empty">No entries</td></tr>';
+  };
+  $('#si-go').onclick = () => load().catch(e => toast(e.message, 'err'));
+  for (const id of ['#si-user', '#si-ip']) $(id).onkeydown = ev => { if (ev.key === 'Enter') $('#si-go').click(); };
+  $('#si-result').onchange = () => $('#si-go').click();
+  await load();
 }
 
 // ---------------------------------------------------------------------------

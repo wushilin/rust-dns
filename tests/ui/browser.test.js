@@ -320,6 +320,17 @@ async function phaseO(b, p, rootApi, admin) {
   await olive.click('#pw-btn');
   await olive.wait('password changed', `return document.querySelector('#toasts').textContent.includes('API tokens revoked') || document.querySelector('#pw-err').textContent`);
   const after = await bearer(otok, 'GET', '/me'); ok('O1: password change from the console revokes the tokens', after === 401, String(after));
+
+  // O4: the sign-in log, filtered on user and result.
+  await fetch(`${p.url}/api/auth/login`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ username: 'olive', password: 'not-olive-password' }) });
+  await admin.route('#/audit', `return !!document.querySelector('#au-signins')`);
+  await admin.click('#au-signins');
+  await admin.wait('sign-in log', `return location.hash === '#/audit/sign-ins' && !!document.querySelector('#si-go') && !document.querySelector('#si-body').textContent.includes('Loading')`);
+  await admin.fill('#si-user', 'olive');
+  await admin.fill('#si-result', 'failure');
+  await admin.click('#si-go');
+  const rowsSi = await admin.wait('filtered rows', `const r = [...document.querySelectorAll('#si-body tr')].map(t => t.textContent); return r.length && r.every(x => x.includes('olive') && x.includes('failure')) && !r.some(x => x.includes('success')) ? r : null`);
+  ok('O4: sign-in log shows the failed password for the filtered user', rowsSi.length >= 1 && rowsSi.some(r => r.includes('password')) && !rowsSi.join().includes('not-olive-password'), JSON.stringify(rowsSi));
   return [olive];
 }
 

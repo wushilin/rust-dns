@@ -222,8 +222,12 @@ Before exposing rust-dns to the internet, note:
   `login_backoff_after` failures (up to 15 minutes); per account from all
   networks, waits capped at one minute (a distributed attack is slowed, the
   owner is never locked out for long); these counters are stored (local
-  table `login_failures`), so a restart does not reset them; 5 wrong codes end an MFA-pending or
-  signed-in session. TOTP codes are single-use (the last accepted time step
+  table `login_failures`), so a restart does not reset them; 5 wrong
+  codes end an MFA-pending or signed-in session. Failed passwords and
+  codes are audited (`login.failure`, `mfa.failure`; never the secret);
+  the console's Audit log -> Sign-in log (`GET /api/audit/sign-ins`) lists
+  sign-ins, failures, second factors and sign-outs, filtered by user,
+  address and result. TOTP codes are single-use (the last accepted time step
   is stored). Replacing an enrolled authenticator needs the current code or
   password. Changing your password signs out your other sessions; API tokens
   keep working unless you tick "Also revoke my API tokens" (`revoke_tokens`;

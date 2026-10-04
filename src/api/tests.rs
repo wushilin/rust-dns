@@ -1438,3 +1438,107 @@ async fn token_creation_can_require_a_session() {
         .unwrap()
         .contains("token_creation_requires_session"));
 }
+
+/// O4: failed passwords and codes are audited (never the secret), and the
+/// sign-in log lists every step, filtered by user, address and result.
+#[tokio::test]
+async fn sign_in_log_lists_successes_and_failures() {
+    let h = Harness::new();
+    let root_c = root_session(&h).await;
+    h.user("mia", "mia-password-1", Some(SECRET));
+    h.user("ned", "ned-password-1", None);
+    assert_eq!(
+        h.login("mia", "not-her-password").await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        h.login("nobody", "whatever-password").await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    let c = h.login("mia", "mia-password-1").await.cookie.unwrap();
+    assert_eq!(h.mfa(&c, "000000").await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(h.mfa(&c, &code(h.step())).await.status, StatusCode::OK);
+    let n = h.login("ned", "ned-password-1").await.cookie.unwrap();
+    assert_eq!(
+        h.call("POST", "/auth/logout", Some(&n), None).await.status,
+        StatusCode::OK
+    );
+
+    let log = |q: &str| {
+        let h = &h;
+        let root_c = root_c.clone();
+        let q = q.to_string();
+        async move {
+            let r = h
+                .call("GET", &format!("/audit/sign-ins{q}"), Some(&root_c), None)
+                .await;
+            assert_eq!(r.status, StatusCode::OK, "{}", r.json);
+            r.json["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| {
+                    format!(
+                        "{} {} {}",
+                        e["username"].as_str().unwrap(),
+                        e["step"].as_str().unwrap(),
+                        e["result"].as_str().unwrap()
+                    )
+                })
+                .collect::<Vec<_>>()
+        }
+    };
+    assert_eq!(
+        log("?user=mia").await,
+        vec![
+            "mia mfa success",
+            "mia mfa failure",
+            "mia password success",
+            "mia password failure"
+        ]
+    );
+    assert_eq!(
+        log("?result=failure").await,
+        vec![
+            "mia mfa failure",
+            "nobody password failure",
+            "mia password failure"
+        ]
+    );
+    assert_eq!(
+        log("?user=ned").await,
+        vec!["ned sign_out success", "ned password success"]
+    );
+    assert!(log("?ip=192.0.2.99").await.is_empty());
+    assert_eq!(log("?ip=0.0.0.0&limit=2").await.len(), 2);
+    let all = h
+        .call("GET", "/audit/sign-ins", Some(&root_c), None)
+        .await
+        .json
+        .to_string();
+    for secret in [
+        "not-her-password",
+        "whatever-password",
+        "000000",
+        "mia-password-1",
+    ] {
+        assert!(!all.contains(secret), "{secret} leaked: {all}");
+    }
+    // Paging: older than the newest entry.
+    let first = h
+        .call("GET", "/audit/sign-ins?limit=1", Some(&root_c), None)
+        .await
+        .json["entries"][0]["id"]
+        .as_i64()
+        .unwrap();
+    let older = log(&format!("?before={first}")).await;
+    assert!(!older.is_empty() && !older.contains(&"ned sign_out success".to_string()));
+    // Administrators only.
+    let mc = h.login("ned", "ned-password-1").await.cookie.unwrap();
+    assert_eq!(
+        h.call("GET", "/audit/sign-ins", Some(&mc), None)
+            .await
+            .status,
+        StatusCode::FORBIDDEN
+    );
+}

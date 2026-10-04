@@ -8,6 +8,7 @@ use super::types::*;
 use super::AppState;
 use crate::auth;
 use crate::model::*;
+use crate::mutation::accounts::SignInFailure;
 use axum::extract::{FromRequestParts, State};
 use axum::http::{header, request::Parts, HeaderMap, HeaderValue};
 use axum::response::{IntoResponse, Response};
@@ -447,6 +448,21 @@ pub async fn login(
     if !ok {
         state.guard.failure(&username, ip);
         tracing::warn!(%ip, user = %username, "failed login");
+        // O4: audited (who was tried, from where; never the password).
+        let actor = Actor {
+            name: username.chars().take(64).collect(),
+            ip: ip.to_string(),
+        };
+        let disabled = user.as_ref().is_some_and(|u| u.disabled_at.is_some());
+        let _ = state.accounts.run(&actor, "login", |t| {
+            t.note_sign_in_failure(
+                SignInFailure::Password,
+                user.as_ref(),
+                &username,
+                serde_json::json!({ "known_user": user.is_some(), "disabled": disabled }),
+            );
+            Ok(())
+        });
         return Err(ApiError::unauthorized("invalid username or password"));
     }
     state.guard.success(&username, ip);
@@ -735,6 +751,20 @@ pub fn account_wait(state: &AppState, username: &str, ip: IpAddr) -> ApiResult<(
 /// the error asks the user to sign in again.
 pub fn code_failed(state: &AppState, user: &User, sess: &Session, ip: IpAddr) -> ApiError {
     state.guard.failure(&user.username, ip);
+    // O4: audited (the session and its step; never the code).
+    let actor = Actor {
+        name: user.username.clone(),
+        ip: ip.to_string(),
+    };
+    let _ = state.accounts.run(&actor, "mfa_verify", |t| {
+        t.note_sign_in_failure(
+            SignInFailure::Code,
+            Some(user),
+            &user.username,
+            serde_json::json!({ "session_id": sess.id, "session_state": sess.state }),
+        );
+        Ok(())
+    });
     if state.guard.code_failure(sess.id) {
         let actor = Actor {
             name: user.username.clone(),

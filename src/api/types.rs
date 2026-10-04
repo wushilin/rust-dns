@@ -354,6 +354,57 @@ pub struct AuditPage {
     pub entries: Vec<crate::mutation::accounts::AuditRecord>,
 }
 
+/// O4: what a sign-in log entry records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SignInStep {
+    /// Username and password checked (`detail.state`: `active`, or the
+    /// second factor still needed: `mfa_pending` / `enroll_pending`).
+    Password,
+    /// A TOTP code (sign-in, or a re-check of the signed-in user).
+    Mfa,
+    /// A one-time recovery code was used to sign in.
+    RecoveryCode,
+    /// An authenticator was enrolled.
+    MfaEnroll,
+    /// Too many wrong codes ended the session.
+    TooManyCodes,
+    /// Signed out.
+    SignOut,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SignInResult {
+    Success,
+    Failure,
+}
+
+/// O4: one entry of the sign-in log (from the audit log).
+#[derive(Debug, Serialize, ToSchema)]
+#[schema(example = json!({ "id": 31, "ts": "2026-01-15T10:02:11.482Z", "username": "alice", "ip": "192.0.2.10", "step": "password", "result": "failure", "detail": { "known_user": true, "disabled": false } }))]
+pub struct SignInEvent {
+    /// The audit entry's id (page with `before`).
+    pub id: i64,
+    #[schema(format = DateTime, example = "2026-01-15T10:02:11.482Z")]
+    pub ts: String,
+    /// The account signed in, or tried (also names that do not exist).
+    pub username: String,
+    /// Client address.
+    pub ip: String,
+    pub step: SignInStep,
+    pub result: SignInResult,
+    /// The audit entry's detail (never a password or code).
+    #[schema(value_type = Object)]
+    pub detail: serde_json::Value,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SignInPage {
+    /// Newest first.
+    pub entries: Vec<SignInEvent>,
+}
+
 // ---- rights -----------------------------------------------------------------------
 
 /// Effective rights of a user (or of their API tokens).

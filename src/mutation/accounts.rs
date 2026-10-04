@@ -584,6 +584,22 @@ impl<'a> AuditTx<'a> {
         Ok(n)
     }
 
+    // ---- O4: sign-in failures (audit only, nothing else is written) ---------
+
+    /// A wrong password (`login.failure`) or code (`mfa.failure`): an audit
+    /// row naming the account tried (`attempted`, cut to 64 characters) and
+    /// its id when it exists. Never the password or code itself.
+    pub fn note_sign_in_failure(
+        &mut self,
+        action: SignInFailure,
+        user: Option<&User>,
+        attempted: &str,
+        detail: serde_json::Value,
+    ) {
+        let target: String = attempted.chars().take(64).collect();
+        self.push(action.as_str(), user.map(|u| u.id), &target, detail);
+    }
+
     // ---- replica list (local bookkeeping: not replicated) --------------------
 
     /// An administrator forgets a standby in the primary's replica list.
@@ -778,6 +794,24 @@ impl<'a> AuditTx<'a> {
             }
         }
         Ok((out, logged))
+    }
+}
+
+/// O4: the kinds of failed sign-in step that are audited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignInFailure {
+    /// Wrong username or password (or a disabled account).
+    Password,
+    /// Wrong TOTP or recovery code (sign-in, enrollment or re-check).
+    Code,
+}
+
+impl SignInFailure {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SignInFailure::Password => "login.failure",
+            SignInFailure::Code => "mfa.failure",
+        }
     }
 }
 

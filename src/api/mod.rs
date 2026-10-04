@@ -379,6 +379,7 @@ fn api_router() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(routes::import_hosts))
         .routes(routes!(routes::changelog))
         .routes(routes!(routes::audit))
+        .routes(routes!(routes::sign_ins))
         .routes(routes!(ws::ws))
         .routes(routes!(routes::list_users, routes::create_user))
         .routes(routes!(routes::update_user, routes::delete_user))
