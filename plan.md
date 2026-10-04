@@ -880,9 +880,9 @@ Group 3: operations
   musl build of this commit): `scripts/soak.py --bin ./rust-dns --duration
   4h --qps 500 --change-rate 6 --interval 60 --workdir ~/soak/run`; pass =
   RSS growth after warm-up under 10% (expected about 26-30 MiB, flat) and
-  `/metrics` `rustdns_build_info{...,allocator="mimalloc"}`. Optional
-  second run with `MIMALLOC_PURGE_DELAY=0` exported (no rebuild): starts
-  at about half the memory; judge whether it stays flat over hours.
+  `/metrics` `rustdns_build_info{...,allocator="mimalloc"}`. Do not set
+  `MIMALLOC_PURGE_DELAY=0`: it starts at about half the memory but grows
+  like musl's allocator (measured, see the Log).
 - [x] O14. Live updates through a reverse proxy: CI job on Linux with nginx
   in front of the console (websocket upgrade works, live feed receives an
   event); locally skipped when nginx is missing.
@@ -2141,9 +2141,10 @@ Final
   18.0 MiB, mappings 59 -> 62), p99 median 0.30 / 0.27 ms, 0 errors on the
   primary and 2 of 900,001 on the standby. Trade-off: about 10 MiB more at
   start, flat; musl passes that within the first hour at this load and
-  keeps growing. `MIMALLOC_PURGE_DELAY=0` (env) starts at about 6.5 MiB
-  anon / 14 MiB RSS but still rose 1.1 MiB in its first 16 min: not
-  adopted, left to a long Linux soak. Both musl targets build (zigbuild,
+  keeps growing. mimalloc with `purge_delay` 0 (`MIMALLOC_PURGE_DELAY=0`,
+  and a build setting it): starts at about 6.5 MiB anon / 14 MiB RSS but
+  grows (25 min: RSS 14.1 -> 16.8 MiB; 40 min: anon 6.4 -> 9.2 MiB
+  primary, 5.3 -> 10.8 MiB standby, mappings 60 -> 88): not adopted. Both musl targets build (zigbuild,
   no warnings). Fix: `mimalloc` (`no_thp`) as global allocator for
   `target_env = "musl"`; `/metrics` reports `rustdns_build_info{version,
   allocator}` and on Linux `rustdns_process_resident_memory_bytes`;
@@ -2213,3 +2214,11 @@ Final
   a key instead of a certificate, the CA; `[peer]` with the CA reports
   "ok: peer is ...", without it "peer not reachable ... certificate").
   New dev-dependency `tokio-rustls` (ring, already in the lock).
+- 2026-10-04 (phase O): checkpoint gates. O13a on 036eeff and Group 5
+  (O21-O23) on 23124b0: all PASS with both previous binaries (d32d67f and
+  3884ba8; 328 and 333 tests each, `--no-fail-fast`), no orphaned test
+  server before, between or after, UI duration / access / browser tests,
+  OpenAPI snapshot and validator, conformance, smoke (`allocator="system"`
+  on macOS), cargo-audit (only `paste`). Both musl targets build with
+  O13a (zigbuild). Not run here: the long Linux soak of O13a (owner, see
+  the item).
