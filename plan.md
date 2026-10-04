@@ -8,7 +8,8 @@ until the whole plan has passed the gate.
 Gate: `cargo fmt --check`, `cargo clippy --all-targets -D warnings`,
 `REQUIRE_BIND_TOOLS=1 REQUIRE_PREV_BIN=1 RUST_DNS_PREV_BIN=<prev> cargo test
 --no-fail-fast -- --test-threads=1` (for each previous binary; `--no-fail-fast`
-so one failing suite does not hide later ones), UI duration test,
+so one failing suite does not hide later ones), `scripts/check-orphans.sh`
+before and after the tests and at the end (no test server left), UI duration test,
 OpenAPI snapshot + validator, conformance (123), smoke-release, cargo-audit.
 
 ## Phase A: small correctness fixes
@@ -783,6 +784,21 @@ Group 0: failures found by the Group 2 checkpoint gate (a6e2f6e)
   and a CHAOS `version.bind` probe answered with its own ID over UDP plus
   a TCP connect) and starts again on another DNS port (or other ports when
   the server exited because the web port was taken) when not.
+- [x] O0c. (coordinator's finding) Test servers outlived their tests: 21
+  rust-dns servers with parent PID 1 after the Group 2 gate, holding ports
+  and CPU during later suites. Mechanism (reproduced): a `std::process::
+  Child` is not killed when dropped, so a server leaks whenever its test
+  process ends without running the suite's `Drop` (killed: SIGKILL of the
+  binary left 3 of 4 servers running on a8e36f6), or a panic hits between
+  `spawn()` and the guard that owns it (e.g. the "did not come up" asserts
+  in the start loops). Fix: the server has a supervisor hook
+  (`RUST_DNS_EXIT_WITH_STDIN=1`: exit at end of file on stdin); every test
+  suite and the browser test start their servers with it and a stdin pipe,
+  so a server ends with its test process however that ends (same SIGKILL
+  test: 0 left). Nodes running an older binary (no hook) are killed before
+  a start timeout panics. `scripts/check-orphans.sh` (gate: before and
+  after the tests, and at the end; CI: after `cargo test`) fails on any
+  rust-dns process whose parent is gone.
 - [x] O0b. `e2e::json_import_and_record_paging` lost the answer of the
   POST to the removed `/api/zones/imp.test/import-bind` under load. Root
   cause: a server bug of the G2 class. `read_body_first` wrapped only the
@@ -1995,3 +2011,16 @@ Final
   smoke, remove), `docker` (buildx multi-arch, amd64 smoke, GHCR push and
   private visibility on a tag), `windows` (service smoke, x86_64),
   `release` (formula: archive download with the token, sha256, `ruby -c`).
+- 2026-10-04 (phase O): O0c (see the item). My gates of Group 3 and 4
+  (2257b18, a8e36f6, each with both previous binaries) left no orphan; the
+  21 the coordinator saw (and 33 e2e servers I found after my stress runs,
+  which killed test binaries) came from test processes that ended without
+  their `Drop`. With orphans possible, part of the O0a/O0b load came from
+  them (ports and CPU held), but both root causes stand on their own: the
+  early answer of the 404/405 paths is deterministic (the headers-only
+  probe gets an answer before the body is sent on a6e2f6e, none after
+  db49d46; `e2e::early_answers_on_unknown_routes_and_wrong_methods_reach_
+  the_client`), and every instrumented forwarding failure had the server's
+  own "cannot bind UDP ... Address already in use" at start. Tests: the
+  SIGKILL check above (manual, scripts/check-orphans.sh), all suites pass
+  with the hook; re-run of the stress below.

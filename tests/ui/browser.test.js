@@ -90,7 +90,9 @@ file = "${path.join(dir, 'server.log')}"
 dir = ""
 ${extra}
 `);
-  const child = spawn(BIN, ['--config', path.join(dir, 'rust-dns.toml')], { stdio: 'ignore' });
+  // O0c: stdin is a pipe held by this process; the server exits when it
+  // closes (this script ended, however), so no server outlives the test.
+  const child = spawn(BIN, ['--config', path.join(dir, 'rust-dns.toml')], { stdio: ['pipe', 'ignore', 'ignore'], env: { ...process.env, RUST_DNS_EXIT_WITH_STDIN: '1' } });
   children.push(child);
   const url = `http://127.0.0.1:${web}`;
   await waitUntil(`${name} up`, async () => (await fetch(`${url}/api/health`)).ok, 20000);

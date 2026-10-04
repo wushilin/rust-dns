@@ -83,6 +83,7 @@ struct Cli {
 static SHUTDOWN: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
 fn main() -> anyhow::Result<()> {
+    exit_with_stdin();
     let cli = Cli::parse();
     #[cfg(windows)]
     {
@@ -97,6 +98,27 @@ fn main() -> anyhow::Result<()> {
         }
     }
     run(cli)
+}
+
+/// Supervisor hook (used by the test suites, O0c): with
+/// `RUST_DNS_EXIT_WITH_STDIN=1` the process exits as soon as its standard
+/// input reaches end of file, i.e. when the process holding the other end
+/// of that pipe is gone, however it ended (a panic, SIGKILL). Off unless
+/// the variable is set; nothing reads stdin otherwise.
+fn exit_with_stdin() {
+    if std::env::var_os("RUST_DNS_EXIT_WITH_STDIN").is_some_and(|v| v == "1") {
+        std::thread::spawn(|| {
+            use std::io::Read;
+            let mut buf = [0u8; 256];
+            let mut stdin = std::io::stdin();
+            loop {
+                match stdin.read(&mut buf) {
+                    Ok(0) | Err(_) => std::process::exit(0),
+                    Ok(_) => {}
+                }
+            }
+        });
+    }
 }
 
 /// Build the runtime and run the server (or the one-shot command) to the end.

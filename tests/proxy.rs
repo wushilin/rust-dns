@@ -109,6 +109,9 @@ level = "warn"
             .arg(dir.join("rust-dns.toml"))
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
+            // O0c: the server exits when this test process is gone.
+            .env("RUST_DNS_EXIT_WITH_STDIN", "1")
+            .stdin(Stdio::piped())
             .spawn()
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(20);

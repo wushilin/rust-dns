@@ -125,6 +125,9 @@ fn single_changes_in_a_signed_zone_stay_valid() {
                 .arg(dir.join("t.toml"))
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
+                // O0c: the server exits when this test process is gone.
+                .env("RUST_DNS_EXIT_WITH_STDIN", "1")
+                .stdin(Stdio::piped())
                 .spawn()
                 .unwrap(),
         );

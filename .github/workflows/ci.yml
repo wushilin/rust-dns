@@ -27,6 +27,9 @@ jobs:
           REQUIRE_BIND_TOOLS: "1"
           # tests/netlink.rs: a network namespace through `sudo -n unshare -n`.
           REQUIRE_NETLINK_TEST: "1"
+      # O0c: every test server exits with its test process; none may remain.
+      - name: No test server outlived its test
+        run: if pgrep -fa 'target/debug/rust-dns --config'; then echo "orphaned test servers"; exit 1; fi
       - run: node tests/ui/duration.test.js
       - run: node tests/ui/access.test.js
       - run: cargo build

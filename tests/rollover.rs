@@ -139,6 +139,9 @@ dir = ""
                 .arg(self.dir.join("rust-dns.toml"))
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
+                // O0c: the server exits when this test process is gone.
+                .env("RUST_DNS_EXIT_WITH_STDIN", "1")
+                .stdin(Stdio::piped())
                 .spawn()
                 .unwrap();
             let deadline = Instant::now() + Duration::from_secs(30);
@@ -147,7 +150,12 @@ dir = ""
                 .call()
                 .is_err()
             {
-                assert!(Instant::now() < deadline, "{} did not start", self.name);
+                if Instant::now() >= deadline {
+                    // Not left running (an older binary has no stdin hook).
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("{} did not start", self.name);
+                }
                 std::thread::sleep(Duration::from_millis(100));
             }
             if common::came_up(&mut child, self.dns) {

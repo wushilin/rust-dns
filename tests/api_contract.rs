@@ -708,6 +708,9 @@ rollover_max_wait_secs = 1
         .arg(&cfg_path)
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
+        // O0c: the server exits when this test process is gone.
+        .env("RUST_DNS_EXIT_WITH_STDIN", "1")
+        .stdin(Stdio::piped())
         .spawn()
         .expect("spawn rust-dns");
     let web = format!("127.0.0.1:{web_port}");

@@ -116,6 +116,9 @@ dir = ""
                 .arg(self.config_path())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
+                // O0c: the server exits when this test process is gone.
+                .env("RUST_DNS_EXIT_WITH_STDIN", "1")
+                .stdin(Stdio::piped())
                 .spawn()
                 .expect("spawn rust-dns");
             let deadline = Instant::now() + Duration::from_secs(20);
@@ -124,12 +127,12 @@ dir = ""
                 .call()
                 .is_err()
             {
-                assert!(
-                    Instant::now() < deadline,
-                    "{} did not come up; log:\n{}",
-                    self.name,
-                    self.log()
-                );
+                if Instant::now() >= deadline {
+                    // Not left running (an older binary has no stdin hook).
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("{} did not come up; log:\n{}", self.name, self.log());
+                }
                 std::thread::sleep(Duration::from_millis(100));
             }
             if common::came_up(&mut child, self.dns) {
