@@ -227,7 +227,17 @@ Before exposing rust-dns to the internet, note:
   codes are audited (`login.failure`, `mfa.failure`; never the secret);
   the console's Audit log -> Sign-in log (`GET /api/audit/sign-ins`) lists
   sign-ins, failures, second factors and sign-outs, filtered by user,
-  address and result. TOTP codes are single-use (the last accepted time step
+  address and result.
+- **Administrator MFA enrollment.** Users -> Edit -> "Set up MFA for this
+  user" (`POST /api/users/{id}/mfa/enroll`) generates the user's
+  authenticator and shows its QR code, `otpauth://` link and secret once,
+  for delivery out of band (MFA becomes required, recovery codes are
+  removed, the user is signed out). The secret replicates like any
+  enrollment; it is never logged or audited. Users -> Account security ->
+  "Only administrators enroll authenticators" (console setting
+  `security`, `mfa_enrollment = "admin"`) refuses enrollment at sign-in
+  and from the account page, so someone who only knows a password cannot
+  enroll their own authenticator. Root is exempt. TOTP codes are single-use (the last accepted time step
   is stored). Replacing an enrolled authenticator needs the current code or
   password. Changing your password signs out your other sessions; API tokens
   keep working unless you tick "Also revoke my API tokens" (`revoke_tokens`;

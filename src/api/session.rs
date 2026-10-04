@@ -3,7 +3,9 @@
 
 use super::client_ip::ClientIp;
 use super::error::{ApiError, ApiResult, ErrorCode};
-use super::openapi::{BadRequest, ReadOnly, ServiceUnavailable, TooManyRequests, Unauthorized};
+use super::openapi::{
+    BadRequest, Forbidden, ReadOnly, ServiceUnavailable, TooManyRequests, Unauthorized,
+};
 use super::types::*;
 use super::AppState;
 use crate::auth;
@@ -403,13 +405,14 @@ pub fn enroll_payload(user: &User, secret: &str) -> EnrollPayload {
     tag = "Auth",
     operation_id = "login",
     summary = "Sign in (step 1)",
-    description = "Checks username and password and starts a cookie session. Depending on the account the session is active at once or still needs a TOTP code (`/auth/mfa`) or forced MFA enrollment (`/auth/enroll`).",
+    description = "Checks username and password and starts a cookie session. Depending on the account the session is active at once or still needs a TOTP code (`/auth/mfa`) or forced MFA enrollment (`/auth/enroll`). 403 when the account must enroll MFA but enrollment is reserved to administrators (`/settings/security`).",
     request_body(content = LoginBody, example = json!({ "username": "root", "password": "rootpass123" })),
     responses(
         (status = 200, description = "Credentials accepted. Sets the session cookie; check `status` for the next step.", body = LoginResponse,
             headers(("Set-Cookie" = String, description = "`rdns_session=...; Path=/; HttpOnly; SameSite=Lax` over plain HTTP; `__Host-rdns_session=...; Path=/; HttpOnly; SameSite=Lax; Secure` over HTTPS (a trusted proxy sent `X-Forwarded-Proto: https`) or with `secure_cookies = true`."))),
         (status = 400, response = BadRequest),
         (status = 401, response = Unauthorized),
+        (status = 403, response = Forbidden),
         (status = 429, response = TooManyRequests),
         (status = 503, response = ServiceUnavailable),
     ),
@@ -467,6 +470,16 @@ pub async fn login(
     }
     state.guard.success(&username, ip);
     let user = user.unwrap();
+    // O5: with MFA enrollment reserved to administrators, a user who must
+    // enroll cannot do it here (the password alone would let anyone who has
+    // it enroll their own authenticator). Root is exempt: its requirement
+    // comes from the config file and it must always be able to sign in.
+    if !user.mfa_enrolled() && user.mfa_required && !user.is_root && admin_enrollment_only(&state) {
+        tracing::warn!(%ip, user = %user.username, "sign-in refused: MFA must be enrolled by an administrator");
+        return Err(ApiError::forbidden(
+            "this account needs MFA, which an administrator sets up: ask one for your authenticator QR code",
+        ));
+    }
     let max_age = (state.cfg.web_console.session_ttl_hours.max(1) * 3600) as i64;
     let (status, sstate, secret, enroll) = if user.mfa_enrolled() {
         (LoginStatus::MfaRequired, "mfa_pending", None, None)
@@ -590,6 +603,7 @@ pub async fn mfa_verify(
         (status = 200, description = "Enrolled; session active. Recovery codes are shown once.", body = EnrollVerifyResponse),
         (status = 400, response = BadRequest),
         (status = 401, response = Unauthorized),
+        (status = 403, response = Forbidden),
         (status = 409, response = ReadOnly),
         (status = 429, response = TooManyRequests),
     ),
@@ -610,6 +624,11 @@ pub async fn enroll_verify(
     };
     if sess.state != "enroll_pending" {
         return Err(ApiError::bad_request("session is not enrolling"));
+    }
+    if !user.is_root && admin_enrollment_only(&state) {
+        return Err(ApiError::forbidden(
+            "MFA enrollment is done by administrators on this server: ask one for your authenticator QR code",
+        ));
     }
     if let Some(why) = state.repl.read_only_reason() {
         if !user.is_root {
@@ -728,6 +747,12 @@ pub async fn logout(
         HeaderValue::from_static("rdns_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"),
     );
     Ok(resp)
+}
+
+/// O5: MFA enrollment is reserved to administrators (security settings).
+pub fn admin_enrollment_only(state: &AppState) -> bool {
+    crate::mutation::settings::security(&state.storage).mfa_enrollment
+        == crate::mutation::settings::MfaEnrollment::Admin
 }
 
 /// 429 while `username` is in its failed-attempt back-off (see

@@ -3347,3 +3347,91 @@ fn a_revocation_on_the_primary_closes_standby_streams_at_once() {
     drop(p);
     let _ = std::fs::remove_dir_all(&root_dir);
 }
+
+/// O5: an authenticator enrolled by an administrator on the primary (the
+/// secret travels in `user_updated`, as for any enrollment) works on the
+/// standby, and the security settings replicate.
+#[test]
+fn an_admin_enrolled_authenticator_works_on_the_standby() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root_dir = std::env::temp_dir().join(format!(
+        "rust-dns-follow-adminmfa-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root_dir).unwrap();
+    let mut p = Node::new(&root_dir, "primary", "rootpass-primary");
+    let mut s = Node::new(&root_dir, "standby", "rootpass-standby");
+    p.configure("");
+    p.start();
+    let pr = p.root();
+    let post = |path: &str, body: Value| {
+        ok(
+            call(&Auth::Session(&pr), "POST", &p.api(path), Some(body)),
+            path,
+        )
+    };
+    let u = post(
+        "/users",
+        json!({ "username": "pia", "password": "pia-password-1" }),
+    );
+    let repl = post("/tokens", json!({ "name": "repl" }))["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    s.configure(&follow_cfg(&p, "dns2", &repl));
+    s.start();
+    let sr = s.root();
+    wait_reconciled(&p, &pr, &s, &sr, "user in the snapshot");
+    let e = post(&format!("/users/{}/mfa/enroll", u["id"]), json!({}));
+    let secret = e["enroll"]["secret"].as_str().unwrap().to_string();
+    ok(
+        call(
+            &Auth::Session(&pr),
+            "PUT",
+            &p.api("/settings/security"),
+            Some(json!({ "mfa_enrollment": "admin" })),
+        ),
+        "security settings",
+    );
+    wait_reconciled(&p, &pr, &s, &sr, "enrolled and settings");
+    let v = ok(
+        call(
+            &Auth::Session(&sr),
+            "GET",
+            &s.api("/settings/security"),
+            None,
+        ),
+        "standby settings",
+    );
+    assert_eq!(v["settings"]["mfa_enrollment"], "admin", "{v}");
+    let a = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(10))
+        .build();
+    let (st, v) = call(
+        &Auth::Session(&a),
+        "POST",
+        &s.api("/auth/login"),
+        Some(json!({ "username": "pia", "password": "pia-password-1" })),
+    );
+    assert_eq!(
+        (st, v["status"].as_str()),
+        (200, Some("mfa_required")),
+        "{v}"
+    );
+    let (st, v) = call(
+        &Auth::Session(&a),
+        "POST",
+        &s.api("/auth/mfa"),
+        Some(json!({ "code": totp_at(&secret, step_now()) })),
+    );
+    assert_eq!(
+        st, 200,
+        "the administrator's QR code works on the standby: {v}"
+    );
+    drop(s);
+    drop(p);
+    let _ = std::fs::remove_dir_all(&root_dir);
+}

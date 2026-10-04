@@ -600,6 +600,17 @@ impl<'a> AuditTx<'a> {
         self.push(action.as_str(), user.map(|u| u.id), &target, detail);
     }
 
+    /// O5: an administrator enrolled `user`'s authenticator (the secret is
+    /// in the `user_updated` change only, never here).
+    pub fn note_admin_enrollment(&mut self, user: &User) {
+        self.push(
+            "mfa.admin_enroll",
+            Some(user.id),
+            &user.username,
+            serde_json::json!({ "username": user.username }),
+        );
+    }
+
     // ---- replica list (local bookkeeping: not replicated) --------------------
 
     /// An administrator forgets a standby in the primary's replica list.

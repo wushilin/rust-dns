@@ -331,6 +331,25 @@ async function phaseO(b, p, rootApi, admin) {
   await admin.click('#si-go');
   const rowsSi = await admin.wait('filtered rows', `const r = [...document.querySelectorAll('#si-body tr')].map(t => t.textContent); return r.length && r.every(x => x.includes('olive') && x.includes('failure')) && !r.some(x => x.includes('success')) ? r : null`);
   ok('O4: sign-in log shows the failed password for the filtered user', rowsSi.length >= 1 && rowsSi.some(r => r.includes('password')) && !rowsSi.join().includes('not-olive-password'), JSON.stringify(rowsSi));
+
+  // O5: administrator-only MFA enrollment, and a user's authenticator set up by the administrator.
+  await admin.route('#/users', `return !!document.querySelector('#sec-mfa')`);
+  await admin.fill('#sec-mfa', 'admin');
+  await admin.click('#sec-save');
+  await admin.wait('security saved', `return document.querySelector('#sec-card')?.textContent.includes('saved')`);
+  ok('O5: enrollment set to administrators only', (await rootApi('GET', '/settings/security')).json.settings.mfa_enrollment === 'admin');
+  const oliveId = (await rootApi('GET', '/users')).json.users.find(u => u.username === 'olive').id;
+  await admin.eval(`document.querySelector('[data-edit="${oliveId}"]').click(); return true`);
+  await admin.wait('user dialog', `return !!document.querySelector('#u-admin-mfa')`);
+  await admin.click('#u-admin-mfa');
+  await admin.wait('confirm', `return !!document.querySelector('#cf-ok')`);
+  await admin.click('#cf-ok');
+  const secret = await admin.wait('QR shown once', `return document.querySelector('#ae-qr svg') ? [...document.querySelectorAll('#modal code')].map(c => c.textContent).find(t => /^[A-Z2-7]{16,}$/.test(t)) : null`);
+  await admin.eval(`document.querySelector('#modal [data-close]').click(); return true`);
+  const login = await fetch(`${p.url}/api/auth/login`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ username: 'olive', password: 'olive-password-2' }) });
+  const lj = await login.json();
+  ok('O5: the user now needs a code from the administrator\'s QR', lj.status === 'mfa_required' && !!secret, JSON.stringify(lj));
+  await rootApi('DELETE', '/settings/security');
   return [olive];
 }
 

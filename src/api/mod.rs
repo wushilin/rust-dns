@@ -11,6 +11,7 @@ pub mod replication;
 pub mod resolver;
 pub mod rollover;
 pub mod routes;
+pub mod security;
 pub mod session;
 pub mod settings;
 #[cfg(test)]
@@ -384,6 +385,12 @@ fn api_router() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(routes::list_users, routes::create_user))
         .routes(routes!(routes::update_user, routes::delete_user))
         .routes(routes!(routes::reset_user_mfa))
+        .routes(routes!(security::admin_enroll))
+        .routes(routes!(
+            security::get_security,
+            security::update_security,
+            security::reset_security
+        ))
         .routes(routes!(routes::user_sessions))
         .routes(routes!(routes::revoke_user_sessions))
         .routes(routes!(routes::list_tokens, routes::create_token))

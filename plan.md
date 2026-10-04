@@ -776,7 +776,7 @@ Group 1: security and accounts
   Local, pruned).
 - [x] O4. Login audit view in the console (sign-ins, failures, MFA, from the
   audit log; filter by user/IP/result).
-- [ ] O5. Admin-initiated MFA enrollment (L13): admin sets "MFA required" and
+- [x] O5. Admin-initiated MFA enrollment (L13): admin sets "MFA required" and
   generates a one-time enrollment link/QR shown once to the admin, delivered
   out of band; first-use enrollment without it is refused for that user.
 - [ ] O6. Password policy (length, reuse of the last N, optional complexity)
@@ -948,6 +948,16 @@ Final
   (per-zone checksum; test `a_zone_record_policy_replicates`). Same order:
   standby first, set policies only after both run this version; no
   downgrade once a policy exists.
+
+- After phase O, group 1 (this session; not deployed): protocol 2, no new
+  change kind, fixture untouched. New console setting key `security`
+  (`setting_set` / `setting_cleared`, JSON with serde defaults, unknown
+  fields ignored): an older standby stores it and ignores it, which is
+  harmless (a standby does not accept enrollments or password changes of
+  replicated accounts). Administrator MFA enrollment writes the existing
+  `user_updated` / `recovery_codes_replaced` changes. New local table
+  `login_failures` (an older binary ignores it). Either upgrade order
+  works so far; standby (baba2) first as always.
 
 ## Log
 
@@ -1621,3 +1631,22 @@ Final
   secrets, admins only), contract test (new operation `get_sign_ins`),
   browser flow "O4: sign-in log shows the failed password for the
   filtered user".
+- 2026-10-04 (phase O): O5 done. `POST /users/{id}/mfa/enroll`
+  (`manage_users`; root only by root): new TOTP secret, MFA required and
+  enrolled, recovery codes removed, signed out everywhere, one
+  transaction (`user_updated` carries the secret to standbys as for any
+  enrollment; audit `mfa.admin_enroll` names the user only); the response
+  (QR, `otpauth://` link, secret) is the only place it is shown. New
+  console setting `security` (`GET/PUT/DELETE /settings/security`,
+  `manage_users`) with `mfa_enrollment`: `self` (default, as before) or
+  `admin`: then sign-in of a user who must enroll is refused (403, no
+  session), as are `/auth/enroll`, `/me/mfa/start` and `/me/mfa/confirm`;
+  root is exempt (its MFA comes from the config file; it must always be
+  able to sign in). Console: user dialog "Set up MFA for this user" (QR
+  shown once), "Account security" card on the Users page. Tests:
+  `api::tests::administrators_enroll_mfa_for_users`,
+  `follow::an_admin_enrolled_authenticator_works_on_the_standby`,
+  contract flow (dedicated: `admin_enroll_mfa`,
+  `update_security_settings`; login and enroll document 403), browser
+  flows "O5: enrollment set to administrators only", "O5: the user now
+  needs a code from the administrator's QR".

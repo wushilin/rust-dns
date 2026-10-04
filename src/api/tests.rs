@@ -1542,3 +1542,115 @@ async fn sign_in_log_lists_successes_and_failures() {
         StatusCode::FORBIDDEN
     );
 }
+
+/// O5: an administrator enrolls a user's authenticator; the secret is in
+/// the response only (not in the audit log), the user is signed out and
+/// then needs a code from it. With enrollment reserved to administrators,
+/// a user who must enroll cannot do it at sign-in or from the account
+/// page; root is exempt.
+#[tokio::test]
+async fn administrators_enroll_mfa_for_users() {
+    use serde_json::json;
+    let h = Harness::new();
+    let root_c = root_session(&h).await;
+    let pia = h.user("pia", "pia-password-1", None);
+    let pia_c = h.login("pia", "pia-password-1").await.cookie.unwrap();
+    // Not for non-admins.
+    let r = h
+        .call(
+            "POST",
+            &format!("/users/{}/mfa/enroll", pia.id),
+            Some(&pia_c),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.json);
+    let r = h
+        .call(
+            "POST",
+            &format!("/users/{}/mfa/enroll", pia.id),
+            Some(&root_c),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.json);
+    let secret = r.json["enroll"]["secret"].as_str().unwrap().to_string();
+    assert!(r.json["enroll"]["otpauth_uri"]
+        .as_str()
+        .unwrap()
+        .starts_with("otpauth://totp/"));
+    assert!(r.json["enroll"]["qr_svg"]
+        .as_str()
+        .unwrap()
+        .starts_with("<svg"));
+    assert_eq!(r.json["user"]["mfa_enrolled"], true);
+    assert_eq!(r.json["user"]["mfa_required"], true);
+    assert_eq!(
+        h.call("GET", "/me", Some(&pia_c), None).await.status,
+        StatusCode::UNAUTHORIZED,
+        "signed out everywhere"
+    );
+    let audit = serde_json::to_string(&h.state.storage.audit_after(0, 1000).unwrap()).unwrap();
+    assert!(!audit.contains(&secret), "the secret is not audited");
+    assert!(audit.contains("mfa.admin_enroll"));
+    let r = h.login("pia", "pia-password-1").await;
+    assert_eq!(r.json["status"], "mfa_required", "{}", r.json);
+    let c = r.cookie.unwrap();
+    let ok = h
+        .mfa(&c, &crate::auth::totp_code_for(&secret, h.step()))
+        .await;
+    assert_eq!(ok.status, StatusCode::OK, "{}", ok.json);
+
+    // Enrollment reserved to administrators.
+    let r = h
+        .call(
+            "PUT",
+            "/settings/security",
+            Some(&root_c),
+            Some(json!({ "mfa_enrollment": "admin" })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.json);
+    assert_eq!(r.json["settings"]["mfa_enrollment"], "admin");
+    assert_eq!(r.json["source"], "console");
+    let quinn = h.user("quinn", "quinn-password-1", None);
+    let qc = h.login("quinn", "quinn-password-1").await.cookie.unwrap();
+    let r = h.call("POST", "/me/mfa/start", Some(&qc), None).await;
+    assert_eq!(
+        r.status,
+        StatusCode::FORBIDDEN,
+        "no voluntary self-enrollment: {}",
+        r.json
+    );
+    let r = h
+        .call(
+            "PUT",
+            &format!("/users/{}", quinn.id),
+            Some(&root_c),
+            Some(json!({ "mfa_required": true })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK);
+    let r = h.login("quinn", "quinn-password-1").await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.json);
+    assert!(r.cookie.is_none());
+    // Root keeps self-service (its MFA comes from the config file).
+    h.state
+        .accounts
+        .sync_root(
+            "root",
+            &crate::auth::hash_password("root-password-1").unwrap(),
+            true,
+        )
+        .unwrap();
+    let r = h.login("root", "root-password-1").await;
+    assert_eq!(r.json["status"], "enroll_required", "{}", r.json);
+    // Back to self-service: quinn enrolls at sign-in again.
+    let r = h
+        .call("DELETE", "/settings/security", Some(&root_c), None)
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.json);
+    assert_eq!(r.json["source"], "config");
+    let r = h.login("quinn", "quinn-password-1").await;
+    assert_eq!(r.json["status"], "enroll_required", "{}", r.json);
+}

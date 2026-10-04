@@ -22,7 +22,7 @@
           "Auth"
         ],
         "summary": "Sign in (step 1)",
-        "description": "Checks username and password and starts a cookie session. Depending on the account the session is active at once or still needs a TOTP code (`/auth/mfa`) or forced MFA enrollment (`/auth/enroll`).",
+        "description": "Checks username and password and starts a cookie session. Depending on the account the session is active at once or still needs a TOTP code (`/auth/mfa`) or forced MFA enrollment (`/auth/enroll`). 403 when the account must enroll MFA but enrollment is reserved to administrators (`/settings/security`).",
         "operationId": "login",
         "requestBody": {
           "content": {
@@ -62,6 +62,9 @@
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
           },
           "429": {
             "$ref": "#/components/responses/TooManyRequests"
@@ -159,6 +162,9 @@
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
           },
           "409": {
             "$ref": "#/components/responses/ReadOnly"
@@ -2623,6 +2629,158 @@
         }
       }
     },
+    "/users/{id}/mfa/enroll": {
+      "post": {
+        "tags": [
+          "Users"
+        ],
+        "summary": "Enroll an authenticator for a user (admin)",
+        "description": "Generates a new TOTP secret for the user, makes MFA required and enrolled with it, removes their recovery codes and signs them out everywhere. The response holds the QR code, `otpauth://` link and secret: shown only this once, deliver it to the user out of band. The secret replicates to standbys like any enrollment; it is never logged or audited (the audit entry `mfa.admin_enroll` names the user only). Replaces an enrolled authenticator. Needs `manage_users`; only root may do this for root.",
+        "operationId": "admin_enroll_mfa",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "User id.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "example": 1
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Enrolled. The secret is in the response only.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminEnrollment"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/ReadOnly"
+          }
+        }
+      }
+    },
+    "/settings/security": {
+      "get": {
+        "tags": [
+          "Users"
+        ],
+        "summary": "Account security settings (admin)",
+        "description": "Who may enroll MFA authenticators. Needs `manage_users`.",
+        "operationId": "get_security_settings",
+        "responses": {
+          "200": {
+            "description": "Settings in effect.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecurityView"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "Users"
+        ],
+        "summary": "Change account security settings (admin)",
+        "description": "Saves the settings; they apply at once and replicate to standbys. Omitted fields take their defaults. Audited as `settings.security.update`. Needs `manage_users`.",
+        "operationId": "update_security_settings",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SecuritySettings"
+              },
+              "example": {
+                "mfa_enrollment": "admin"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Saved.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecurityView"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/ReadOnly"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Users"
+        ],
+        "summary": "Use the default security settings again (admin)",
+        "description": "Removes the saved settings (users enroll MFA themselves). Audited as `settings.security.reset`; no-op when nothing is saved. Needs `manage_users`.",
+        "operationId": "reset_security_settings",
+        "responses": {
+          "200": {
+            "description": "Defaults in effect.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecurityView"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/ReadOnly"
+          }
+        }
+      }
+    },
     "/users/{id}/sessions": {
       "get": {
         "tags": [
@@ -4433,6 +4591,23 @@
   },
   "components": {
     "schemas": {
+      "AdminEnrollment": {
+        "type": "object",
+        "description": "The new authenticator of a user, shown once.",
+        "required": [
+          "user",
+          "enroll"
+        ],
+        "properties": {
+          "user": {
+            "$ref": "#/components/schemas/User"
+          },
+          "enroll": {
+            "$ref": "#/components/schemas/EnrollPayload",
+            "description": "Hand the QR code (or the `otpauth://` link, or the secret) to the\nuser out of band. It is not shown again."
+          }
+        }
+      },
       "AuditPage": {
         "type": "object",
         "required": [
@@ -6979,6 +7154,14 @@
         ],
         "example": "editor"
       },
+      "MfaEnrollment": {
+        "type": "string",
+        "description": "Who may enroll a TOTP authenticator (O5).",
+        "enum": [
+          "self",
+          "admin"
+        ]
+      },
       "MfaVerifyResponse": {
         "type": "object",
         "required": [
@@ -8519,6 +8702,52 @@
               "type": "string"
             },
             "description": "Standbys that cannot follow a rollover (older versions): starting\nis refused until they are upgraded (or removed from the list)."
+          }
+        }
+      },
+      "SecuritySettings": {
+        "type": "object",
+        "description": "Account security settings (console setting `security`). Every field\nhas a default that keeps the behaviour before it existed; unknown\nfields are ignored (an older server stores the row and ignores it).",
+        "properties": {
+          "mfa_enrollment": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/MfaEnrollment"
+              }
+            ],
+            "default": "self"
+          }
+        }
+      },
+      "SecurityView": {
+        "type": "object",
+        "description": "The security settings in effect.",
+        "required": [
+          "settings",
+          "source",
+          "updated_by",
+          "updated_at"
+        ],
+        "properties": {
+          "settings": {
+            "$ref": "#/components/schemas/SecuritySettings"
+          },
+          "source": {
+            "$ref": "#/components/schemas/SettingSource",
+            "description": "`config`: the defaults (nothing saved); `console`: saved settings."
+          },
+          "updated_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "updated_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
           }
         }
       },

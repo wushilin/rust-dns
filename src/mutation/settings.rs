@@ -419,6 +419,63 @@ pub fn load_blocklists(
     }
 }
 
+/// O5/O6: account security settings, console setting `security`.
+pub const SECURITY_KEY: &str = "security";
+
+/// Who may enroll a TOTP authenticator (O5).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub enum MfaEnrollment {
+    /// Users themselves: at sign-in when MFA is required, or voluntarily
+    /// from their account page (the behaviour before O5).
+    #[default]
+    #[serde(rename = "self")]
+    SelfService,
+    /// Only an administrator, who generates the QR code for the user and
+    /// hands it over out of band; users cannot enroll (or replace) an
+    /// authenticator themselves, so a stolen password cannot be used to
+    /// enroll the thief's.
+    #[serde(rename = "admin")]
+    Admin,
+}
+
+/// Account security settings (console setting `security`). Every field
+/// has a default that keeps the behaviour before it existed; unknown
+/// fields are ignored (an older server stores the row and ignores it).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct SecuritySettings {
+    pub mfa_enrollment: MfaEnrollment,
+}
+
+impl SecuritySettings {
+    pub fn validate(self) -> Result<Self, Vec<String>> {
+        Ok(self)
+    }
+}
+
+/// The stored security settings, with who set them and when.
+pub fn load_security_stored(
+    storage: &Storage,
+) -> Result<Option<(SecuritySettings, String, String)>> {
+    match storage.get_setting(SECURITY_KEY)? {
+        None => Ok(None),
+        Some((value, by, at)) => Ok(Some((serde_json::from_str(&value)?, by, at))),
+    }
+}
+
+/// The security settings in effect (defaults when none are saved or the
+/// row cannot be read: logged).
+pub fn security(storage: &Storage) -> SecuritySettings {
+    match load_security_stored(storage) {
+        Ok(Some((s, _, _))) => s,
+        Ok(None) => SecuritySettings::default(),
+        Err(e) => {
+            tracing::warn!(error = %e, "unreadable security settings; using the defaults");
+            SecuritySettings::default()
+        }
+    }
+}
+
 impl AuditTx<'_> {
     /// Store a console setting `key` (replacing any previous value) and
     /// audit it as `action` (`settings.<key>.update`) with before/after.

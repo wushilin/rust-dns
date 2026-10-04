@@ -2062,6 +2062,11 @@ pub async fn mfa_start(
     let sid = caller
         .session_id
         .ok_or_else(|| ApiError::forbidden("MFA enrollment requires an interactive session"))?;
+    if super::session::admin_enrollment_only(&s) && !caller.user.is_root {
+        return Err(ApiError::forbidden(
+            "MFA enrollment is done by administrators on this server: ask one for a new authenticator QR code",
+        ));
+    }
     if caller.user.mfa_enrolled() {
         // Replacing an enrolled authenticator needs the current factor, so a
         // stolen session cookie cannot swap it for the attacker's.
@@ -2125,6 +2130,11 @@ pub async fn mfa_confirm(
     let sid = caller
         .session_id
         .ok_or_else(|| ApiError::forbidden("MFA enrollment requires an interactive session"))?;
+    if super::session::admin_enrollment_only(&s) && !caller.user.is_root {
+        return Err(ApiError::forbidden(
+            "MFA enrollment is done by administrators on this server",
+        ));
+    }
     let sess = s
         .storage
         .get_session_by_id(sid)?

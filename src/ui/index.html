@@ -2540,11 +2540,26 @@ async function viewUsers() {
   $('#main').innerHTML = `<div class="topbar"><h1>Users</h1><button class="btn primary" id="u-new" data-perm="manage_users">New user</button></div>
     <div class="card"><table><thead><tr><th>Username</th><th>Name</th><th>Role</th><th>MFA</th><th>Status</th><th>Created</th><th></th></tr></thead><tbody>
     ${users.map(u => `<tr><td><b>${esc(u.username)}</b>${u.is_root ? ' <span class="badge muted">root</span>' : ''}</td><td>${esc(u.display_name)}</td><td>${u.is_admin ? '<span class="badge">admin</span>' : 'user'}</td><td>${u.mfa_enrolled ? '<span class="badge ok">enrolled</span>' : u.mfa_required ? '<span class="badge warn">pending</span>' : '<span class="badge muted">off</span>'}</td><td>${u.disabled_at ? '<span class="badge bad">disabled</span>' : '<span class="badge ok">active</span>'}</td><td class="hint">${ago(u.created_at)}</td><td class="actions"><button class="btn sm ghost" data-rights="${u.id}" data-ro-ok>Rights</button><button class="btn sm ghost" data-edit="${u.id}" data-perm="manage_users"${blockAttr(u.is_root && !S.user.is_root && 'Only root can change the root account')}>Edit</button>${u.is_root ? '' : `<button class="btn sm ghost danger" data-del="${u.id}" data-perm="manage_users"${blockAttr(u.id === S.user.id && 'You cannot delete your own account')}>Delete</button>`}</td></tr>`).join('')}
-    </tbody></table></div>`;
+    </tbody></table></div>
+    <div class="card panel" style="max-width:820px;margin-top:16px" id="sec-card"><h2>Account security</h2><div class="hint">Loading…</div></div>`;
+  securityCard().catch(e => { $('#sec-card').innerHTML = `<h2>Account security</h2><div class="error">${esc(e.message)}</div>`; });
   $('#u-new').onclick = () => userModal(null);
   $$('[data-rights]').forEach(b => b.onclick = () => rightsModal(Number(b.dataset.rights), 'session'));
   $$('[data-edit]').forEach(b => b.onclick = () => userModal(users.find(u => u.id === Number(b.dataset.edit))));
   $$('[data-del]').forEach(b => b.onclick = async () => { const u = users.find(x => x.id === Number(b.dataset.del)); if (await confirmModal('Delete user', `Delete ${u.username}? Their zones keep existing without an owner.`, 'Delete', b)) { try { await DEL('/users/' + u.id); toast('User deleted', 'ok'); viewUsers(); } catch (e) { toast(e.message, 'err'); } } });
+}
+// O5/O6: account security settings (console setting `security`).
+async function securityCard() {
+  const v = await GET('/settings/security'), st = v.settings;
+  const src = v.source === 'console' ? `<span class="badge">saved</span> <span class="hint">by ${esc(v.updated_by || '?')} ${v.updated_at ? ago(v.updated_at) : ''}</span>` : '<span class="badge muted">defaults</span>';
+  $('#sec-card').innerHTML = `<div class="row between"><h2>Account security</h2><div>${src}</div></div>
+    <div class="field"><label>MFA enrollment</label><select id="sec-mfa"><option value="self" ${st.mfa_enrollment === 'self' ? 'selected' : ''}>Users enroll their own authenticator (at sign-in when MFA is required)</option><option value="admin" ${st.mfa_enrollment === 'admin' ? 'selected' : ''}>Only administrators enroll authenticators (Users -> Edit -> Set up MFA)</option></select>
+      <span class="hint">Administrator-only enrollment stops someone who knows a password from enrolling their own authenticator. Root is exempt (its MFA is set in the configuration file).</span></div>
+    <div class="error" id="sec-err"></div>
+    <div class="row"><button class="btn primary" id="sec-save" data-perm="manage_users">Save</button>${v.source === 'console' ? '<button class="btn ghost" id="sec-reset" data-perm="manage_users">Use defaults</button>' : ''}</div>`;
+  $('#sec-save').onclick = async () => { $('#sec-err').textContent = ''; try { await PUT('/settings/security', { ...st, mfa_enrollment: $('#sec-mfa').value }); toast('Security settings saved', 'ok'); await securityCard(); } catch (e) { $('#sec-err').textContent = e.message; } };
+  if ($('#sec-reset')) $('#sec-reset').onclick = async () => { try { await DEL('/settings/security'); toast('Defaults in effect', 'ok'); await securityCard(); } catch (e) { $('#sec-err').textContent = e.message; } };
+  applyAccess();
 }
 function userModal(u) {
   const isNew = !u; u = u || {};
@@ -2559,17 +2574,30 @@ function userModal(u) {
     </div>
     ${isNew || u.is_root ? '' : '<div class="row" style="margin-top:8px"><label><input type="checkbox" name="revoke_tokens"> With a new password: also revoke their API tokens</label></div>'}
     ${!isNew && u.mfa_enrolled ? '<p class="hint" style="margin-top:12px">MFA is enrolled. <button type="button" class="linkbtn" id="u-reset-mfa" data-perm="manage_users">Reset MFA</button> to force re-enrollment (all sessions are signed out).</p>' : ''}
+    ${!isNew && (!u.is_root || S.user.is_root) ? `<p class="hint" style="margin-top:6px"><button type="button" class="linkbtn" id="u-admin-mfa" data-perm="manage_users">${u.mfa_enrolled ? 'Replace their authenticator' : 'Set up MFA for this user'}</button>: a QR code for the user, shown once (they are signed out).</p>` : ''}
     ${!isNew ? '<p class="hint" style="margin-top:6px"><button type="button" class="linkbtn" id="u-signout" data-perm="manage_users" data-ro-ok>Sign this user out everywhere</button></p>' : ''}
     <p class="hint" style="margin-top:10px">When MFA is required, the user must enroll an authenticator on their next sign-in.</p>
     <div class="error" id="m-err"></div>
     <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="m-ok" data-perm="manage_users">${isNew ? 'Create' : 'Save'}</button></div>`, m => {
     if ($('#u-signout')) $('#u-signout').onclick = async e => { e.preventDefault(); try { const r = await POST(`/users/${u.id}/sessions/revoke`); toast(`Revoked ${r.revoked} session(s)`, 'ok'); } catch (e) { $('#m-err').textContent = e.message; } };
+    if ($('#u-admin-mfa')) $('#u-admin-mfa').onclick = async e => { e.preventDefault(); if (!await confirmModal('Set up MFA', `Generate a new authenticator for ${u.username}? MFA becomes required, their recovery codes are removed and they are signed out everywhere.`, 'Generate', $('#u-admin-mfa'))) return; try { showAdminEnrollment(u, await POST(`/users/${u.id}/mfa/enroll`)); } catch (e) { toast(e.message, 'err'); } };
     if ($('#u-reset-mfa')) $('#u-reset-mfa').onclick = async e => { e.preventDefault(); try { await POST(`/users/${u.id}/reset-mfa`); closeModal(); toast('MFA reset', 'ok'); viewUsers(); } catch (e) { $('#m-err').textContent = e.message; } };
     $('#m-ok').onclick = async () => {
       const b = {}; m.querySelectorAll('[name]').forEach(i => { if (i.type === 'checkbox') { if (!i.disabled) b[i.name] = i.checked; } else if (i.value !== '') b[i.name] = i.value; });
       try { if (isNew) await POST('/users', b); else await PUT('/users/' + u.id, b); closeModal(); toast(isNew ? 'User created' : 'User updated', 'ok'); viewUsers(); } catch (e) { $('#m-err').textContent = e.message; }
     };
   });
+}
+
+// O5: an administrator enrolls a user's authenticator; the QR code is shown once.
+function showAdminEnrollment(u, r) {
+  openModal(`<h2>Authenticator for ${esc(u.username)}</h2>
+    <div class="note warn">${ico('warn', 's')}<span>Shown only now. Hand it to ${esc(u.username)} out of band (in person, or over a channel you trust); it is not stored anywhere you can see again.</span></div>
+    <div class="qr" id="ae-qr">${r.enroll.qr_svg || ''}</div>
+    <div class="field"><label>Setup link</label>${copyVal(r.enroll.otpauth_uri)}</div>
+    <div class="field"><label>Secret (manual entry)</label>${copyVal(r.enroll.secret)}</div>
+    <div class="foot"><button class="btn primary" data-close data-ro-ok>Done</button></div>`);
+  if (location.hash === '#/users') viewUsers();
 }
 
 // ---------------------------------------------------------------------------

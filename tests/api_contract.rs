@@ -96,6 +96,9 @@ const DEDICATED: &[&str] = &[
     "websocket",
     // Needs a second server following this one (see the promotion flow).
     "promote_standby",
+    // O5/O6: change who can sign in; exercised in their own flow.
+    "admin_enroll_mfa",
+    "update_security_settings",
 ];
 
 // ---------------------------------------------------------------------------
@@ -1519,6 +1522,70 @@ fn live_api_matches_spec() {
         );
         c.expect("enroll with a valid TOTP", &r, 200);
     }
+
+    // ---- O5: an administrator enrolls pwuser's authenticator; then, with
+    // enrollment reserved to administrators, a user who must enroll cannot
+    // sign in (the security settings are reset right after).
+    let users = c
+        .call(Auth::Session(&root), "get", "/users", &[], "", Body::None)
+        .json();
+    let pw_id = users["users"]
+        .as_array()
+        .and_then(|u| u.iter().find(|u| u["username"] == "pwuser"))
+        .map(|u| u["id"].to_string())
+        .unwrap_or_default();
+    let r = c.call(
+        Auth::Session(&root),
+        "post",
+        "/users/{id}/mfa/enroll",
+        &[("id", pw_id)],
+        "",
+        Body::None,
+    );
+    c.expect("administrator enrolls pwuser's authenticator", &r, 200);
+    let ex = c.example("/settings/security", "put");
+    let r = c.send_example(
+        Auth::Session(&root),
+        "put",
+        "/settings/security",
+        &[],
+        "",
+        &ex,
+    );
+    c.expect("PUT /settings/security with the spec example", &r, 200);
+    let r = c.call(
+        Auth::Session(&root),
+        "post",
+        "/users",
+        &[],
+        "",
+        Body::Json(
+            &json!({ "username": "mfauser", "password": "mfauser-pass-1", "mfa_required": true }),
+        ),
+    );
+    c.expect("create mfauser", &r, 201);
+    let r = c.call(
+        Auth::Session(&agent()),
+        "post",
+        "/auth/login",
+        &[],
+        "",
+        Body::Json(&json!({ "username": "mfauser", "password": "mfauser-pass-1" })),
+    );
+    c.expect(
+        "enrollment at sign-in refused in administrator mode",
+        &r,
+        403,
+    );
+    let r = c.call(
+        Auth::Session(&root),
+        "delete",
+        "/settings/security",
+        &[],
+        "",
+        Body::None,
+    );
+    c.expect("security settings back to the defaults", &r, 200);
 
     // ---- voluntary MFA for root: start, confirm, recovery, login, disable -----
     let r = c.call(
