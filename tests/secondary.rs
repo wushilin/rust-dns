@@ -456,9 +456,8 @@ zone "exp.test" {{ type primary; file "exp.test.db"; }};
     );
     let log = std::fs::read_to_string(dir.join("server.log")).unwrap_or_default();
     assert!(log.contains("NOTIFY accepted"), "NOTIFY logged");
-    // A NOTIFY from elsewhere (not a primary address, unsigned) is refused:
-    // ours come from 127.0.0.1, which is the primary's address, so check
-    // a NOTIFY for a zone that is not a secondary zone here.
+    // A NOTIFY for a zone that is not a secondary zone here: NOTIMP, as
+    // before secondary zones existed.
     let n = out(
         &dig_bin,
         &[
@@ -471,7 +470,7 @@ zone "exp.test" {{ type primary; file "exp.test.db"; }};
             "SOA",
         ],
     );
-    assert!(n.contains("REFUSED"), "{n}");
+    assert!(n.contains("NOTIMP"), "{n}");
 
     // The outbound transfer of a secondary zone (to our own secondaries).
     let axfr = dig(&dig_bin, rp, &["sec.test", "AXFR"]);

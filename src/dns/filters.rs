@@ -81,8 +81,9 @@ impl DnsServer {
 
     /// O27: an inbound NOTIFY (RFC 1996) for a secondary zone: accepted
     /// when signed with the zone's TSIG key or sent from one of its
-    /// primaries' addresses; the zone is refreshed at once. REFUSED for a
-    /// zone that is not a secondary zone here, or from anyone else.
+    /// primaries' addresses; the zone is refreshed at once; REFUSED from
+    /// anyone else. A NOTIFY for any other name is answered NOTIMP, as
+    /// before secondary zones existed (unchanged answers by default).
     fn notify_in(&self, q: &mut QueryCtx<'_>) -> Step {
         let Some(question) = q.request.queries.first().cloned() else {
             return q.reply(ResponseCode::FormErr, "error");
@@ -95,8 +96,7 @@ impl DnsServer {
             .and_then(|z| Some((z.zone.name.clone(), z.zone.secondary.as_deref()?.clone())));
         let client = q.meta.client.ip();
         let Some((zone, spec)) = found else {
-            tracing::debug!(%client, zone = %fqdn, "NOTIFY for a zone that is not a secondary zone here: refused");
-            return q.reply(ResponseCode::Refused, "refused");
+            return q.reply(ResponseCode::NotImp, "error");
         };
         let by_key = match (q.signed_by, &spec.key) {
             (Some(b), Some(k)) => b.entry.key.name.eq_ignore_ascii_case(k),

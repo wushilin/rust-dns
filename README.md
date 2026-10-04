@@ -747,8 +747,8 @@ curl -X POST .../api/zones -d '{"name": "example.org",
   a failure, and when no refresh succeeded for `expire` seconds the zone is
   answered SERVFAIL until a transfer succeeds again (as BIND does).
 - A NOTIFY from one of the primaries' addresses, or signed with the zone's
-  TSIG key, refreshes it at once. A NOTIFY for any other zone, or from
-  anyone else, is REFUSED.
+  TSIG key, refreshes it at once; from anyone else it is REFUSED. A NOTIFY
+  for any other name is answered NOTIMP, as before.
 - `key` (optional): a TSIG key (create it under *TSIG keys* with the
   primary's secret) that signs every SOA, AXFR and IXFR request; every
   answer must then be signed with it.

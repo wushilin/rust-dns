@@ -2624,3 +2624,11 @@ Final
   with a 3 queries/s limit, 10 quick DoT / DoH queries get >= 3 REFUSED;
   `named` with `tls` and `http` listeners as the upstream: forwarding over
   DoT and over DoH answers, and with an untrusted CA SERVFAIL).
+- 2026-10-04 (phase O): O27 follow-up found by the O31 equivalence run
+  (d32d67f vs fc76ef1: 18 differences, all NOTIFY queries: the O27
+  handler answered REFUSED where every earlier version answers NOTIMP).
+  A NOTIFY for a name that is not a secondary zone here is answered
+  NOTIMP again (unchanged by default); only a NOTIFY for a secondary zone
+  is handled (accepted from a primary or with the zone key, else
+  REFUSED). `tests/secondary.rs` asserts NOTIMP. Equivalence after the
+  fix: 20,743 cases, 0 differences.
