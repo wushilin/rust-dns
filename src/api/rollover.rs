@@ -525,16 +525,13 @@ async fn drive_zone(s: &AppState, zone: &str) -> Option<Duration> {
     let apex = Name::from_ascii(z.fqdn()).ok()?;
     let fwd = s.dns.runtime.load_full().forwarding.clone();
     let probe = parent::probe(&fwd, &apex, cfg.parent_port, &new, old.as_ref()).await;
-    let ok = match &probe {
-        Ok(p) => {
-            if which == "new" {
-                p.all_have("new")
-            } else {
-                p.none_has("old")
-            }
-        }
-        Err(_) => false,
+    // Only answers that contradict reset a wait; a server that could not
+    // be asked (Unknown) changes nothing until the next round.
+    let verdict = match &probe {
+        Ok(p) => p.verdict(which, which == "new"),
+        Err(_) => parent::Verdict::Unknown,
     };
+    let ok = verdict == parent::Verdict::Agree;
     let ds_ttl = probe
         .as_ref()
         .ok()
@@ -548,14 +545,16 @@ async fn drive_zone(s: &AppState, zone: &str) -> Option<Duration> {
         }),
         Err(e) => observe(zone, |o| o.probe_error = Some(e.to_string())),
     }
-    let step = if ok {
-        RolloverStep::ParentOk { ds_ttl }
-    } else {
-        RolloverStep::ParentNotOk
+    let step = match verdict {
+        parent::Verdict::Agree => Some(RolloverStep::ParentOk { ds_ttl }),
+        parent::Verdict::Disagree => Some(RolloverStep::ParentNotOk),
+        parent::Verdict::Unknown => None,
     };
-    if let Err(e) = s.mutator.rollover_step(zone, step).await {
-        tracing::warn!(zone, error = %e, "DNSSEC rollover: could not record the parent check");
-        return None;
+    if let Some(step) = step {
+        if let Err(e) = s.mutator.rollover_step(zone, step).await {
+            tracing::warn!(zone, error = %e, "DNSSEC rollover: could not record the parent check");
+            return None;
+        }
     }
     if ok {
         let last = match r.stage {

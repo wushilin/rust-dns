@@ -742,6 +742,15 @@ what the registrar's DS must match on the live zone; plan it separately.
   with 2 s timers (start dialog, DNSKEY wait, DS fields, standby read-only
   view, mistyped DS shown "differs: digest", switch + self-check, no
   cancel, done) with no page errors; screenshots checked by eye.
+  Self-review fix (after bab80da): the parent verdict is per name server,
+  not per address, and three-valued: `Agree` (every NS answered through at
+  least one address and all agree), `Disagree` (an answer contradicts:
+  the wait restarts), `Unknown` (no contradiction but an NS could not be
+  asked, or has no address: nothing changes, asked again next round).
+  Before, a host without an IPv6 route to the `.net` servers would never
+  have progressed, and one timeout would have restarted a 1-day DS wait.
+  The addresses are asked concurrently. Unit test `dnssec::parent::tests::
+  verdict_counts_name_servers_not_addresses`.
 - [x] N2. pending.md: "signing auto-PTR answers" moved to the bottom (Low
   priority) with the reason (public PTRs belong to the address holder;
   matters only for private/VPN reverse zones).

@@ -60,23 +60,56 @@ pub struct ParentProbe {
     pub checked_at: String,
 }
 
-impl ParentProbe {
-    /// Every server answered and each publishes a DS matching `which`.
-    pub fn all_have(&self, which: &str) -> bool {
-        !self.servers.is_empty()
-            && self
-                .servers
-                .iter()
-                .all(|s| s.error.is_none() && s.ds.iter().any(|d| d.matches == which))
-    }
+/// What the parent's servers say about a DS, per name server (a name
+/// server counts once, whichever of its addresses answered).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// Every name server answered (through at least one address) and every
+    /// answer agrees.
+    Agree,
+    /// At least one answer contradicts (the change is not everywhere yet).
+    Disagree,
+    /// No answer contradicts, but some name server could not be asked
+    /// (timeouts, an address family without a route): try again later.
+    Unknown,
+}
 
-    /// Every server answered and none publishes a DS matching `which`.
-    pub fn none_has(&self, which: &str) -> bool {
-        !self.servers.is_empty()
-            && self
+impl ParentProbe {
+    /// Whether the parent publishes a DS matching `which` (`present`) or
+    /// does not (`!present`), per name server. An address that did not
+    /// answer is ignored when another address of the same name server did
+    /// (no IPv6 route on this host, say); a name server none of whose
+    /// addresses answered makes the verdict `Unknown`, never `Agree`.
+    pub fn verdict(&self, which: &str, present: bool) -> Verdict {
+        if self.servers.is_empty() {
+            return Verdict::Unknown;
+        }
+        let mut names: Vec<&str> = self.servers.iter().map(|s| s.ns.as_str()).collect();
+        names.sort();
+        names.dedup();
+        let mut unknown = false;
+        for n in names {
+            let answered: Vec<&ParentServer> = self
                 .servers
                 .iter()
-                .all(|s| s.error.is_none() && !s.ds.iter().any(|d| d.matches == which))
+                .filter(|s| s.ns == n && s.error.is_none())
+                .collect();
+            if answered.is_empty() {
+                unknown = true;
+                continue;
+            }
+            if answered
+                .iter()
+                .any(|s| s.ds.iter().any(|d| d.matches == which) != present)
+            {
+                return Verdict::Disagree;
+            }
+        }
+        if unknown {
+            Verdict::Unknown
+        } else {
+            Verdict::Agree
+        }
     }
 
     /// The longest DS TTL any server returned.
@@ -154,7 +187,7 @@ async fn parent_servers(
     fwd: &ForwardingConfig,
     apex: &Name,
     port: u16,
-) -> anyhow::Result<(Name, Vec<(String, SocketAddr)>)> {
+) -> anyhow::Result<(Name, Vec<(String, SocketAddr)>, Vec<String>)> {
     let mut p = apex.base_name();
     loop {
         let m = recurse(fwd, &p, RecordType::NS).await?;
@@ -169,7 +202,9 @@ async fn parent_servers(
             .collect();
         if m.metadata.response_code == ResponseCode::NoError && !ns.is_empty() {
             let mut out = Vec::new();
+            let mut missing = Vec::new();
             for n in ns {
+                let before = out.len();
                 for t in [RecordType::A, RecordType::AAAA] {
                     let Ok(a) = recurse(fwd, &n, t).await else {
                         continue;
@@ -183,13 +218,16 @@ async fn parent_servers(
                         out.push((n.to_ascii().to_lowercase(), SocketAddr::new(ip, port)));
                     }
                 }
+                if out.len() == before {
+                    missing.push(n.to_ascii().to_lowercase());
+                }
             }
             out.sort();
             out.dedup();
             if out.is_empty() {
                 anyhow::bail!("no address for the name servers of {p}");
             }
-            return Ok((p, out));
+            return Ok((p, out, missing));
         }
         if p.is_root() {
             anyhow::bail!("no parent zone with name servers found for {apex}");
@@ -211,45 +249,69 @@ pub async fn probe(
     if fwd.upstreams.is_empty() {
         anyhow::bail!("no forwarding upstream is configured to find the parent's name servers (Server settings > Forwarding)");
     }
-    let (parent, servers) = parent_servers(fwd, apex, port).await?;
+    let (parent, servers, missing) = parent_servers(fwd, apex, port).await?;
     let q = super::check::query_bytes(apex, RecordType::DS, false, true);
-    let mut out = Vec::new();
-    for (ns, addr) in servers {
-        let mut s = ParentServer {
-            ns,
-            address: addr.to_string(),
-            ds: vec![],
-            ttl: None,
-            error: None,
-        };
-        let r = forward_via(
-            &[addr],
-            fwd.timeout_ms.max(2000),
-            UpstreamStrategy::InOrder,
-            None,
-            &q,
-            Proto::Udp,
-        )
-        .await
-        .and_then(|b| Ok(Message::from_bytes(&b)?));
-        match r {
-            Err(e) => s.error = Some(format!("no answer: {e}")),
-            Ok(m) => match m.metadata.response_code {
-                ResponseCode::NoError | ResponseCode::NXDomain => {
-                    for rr in m.answers.iter().filter(|r| {
-                        u16::from(r.record_type()) == wire::T_DS
-                            && super::check::same_name(&r.name, apex)
-                    }) {
-                        if let Some(ds) = wire::raw_rdata(rr).and_then(wire::parse_ds) {
-                            s.ttl = Some(s.ttl.map_or(rr.ttl, |t| t.max(rr.ttl)));
-                            s.ds.push(classify(apex, ds, new, old));
+    // All addresses at once (a TLD has a dozen name servers, two addresses
+    // each); the answers keep the servers' order.
+    let mut set = tokio::task::JoinSet::new();
+    for (i, (ns, addr)) in servers.into_iter().enumerate() {
+        let (q, apex, new, old) = (q.clone(), apex.clone(), new.clone(), old.cloned());
+        let timeout = fwd.timeout_ms.max(2000);
+        set.spawn(async move {
+            let mut s = ParentServer {
+                ns,
+                address: addr.to_string(),
+                ds: vec![],
+                ttl: None,
+                error: None,
+            };
+            let r = forward_via(
+                &[addr],
+                timeout,
+                UpstreamStrategy::InOrder,
+                None,
+                &q,
+                Proto::Udp,
+            )
+            .await
+            .and_then(|b| Ok(Message::from_bytes(&b)?));
+            match r {
+                Err(e) => s.error = Some(format!("no answer: {e}")),
+                Ok(m) => match m.metadata.response_code {
+                    ResponseCode::NoError | ResponseCode::NXDomain => {
+                        for rr in m.answers.iter().filter(|r| {
+                            u16::from(r.record_type()) == wire::T_DS
+                                && super::check::same_name(&r.name, &apex)
+                        }) {
+                            if let Some(ds) = wire::raw_rdata(rr).and_then(wire::parse_ds) {
+                                s.ttl = Some(s.ttl.map_or(rr.ttl, |t| t.max(rr.ttl)));
+                                s.ds.push(classify(&apex, ds, &new, old.as_ref()));
+                            }
                         }
                     }
-                }
-                rc => s.error = Some(format!("answered {rc}")),
-            },
+                    rc => s.error = Some(format!("answered {rc}")),
+                },
+            }
+            (i, s)
+        });
+    }
+    let mut out: Vec<(usize, ParentServer)> = Vec::new();
+    while let Some(r) = set.join_next().await {
+        if let Ok(v) = r {
+            out.push(v);
         }
-        out.push(s);
+    }
+    out.sort_by_key(|(i, _)| *i);
+    let mut out: Vec<ParentServer> = out.into_iter().map(|(_, s)| s).collect();
+    // A name server without an address cannot confirm anything.
+    for ns in missing {
+        out.push(ParentServer {
+            ns,
+            address: String::new(),
+            ds: vec![],
+            ttl: None,
+            error: Some("no address found for this name server".into()),
+        });
     }
     Ok(ParentProbe {
         parent: parent.to_ascii().to_lowercase(),
@@ -275,6 +337,55 @@ mod tests {
             )),
             public_key: k.public_key,
         }
+    }
+
+    /// Per name server: an unreachable address of a server that answered
+    /// elsewhere is ignored; an unreachable server is "unknown", never
+    /// "agree"; one contrary answer is "disagree".
+    #[test]
+    fn verdict_counts_name_servers_not_addresses() {
+        let srv = |ns: &str, matches: Option<&str>, error: bool| ParentServer {
+            ns: ns.into(),
+            address: "192.0.2.1:53".into(),
+            ds: matches
+                .map(|m| {
+                    vec![SeenDs {
+                        key_tag: 1,
+                        algorithm: 13,
+                        digest_type: 2,
+                        digest: "AA".into(),
+                        matches: m.into(),
+                        differs: vec![],
+                    }]
+                })
+                .unwrap_or_default(),
+            ttl: Some(86400),
+            error: error.then(|| "no answer".to_string()),
+        };
+        let p = |servers| ParentProbe {
+            parent: "net.".into(),
+            servers,
+            checked_at: String::new(),
+        };
+        // a: v4 answers, v6 unreachable; b: answers.
+        let both = p(vec![
+            srv("a", Some("new"), false),
+            srv("a", None, true),
+            srv("b", Some("new"), false),
+        ]);
+        assert_eq!(both.verdict("new", true), Verdict::Agree);
+        assert_eq!(both.verdict("old", false), Verdict::Agree);
+        let one_down = p(vec![srv("a", Some("new"), false), srv("b", None, true)]);
+        assert_eq!(one_down.verdict("new", true), Verdict::Unknown);
+        let stale = p(vec![
+            srv("a", Some("new"), false),
+            srv("b", Some("old"), false),
+        ]);
+        assert_eq!(stale.verdict("new", true), Verdict::Disagree);
+        assert_eq!(stale.verdict("old", false), Verdict::Disagree);
+        let none_yet = p(vec![srv("a", None, false), srv("b", None, true)]);
+        assert_eq!(none_yet.verdict("new", true), Verdict::Disagree);
+        assert_eq!(p(vec![]).verdict("new", true), Verdict::Unknown);
     }
 
     /// A mistyped DS names the field that differs.
