@@ -31,6 +31,15 @@ pub struct InterfaceStatus {
 }
 
 /// Every address of every interface (`getifaddrs`), by interface name.
+/// Unix only: on Windows (O20) there are none, so `[server].interfaces`
+/// binds nothing there (use `[server].bind`).
+#[cfg(not(unix))]
+pub fn interface_addrs() -> BTreeMap<String, BTreeSet<IpAddr>> {
+    BTreeMap::new()
+}
+
+/// Every address of every interface (`getifaddrs`), by interface name.
+#[cfg(unix)]
 pub fn interface_addrs() -> BTreeMap<String, BTreeSet<IpAddr>> {
     let mut out: BTreeMap<String, BTreeSet<IpAddr>> = BTreeMap::new();
     // SAFETY: getifaddrs allocates a list we only read and then free with

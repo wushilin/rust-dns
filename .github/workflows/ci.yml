@@ -57,3 +57,16 @@ jobs:
         env:
           REQUIRE_NGINX_TEST: "1"
           NGINX_BIN: /usr/sbin/nginx
+
+  # O20: the Windows build, and the binary as a Windows service: installed
+  # (--install-service), started and stopped through the service control
+  # manager, answering DNS and the API in between, then removed.
+  windows-service:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build
+      - run: python scripts/smoke-release.py target/debug/rust-dns.exe
+      - run: python scripts/smoke-release.py --windows-service target/debug/rust-dns.exe

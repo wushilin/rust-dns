@@ -5,8 +5,13 @@ name: Release
 # start, API, DNS over UDP and TCP) wherever the runner can execute it.
 #
 #   push a tag vX.Y.Z      -> build, test, publish a GitHub release
-#                             (tags with a '-' such as v1.2.0-rc.1 are pre-releases)
+#                             (tags with a '-' such as v1.2.0-rc.1 are pre-releases),
+#                             push the multi-arch image to ghcr.io/<owner>/rust-dns
 #   run manually           -> build and test only; archives are kept as workflow artifacts
+#
+# Also built and tested from the Linux binaries: Debian packages (.deb,
+# installed and exercised under systemd), a multi-arch container image
+# (linux/amd64 + linux/arm64), and a Homebrew formula (source build).
 on:
   push:
     tags: ["v*"]
@@ -49,8 +54,10 @@ jobs:
         include:
           - arch: x86_64
             target: x86_64-unknown-linux-musl
+            debarch: amd64
           - arch: aarch64
             target: aarch64-unknown-linux-musl
+            debarch: arm64
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -82,11 +89,127 @@ jobs:
           cp -r examples "dist/$name/"
           cp deploy/install.sh "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
+      - name: Debian package (O19)
+        run: |
+          python3 scripts/build-deb.py target/${{ matrix.target }}/release/rust-dns \
+            "${{ needs.version.outputs.version }}" ${{ matrix.debarch }} dist
+          python3 scripts/check-deb.py dist/*.deb ${{ matrix.debarch }}
+          dpkg-deb --info dist/*.deb
+          dpkg-deb --contents dist/*.deb
       - uses: actions/upload-artifact@v4
         with:
           name: linux-${{ matrix.arch }}
-          path: dist/*.tar.gz
+          path: |
+            dist/*.tar.gz
+            dist/*.deb
           if-no-files-found: error
+      # The bare binary for the container image (O18).
+      - name: Binary for the image
+        run: |
+          mkdir -p image
+          cp target/${{ matrix.target }}/release/rust-dns image/rust-dns-linux-${{ matrix.debarch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image-bin-${{ matrix.debarch }}
+          path: image/
+          if-no-files-found: error
+
+  # O19: the amd64 package installed with apt on a systemd runner, its
+  # service started by the package and exercised (API, DNS over UDP and
+  # TCP), then removed. A config written before the install (high ports;
+  # port 53 is taken by systemd-resolved on the runner) is kept.
+  deb-install:
+    needs: [version, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-x86_64
+          path: dist
+      - name: Install, exercise, remove
+        run: |
+          set -e
+          sudo install -d -m 0700 /etc/rust-dns
+          python3 scripts/smoke-release.py --print-smoke-config 5300 8853 /var/lib/rust-dns/smoke.db \
+            | sudo tee /etc/rust-dns/rust-dns.toml >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y ./dist/rust-dns_*_amd64.deb
+          sudo stat -c '%a %U %n' /etc/rust-dns /etc/rust-dns/rust-dns.toml /var/lib/rust-dns
+          systemctl is-enabled rust-dns
+          for i in $(seq 30); do systemctl is-active --quiet rust-dns && break; sleep 1; done
+          systemctl status rust-dns --no-pager
+          python3 scripts/smoke-release.py --attach 8853 5300
+          sudo apt-get remove -y rust-dns
+          if systemctl is-active --quiet rust-dns; then echo "still running after remove"; exit 1; fi
+          test ! -e /usr/bin/rust-dns
+          sudo test -f /etc/rust-dns/rust-dns.toml
+      - name: Service log
+        if: always()
+        run: sudo journalctl -u rust-dns --no-pager | tail -50
+
+  # O18: the multi-arch image from the release binaries. Pushed to GHCR
+  # only for a tag (private repository: the package is private); a manual
+  # run builds both platforms and tests the amd64 image.
+  docker:
+    needs: [version, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: image-bin-*
+          path: dist
+          merge-multiple: true
+      - run: ls -la dist
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@v3
+      - name: Image name
+        id: img
+        run: |
+          echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/rust-dns" >> "$GITHUB_OUTPUT"
+      - name: Test the amd64 image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile.release
+          platforms: linux/amd64
+          load: true
+          tags: rust-dns:test
+      - name: Smoke test the image
+        run: |
+          set -e
+          docker run --rm rust-dns:test --version
+          docker volume create rdns
+          python3 scripts/smoke-release.py --print-smoke-config 5300 8853 /data/smoke.db 0.0.0.0 \
+            | docker run -i --rm -v rdns:/data --entrypoint sh rust-dns:test -c 'cat > /data/rust-dns.toml'
+          docker run -d --name rdns -v rdns:/data -p 127.0.0.1:5300:5300/udp -p 127.0.0.1:5300:5300/tcp \
+            -p 127.0.0.1:8853:8853 rust-dns:test
+          python3 scripts/smoke-release.py --attach 8853 5300
+          docker exec rdns id
+          docker logs rdns | tail -5
+          docker rm -f rdns
+      - uses: docker/login-action@v3
+        if: github.ref_type == 'tag'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build both platforms (push for a tag)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile.release
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.ref_type == 'tag' }}
+          tags: |
+            ${{ steps.img.outputs.name }}:${{ needs.version.outputs.version }}
+            ${{ (github.ref_type == 'tag' && !contains(github.ref_name, '-')) && format('{0}:latest', steps.img.outputs.name) || format('{0}:dev', steps.img.outputs.name) }}
 
   windows:
     needs: version
@@ -116,6 +239,9 @@ jobs:
         # An x64 runner cannot execute arm64 binaries; that build is compiled only.
         if: matrix.arch == 'x86_64'
         run: python scripts/smoke-release.py target/${{ matrix.target }}/release/rust-dns.exe
+      - name: Smoke test as a Windows service (O20)
+        if: matrix.arch == 'x86_64'
+        run: python scripts/smoke-release.py --windows-service target/${{ matrix.target }}/release/rust-dns.exe
       - name: Package
         shell: pwsh
         run: |
@@ -179,15 +305,29 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: [version, linux, windows, freebsd]
+    needs: [version, linux, windows, freebsd, deb-install, docker]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
+          pattern: "{linux,windows,freebsd}-*"
           merge-multiple: true
+      - name: Homebrew formula (O19)
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          url="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz"
+          curl -fsSL -H "Authorization: token ${GH_TOKEN}" -o src.tar.gz "$url"
+          sha=$(sha256sum src.tar.gz | cut -d' ' -f1)
+          python3 scripts/homebrew-formula.py "${{ needs.version.outputs.version }}" "${GITHUB_REF_NAME}" "$sha" "${GITHUB_REPOSITORY}" > dist/rust-dns.rb
+          ruby -c dist/rust-dns.rb
+          rm src.tar.gz
       - name: Checksums
         run: |
           cd dist

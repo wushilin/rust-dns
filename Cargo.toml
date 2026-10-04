@@ -53,6 +53,10 @@ ring = "0.17"
 ureq = { version = "2", features = ["json", "cookies"] }
 jsonschema = { version = "0.58", default-features = false }
 
+# O20: run as a Windows service (pure Rust, over windows-sys).
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"
+
 [profile.release]
 lto = true
 codegen-units = 1

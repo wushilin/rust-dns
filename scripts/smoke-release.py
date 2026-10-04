@@ -2,6 +2,18 @@
 """Smoke-test a release binary on the platform it was built for.
 
 Usage: smoke-release.py <path-to-rust-dns-binary>
+       smoke-release.py --windows-service <path-to-rust-dns.exe>
+       smoke-release.py --attach <web-port> <dns-port>
+
+The second form (Windows, elevated; O20) does the same with the binary
+installed as the Windows service `rust-dns` (--install-service), started
+and stopped through the service control manager (sc.exe), then removed.
+The third form exercises a server that is already running on 127.0.0.1
+with the root password of `--print-smoke-config` (the .deb and container
+checks of the release workflow: O18, O19).
+
+    smoke-release.py --print-smoke-config <dns-port> <web-port> <db-path> [bind]
+prints that configuration.
 
 Starts the binary with a throwaway config on free loopback ports, signs in,
 creates a zone and an A record through the API, then resolves the record over
@@ -112,14 +124,10 @@ def dns_tcp(port, name):
     return a_answers(buf[2:], qid)
 
 
-def main():
-    if len(sys.argv) != 2:
-        raise SystemExit(__doc__)
-    binary = os.path.abspath(sys.argv[1])
-    work = tempfile.mkdtemp(prefix="rust-dns-smoke-")
-    dns, web = free_dns_port(), free_port(socket.SOCK_STREAM)
+def write_config(work, dns, web):
     cfg = os.path.join(work, "rust-dns.toml")
     db = os.path.join(work, "smoke.db").replace("\\", "/")
+    log = os.path.join(work, "rust-dns.log").replace("\\", "/")
     with open(cfg, "w") as f:
         f.write(f"""[server]
 bind = ["127.0.0.1"]
@@ -137,56 +145,172 @@ username = "root"
 password = "{PASSWORD}"
 [logging]
 level = "warn"
+file = "{log}"
 """)
+    return cfg
+
+
+def exercise(web, dns, alive):
+    """Health, sign-in, a zone and a record through the API, then the
+    record over UDP and TCP. `alive()` raises when the server is gone."""
+    base = f"http://127.0.0.1:{web}/api"
+    jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+
+    def call(method, path, body=None):
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(base + path, data=data, method=method)
+        req.add_header("X-Requested-With", "rust-dns")
+        for c in jar:
+            if c.name in ("rdns_csrf", "__Host-rdns_csrf"):
+                req.add_header("X-CSRF-Token", c.value)
+        if data is not None:
+            req.add_header("Content-Type", "application/json")
+        with opener.open(req, timeout=10) as r:
+            return r.status, json.loads(r.read() or b"null")
+
+    deadline = time.time() + 30
+    while True:
+        alive()
+        try:
+            call("GET", "/health")
+            break
+        except OSError:
+            if time.time() > deadline:
+                raise AssertionError("server did not become healthy within 30s")
+            time.sleep(0.2)
+    print("health: ok")
+
+    call("POST", "/auth/login", {"username": "root", "password": PASSWORD})
+    status, _ = call("POST", "/zones", {"name": ZONE})
+    assert status == 201, f"create zone: {status}"
+    status, _ = call("POST", f"/zones/{ZONE}/records", {"name": "www", "type": "A", "value": ADDR})
+    assert status == 201, f"create record: {status}"
+    print("api: zone and record created")
+
+    name = f"www.{ZONE}"
+    for proto, fn in (("udp", dns_udp), ("tcp", dns_tcp)):
+        got = fn(dns, name)
+        assert got == [ADDR], f"{proto}: {name} A -> {got}"
+        print(f"dns {proto}: {name} A {ADDR}")
+
+
+def sc_state(name="rust-dns"):
+    """STATE of a service from `sc query` (RUNNING, STOPPED, ...), or None
+    when it does not exist."""
+    r = subprocess.run(["sc.exe", "query", name], capture_output=True, text=True)
+    for line in r.stdout.splitlines():
+        if "STATE" in line:
+            return line.split()[-1]
+    return None
+
+
+def wait_state(want, secs=30):
+    deadline = time.time() + secs
+    while sc_state() != want:
+        if time.time() > deadline:
+            raise AssertionError(f"service did not reach {want} (now {sc_state()})")
+        time.sleep(0.5)
+
+
+def windows_service(binary, work, dns, web):
+    """O20: install, start, use, stop and remove the Windows service."""
+    cfg = write_config(work, dns, web)
+    if sc_state() is not None:
+        raise AssertionError("a service named rust-dns already exists")
+    subprocess.run([binary, "--install-service", "--config", cfg], check=True)
+    try:
+        subprocess.run(["sc.exe", "start", "rust-dns"], check=True, capture_output=True)
+        wait_state("RUNNING")
+        print("service: running")
+
+        def alive():
+            if sc_state() != "RUNNING":
+                raise AssertionError(f"service state {sc_state()}")
+
+        exercise(web, dns, alive)
+        subprocess.run(["sc.exe", "stop", "rust-dns"], check=True, capture_output=True)
+        wait_state("STOPPED")
+        print("service: stopped through the service control manager")
+        for proto, fn in (("udp", dns_udp), ("tcp", dns_tcp)):
+            try:
+                fn(dns, f"www.{ZONE}")
+            except OSError:
+                continue
+            raise AssertionError(f"dns {proto} still answers after the stop")
+        print("service: no longer answers")
+    finally:
+        subprocess.run([binary, "--uninstall-service"], check=False)
+        if os.path.exists(os.path.join(work, "rust-dns.log")):
+            print(open(os.path.join(work, "rust-dns.log"), errors="replace").read()[-2000:])
+    deadline = time.time() + 30
+    while sc_state() is not None:
+        if time.time() > deadline:
+            raise AssertionError("service was not removed")
+        time.sleep(0.5)
+    print("service: removed")
+    print("smoke test passed")
+
+
+def smoke_config(dns, web, db, bind="127.0.0.1"):
+    return f"""[server]
+bind = ["{bind}"]
+port = {dns}
+[forwarding]
+upstreams = []
+[database]
+path = "{db}"
+[backup]
+dir = ""
+[web_console]
+bind = "{bind}:{web}"
+[root]
+username = "root"
+password = "{PASSWORD}"
+[logging]
+level = "info"
+"""
+
+
+def main():
+    args = sys.argv[1:]
+    if args and args[0] == "--print-smoke-config":
+        sys.stdout.write(smoke_config(*args[1:]))
+        return
+    if args and args[0] == "--attach":
+        if len(args) != 3:
+            raise SystemExit(__doc__)
+        exercise(int(args[1]), int(args[2]), lambda: None)
+        print("smoke test passed")
+        return
+    service = bool(args) and args[0] == "--windows-service"
+    if service:
+        args = args[1:]
+    if len(args) != 1:
+        raise SystemExit(__doc__)
+    binary = os.path.abspath(args[0])
+    work = tempfile.mkdtemp(prefix="rust-dns-smoke-")
+    dns, web = free_dns_port(), free_port(socket.SOCK_STREAM)
 
     version = subprocess.run([binary, "--version"], capture_output=True, text=True, check=True).stdout.strip()
     print(f"version: {version}")
+    if service:
+        try:
+            windows_service(binary, work, dns, web)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+        return
+    cfg = write_config(work, dns, web)
     subprocess.run([binary, "--check", "--config", cfg], check=True)
     print("config check: ok")
 
     proc = subprocess.Popen([binary, "--config", cfg], cwd=work)
     try:
-        base = f"http://127.0.0.1:{web}/api"
-        jar = http.cookiejar.CookieJar()
-        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
-
-        def call(method, path, body=None):
-            data = json.dumps(body).encode() if body is not None else None
-            req = urllib.request.Request(base + path, data=data, method=method)
-            req.add_header("X-Requested-With", "rust-dns")
-            for c in jar:
-                if c.name in ("rdns_csrf", "__Host-rdns_csrf"):
-                    req.add_header("X-CSRF-Token", c.value)
-            if data is not None:
-                req.add_header("Content-Type", "application/json")
-            with opener.open(req, timeout=10) as r:
-                return r.status, json.loads(r.read() or b"null")
-
-        deadline = time.time() + 30
-        while True:
+        def alive():
             if proc.poll() is not None:
                 raise AssertionError(f"server exited with {proc.returncode}")
-            try:
-                call("GET", "/health")
-                break
-            except OSError:
-                if time.time() > deadline:
-                    raise AssertionError("server did not become healthy within 30s")
-                time.sleep(0.2)
-        print("health: ok")
 
-        call("POST", "/auth/login", {"username": "root", "password": PASSWORD})
-        status, _ = call("POST", "/zones", {"name": ZONE})
-        assert status == 201, f"create zone: {status}"
-        status, _ = call("POST", f"/zones/{ZONE}/records", {"name": "www", "type": "A", "value": ADDR})
-        assert status == 201, f"create record: {status}"
-        print("api: zone and record created")
-
-        name = f"www.{ZONE}"
-        for proto, fn in (("udp", dns_udp), ("tcp", dns_tcp)):
-            got = fn(dns, name)
-            assert got == [ADDR], f"{proto}: {name} A -> {got}"
-            print(f"dns {proto}: {name} A {ADDR}")
+        exercise(web, dns, alive)
         print("smoke test passed")
     finally:
         proc.terminate()

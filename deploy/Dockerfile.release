@@ -1,0 +1,24 @@
+# Release image (O18): the static musl binaries the release workflow built
+# (dist/rust-dns-linux-amd64, dist/rust-dns-linux-arm64), one per platform
+# of a multi-arch build:
+#   docker buildx build --platform linux/amd64,linux/arm64 -f deploy/Dockerfile.release .
+# Same runtime layout as deploy/Dockerfile (which builds from source).
+FROM debian:bookworm-slim
+ARG TARGETARCH
+LABEL org.opencontainers.image.source="https://github.com/wushilin/rust-dns" \
+      org.opencontainers.image.description="SQLite-backed authoritative DNS server with a realtime web console" \
+      org.opencontainers.image.licenses="Apache-2.0"
+# CA certificates are required: the HTTPS client (standby replication,
+# blocklist downloads) loads the system trust store at start, and the
+# server does not start without one.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd -r -u 10001 rust-dns \
+ && mkdir -p /data && chown rust-dns /data
+COPY --chmod=0755 dist/rust-dns-linux-${TARGETARCH} /usr/local/bin/rust-dns
+USER rust-dns
+WORKDIR /data
+VOLUME /data
+EXPOSE 53/udp 53/tcp 8053/tcp
+ENTRYPOINT ["rust-dns", "--config", "/data/rust-dns.toml"]

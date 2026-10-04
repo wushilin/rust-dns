@@ -872,13 +872,16 @@ Group 3: operations
   snapshot, run the contract test).
 
 Group 4: packaging
-- [ ] O18. Multi-arch Docker image (linux/amd64, linux/arm64) built and
+- [x] O18. Multi-arch Docker image (linux/amd64, linux/arm64) built and
   published to GHCR from the release workflow (private repo: private image).
-- [ ] O19. Debian package (.deb from the release workflow, systemd unit,
+  (Validated locally with podman; first CI proof: see the Log.)
+- [x] O19. Debian package (.deb from the release workflow, systemd unit,
   user, config in /etc) and a Homebrew formula (tap in this repo or a
-  generated formula file).
-- [ ] O20. Windows service wrapper (windows-service crate if pure Rust),
+  generated formula file). (Validated locally in a Debian container and
+  with `brew style`; first CI proof: see the Log.)
+- [x] O20. Windows service wrapper (windows-service crate if pure Rust),
   tested on the Windows CI runner (install, start, answer a query, stop).
+  (Cross-compiled here; the runner test runs in CI only: see the Log.)
 
 Group 5: replication extras
 - [ ] O21. Cascading standbys (a standby may serve replication to another
@@ -1068,6 +1071,18 @@ Final
   (the old binary would serve the zone with the server's transfer ACL and
   NOTIFY targets). Zone clones and the JSON export/import do not carry
   them (they need `server_admin`). O14 is CI-only (no runtime change).
+
+- After phase O, group 4 (this session; not deployed): no replication,
+  data or config change. Packaging only: `deploy/Dockerfile.release`,
+  `scripts/build-deb.py` / `check-deb.py`, `scripts/homebrew-formula.py`,
+  release workflow jobs `deb-install` and `docker` (pushes
+  `ghcr.io/<owner>/rust-dns` on a tag only), CI job `windows-service`.
+  Binary: `main` builds the runtime itself (same behaviour on Unix; a new
+  internal stop signal only the Windows service uses); Windows-only flags
+  `--install-service`, `--uninstall-service`; `[server].interfaces` is
+  Unix-only (it did not compile for Windows since I11: the release
+  workflow's Windows build was broken until this fix). gate and baba2 are
+  unaffected (Linux, same code paths).
 
 ## Log
 
@@ -1944,3 +1959,39 @@ Final
   0.3 build with one change but the spec is not equivalent (unsatisfiable
   `allOf` for the three enum query parameters with a default). Tried in a
   scratch copy; nothing of it is committed.
+- 2026-10-04 (phase O): O18-O20 done as far as this machine can go; the
+  release workflow and the new CI job cannot run without a push (none
+  made). O18: `deploy/Dockerfile.release` (debian:bookworm-slim, the
+  static binary per `TARGETARCH`, user 10001, /data). Here: both images
+  built with podman from musl cross-builds of this tree (arm64 natively,
+  amd64 under emulation) and each run with a config volume and published
+  ports: `smoke-release.py --attach` passed (API, zone, record, DNS over
+  UDP and TCP), running as uid 10001. Release workflow: job `docker`
+  (amd64 image loaded and smoke-tested, then both platforms built; pushed
+  to `ghcr.io/<owner>/rust-dns:<version>` and `:latest` only for a tag).
+  O19: `scripts/build-deb.py` (stdlib only), `scripts/check-deb.py`. Here:
+  the arm64 .deb installed with apt in debian:bookworm (dependencies
+  resolved, user and 0700 dirs created, config generated and checked,
+  reinstall keeps the config, remove deletes the binary, purge keeps
+  config and data). Found there: without ca-certificates the server does
+  not start (the HTTPS client loads the system trust store), so the
+  package depends on it and the image installs it. Homebrew:
+  `scripts/homebrew-formula.py` (source build; Homebrew only installs from
+  a tap, documented with a local tap; the private repository needs
+  `HOMEBREW_GITHUB_API_TOKEN`); `ruby -c` and `brew style` clean in a
+  temporary local tap (removed again; `brew audit` crashed inside
+  Homebrew). O20: `src/winsvc.rs` (`windows-service` 0.8.1, pure Rust over
+  windows-sys; cargo-audit still only `paste`): `--install-service`,
+  `--uninstall-service`, `--windows-service` (SCM), stop = Ctrl-C path.
+  Here: `cargo zigbuild --target x86_64-pc-windows-gnu` builds and links,
+  no warnings; doing so found that HEAD did not compile for Windows at all
+  since I11 (`getifaddrs`): fixed (`[server].interfaces` Unix-only).
+  Tests: `scripts/smoke-release.py --windows-service` (install, start
+  through the SCM, API and DNS over UDP and TCP, stop, no longer
+  answering, uninstall), `--attach`, `--print-smoke-config`. Still to be
+  proven by the first CI runs: CI `windows-service` (msvc build, the
+  service test as admin), CI `nginx-proxy` (O14), release `linux` (.deb
+  build + dpkg-deb), `deb-install` (apt install under systemd, service up,
+  smoke, remove), `docker` (buildx multi-arch, amd64 smoke, GHCR push and
+  private visibility on a tag), `windows` (service smoke, x86_64),
+  `release` (formula: archive download with the token, sha256, `ruby -c`).

@@ -15,6 +15,8 @@ mod reload;
 mod replication;
 mod storage;
 mod ui;
+#[cfg(windows)]
+mod winsvc;
 mod zones;
 
 use clap::Parser;
@@ -59,11 +61,53 @@ struct Cli {
     /// Confirm --prepare-standby.
     #[arg(long)]
     yes: bool,
+    /// Windows: register rust-dns as a service (name `rust-dns`, started
+    /// automatically, LocalSystem) that runs with this --config, then exit.
+    /// Needs an elevated prompt.
+    #[cfg(windows)]
+    #[arg(long)]
+    install_service: bool,
+    /// Windows: stop and remove the `rust-dns` service, then exit.
+    #[cfg(windows)]
+    #[arg(long)]
+    uninstall_service: bool,
+    /// Windows: run under the service control manager (set by
+    /// --install-service; not for interactive use).
+    #[cfg(windows)]
+    #[arg(long, hide = true)]
+    windows_service: bool,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// O20: a request to stop from outside the console (the Windows service
+/// control manager); the server shuts down as on Ctrl-C.
+static SHUTDOWN: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    #[cfg(windows)]
+    {
+        if cli.install_service {
+            return winsvc::install(&cli.config);
+        }
+        if cli.uninstall_service {
+            return winsvc::uninstall();
+        }
+        if cli.windows_service {
+            return winsvc::run_dispatcher();
+        }
+    }
+    run(cli)
+}
+
+/// Build the runtime and run the server (or the one-shot command) to the end.
+fn run(cli: Cli) -> anyhow::Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main(cli))
+}
+
+async fn async_main(cli: Cli) -> anyhow::Result<()> {
     // Everything this process creates (database, WAL, backups, logs, config)
     // is private to the service user.
     #[cfg(unix)]
@@ -372,6 +416,7 @@ async fn main() -> anyhow::Result<()> {
         r = dns_task => { r??; }
         r = web_task => { r??; }
         _ = tokio::signal::ctrl_c() => { tracing::info!("shutting down"); bus.shutdown(); }
+        _ = SHUTDOWN.notified() => { tracing::info!("stop requested; shutting down"); bus.shutdown(); }
     }
     Ok(())
 }
