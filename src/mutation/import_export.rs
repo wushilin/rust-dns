@@ -291,6 +291,7 @@ impl Mutator {
                         upstreams: Some(o.upstreams.iter().map(|u| u.to_string()).collect()),
                     }),
                     record_policy: None,
+                    secondary: None,
                 };
                 let zone = match t.zone(&name)? {
                     Some(before) => {

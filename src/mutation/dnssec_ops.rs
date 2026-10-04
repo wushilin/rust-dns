@@ -105,6 +105,11 @@ impl Mutator {
                         "an override zone is not authoritative and is never DNSSEC-signed".into(),
                     ));
                 }
+                if z.is_secondary() {
+                    return Err(MutationError::Conflict(
+                        "a secondary zone is never signed here: its primary signs it, and its signatures are served as transferred".into(),
+                    ));
+                }
                 if new_key && z.dnssec {
                     return Err(MutationError::Conflict(
                         "the key cannot be replaced while signing is on: remove the DS at the registrar, wait for its TTL, turn signing off, then turn it on with a new key".into(),

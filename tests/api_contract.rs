@@ -2140,6 +2140,27 @@ fn live_api_matches_spec() {
         &ex,
     );
     c.expect("zone settings with the spec example", &r, 200);
+    // O27: a secondary zone (its primary does not answer: state pending).
+    let r = c.call(
+        Auth::Session(&root),
+        "post",
+        "/zones",
+        &[],
+        "",
+        Body::Json(
+            &json!({ "name": "sec.example.com", "secondary": { "primaries": ["127.0.0.1:9"] } }),
+        ),
+    );
+    c.expect("create a secondary zone", &r, 201);
+    let r = c.call(
+        Auth::Session(&root),
+        "get",
+        "/zones/{zone}/secondary",
+        &[("zone", "sec.example.com".to_string())],
+        "",
+        Body::None,
+    );
+    c.expect("secondary zone status", &r, 200);
 
     // ---- logout --------------------------------------------------------------
     let r = c.call(

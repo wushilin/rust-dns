@@ -93,6 +93,8 @@ pub const TABLES: &[Table] = &[
         // `zone-settings` before a zone gets settings (the primary refuses).
         // `nsec3` (O24) likewise (`nsec3` in the zone row JSON only when
         // on); a standby must have the feature `nsec3` first.
+        // `secondary_spec` (O27) likewise (`secondary` in the zone row JSON
+        // only for a secondary zone); feature `secondary-zones` first.
         compat_columns: &[
             "dnssec",
             "signed_at",
@@ -100,6 +102,7 @@ pub const TABLES: &[Table] = &[
             "record_policy",
             "zone_settings",
             "nsec3",
+            "secondary_spec",
         ],
         ..replicated("zones", "id", ("zone", "zones"))
     },
@@ -179,6 +182,10 @@ pub const TABLES: &[Table] = &[
     // against it (like sessions). Bookkeeping in storage.rs, not audited:
     // the failures themselves are (O4).
     local("login_failures"),
+    // O27: the transferred data of secondary zones. Every server is a
+    // secondary of the zone's primaries itself (as BIND secondaries are);
+    // the zone definition replicates, its content does not.
+    local("secondary_transfers"),
     // SQLite's AUTOINCREMENT counters.
     local("sqlite_sequence"),
 ];

@@ -338,6 +338,9 @@ pub struct Signer {
     errors: Mutex<HashMap<i64, String>>,
     /// Signatures computed since start (not the reused ones).
     signatures_made: std::sync::atomic::AtomicU64,
+    /// O27: the transferred data of secondary zones, an input of every
+    /// catalog build next to storage (each server transfers it itself).
+    pub secondaries: Arc<crate::secondary::Store>,
 }
 
 impl Default for Signer {
@@ -347,6 +350,7 @@ impl Default for Signer {
             cache: Mutex::new(HashMap::new()),
             errors: Mutex::new(HashMap::new()),
             signatures_made: Default::default(),
+            secondaries: Default::default(),
         }
     }
 }

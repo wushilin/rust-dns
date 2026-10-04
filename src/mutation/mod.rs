@@ -216,6 +216,21 @@ impl Mutator {
         self.expiry_wake.notify_one();
     }
 
+    /// O27: rebuild the catalog entries of `ids` (a secondary zone's data
+    /// changed or expired; nothing in storage did). Under the mutator lock,
+    /// as after a commit.
+    pub async fn rebuild_zones(&self, ids: Vec<i64>) -> Result<()> {
+        let _guard = self.lock.lock().await;
+        let (storage, signer, cache) = (
+            self.storage.clone(),
+            self.signer.clone(),
+            self.cache.clone(),
+        );
+        tokio::task::spawn_blocking(move || update_catalog(&storage, &signer, &cache, &ids))
+            .await
+            .map_err(|e| anyhow::anyhow!("catalog update: {e}"))?
+    }
+
     /// Rebuild the catalog from storage (used at startup).
     pub fn rebuild(&self) -> Result<()> {
         rebuild_catalog(&self.storage, &self.signer, &self.cache)

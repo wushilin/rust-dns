@@ -37,6 +37,19 @@ pub fn ed25519_signed_zones(c: &Connection) -> Result<Vec<String>> {
     Ok(names)
 }
 
+/// O27: secondary zones, by name. A standby that does not advertise
+/// `secondary-zones` would store such a zone as an empty zone of its own
+/// and answer for it wrongly: the replication endpoints refuse it while one
+/// exists.
+pub fn secondary_zones(c: &Connection) -> Result<Vec<String>> {
+    let mut st =
+        c.prepare("SELECT name FROM zones WHERE secondary_spec IS NOT NULL ORDER BY name")?;
+    let names = st
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(names)
+}
+
 /// The next offset that will be assigned minus one (0 for a fresh log).
 pub fn changelog_head(c: &Connection) -> Result<i64> {
     Ok(c.query_row(

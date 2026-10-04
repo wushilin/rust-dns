@@ -67,6 +67,9 @@ impl DnsServer {
     /// `request`: only standard queries (NOTIMP otherwise) with exactly one
     /// question (FORMERR otherwise).
     pub(super) fn filter_request(&self, q: &mut QueryCtx<'_>) -> Step {
+        if q.request.metadata.op_code == OpCode::Notify {
+            return self.notify_in(q);
+        }
         if q.request.metadata.op_code != OpCode::Query {
             return q.reply(ResponseCode::NotImp, "error");
         }
@@ -74,6 +77,44 @@ impl DnsServer {
             return q.reply(ResponseCode::FormErr, "error");
         }
         Step::Next
+    }
+
+    /// O27: an inbound NOTIFY (RFC 1996) for a secondary zone: accepted
+    /// when signed with the zone's TSIG key or sent from one of its
+    /// primaries' addresses; the zone is refreshed at once. REFUSED for a
+    /// zone that is not a secondary zone here, or from anyone else.
+    fn notify_in(&self, q: &mut QueryCtx<'_>) -> Step {
+        let Some(question) = q.request.queries.first().cloned() else {
+            return q.reply(ResponseCode::FormErr, "error");
+        };
+        let fqdn = question.name().to_lowercase().to_ascii();
+        let cat = self.cache.load();
+        let found = cat
+            .zones
+            .get(&fqdn)
+            .and_then(|z| Some((z.zone.name.clone(), z.zone.secondary.as_deref()?.clone())));
+        let client = q.meta.client.ip();
+        let Some((zone, spec)) = found else {
+            tracing::debug!(%client, zone = %fqdn, "NOTIFY for a zone that is not a secondary zone here: refused");
+            return q.reply(ResponseCode::Refused, "refused");
+        };
+        let by_key = match (q.signed_by, &spec.key) {
+            (Some(b), Some(k)) => b.entry.key.name.eq_ignore_ascii_case(k),
+            _ => false,
+        };
+        let from_primary = spec.primaries.iter().any(|p| p.ip() == client);
+        if !by_key && !from_primary {
+            tracing::warn!(%client, zone = %zone, "NOTIFY from an address that is not a primary of the zone (and not signed with its key): refused");
+            return q.reply(ResponseCode::Refused, "refused");
+        }
+        tracing::info!(%client, zone = %zone, signed = by_key, "NOTIFY accepted; refreshing the secondary zone");
+        if let Some(st) = self.secondaries.get() {
+            st.notified(&zone);
+        }
+        let mut m = q.take_resp();
+        m.metadata.authoritative = true;
+        m.add_query(question);
+        Step::Answer(Response::Message(m, "authoritative"))
     }
 
     /// `special`: the CHAOS class answers only `version.bind` /
@@ -129,7 +170,11 @@ impl DnsServer {
         let catalog = self.cache.load();
         let key = crate::zones::key_of(&qname);
         // Override zones are never transferred (not authoritative).
-        let zone = catalog.zones.get(&key).filter(|z| !z.zone.is_override());
+        // O27: a secondary zone without usable data is not transferred on.
+        let zone = catalog
+            .zones
+            .get(&key)
+            .filter(|z| !z.zone.is_override() && !z.unavailable);
         let signed_by = q.signed_by;
         let key_name = signed_by.map(|b| b.entry.key.name.as_str());
         // O16: a zone's own transfer ACL and TSIG requirement replace the

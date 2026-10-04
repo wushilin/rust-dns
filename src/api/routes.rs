@@ -582,6 +582,16 @@ pub async fn create_zone(
     Json(input): Json<ZoneInput>,
 ) -> ApiResult<(StatusCode, Json<ZoneView>)> {
     s.require(&caller, GlobalPerm::CreateZones)?;
+    if let Some(sec) = &input.secondary {
+        check_secondary_key(&s, input.name.as_deref().unwrap_or(""), sec)?;
+        let blocked = standbys_without(&s, "secondary-zones");
+        if !blocked.is_empty() {
+            return Err(ApiError::conflict(format!(
+                "standbys of an older version follow this server and could not serve a secondary zone (they would serve it as an empty zone of their own): {}. Upgrade them first (or forget a standby that no longer follows, on the Replication page)",
+                blocked.join(", ")
+            )));
+        }
+    }
     let owner_id = match &input.owner {
         Some(name) if !name.is_empty() => Some(
             s.storage
@@ -599,6 +609,60 @@ pub async fn create_zone(
         StatusCode::CREATED,
         Json(zone_view(&s, &z, ZoneRole::Owner, 0)),
     ))
+}
+
+/// O27: a secondary zone's TSIG key must exist and be allowed for it.
+fn check_secondary_key(
+    s: &AppState,
+    zone: &str,
+    sec: &crate::model::ZoneSecondaryInput,
+) -> ApiResult<()> {
+    let Some(k) = sec.key.as_deref().map(str::trim).filter(|k| !k.is_empty()) else {
+        return Ok(());
+    };
+    let name = crate::mutation::tsig::normalize_key_name(k)
+        .map_err(|e| ApiError::bad_request(format!("secondary key: {}", e.0)))?;
+    let zone = zone.trim().trim_end_matches('.').to_ascii_lowercase();
+    match s.dns.tsig_keys.load().get(&name) {
+        None => Err(ApiError::bad_request(format!(
+            "secondary key: TSIG key '{name}' does not exist (create it under TSIG keys with the primary's secret)"
+        ))),
+        Some(e) if !e.allows_zone(&zone) => Err(ApiError::bad_request(format!(
+            "secondary key: TSIG key '{name}' is not allowed for zone {zone}"
+        ))),
+        Some(_) => Ok(()),
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/zones/{zone}/secondary",
+    tag = "Zones",
+    operation_id = "get_secondary_status",
+    summary = "Transfer status of a secondary zone on this server",
+    description = "O27. Every server transfers a secondary zone from its primaries itself, so this is this server's view: the serial served, the last transfer (AXFR or IXFR) and refresh, the last error, when the data expires (then the zone is answered SERVFAIL), NOTIFYs accepted, whether the primary signed the zone, and record types it sends that this server does not serve. 404 for a zone that is not a secondary zone. Needs view rights on the zone.",
+    params(ZonePath),
+    responses(
+        (status = 200, description = "Status.", body = crate::secondary::SecondaryStatus),
+        (status = 400, response = BadRequest),
+        (status = 401, response = Unauthorized),
+        (status = 403, response = Forbidden),
+        (status = 404, response = NotFound),
+    ),
+)]
+pub async fn get_secondary_status(
+    State(s): St,
+    caller: Caller,
+    Path(ZonePath { zone }): Path<ZonePath>,
+) -> ApiResult<Json<crate::secondary::SecondaryStatus>> {
+    let (z, _) = s.require_zone(&caller, &zone, ZonePerm::View)?;
+    if !z.is_secondary() {
+        return Err(ApiError::not_found(format!(
+            "'{}' is not a secondary zone",
+            z.name
+        )));
+    }
+    Ok(Json(s.mutator.signer().secondaries.status(&z.name)))
 }
 
 /// O11: the new name of a zone (rename) or of the copy (clone).
@@ -854,6 +918,9 @@ pub async fn update_zone(
     Json(input): Json<ZoneInput>,
 ) -> ApiResult<Json<ZoneView>> {
     let (z, _) = s.require_zone(&caller, &zone, ZonePerm::EditSettings)?;
+    if let Some(sec) = &input.secondary {
+        check_secondary_key(&s, &z.name, sec)?;
+    }
     let new_owner = match &input.owner {
         Some(name) => {
             s.require(&caller, GlobalPerm::TransferOwnership)

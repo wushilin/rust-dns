@@ -318,6 +318,9 @@ pub struct DnsServer {
     pub rebind_log: filters::RebindLog,
     /// Followed interfaces and their bound addresses (I11).
     pub interfaces: ifaces::Follower,
+    /// O27: secondary zones (set at startup): an accepted NOTIFY wakes
+    /// the zone's refresh.
+    pub secondaries: std::sync::OnceLock<Arc<crate::secondary::Store>>,
 }
 
 /// What the handler wants sent back.
@@ -370,6 +373,7 @@ impl DnsServer {
             blocklists: Arc::new(crate::blocklist::Blocklists::default()),
             rebind_log: filters::RebindLog::default(),
             interfaces: ifaces::Follower::default(),
+            secondaries: std::sync::OnceLock::new(),
         }
     }
 

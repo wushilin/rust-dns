@@ -726,10 +726,17 @@ function rightsIndex(r) {
   for (const p of r.zone_permissions || []) legend[p.perm] = p;
   return { global, zones, legend };
 }
-// ctl: { safe, perm, zone, block }; ctx: { rights (rightsIndex or null), ro }.
+// ctl: { safe, perm, zone, block }; ctx: { rights (rightsIndex or null), ro,
+// secondary (O27: { zone name: primaries text } of secondary zones) }.
 // Returns { ok, reason }.
+const SECONDARY_READ_ONLY = ['edit_records', 'edit_settings', 'import'];
+const secondaryReason = (zone, primaries) => `Secondary zone: ${zone}'s records, SOA and signatures are transferred from its primary${primaries ? ` (${primaries})` : ''}; read-only here`;
 function decide(ctl, ctx) {
   const rt = ctx.rights;
+  const sec = ctx.secondary || {};
+  if (ctl.perm && ctl.zone && ctl.zone !== '*' && ctl.zone in sec && SECONDARY_READ_ONLY.includes(ctl.perm)) {
+    return { ok: false, reason: secondaryReason(ctl.zone, sec[ctl.zone]) };
+  }
   if (ctl.perm) {
     if (!rt) return { ok: false, reason: 'Checking your permissions…' };
     const g = rt.global[ctl.perm], zp = rt.legend[ctl.perm];
@@ -758,7 +765,10 @@ const describeCtl = el => ({ safe: el.matches(SAFE_SEL), perm: el.dataset.perm |
 const ctlAttrs = from => !from ? '' : ['perm', 'zone', 'block'].filter(k => from.dataset[k] != null).map(k => ` data-${k}="${esc(from.dataset[k])}"`).join('') + (from.matches(SAFE_SEL) ? ' data-ro-ok' : '');
 const blockAttr = why => why ? ` data-block="${esc(why)}"` : '';
 function accessCtx() {
-  return { rights: S.rights || null, ro: S.readOnly ? { primary: (S.repl && S.repl.primary) || '', allow: (S.repl && S.repl.standby_writable) || [] } : null };
+  const secondary = {};
+  for (const z of S.zones || []) if (z.secondary) secondary[z.name] = (z.secondary.primaries || []).join(', ');
+  if (S.zone && S.zone.secondary) secondary[S.zone.name] = (S.zone.secondary.primaries || []).join(', ');
+  return { rights: S.rights || null, ro: S.readOnly ? { primary: (S.repl && S.repl.primary) || '', allow: (S.repl && S.repl.standby_writable) || [] } : null, secondary };
 }
 function applyAccess() {
   const ctx = accessCtx();
@@ -1040,15 +1050,20 @@ function newZoneModal() {
     <div class="field"><label>Zone name</label><input type="text" name="name" placeholder="example.com  ·  0.0.10.in-addr.arpa  ·  ."></div>
     <div class="field"><label>Type</label><select id="nz-type">
       <option value="auth">Authoritative (this server is the source of truth for the zone)</option>
-      <option value="override">Override (local names for clients that use forwarding; everything else forwarded)</option></select></div>
+      <option value="override">Override (local names for clients that use forwarding; everything else forwarded)</option>
+      <option value="secondary">Secondary (transferred from a primary server elsewhere; read-only here)</option></select></div>
     <div id="nz-ov" class="hidden">${overrideFields({ mode: 'transparent', upstreams: [] })}</div>
-    <p class="hint">Leave the SOA fields empty to use the server defaults.</p>
-    ${zoneForm({ soa_mname: '', soa_rname: '' })}
+    <div id="nz-sec" class="hidden"><div class="note">${ico('info', 's')}<span>Every server of this installation (standbys too) transfers the zone itself (AXFR / IXFR) and refreshes it by its SOA timers and on NOTIFY: allow transfers to all of them on the primary. Records, SOA and DNSSEC signatures come from the primary.</span></div>
+      <div class="field"><label>Primaries</label><input type="text" id="nz-sec-p" placeholder="192.0.2.53, [2001:db8::53]:53"></div>
+      <div class="field"><label>TSIG key <span class="hint">(optional; create it under TSIG keys first)</span></label><input type="text" id="nz-sec-k" placeholder="xfr-key."></div></div>
+    <div id="nz-soa"><p class="hint">Leave the SOA fields empty to use the server defaults.</p>
+    ${zoneForm({ soa_mname: '', soa_rname: '' })}</div>
     <div class="error" id="m-err"></div>
     <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="m-ok" data-perm="create_zones">Create</button></div>`, m => {
     m.querySelectorAll('[name=default_ttl],[name=minimum],[name=refresh],[name=retry],[name=expire]').forEach(i => i.value = '');
-    m.querySelector('#nz-type').onchange = e => m.querySelector('#nz-ov').classList.toggle('hidden', e.target.value !== 'override');
-    $('#m-ok').onclick = async () => { try { const body = readForm(m); if (m.querySelector('#nz-type').value === 'override') body.override = readOverride(m); const z = await POST('/zones', body); closeModal(); await refreshZones(); location.hash = '#/zones/' + encodeURIComponent(z.name); toast(`Zone ${z.name} created`, 'ok'); } catch (e) { $('#m-err').textContent = e.message; } };
+    m.querySelector('#nz-type').onchange = e => { m.querySelector('#nz-ov').classList.toggle('hidden', e.target.value !== 'override'); m.querySelector('#nz-sec').classList.toggle('hidden', e.target.value !== 'secondary'); m.querySelector('#nz-soa').classList.toggle('hidden', e.target.value === 'secondary'); };
+    $('#m-ok').onclick = async () => { try { let body = readForm(m); if (m.querySelector('#nz-type').value === 'override') body.override = readOverride(m);
+      if (m.querySelector('#nz-type').value === 'secondary') body = { name: body.name, secondary: { primaries: m.querySelector('#nz-sec-p').value.split(/[\s,]+/).filter(Boolean), key: m.querySelector('#nz-sec-k').value.trim() } }; const z = await POST('/zones', body); closeModal(); await refreshZones(); location.hash = '#/zones/' + encodeURIComponent(z.name); toast(`Zone ${z.name} created`, 'ok'); } catch (e) { $('#m-err').textContent = e.message; } };
   });
 }
 // ---------------------------------------------------------------------------
@@ -1083,14 +1098,15 @@ function renderZone(keepFilter) {
           <button class="btn" id="z-io" data-ro-ok>Import / Export</button>
           ${isOwner && z.override ? `<button class="btn" id="z-ov" data-perm="edit_settings" data-zone="${esc(z.name)}">Override settings</button>` : ''}
           ${S.user.is_admin && !z.override ? `<button class="btn" id="z-xfer" data-perm="server_admin">Transfers &amp; PTR</button>` : ''}
-          ${S.user.is_admin ? `<button class="btn" id="z-clone" data-perm="create_zones">Clone</button>` : ''}
-          ${isOwner && S.user.is_admin ? `<button class="btn" id="z-rename" data-perm="delete_zone" data-zone="${esc(z.name)}">Rename</button>` : ''}
+          ${S.user.is_admin ? `<button class="btn" id="z-clone" data-perm="create_zones"${blockAttr(z.secondary && secondaryReason(z.name, z.secondary.primaries.join(', ')))}>Clone</button>` : ''}
+          ${isOwner && S.user.is_admin ? `<button class="btn" id="z-rename" data-perm="delete_zone" data-zone="${esc(z.name)}"${blockAttr(z.secondary && secondaryReason(z.name, z.secondary.primaries.join(', ')))}>Rename</button>` : ''}
           ${isOwner ? `<button class="btn" id="z-edit" data-perm="edit_settings" data-zone="${esc(z.name)}">Settings</button><button class="btn danger" id="z-del" data-perm="delete_zone" data-zone="${esc(z.name)}">Delete zone</button>` : ''}
         </div>
       </div>
       <div class="chips">
         <button class="chip-btn" data-ro-ok data-panel="soa" title="Start of authority: serial, timers, contacts">${ico('info', 's')} SOA <span class="sub mono">serial ${z.serial}</span></button>
         ${z.override ? '' : `<button class="chip-btn${delegWarn ? ' warn' : ''}" data-ro-ok data-panel="deleg" title="${dl.reverse ? 'How reverse delegation works' : 'Nameservers and glue for your registrar'}">${ico(delegWarn ? 'warn' : 'deleg', 's')} ${dl.reverse ? 'Reverse delegation' : 'Delegation'} <span class="sub">${dl.ns.length} NS</span></button>`}
+        ${z.secondary ? `<button class="chip-btn" data-ro-ok data-panel="secondary" id="z-sec" title="Transfers from the primary on this server">${ico('info', 's')} Secondary of <span class="sub mono">${esc(z.secondary.primaries.join(', '))}</span></button>` : ''}
         <button class="chip-btn" data-ro-ok data-panel="dig" title="Commands to query this zone">${ico('term', 's')} Test with dig</button>
         ${z.override ? `<span class="badge warn" title="Answered only for clients allowed to use forwarding; never AA, AD, signed or transferred">Override zone · not authoritative · ${z.override.mode === 'static' ? 'static' : 'transparent'}${z.override.upstreams.length ? ' → ' + esc(z.override.upstreams.join(', ')) : ''}</span>` : `<button class="chip-btn" data-ro-ok data-panel="dnssec" title="DNSSEC signing: status, DS record for the registrar, checks">${ico('shield', 's')} DNSSEC <span class="sub">${z.dnssec ? 'signing' : 'off'}</span></button>`}
         ${isOwner ? `<button class="chip-btn" data-ro-ok data-panel="access" title="Who can see and edit this zone">${ico('lock', 's')} Access <span class="sub">${z.members.length}</span></button>` : ''}
@@ -1478,8 +1494,8 @@ async function openZonePanel(tab) {
   const keep = same ? ($('#drawer .d-body') || {}).scrollTop || 0 : 0;
   S.panel = { zone: z.name, tab };
   const dl = delegationInfo(z);
-  const tabs = [['soa', 'SOA'], ['deleg', dl.reverse ? 'Reverse delegation' : 'Delegation'], ['dig', 'Test with dig'], ['dnssec', 'DNSSEC']].concat(isOwner ? [['access', 'Access']] : []);
-  const body = tab === 'soa' ? soaHtml(z) : tab === 'deleg' ? delegHtml(z, dl) : tab === 'dig' ? digHtml(z) : tab === 'dnssec' ? dnssecHtml(z) : accessHtml(z);
+  const tabs = (z.secondary ? [['secondary', 'Secondary']] : []).concat([['soa', 'SOA'], ['deleg', dl.reverse ? 'Reverse delegation' : 'Delegation'], ['dig', 'Test with dig'], ['dnssec', 'DNSSEC']]).concat(isOwner ? [['access', 'Access']] : []);
+  const body = tab === 'secondary' ? secondaryHtml(z) : tab === 'soa' ? soaHtml(z) : tab === 'deleg' ? delegHtml(z, dl) : tab === 'dig' ? digHtml(z) : tab === 'dnssec' ? dnssecHtml(z) : accessHtml(z);
   openDrawer(`<div class="d-head"><div class="d-title"><h2 class="mono">${esc(z.fqdn)}</h2><button type="button" class="icon-btn" data-dclose title="Close (Esc)" aria-label="Close">${ico('close')}</button></div>
     <div class="tabs" role="tablist">${tabs.map(([k, l]) => `<button type="button" role="tab" data-ro-ok data-dtab="${k}" class="${k === tab ? 'on' : ''}">${l}</button>`).join('')}</div></div>
     <div class="d-body">${body}</div>`);
@@ -1496,6 +1512,10 @@ async function openZonePanel(tab) {
   }
   if (tab === 'dnssec') wireDnssec(z, d);
   markPanelChip();
+  if (tab === 'secondary') {
+    try { S.secStatus = { zone: z.name, st: await GET(`/zones/${encodeURIComponent(z.name)}/secondary`) }; } catch (e) { S.secStatus = { zone: z.name, err: e.message }; }
+    if (S.panel && S.panel.zone === z.name && S.panel.tab === 'secondary' && $('.d-body', d)) $('.d-body', d).innerHTML = secondaryHtml(z);
+  }
   if (tab === 'dnssec' && (!S.dnssec || S.dnssec.zone !== z.name || S.dnssec.serial !== z.serial)) {
     const prev = S.dnssec && S.dnssec.zone === z.name ? S.dnssec : {};
     try {
@@ -1617,6 +1637,24 @@ function checkHtml(c) {
   return `<div class="note ${c.ok ? 'ok' : 'bad'}">${ico(c.ok ? 'check' : 'warn', 's')}<span>${c.ok ? `<b>All ${c.checks.length} checks passed:</b> this server's signed answers validate with key ${c.key_tag}.` : '<b>Some checks failed:</b> do not publish the DS until they pass.'}</span></div>
     <div class="tw"><table><tbody>${c.checks.map(x => `<tr><td style="width:1%">${x.ok ? '<span class="badge ok">ok</span>' : '<span class="badge bad">fail</span>'}</td><td><div class="mono">${esc(x.query)}</div><div class="hint" style="word-break:break-word">${esc(x.detail)}</div></td></tr>`).join('')}</tbody></table></div>
     <p class="hint">${esc(c.note)}</p>`;
+}
+// O27: this server's transfer status of a secondary zone.
+function secondaryHtml(z) {
+  const d = S.secStatus && S.secStatus.zone === z.name ? S.secStatus : null;
+  const head = `<p class="hint">This server transfers ${esc(z.name)} from its primaries itself (AXFR / IXFR, refreshed by the SOA timers and at once on NOTIFY) and serves it read-only; so does every standby. Records, SOA and DNSSEC signatures come from the primary: change them there.</p>
+    <div class="facts"><span class="k">Primaries</span><span class="mono">${esc(z.secondary.primaries.join(', '))}</span><span class="k">TSIG key</span><span class="mono">${esc(z.secondary.key || 'none')}</span>`;
+  if (!d) return head + '</div><p class="hint">Loading…</p>';
+  if (d.err) return head + `</div><div class="note bad">${ico('warn', 's')}<span>${esc(d.err)}</span></div>`;
+  const st = d.st, badge = { ok: 'ok', pending: 'muted', error: 'warn', expired: 'bad' }[st.state] || 'muted';
+  return head + `<span class="k">State</span><span id="sec2-state"><span class="badge ${badge}">${esc(st.state)}</span></span>
+    <span class="k">Serial</span><span class="mono" id="sec2-serial">${st.serial ?? '–'}</span>
+    <span class="k">Records</span><span>${num(st.records)}${st.signed ? ' · signed by the primary' : ''}</span>
+    <span class="k">Last transfer</span><span>${st.last_transfer ? esc(st.last_transfer.toUpperCase()) + ' · ' + ago(st.last_transfer_at) : '–'}</span>
+    <span class="k">Last refresh</span><span>${st.last_refresh_at ? ago(st.last_refresh_at) : '–'}</span>
+    <span class="k">Expires</span><span>${st.expires_at ? esc(st.expires_at) + ' (answered SERVFAIL after it without a refresh)' : '–'}</span>
+    <span class="k">NOTIFYs</span><span>${num(st.notifies)}</span>
+    ${st.last_error ? `<span class="k">Last error</span><span>${esc(st.last_error)}</span>` : ''}
+    ${st.unsupported_types.length ? `<span class="k">Not served</span><span>${esc(st.unsupported_types.join(', '))} (types this server does not serve)</span>` : ''}</div>`;
 }
 function dnssecHtml(z) {
   const d = S.dnssec && S.dnssec.zone === z.name ? S.dnssec : null;

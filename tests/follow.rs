@@ -469,7 +469,7 @@ fn primary_standby_failover_and_rejoin() {
     assert_eq!(
         r["version"],
         format!(
-            "{}+dnssec-rollover.zone-rename.zone-settings.nsec3.ed25519",
+            "{}+dnssec-rollover.zone-rename.zone-settings.nsec3.ed25519.secondary-zones",
             env!("CARGO_PKG_VERSION")
         )
     );
@@ -4912,5 +4912,169 @@ fn ed25519_replicates_and_older_standbys_are_refused() {
         drop(old);
     }
     drop(p);
+    let _ = std::fs::remove_dir_all(&root_dir);
+}
+
+/// O27: a secondary zone's definition replicates like any zone; its
+/// content does not: every server is a secondary of the zone's primary
+/// itself. Here the zone's primary is a third rust-dns server (U) that
+/// NOTIFYs both. The primary (P) and its standby (S) each transfer the
+/// zone, serve it read-only with the same answers, refresh at once on
+/// U's NOTIFY, and no record of it enters P's changelog. A previous
+/// release cannot represent a secondary zone (it would serve an empty
+/// zone of its own): while one exists its snapshot and change requests are
+/// refused (409, state `refused`, never halted), and once none exists it
+/// follows, and then creating one is refused naming it.
+#[test]
+fn secondary_zones_replicate_their_definition_and_every_server_transfers_itself() {
+    let root_dir = temp_root("follow-secondary");
+    let mut u = Node::new(&root_dir, "upstream", "rootpass-up");
+    let mut p = Node::new(&root_dir, "primary", "rootpass-primary");
+    let mut s = Node::new(&root_dir, "standby", "rootpass-standby");
+    let xfer = "[transfer]\nallow = [\"127.0.0.0/8\"]\n";
+    u.configure(&format!(
+        "[transfer]\nallow = [\"127.0.0.0/8\"]\nnotify = [\"127.0.0.1:{}\", \"127.0.0.1:{}\"]\n",
+        p.dns, s.dns
+    ));
+    u.start();
+    let ur = u.root();
+    ok(
+        call(
+            &Auth::Session(&ur),
+            "POST",
+            &u.api("/zones"),
+            Some(json!({ "name": "far.test" })),
+        ),
+        "upstream zone",
+    );
+    add_record(&u, &ur, "far.test", "www", "192.0.2.10");
+    p.configure(xfer);
+    p.start();
+    let pr = p.root();
+    let post =
+        |path: &str, body: Value| call(&Auth::Session(&pr), "POST", &p.api(path), Some(body));
+    let repl = ok(post("/tokens", json!({ "name": "repl" })), "token")["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let head_before = status(&p, &pr)["head"].as_i64().unwrap();
+    let z = ok(
+        post(
+            "/zones",
+            json!({ "name": "far.test", "secondary": { "primaries": [format!("127.0.0.1:{}", u.dns)] } }),
+        ),
+        "secondary zone",
+    );
+    assert_eq!(
+        z["secondary"]["primaries"][0],
+        format!("127.0.0.1:{}", u.dns)
+    );
+    s.configure(&format!("{xfer}{}", follow_cfg(&p, "dns2", &repl)));
+    s.start();
+    let sr = s.root();
+    wait_reconciled(&p, &pr, &s, &sr, "secondary zone definition");
+    let sec_status = |n: &Node, a: &ureq::Agent| {
+        call(
+            &Auth::Session(a),
+            "GET",
+            &n.api("/zones/far.test/secondary"),
+            None,
+        )
+        .1
+    };
+    for (n, a) in [(&p, &pr), (&s, &sr)] {
+        wait_for(&format!("{} transfers far.test", n.name), 20, || {
+            answers(n.dns, "www.far.test.", RecordType::A).1.len() == 1
+        });
+        let st = sec_status(n, a);
+        assert_eq!(st["state"], "ok", "{}: {st}", n.name);
+        assert_eq!(st["source"], format!("127.0.0.1:{}", u.dns), "{st}");
+    }
+    assert_eq!(
+        answers(p.dns, "www.far.test.", RecordType::A),
+        answers(s.dns, "www.far.test.", RecordType::A)
+    );
+    // Read-only on the primary (secondary zone) and on the standby.
+    let (st, v) = post(
+        "/zones/far.test/records",
+        json!({ "name": "x", "type": "A", "value": "192.0.2.1" }),
+    );
+    assert_eq!(st, 409, "{v}");
+    // U changes: its NOTIFY reaches both, each transfers again.
+    add_record(&u, &ur, "far.test", "new", "192.0.2.11");
+    for n in [&p, &s] {
+        wait_for(&format!("{} refreshed by NOTIFY", n.name), 15, || {
+            answers(n.dns, "new.far.test.", RecordType::A).1.len() == 1
+        });
+    }
+    assert!(sec_status(&s, &sr)["notifies"].as_u64().unwrap() >= 1);
+    // Only the zone itself entered P's changelog, no transferred record.
+    let ch = ok(
+        call(
+            &Auth::Session(&pr),
+            "GET",
+            &p.api(&format!("/changelog?after={head_before}")),
+            None,
+        ),
+        "changelog",
+    );
+    let kinds: Vec<String> = ch["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["zone"] == "far.test")
+        .map(|c| format!("{} {}", c["entity"], c["action"]))
+        .collect();
+    assert!(
+        !kinds.is_empty() && kinds.iter().all(|k| !k.contains("record")),
+        "only the definition, no transferred record: {kinds:?}"
+    );
+    wait_reconciled(&p, &pr, &s, &sr, "after refreshes");
+    drop(s);
+
+    if let Some(prev) = prev_bin() {
+        // 1. A secondary zone exists: the old standby is refused.
+        let mut old = Node::new(&root_dir, "old", "rootpass-old");
+        old.bin = prev;
+        old.configure(&format!("{xfer}{}", follow_cfg(&p, "dns3", &repl)));
+        old.start();
+        let or = old.root();
+        wait_for("the old standby is refused", 30, || {
+            let st = status(&old, &or);
+            assert!(st["follow"]["halted"].is_null(), "not halted: {st}");
+            st["follow"]["state"] == "refused"
+                && st["follow"]["last_error"]
+                    .as_str()
+                    .is_some_and(|e| e.contains("secondary zone") && e.contains("far.test"))
+        });
+        assert!(
+            answers(old.dns, "www.far.test.", RecordType::A)
+                .1
+                .is_empty(),
+            "the old standby serves nothing of it"
+        );
+        // 2. None exists: it follows; then creating one is refused.
+        ok(
+            call(
+                &Auth::Session(&pr),
+                "DELETE",
+                &p.api("/zones/far.test"),
+                None,
+            ),
+            "delete",
+        );
+        old.stop();
+        old.start();
+        let or = old.root();
+        wait_reconciled(&p, &pr, &old, &or, "old standby, no secondary zone");
+        let (st, v) = post(
+            "/zones",
+            json!({ "name": "far.test", "secondary": { "primaries": [format!("127.0.0.1:{}", u.dns)] } }),
+        );
+        assert_eq!(st, 409, "{v}");
+        assert!(v["error"].as_str().unwrap().contains("dns3"), "{v}");
+        drop(old);
+    }
+    drop((p, u));
     let _ = std::fs::remove_dir_all(&root_dir);
 }

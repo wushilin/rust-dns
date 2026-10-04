@@ -79,31 +79,46 @@ fn replica_headers(h: &HeaderMap, required: bool) -> ApiResult<Option<ReplicaHea
     }))
 }
 
-/// O25: the zones a standby of this version could not sign (Ed25519 ones,
-/// for a standby that does not advertise `ed25519`), read in the same
-/// transaction as the answer.
+/// O25 / O27: the zones a standby of this version could not serve
+/// correctly, with the reason: Ed25519-signed zones for a standby that does
+/// not advertise `ed25519`, secondary zones for one without
+/// `secondary-zones`. Read in the same transaction as the answer.
 fn unsignable_for(c: &rusqlite::Connection, h: &ReplicaHeaders) -> anyhow::Result<Vec<String>> {
-    if crate::replication::replicas::has_feature(&h.version, "ed25519") {
-        return Ok(Vec::new());
+    use crate::replication::replicas::has_feature;
+    let mut out = Vec::new();
+    if !has_feature(&h.version, "ed25519") {
+        out.extend(
+            data::ed25519_signed_zones(c)?
+                .into_iter()
+                .map(|z| format!("{z} (signed with Ed25519, DNSSEC algorithm 15)")),
+        );
     }
-    data::ed25519_signed_zones(c)
+    if !has_feature(&h.version, "secondary-zones") {
+        out.extend(
+            data::secondary_zones(c)?
+                .into_iter()
+                .map(|z| format!("{z} (a secondary zone)")),
+        );
+    }
+    Ok(out)
 }
 
-/// O25: refuse (409: the standby keeps its data and retries, it does not
-/// halt) a standby whose version cannot sign a zone this server signs with
-/// Ed25519: it would load the zone and serve it unsigned (an older binary
-/// logs "unsupported DNSSEC algorithm" and serves the zone without
-/// signatures, which validating resolvers reject once a DS is published).
+/// O25 / O27: refuse (409: the standby keeps its data and retries, it does
+/// not halt) a standby whose version cannot serve a zone of this server
+/// correctly. An older binary would load an Ed25519 zone and serve it
+/// unsigned (it logs "unsupported DNSSEC algorithm"; validating resolvers
+/// reject it once a DS is published), and would store a secondary zone as
+/// an empty zone of its own, answering NXDOMAIN for its names.
 fn refuse_unsignable(zones: &[String], h: &ReplicaHeaders) -> ApiResult<()> {
     if zones.is_empty() {
         return Ok(());
     }
-    tracing::warn!(standby = %h.instance, version = %h.version, zones = %zones.join(","), "replication refused: the standby cannot sign Ed25519 zones");
+    tracing::warn!(standby = %h.instance, version = %h.version, zones = %zones.join(","), "replication refused: the standby cannot serve these zones");
     Err(ApiError::conflict(format!(
-        "this server signs {} with Ed25519 (DNSSEC algorithm 15), which standby '{}' (version {}) cannot sign; upgrade the standby",
-        zones.join(", "),
+        "this server has zones that standby '{}' (version {}) cannot serve correctly: {}; upgrade the standby",
         h.instance,
-        if h.version.is_empty() { "unknown" } else { &h.version }
+        if h.version.is_empty() { "unknown" } else { &h.version },
+        zones.join(", ")
     )))
 }
 

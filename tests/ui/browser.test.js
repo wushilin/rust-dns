@@ -229,6 +229,27 @@ async function main() {
   let recs = (await rootApi('GET', '/zones/ui.test/records')).json.records;
   ok('add record', recs.length === 1 && recs[0].value === '192.0.2.10', JSON.stringify(recs));
 
+  // O27: a secondary zone from the console; its read-only controls name the reason.
+  await admin.route('#/zones', `return !!document.querySelector('#z-new')`);
+  await admin.click('#z-new');
+  await admin.wait('new zone dialog', `return !!document.querySelector('#modal [name=name]')`);
+  await admin.fill('#modal [name=name]', 'sec.ui.test');
+  await admin.eval(`const t = document.querySelector('#nz-type'); t.value = 'secondary'; t.dispatchEvent(new Event('change')); return true`);
+  ok('O27: a secondary zone asks for primaries, not SOA fields', await admin.eval(`return document.querySelector('#nz-soa').classList.contains('hidden') && !document.querySelector('#nz-sec').classList.contains('hidden')`));
+  await admin.fill('#nz-sec-p', '127.0.0.1:9');
+  await admin.click('#m-ok');
+  await admin.wait('secondary zone page', `return location.hash === '#/zones/sec.ui.test' && !!document.querySelector('#z-sec')`);
+  ok('O27: created as a secondary zone', (await rootApi('GET', '/zones/sec.ui.test')).json.secondary?.primaries?.[0] === '127.0.0.1:9');
+  await admin.wait('add record disabled', `const b = document.querySelector('#r-add'); return b && b.disabled`);
+  const secAdd = await admin.eval(`const b = document.querySelector('#r-add'); return { disabled: b.disabled, title: b.title }`);
+  ok('O27: adding a record is disabled with the reason', secAdd.disabled && /Secondary zone/.test(secAdd.title), JSON.stringify(secAdd));
+  await admin.click('#z-sec');
+  await admin.wait('secondary panel', `return !!document.querySelector('#sec2-state')`);
+  ok('O27: the panel shows this server\'s transfer state', /pending|error/.test(await admin.eval(`return document.querySelector('#sec2-state').textContent`)));
+  await admin.click('[data-dclose]');
+  await rootApi('DELETE', '/zones/sec.ui.test');
+  await admin.route('#/zones/ui.test', `return document.querySelector('#records')?.textContent.includes('192.0.2.10')`);
+
   await admin.eval(`document.querySelector('#records [data-edit]').click(); return true`);
   await admin.wait('edit dialog', `return document.querySelector('#rf-value')?.value === '192.0.2.10'`);
   await admin.fill('#rf-value', '192.0.2.11');

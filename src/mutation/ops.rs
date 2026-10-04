@@ -97,6 +97,90 @@ pub(super) fn apply_override(
     Ok(())
 }
 
+/// O27: apply the secondary part of a zone input. Creating: a `secondary`
+/// object makes a secondary zone. Updating: only a secondary zone takes
+/// one. A secondary zone's SOA, records and signing come from its
+/// primary: SOA fields in the input are refused for it.
+pub(super) fn apply_secondary(
+    z: &mut Zone,
+    input: &ZoneInput,
+    creating: bool,
+) -> Result<(), Invalid> {
+    let soa_given = input.soa_mname.is_some()
+        || input.soa_rname.is_some()
+        || input.refresh.is_some()
+        || input.retry.is_some()
+        || input.expire.is_some()
+        || input.minimum.is_some()
+        || input.default_ttl.is_some()
+        || input.record_policy.is_some();
+    let Some(sec) = &input.secondary else {
+        if z.is_secondary() && soa_given {
+            return Err(Invalid(
+                "a secondary zone's SOA, timers and TTLs come from its primary".into(),
+            ));
+        }
+        return Ok(());
+    };
+    if !creating && !z.is_secondary() {
+        return Err(Invalid(
+            "a zone of our own cannot become a secondary zone; the type is chosen when the zone is created".into(),
+        ));
+    }
+    if input.overrides.is_some() || z.is_override() {
+        return Err(Invalid(
+            "a zone is either an override zone or a secondary zone".into(),
+        ));
+    }
+    if soa_given {
+        return Err(Invalid(
+            "a secondary zone's SOA, timers and TTLs come from its primary".into(),
+        ));
+    }
+    let mut spec = z
+        .secondary
+        .as_deref()
+        .cloned()
+        .unwrap_or(crate::model::ZoneSecondary {
+            primaries: Vec::new(),
+            key: None,
+        });
+    if let Some(ps) = &sec.primaries {
+        let mut out: Vec<std::net::SocketAddr> = Vec::new();
+        for p in ps.iter().map(|p| p.trim()).filter(|p| !p.is_empty()) {
+            let sa = crate::mutation::settings::parse_upstream(p)
+                .map_err(|e| Invalid(format!("secondary primary: {e}")))?;
+            if !out.contains(&sa) {
+                out.push(sa);
+            }
+        }
+        spec.primaries = out;
+    }
+    if spec.primaries.is_empty() || spec.primaries.len() > 8 {
+        return Err(Invalid(
+            "a secondary zone needs 1 to 8 primaries (ip or ip:port)".into(),
+        ));
+    }
+    if let Some(k) = &sec.key {
+        let k = k.trim();
+        spec.key = if k.is_empty() {
+            None
+        } else {
+            Some(
+                crate::mutation::tsig::normalize_key_name(k)
+                    .map_err(|e| Invalid(format!("secondary key: {}", e.0)))?,
+            )
+        };
+    }
+    if z.dnssec {
+        return Err(Invalid(
+            "a secondary zone is never signed here (a signed primary's signatures are served as transferred)".into(),
+        ));
+    }
+    z.secondary = Some(Box::new(spec));
+    Ok(())
+}
+
 pub(super) fn soa_differs(a: &Zone, b: &Zone) -> bool {
     (
         &a.soa_mname,
@@ -161,6 +245,7 @@ pub(super) fn default_zone(name: &str, owner_id: Option<i64>) -> Zone {
         record_policy: None,
         nsec3: false,
         settings: None,
+        secondary: None,
     }
 }
 
@@ -206,6 +291,7 @@ impl Mutator {
         self.execute(actor, "create_zone", move |t| {
             let name = normalize_zone_name(input.name.as_deref().unwrap_or(""))?;
             let mut z = new_zone(&defaults, &name, owner_id);
+            apply_secondary(&mut z, &input, true)?;
             apply_zone_input(&mut z, &input)?;
             apply_override(&mut z, &input, true)?;
             t.create_zone(z)
@@ -226,6 +312,7 @@ impl Mutator {
                 let name = normalize_zone_name(&name)?;
                 let before = t.require_zone(&name)?;
                 let mut after = before.clone();
+                apply_secondary(&mut after, &input, false)?;
                 apply_zone_input(&mut after, &input)?;
                 apply_override(&mut after, &input, false)?;
                 if let Some(o) = new_owner {
@@ -279,6 +366,12 @@ impl Mutator {
         }
         self.execute(actor, "rename_zone", move |t| {
             let z = t.require_zone(&name)?;
+            if z.is_secondary() {
+                return Err(MutationError::Conflict(
+                    "a secondary zone has its primary's name: create a new secondary zone instead"
+                        .into(),
+                ));
+            }
             if t.dnssec_key(z.id)?.is_some_and(|k| k.rollover.is_some()) {
                 return Err(MutationError::Conflict(
                     "a DNSSEC key rollover is in progress: finish or cancel it first".into(),
@@ -304,6 +397,11 @@ impl Mutator {
         let (name, new_name) = (normalize_zone_name(name)?, normalize_zone_name(new_name)?);
         self.execute(actor, "clone_zone", move |t| {
             let src = t.require_zone(&name)?;
+            if src.is_secondary() {
+                return Err(MutationError::Conflict(
+                    "a secondary zone cannot be cloned (its records are its primary's)".into(),
+                ));
+            }
             let mut z = default_zone(&new_name, owner_id);
             for (from, to) in [
                 (&src.soa_mname, &mut z.soa_mname),

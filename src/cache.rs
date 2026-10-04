@@ -40,6 +40,15 @@ impl Rec {
         Rec { stored, wire }
     }
 
+    /// O27: a transferred record, already in wire form.
+    fn from_wire(stored: Record, mut wire: WireRecord) -> Rec {
+        wire.name = Name::root();
+        Rec {
+            stored,
+            wire: Some(wire),
+        }
+    }
+
     /// The wire record, owned by `owner` (the query name: its letter case
     /// is echoed; or the wildcard-expanded name).
     pub fn rr(&self, owner: &Name) -> Option<WireRecord> {
@@ -73,6 +82,9 @@ pub struct ZoneData {
     /// zone must be built again without it (every node does so in memory,
     /// see `Mutator::spawn_expiry_watch`).
     pub next_expiry: Option<String>,
+    /// O27: a secondary zone without usable data (never transferred, or
+    /// expired: no refresh within the SOA expire time): answered SERVFAIL.
+    pub unavailable: bool,
 }
 
 impl ZoneData {
@@ -81,6 +93,17 @@ impl ZoneData {
     /// longer produce automatic PTR answers. Unsigned (see [`Catalog`]).
     /// `records`: the zone's records in id order.
     pub fn build(zone: Zone, records: Vec<Record>, now: &str) -> ZoneData {
+        let recs = records
+            .into_iter()
+            .filter(|r| !r.is_expired_at(now))
+            .map(|r| Rec::new(&zone, r))
+            .collect();
+        Self::from_recs(zone, recs)
+    }
+
+    /// One zone from prepared records (ours: [`Self::build`]; a secondary
+    /// zone's: [`Self::build_secondary`]).
+    fn from_recs(zone: Zone, recs: Vec<Rec>) -> ZoneData {
         let apex = zone.fqdn();
         let mut names: HashMap<String, Vec<Rec>> = HashMap::new();
         let mut existing: HashSet<String> = HashSet::new();
@@ -88,7 +111,7 @@ impl ZoneData {
         let mut reverse = Vec::new();
         let mut next_expiry: Option<String> = None;
         existing.insert(apex.clone());
-        for r in records.into_iter().filter(|r| !r.is_expired_at(now)) {
+        for r in recs {
             if let Some(e) = &r.expires_at {
                 if next_expiry.as_ref().is_none_or(|n| e < n) {
                     next_expiry = Some(e.clone());
@@ -110,13 +133,16 @@ impl ZoneData {
                 delegations.push(owner.clone());
             }
             // Override zones are not authoritative: their addresses give
-            // no automatic PTR answers.
-            if matches!(r.rtype, RecordType::A | RecordType::AAAA) && zone.overrides.is_none() {
+            // no automatic PTR answers; nor do a secondary zone's (O27).
+            if matches!(r.rtype, RecordType::A | RecordType::AAAA)
+                && zone.overrides.is_none()
+                && zone.secondary.is_none()
+            {
                 if let Ok(ip) = r.value.parse::<std::net::IpAddr>() {
                     reverse.push((reverse_name(&ip), owner.clone()));
                 }
             }
-            names.entry(owner).or_default().push(Rec::new(&zone, r));
+            names.entry(owner).or_default().push(r);
         }
         let mut z = ZoneData {
             zone,
@@ -129,9 +155,79 @@ impl ZoneData {
             apex_ns: Vec::new(),
             reverse,
             next_expiry,
+            unavailable: false,
         };
         z.soa = crate::zones::build_soa(&z);
         z.apex_ns = crate::zones::build_apex_ns(&z);
+        z
+    }
+
+    /// O27: a secondary zone from its transferred data as of `now_unix`.
+    /// The SOA, its timers and TTL are the transferred SOA's (copied into
+    /// this catalog's zone row, which only the catalog sees); records of a
+    /// type this server does not model are not served (counted in the
+    /// transfer status); a signed primary's DNSSEC records make the signed
+    /// view ([`SignedZone::from_transfer`]). No data, or expired data:
+    /// `unavailable` (SERVFAIL).
+    ///
+    /// [`SignedZone::from_transfer`]: crate::dnssec::SignedZone::from_transfer
+    pub fn build_secondary(
+        mut zone: Zone,
+        data: Option<&crate::secondary::Transferred>,
+        now_unix: i64,
+    ) -> ZoneData {
+        let data = data.filter(|d| !d.expired_at(now_unix));
+        let Some((d, soa)) = data.and_then(|d| Some((d, d.soa()?))) else {
+            let mut z = Self::from_recs(zone, Vec::new());
+            z.unavailable = true;
+            z.soa = None;
+            z.apex_ns = Vec::new();
+            return z;
+        };
+        if let hickory_proto::rr::RData::SOA(s) = &soa.data {
+            zone.serial = s.serial;
+            zone.soa_mname = s.mname.to_ascii();
+            zone.soa_rname = s.rname.to_ascii();
+            zone.refresh = s.refresh.max(0) as u32;
+            zone.retry = s.retry.max(0) as u32;
+            zone.expire = s.expire.max(0) as u32;
+            zone.minimum = s.minimum;
+        }
+        zone.default_ttl = soa.ttl;
+        let apex = zone.fqdn();
+        let mut recs = Vec::new();
+        let mut sec = Vec::new();
+        for r in &d.records {
+            let code = u16::from(r.record_type());
+            if crate::secondary::is_dnssec_type(code) {
+                sec.push(r.clone());
+                continue;
+            }
+            let Some(rt) = RecordType::ALL
+                .iter()
+                .copied()
+                .find(|t| u16::from(t.to_hickory()) == code)
+            else {
+                continue;
+            };
+            let owner = r.name.to_lowercase().to_ascii();
+            let stored = Record {
+                id: 0,
+                zone_id: zone.id,
+                name: crate::secondary::relative_name(&owner, &apex),
+                rtype: rt,
+                value: crate::secondary::value_text(r),
+                ttl: Some(r.ttl),
+                created_at: String::new(),
+                updated_at: String::new(),
+                expires_at: None,
+            };
+            recs.push(Rec::from_wire(stored, r.clone()));
+        }
+        let mut z = Self::from_recs(zone, recs);
+        z.soa = Some(soa.clone());
+        z.signed =
+            crate::dnssec::SignedZone::from_transfer(&z.apex, &z.existing, &sec).map(Arc::new);
         z
     }
 
@@ -247,7 +343,12 @@ impl Catalog {
         let mut signed_ids = Vec::new();
         for zone in zones {
             let id = zone.id;
-            let mut zd = ZoneData::build(zone, by_zone.remove(&id).unwrap_or_default(), &now_s);
+            let mut zd = if zone.is_secondary() {
+                let data = signer.secondaries.get(&zone.name);
+                ZoneData::build_secondary(zone, data.as_deref(), now.timestamp())
+            } else {
+                ZoneData::build(zone, by_zone.remove(&id).unwrap_or_default(), &now_s)
+            };
             if zd.zone.dnssec {
                 signed_ids.push(id);
             }
@@ -291,7 +392,12 @@ impl Catalog {
                 signer.forget(*id);
                 continue;
             };
-            let mut zd = ZoneData::build(zone.clone(), records.clone(), &now_s);
+            let mut zd = if zone.is_secondary() {
+                let data = signer.secondaries.get(&zone.name);
+                ZoneData::build_secondary(zone.clone(), data.as_deref(), now.timestamp())
+            } else {
+                ZoneData::build(zone.clone(), records.clone(), &now_s)
+            };
             Self::sign_zone(&mut zd, key.as_ref(), signer, now.timestamp());
             new_reverse.extend(zd.reverse.iter().cloned());
             // A new zone takes over the name of one deleted in the same
@@ -569,6 +675,7 @@ mod tests {
             overrides: None,
             record_policy: None,
             nsec3: false,
+            secondary: None,
             settings: None,
         }
     }

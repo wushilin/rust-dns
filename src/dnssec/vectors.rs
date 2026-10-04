@@ -65,6 +65,7 @@ fn zone() -> Zone {
         overrides: None,
         record_policy: None,
         nsec3: false,
+        secondary: None,
         settings: None,
     }
 }

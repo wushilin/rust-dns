@@ -106,7 +106,9 @@ CREATE TABLE IF NOT EXISTS zones (
     -- O16: JSON of model::ZoneSettings; NULL = the server's settings.
     zone_settings TEXT,
     -- O24: 1 = signed with NSEC3 instead of NSEC; NULL = NSEC.
-    nsec3 INTEGER
+    nsec3 INTEGER,
+    -- O27: JSON of model::ZoneSecondary; NULL = a zone of our own.
+    secondary_spec TEXT
 );
 CREATE TABLE IF NOT EXISTS records (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -225,6 +227,16 @@ CREATE TABLE IF NOT EXISTS replication_state (
 );
 -- Standbys that follow this server (primary side). Local bookkeeping:
 -- not replicated, not changelogged (src/replication/replicas.rs).
+-- O27: the data of each secondary zone as this server last transferred
+-- it (every server transfers for itself). Local bookkeeping, never
+-- replicated: it lets a restart serve the last good copy until it expires.
+CREATE TABLE IF NOT EXISTS secondary_transfers (
+    zone          TEXT PRIMARY KEY,   -- zone name (no trailing dot)
+    serial        INTEGER NOT NULL,
+    records       BLOB NOT NULL,      -- length-prefixed wire records
+    transferred_at TEXT NOT NULL,     -- last successful transfer or refresh
+    primary_addr  TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS replicas (
     instance    TEXT PRIMARY KEY,
     data        TEXT NOT NULL,
@@ -453,6 +465,10 @@ fn migrate(conn: &Connection) -> Result<()> {
     // O24: NULL for every existing zone (NSEC); nothing rewritten.
     if !zcols.is_empty() && !zcols.iter().any(|c| c == "nsec3") {
         conn.execute_batch("ALTER TABLE zones ADD COLUMN nsec3 INTEGER")?;
+    }
+    // O27: NULL for every existing zone (our own); nothing rewritten.
+    if !zcols.is_empty() && !zcols.iter().any(|c| c == "secondary_spec") {
+        conn.execute_batch("ALTER TABLE zones ADD COLUMN secondary_spec TEXT")?;
     }
     let rcols: Vec<String> = conn
         .prepare("SELECT name FROM pragma_table_info('records')")?
@@ -724,6 +740,59 @@ impl Storage {
                 params![instance, data, last_seen],
             )?;
             Ok(())
+        })
+    }
+
+    /// O27 bookkeeping: the transferred data of a secondary zone (local).
+    pub fn save_secondary_transfer(
+        &self,
+        zone: &str,
+        serial: u32,
+        records: &[u8],
+        transferred_at: &str,
+        primary: &str,
+    ) -> Result<()> {
+        self.bookkeeping(|c| {
+            c.execute(
+                "INSERT INTO secondary_transfers (zone, serial, records, transferred_at, primary_addr)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(zone) DO UPDATE SET serial = excluded.serial, records = excluded.records,
+                    transferred_at = excluded.transferred_at, primary_addr = excluded.primary_addr",
+                params![zone, serial as i64, records, transferred_at, primary],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// O27 bookkeeping: forget a secondary zone's data (zone deleted).
+    pub fn delete_secondary_transfer(&self, zone: &str) -> Result<()> {
+        self.bookkeeping(|c| {
+            c.execute(
+                "DELETE FROM secondary_transfers WHERE zone = ?1",
+                params![zone],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// O27: every stored transfer: (zone, serial, records, transferred_at,
+    /// primary).
+    #[allow(clippy::type_complexity)]
+    pub fn load_secondary_transfers(&self) -> Result<Vec<(String, u32, Vec<u8>, String, String)>> {
+        self.with_read(|c| {
+            let mut stmt = c.prepare(
+                "SELECT zone, serial, records, transferred_at, primary_addr FROM secondary_transfers",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get::<_, i64>(1)? as u32,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                ))
+            })?;
+            Ok(rows.collect::<Result<_, _>>()?)
         })
     }
 
@@ -1336,11 +1405,15 @@ fn row_to_zone(r: &Row<'_>) -> rusqlite::Result<Zone> {
             .and_then(|j| serde_json::from_str(&j).ok())
             .map(Box::new),
         nsec3: r.get::<_, Option<i64>>(18)?.unwrap_or(0) != 0,
+        secondary: r
+            .get::<_, Option<String>>(19)?
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .map(Box::new),
     })
 }
 
 const ZONE_COLS: &str =
-    "id, name, serial, soa_mname, soa_rname, refresh, retry, expire, minimum, default_ttl, created_at, updated_at, owner_id, dnssec, signed_at, override_spec, record_policy, zone_settings, nsec3";
+    "id, name, serial, soa_mname, soa_rname, refresh, retry, expire, minimum, default_ttl, created_at, updated_at, owner_id, dnssec, signed_at, override_spec, record_policy, zone_settings, nsec3, secondary_spec";
 
 pub(crate) const USER_COLS: &str =
     "id, username, password_hash, display_name, is_admin, is_root, mfa_required, totp_secret, totp_enrolled_at, disabled_at, created_at, updated_at";
@@ -1792,13 +1865,14 @@ mod tests {
         migrate(&conn).unwrap(); // idempotent
         let c = cols(&conn);
         assert_eq!(
-            &c[c.len() - 5..],
+            &c[c.len() - 6..],
             &[
                 "signed_at".to_string(),
                 "override_spec".to_string(),
                 "record_policy".to_string(),
                 "zone_settings".to_string(),
-                "nsec3".to_string()
+                "nsec3".to_string(),
+                "secondary_spec".to_string()
             ],
             "added at the end, in the order of the fresh schema"
         );
@@ -1808,6 +1882,11 @@ mod tests {
             .settings
             .is_none());
         assert!(!get_zone(&conn, "old.test").unwrap().unwrap().nsec3);
+        assert!(get_zone(&conn, "old.test")
+            .unwrap()
+            .unwrap()
+            .secondary
+            .is_none());
         assert_eq!(
             get_zone(&conn, "old.test").unwrap().unwrap().record_policy,
             None

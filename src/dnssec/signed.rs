@@ -110,6 +110,10 @@ pub struct SignedZone {
     nsec3_index: HashMap<String, usize>,
     /// The apex NSEC3PARAM record (NSEC3 zones only).
     pub nsec3param: Option<Record>,
+    /// O27: the NSEC3 hash parameters (ours: RFC 9276; a transferred
+    /// zone's: its NSEC3PARAM's).
+    nsec3_salt: Vec<u8>,
+    nsec3_iterations: u16,
 }
 
 /// Where a name stands in the zone.
@@ -489,6 +493,167 @@ impl SignedZone {
             nsec3,
             nsec3_index,
             nsec3param,
+            nsec3_salt: NSEC3_SALT.to_vec(),
+            nsec3_iterations: NSEC3_ITERATIONS,
+        })
+    }
+
+    /// O27: the signed view of a secondary zone whose primary signed it:
+    /// its DNSKEY RRset, RRSIGs and NSEC or NSEC3 chain exactly as
+    /// transferred (nothing is signed here). `existing`: the zone's names
+    /// (owners and empty non-terminals, as `ZoneData::existing`), to map
+    /// NSEC3 hashes back to names. `None`: the zone is not signed (no
+    /// DNSKEY at the apex). One RRSIG is kept per RRset: for the DNSKEY
+    /// RRset one made by a SEP key (flags 257, the key a DS points to),
+    /// for others one made by a non-SEP key when there is one (KSK / ZSK
+    /// split); with a single CSK both are the same. NSEC3 opt-out
+    /// delegations have no NSEC3 and are answered without a proof.
+    pub fn from_transfer<'a>(
+        apex: &str,
+        existing: impl IntoIterator<Item = &'a String>,
+        recs: &[Record],
+    ) -> Option<SignedZone> {
+        let mut dnskey_set: Vec<Record> = Vec::new();
+        let mut rrsigs: Vec<(String, RrsigFields, &Record)> = Vec::new();
+        let mut chain: Vec<NsecEntry> = Vec::new();
+        let mut nsec3_raw: Vec<(String, [u8; 20], &Record, Vec<u16>)> = Vec::new();
+        let mut nsec3param: Option<(Record, u16, Vec<u8>)> = None;
+        for r in recs {
+            // A malformed record is skipped (it is never served then).
+            let _ = (|| -> Option<()> {
+                let owner = r.name.to_lowercase().to_ascii();
+                let raw = wire::raw_rdata(r)?;
+                match u16::from(r.record_type()) {
+                    T_DNSKEY if owner == apex => dnskey_set.push(r.clone()),
+                    T_RRSIG => {
+                        let (f, _) = wire::parse_rrsig(raw)?;
+                        rrsigs.push((owner, f, r));
+                    }
+                    T_NSEC => {
+                        let (_, types) = wire::parse_nsec(raw)?;
+                        chain.push(NsecEntry {
+                            key: wire::canon_key(&r.name),
+                            owner,
+                            record: r.clone(),
+                            types,
+                        });
+                    }
+                    T_NSEC3 => {
+                        let (_, _, _, _, _, types) = wire::parse_nsec3(raw)?;
+                        let label = owner.split('.').next().unwrap_or("");
+                        let h = data_encoding::BASE32HEX_NOPAD
+                            .decode(label.to_ascii_uppercase().as_bytes())
+                            .ok()?;
+                        let hash: [u8; 20] = h.try_into().ok()?;
+                        nsec3_raw.push((owner, hash, r, types));
+                    }
+                    T_NSEC3PARAM if owner == apex => {
+                        let (iter, slen) = (
+                            u16::from_be_bytes([*raw.get(2)?, *raw.get(3)?]),
+                            *raw.get(4)? as usize,
+                        );
+                        let salt = raw.get(5..5 + slen)?.to_vec();
+                        nsec3param = Some((r.clone(), iter, salt));
+                    }
+                    _ => {}
+                }
+                Some(())
+            })();
+        }
+        if dnskey_set.is_empty() {
+            return None;
+        }
+        // Key tags of the SEP keys (flags 257).
+        let sep: Vec<u16> = dnskey_set
+            .iter()
+            .filter_map(|k| wire::raw_rdata(k))
+            .filter(|d| d.len() > 4 && u16::from_be_bytes([d[0], d[1]]) & 1 == 1)
+            .map(wire::key_tag)
+            .collect();
+        let mut sigs: HashMap<(String, u16), Record> = HashMap::new();
+        for (owner, f, r) in rrsigs {
+            let by_sep = sep.contains(&f.key_tag);
+            let want_sep = f.type_covered == T_DNSKEY;
+            let k = (owner, f.type_covered);
+            let better = match sigs.get(&k) {
+                None => true,
+                Some(old) => {
+                    let old_sep = wire::raw_rdata(old)
+                        .and_then(wire::parse_rrsig)
+                        .is_some_and(|(o, _)| sep.contains(&o.key_tag));
+                    old_sep != want_sep && by_sep == want_sep
+                }
+            };
+            if better {
+                sigs.insert(k, r.clone());
+            }
+        }
+        chain.sort_by(|a, b| a.key.cmp(&b.key));
+        let index = chain
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.owner.clone(), i))
+            .collect();
+        let (param, iterations, salt) = match nsec3param {
+            Some((r, i, s)) if !nsec3_raw.is_empty() => (Some(r), i, s),
+            _ => (None, NSEC3_ITERATIONS, NSEC3_SALT.to_vec()),
+        };
+        let mut by_hash: HashMap<[u8; 20], String> = HashMap::new();
+        if param.is_some() {
+            for n in existing {
+                if let Ok(name) = Name::from_ascii(n) {
+                    by_hash.insert(wire::nsec3_hash(&name, &salt, iterations), n.clone());
+                }
+            }
+        }
+        let mut nsec3: Vec<Nsec3Entry> = nsec3_raw
+            .into_iter()
+            .map(|(hashed, hash, r, types)| Nsec3Entry {
+                owner: by_hash.get(&hash).cloned().unwrap_or_default(),
+                hash,
+                hashed,
+                record: r.clone(),
+                types,
+            })
+            .collect();
+        nsec3.sort_by_key(|e| e.hash);
+        let nsec3_index = nsec3
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| !e.owner.is_empty())
+            .map(|(i, e)| (e.owner.clone(), i))
+            .collect();
+        let (inception, expiration) = sigs
+            .get(&(apex.to_string(), 6))
+            .and_then(|r| wire::raw_rdata(r))
+            .and_then(wire::parse_rrsig)
+            .map(|(f, _)| (f.inception, f.expiration))
+            .unwrap_or((0, 0));
+        let dnskey = dnskey_set[0].clone();
+        let key_tag = wire::raw_rdata(&dnskey).map(wire::key_tag).unwrap_or(0);
+        Some(SignedZone {
+            fingerprint: "transferred".into(),
+            key_tag,
+            inception,
+            expiration,
+            dnskey,
+            dnskey_set,
+            signed_rrsets: sigs.len(),
+            fresh_signatures: 0,
+            reused_signatures: 0,
+            sig_cache: HashMap::new(),
+            sigs,
+            chain: if param.is_some() { Vec::new() } else { chain },
+            index: if param.is_some() {
+                HashMap::new()
+            } else {
+                index
+            },
+            nsec3,
+            nsec3_index,
+            nsec3param: param,
+            nsec3_salt: salt,
+            nsec3_iterations: iterations,
         })
     }
 
@@ -637,7 +802,7 @@ impl SignedZone {
             return None;
         }
         let n = Name::from_ascii(name).ok()?;
-        let h = wire::nsec3_hash(&n, NSEC3_SALT, NSEC3_ITERATIONS);
+        let h = wire::nsec3_hash(&n, &self.nsec3_salt, self.nsec3_iterations);
         let pp = self.nsec3.partition_point(|e| e.hash < h);
         if pp < self.nsec3.len() && self.nsec3[pp].hash == h {
             return None;
@@ -936,6 +1101,7 @@ mod tests {
             overrides: None,
             record_policy: None,
             nsec3: false,
+            secondary: None,
             settings: None,
         }
     }

@@ -333,6 +333,13 @@ pub fn lookup_dnssec(
         }
     };
     let zone = ds_parent_side(catalog, &zone, &key, qtype).unwrap_or(zone);
+    // O27: a secondary zone without usable data (not transferred yet, or
+    // expired) is answered SERVFAIL, as BIND does.
+    if zone.unavailable {
+        let mut a = Answer::new(ResponseCode::ServFail);
+        a.authoritative = false;
+        return Lookup::Answer(a);
+    }
     let mut ans = Answer::new(ResponseCode::NoError);
     resolve_into(
         catalog, &zone, qname, &key, qtype, auto_ptr, &mut ans, 0, dnssec_ok,
@@ -799,6 +806,7 @@ mod tests {
             overrides: None,
             record_policy: None,
             nsec3: false,
+            secondary: None,
             settings: None,
         }
     }

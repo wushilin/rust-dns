@@ -181,6 +181,28 @@ pub struct Zone {
     /// opt-out) instead of NSEC; absent: NSEC.
     #[serde(default, skip_serializing_if = "is_false")]
     pub nsec3: bool,
+    /// O27: present for a secondary zone: its data is transferred (AXFR /
+    /// IXFR) from these primaries by every server itself, served read-only
+    /// and never signed here (a signed primary's RRSIG / NSEC / NSEC3 are
+    /// served as transferred). Absent for a zone of our own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false, value_type = Option<ZoneSecondary>)]
+    pub secondary: Option<Box<ZoneSecondary>>,
+}
+
+/// O27: where a secondary zone is transferred from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(example = json!({ "primaries": ["192.0.2.53:53"], "key": "xfr-key." }))]
+pub struct ZoneSecondary {
+    /// The primaries (`ip:port`), tried in order.
+    #[schema(value_type = Vec<String>, example = json!(["192.0.2.53:53"]))]
+    pub primaries: Vec<std::net::SocketAddr>,
+    /// TSIG key that signs the SOA, AXFR and IXFR requests (every answer
+    /// must then be signed with it) and that a NOTIFY may be signed with;
+    /// absent: unsigned (a NOTIFY must then come from a primary's address).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false, example = "xfr-key.")]
+    pub key: Option<String>,
 }
 
 /// One NOTIFY target of a zone (O16).
@@ -393,6 +415,11 @@ fn is_false(b: &bool) -> bool {
 }
 
 impl Zone {
+    /// O27: a secondary zone (transferred, read-only here).
+    pub fn is_secondary(&self) -> bool {
+        self.secondary.is_some()
+    }
+
     /// An override zone (I1), not an authoritative one.
     pub fn is_override(&self) -> bool {
         self.overrides.is_some()
@@ -450,6 +477,25 @@ pub struct ZoneInput {
     )]
     #[schema(value_type = Option<RecordPolicy>)]
     pub record_policy: Option<Option<RecordPolicy>>,
+    /// O27. Create: makes a secondary zone (transferred from `primaries`,
+    /// read-only here). Update: changes the primaries or the key of a
+    /// secondary zone (the type is chosen at creation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false, example = json!({ "primaries": ["192.0.2.53"], "key": "xfr-key." }))]
+    pub secondary: Option<ZoneSecondaryInput>,
+}
+
+/// O27: secondary zone settings as entered.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct ZoneSecondaryInput {
+    /// IP addresses with an optional port (53 when omitted), 1 to 8.
+    /// Required on creation; unchanged when omitted on update.
+    #[schema(nullable = false, example = json!(["192.0.2.53", "[2001:db8::53]:53"]))]
+    pub primaries: Option<Vec<String>>,
+    /// TSIG key name (it must exist); empty string: unsigned. Unchanged
+    /// when omitted on update.
+    #[schema(nullable = false, example = "xfr-key.")]
+    pub key: Option<String>,
 }
 
 /// Override settings as entered (I1).

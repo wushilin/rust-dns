@@ -613,6 +613,7 @@ impl<'a> Tx<'a> {
         ttl: Option<u32>,
         expires_at: Option<String>,
     ) -> MResult<Record> {
+        read_only(zone)?;
         if ttl == Some(0) {
             return Err(MutationError::Invalid(
                 "ttl must be at least 1 (or empty for the zone default)".into(),
@@ -662,6 +663,7 @@ impl<'a> Tx<'a> {
         ttl: Option<u32>,
         expires_at: Option<String>,
     ) -> MResult<Record> {
+        read_only(zone)?;
         if ttl == Some(0) {
             return Err(MutationError::Invalid(
                 "ttl must be at least 1 (or empty for the zone default)".into(),
@@ -727,6 +729,7 @@ impl<'a> Tx<'a> {
     }
 
     pub fn delete_record(&mut self, zone: &Zone, record: &Record) -> MResult<()> {
+        read_only(zone)?;
         sql::delete_record(self.conn, record.id)?;
         self.touched.insert(zone.id, zone.name.clone());
         self.changes.push(Change::Dns(DnsChange::RecordDeleted {
@@ -922,6 +925,19 @@ impl<'a> Tx<'a> {
 }
 
 /// The zones a list of changes touches, for the incremental catalog build.
+/// O27: a secondary zone's records are transferred from its primary and
+/// never written here (every record write path goes through these `Tx`
+/// methods).
+fn read_only(zone: &Zone) -> MResult<()> {
+    if zone.is_secondary() {
+        return Err(MutationError::Conflict(format!(
+            "'{}' is a secondary zone: its records are transferred from its primary and read-only here",
+            zone.name
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn catalog_zones<'a>(changes: impl IntoIterator<Item = &'a Change>) -> Vec<i64> {
     let ids: std::collections::BTreeSet<i64> = changes
         .into_iter()

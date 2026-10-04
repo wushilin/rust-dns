@@ -1382,6 +1382,52 @@
         }
       }
     },
+    "/zones/{zone}/secondary": {
+      "get": {
+        "tags": [
+          "Zones"
+        ],
+        "summary": "Transfer status of a secondary zone on this server",
+        "description": "O27. Every server transfers a secondary zone from its primaries itself, so this is this server's view: the serial served, the last transfer (AXFR or IXFR) and refresh, the last error, when the data expires (then the zone is answered SERVFAIL), NOTIFYs accepted, whether the primary signed the zone, and record types it sends that this server does not serve. 404 for a zone that is not a secondary zone. Needs view rights on the zone.",
+        "operationId": "get_secondary_status",
+        "parameters": [
+          {
+            "name": "zone",
+            "in": "path",
+            "description": "Zone name, e.g. `example.com`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "example.com"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Status.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecondaryStatus"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
     "/zones/{zone}/clone": {
       "post": {
         "tags": [
@@ -9578,6 +9624,112 @@
           "total": 1
         }
       },
+      "SecondaryStatus": {
+        "type": "object",
+        "description": "What this server knows about one secondary zone (local, per server).",
+        "required": [
+          "state",
+          "serial",
+          "records",
+          "unsupported_types",
+          "last_transfer_at",
+          "last_transfer",
+          "last_refresh_at",
+          "last_error",
+          "last_error_at",
+          "expires_at",
+          "source",
+          "notifies",
+          "signed"
+        ],
+        "properties": {
+          "state": {
+            "type": "string",
+            "description": "`ok` (data current), `pending` (no data yet), `expired` (not\nrefreshed within the SOA expire time: answered SERVFAIL), `error`\n(the last refresh failed; the data is still served until it expires)."
+          },
+          "serial": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The serial served; `null` without data.",
+            "minimum": 0
+          },
+          "records": {
+            "type": "integer",
+            "description": "Records served (DNSSEC records included).",
+            "minimum": 0
+          },
+          "unsupported_types": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Types the primary sends that this server does not serve."
+          },
+          "last_transfer_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "last_transfer": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`axfr` or `ixfr`."
+          },
+          "last_refresh_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "The last successful transfer or up-to-date check."
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_error_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "expires_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When the data stops being served without a refresh."
+          },
+          "source": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The primary of the data served (`ip:port`)."
+          },
+          "notifies": {
+            "type": "integer",
+            "format": "int64",
+            "description": "NOTIFYs accepted since start.",
+            "minimum": 0
+          },
+          "signed": {
+            "type": "boolean",
+            "description": "The data is signed by the primary (DNSKEY at the apex)."
+          }
+        }
+      },
       "SecuritySettings": {
         "type": "object",
         "description": "Account security settings (console setting `security`). Every field\nhas a default that keeps the behaviour before it existed; unknown\nfields are ignored (an older server stores the row and ignores it).",
@@ -11290,6 +11442,10 @@
           "nsec3": {
             "type": "boolean",
             "description": "O24: a signed zone proves non-existence with NSEC3 (RFC 5155 with\nthe RFC 9276 parameters: SHA-1, no extra iterations, no salt, no\nopt-out) instead of NSEC; absent: NSEC."
+          },
+          "secondary": {
+            "$ref": "#/components/schemas/ZoneSecondary",
+            "description": "O27: present for a secondary zone: its data is transferred (AXFR /\nIXFR) from these primaries by every server itself, served read-only\nand never signed here (a signed primary's RRSIG / NSEC / NSEC3 are\nserved as transferred). Absent for a zone of our own."
           }
         }
       },
@@ -11511,6 +11667,10 @@
                 "description": "Record expiry policy (M2). Absent: unchanged; `null` or `{}`:\nremoved; an object: replaces the policy."
               }
             ]
+          },
+          "secondary": {
+            "$ref": "#/components/schemas/ZoneSecondaryInput",
+            "description": "O27. Create: makes a secondary zone (transferred from `primaries`,\nread-only here). Update: changes the primaries or the key of a\nsecondary zone (the type is chosen at creation)."
           }
         }
       },
@@ -11707,6 +11867,58 @@
           "owner"
         ],
         "example": "owner"
+      },
+      "ZoneSecondary": {
+        "type": "object",
+        "description": "O27: where a secondary zone is transferred from.",
+        "required": [
+          "primaries"
+        ],
+        "properties": {
+          "primaries": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The primaries (`ip:port`), tried in order.",
+            "example": [
+              "192.0.2.53:53"
+            ]
+          },
+          "key": {
+            "type": "string",
+            "description": "TSIG key that signs the SOA, AXFR and IXFR requests (every answer\nmust then be signed with it) and that a NOTIFY may be signed with;\nabsent: unsigned (a NOTIFY must then come from a primary's address).",
+            "example": "xfr-key."
+          }
+        },
+        "example": {
+          "key": "xfr-key.",
+          "primaries": [
+            "192.0.2.53:53"
+          ]
+        }
+      },
+      "ZoneSecondaryInput": {
+        "type": "object",
+        "description": "O27: secondary zone settings as entered.",
+        "properties": {
+          "primaries": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "IP addresses with an optional port (53 when omitted), 1 to 8.\nRequired on creation; unchanged when omitted on update.",
+            "example": [
+              "192.0.2.53",
+              "[2001:db8::53]:53"
+            ]
+          },
+          "key": {
+            "type": "string",
+            "description": "TSIG key name (it must exist); empty string: unsigned. Unchanged\nwhen omitted on update.",
+            "example": "xfr-key."
+          }
+        }
       },
       "ZoneSettings": {
         "type": "object",

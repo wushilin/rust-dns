@@ -939,7 +939,7 @@ Group 6: DNS protocol depth (all OFF by default; live zone not switched)
   the rollover wizard (algorithm rollover documented, not automated).
 - [x] O26. Response rate limiting per response tuple (RRL with slip),
   alongside per-client limits.
-- [ ] O27. Acting as a secondary for zones hosted elsewhere (AXFR/IXFR in,
+- [x] O27. Acting as a secondary for zones hosted elsewhere (AXFR/IXFR in,
   NOTIFY in, TSIG, refresh/retry/expire timers, served read-only).
 - [ ] O28. Record types hickory's text parser lacks (LOC and others that
   matter), via presentation-format parsing.
@@ -1138,6 +1138,27 @@ Final
   start with `ca_file` set: add it only after the upgrade, and remove it
   before a downgrade. gate and baba2 use the system trust store today:
   nothing to change.
+
+- After phase O, O27 (secondary zones; this session; not deployed):
+  protocol 2, no new change kind, fixture untouched. New nullable column
+  `zones.secondary_spec` (added NULL, nothing rewritten; `compat_columns`,
+  covered by the per-zone checksum) and an optional `secondary` field in
+  the zone row of `zone_created` / `zone_updated` and snapshots, present
+  only for a secondary zone. New LOCAL table `secondary_transfers` (each
+  server's own transferred data; an older binary ignores it). Standbys
+  advertise `secondary-zones` (`X-Rust-DNS-Version: 0.1.0+dnssec-rollover.
+  zone-rename.zone-settings.nsec3.ed25519.secondary-zones`). An older
+  (d32d67f, 3884ba8) standby would store a secondary zone as an empty zone
+  of its own and answer NXDOMAIN for its names, so: the primary refuses to
+  create one (409 naming the standby) while a known standby lacks the
+  feature, and while any secondary zone exists the snapshot and change
+  endpoints refuse such a standby (409: `refused`, keeps its data, not
+  halted; test `secondary_zones_replicate_their_definition_and_every_
+  server_transfers_itself`, real d32d67f and 3884ba8). Upgrade baba2 first,
+  then gate; create secondary zones only after both run this version, and
+  allow transfers (and NOTIFY) from the zone's primary to BOTH servers
+  (each transfers itself). No downgrade once a secondary zone exists (the
+  old binary would serve it empty); delete it first.
 
 - After phase O, O26 (RRL; this session; not deployed): no replication,
   data or console-setting change. New optional `[rate_limit.rrl]` table in
@@ -2441,4 +2462,64 @@ Final
   NODATA x3, four other names) all answered in full; 20 TCP queries all
   answered; 40 queries with a valid server cookie all answered; the API
   view and `/metrics` counters; an exempt network gets 60 of 60); OpenAPI
+  snapshot.
+- 2026-10-04 (phase O): O27 done. Secondary zones: a zone row with a
+  `secondary` spec (primaries `ip:port`, optional TSIG key), created with
+  `POST /zones {"name", "secondary": {...}}` (console: New zone, type
+  Secondary). Decision on replication (AGENT.md): the definition is
+  ordinary replicated zone data; the content is NOT replicated: every
+  server (standbys too) is a secondary of the zone's primaries itself, like
+  several BIND secondaries, keeping its last transfer in the new local
+  table `secondary_transfers` (classified Local in `replication/tables.rs`:
+  bookkeeping of this server's own transfer, never in the changelog; a
+  standby still never writes replicated data). Simplest correct rule: no
+  transferred record ever crosses our changelog, so nothing to reconcile,
+  and a standby needs no data from our primary that the zone's primary
+  does not give it directly. `src/secondary.rs`: per zone a refresh task
+  (SOA serial check over UDP/TCP with RFC 1982 comparison; IXFR from our
+  serial when we hold data, AXFR otherwise or when an IXFR fails or comes
+  back as a whole zone; `interpret` applies RFC 1995 difference sequences
+  and refuses inconsistent ones; every message TSIG-verified with
+  `ResponseVerifier` when a key is set), timers from the transferred SOA
+  (refresh / retry; expire -> `unavailable`: SERVFAIL, not transferred
+  on), inbound NOTIFY (opcode NOTIFY in the `request` filter: accepted
+  from a primary's address or signed with the zone key, else REFUSED;
+  wakes the zone's task), catalog integration through
+  `Signer::secondaries` (`ZoneData::build_secondary`: the transferred SOA
+  and records, the catalog's copy of the zone row takes the SOA timers;
+  DNSSEC records feed `SignedZone::from_transfer`, which serves the
+  primary's DNSKEY, RRSIGs and NSEC / NSEC3 chain as transferred, NSEC3
+  hashes mapped back with the primary's NSEC3PARAM salt and iterations),
+  `Mutator::rebuild_zones` after a transfer or expiry. Read-only:
+  `Tx` refuses record writes on a secondary zone (every path: API, bulk,
+  imports), signing, rename, clone and SOA fields are refused; console
+  rule in `decide()` (edit_records / edit_settings / import on a
+  secondary zone: disabled with the reason), Clone / Rename blocked with
+  the reason, a *Secondary* tab with this server's status. API `GET
+  /zones/{zone}/secondary`. Compatibility in Rollout (feature
+  `secondary-zones`). Tests: unit `secondary::tests::{serials_compare_by_
+  rfc1982, axfr_and_ixfr_answers_are_interpreted, stored_data_round_
+  trips_and_expires}`, storage migration test; new suite `tests/
+  secondary.rs` `secondary_zones_from_a_bind_primary` (real `named`
+  9.20.29 as the primary with TSIG `allow-transfer`, `also-notify ... key`:
+  four zones transferred by AXFR; answers equal BIND's (A, TXT, wildcard,
+  MX, NS) with AA; NXDOMAIN with SOA; records / signing / SOA / rename
+  refused; `nsupdate` add -> signed NOTIFY -> IXFR within seconds (status
+  `ixfr`, serial 2, notifies >= 1), delete -> IXFR; NOTIFY for a zone that
+  is not secondary REFUSED; AXFR out of the secondary zone; two zones
+  pre-signed by `dnssec-signzone` (NSEC, and NSEC3 `-3 -`) validated by
+  `delv` with the primary's key against rust-dns for positive, wildcard,
+  NXDOMAIN, NODATA, empty non-terminal and DNSKEY; named stopped and
+  rust-dns restarted: served from the local copy (serial 3); a 4 s expire
+  zone answers SERVFAIL, status `expired`; named back: transferred again;
+  a key with the wrong secret: refresh fails (BADSIG), SERVFAIL after
+  expiry; an unknown key 400); follow `secondary_zones_replicate_their_
+  definition_and_every_server_transfers_itself` (a third rust-dns as the
+  zone's primary NOTIFYing both; primary and standby each transfer (status
+  `ok`, source = that server), same answers, record write 409, a change
+  reaches both by NOTIFY, the changelog holds only the zone definition;
+  previous release refused while a secondary zone exists, follows once
+  none does, and then creating one is refused naming it); browser: New
+  zone -> Secondary (SOA fields hidden), the add-record control disabled
+  "Secondary zone: ...", the Secondary tab shows the state; OpenAPI
   snapshot.

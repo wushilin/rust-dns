@@ -371,6 +371,7 @@ fn api_router() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(routes::search))
         .routes(routes!(routes::rename_zone))
         .routes(routes!(routes::set_zone_settings))
+        .routes(routes!(routes::get_secondary_status))
         .routes(routes!(routes::clone_zone))
         .routes(routes!(routes::bulk_records))
         .routes(routes!(routes::set_member, routes::remove_member))

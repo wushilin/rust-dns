@@ -13,6 +13,7 @@ mod mutation;
 mod ratelimit;
 mod reload;
 mod replication;
+mod secondary;
 mod storage;
 mod ui;
 #[cfg(windows)]
@@ -277,6 +278,14 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         eprintln!("\n  Root login: {}  /  {}\n  (the plaintext is only shown once; the config now holds a hash)\n", root.username, pw);
     }
     mutator.set_dnssec_config(cfg.dnssec.clone());
+    // O27: secondary zones serve their last transfer until it expires.
+    match mutator.signer().secondaries.load(&storage) {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(zones = n, "secondary zone data loaded"),
+        Err(e) => {
+            tracing::warn!(error = %e, "secondary zone data could not be loaded; transferring again")
+        }
+    }
     mutator.rebuild()?;
     let (zc, rc) = storage.counts()?;
     tracing::info!(zones = zc, records = rc, "catalog loaded");
@@ -312,6 +321,15 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     }
     let dns_task = tokio::spawn(dns::serve(dns.clone()));
     tokio::spawn(dns::notify::run(dns.clone()));
+    // O27: secondary zones (every server transfers them itself).
+    let _ = dns.secondaries.set(mutator.signer().secondaries.clone());
+    tokio::spawn(secondary::run(Arc::new(secondary::Ctx {
+        storage: storage.clone(),
+        mutator: mutator.clone(),
+        cache: cache.clone(),
+        dns: dns.clone(),
+        store: mutator.signer().secondaries.clone(),
+    })));
 
     let reloader = Arc::new(reload::Reloader {
         path: cli.config.clone(),

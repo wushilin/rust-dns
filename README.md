@@ -695,6 +695,54 @@ zone "example.com" {
 Test from an allowed address with
 `dig -y hmac-sha256:hn-secondary.:<secret> @192.0.2.1 example.com AXFR`.
 
+## Secondary zones
+
+A zone hosted on another server (BIND, NSD, Knot, another rust-dns) can be
+served here read-only as a *secondary zone* (off unless created):
+
+```bash
+curl -X POST .../api/zones -d '{"name": "example.org",
+  "secondary": {"primaries": ["192.0.2.53", "[2001:db8::53]:53"], "key": "xfr-key."}}'
+```
+
+- The data is transferred with AXFR, then IXFR (incremental, from the
+  primary's journal; AXFR again when the primary answers an IXFR with the
+  whole zone or cannot serve one). The primary's SOA timers decide:
+  the serial is checked every `refresh` seconds, every `retry` seconds after
+  a failure, and when no refresh succeeded for `expire` seconds the zone is
+  answered SERVFAIL until a transfer succeeds again (as BIND does).
+- A NOTIFY from one of the primaries' addresses, or signed with the zone's
+  TSIG key, refreshes it at once. A NOTIFY for any other zone, or from
+  anyone else, is REFUSED.
+- `key` (optional): a TSIG key (create it under *TSIG keys* with the
+  primary's secret) that signs every SOA, AXFR and IXFR request; every
+  answer must then be signed with it.
+- Read-only: records, SOA settings, signing, rename and clone are refused
+  (409 / 400), and disabled in the console with the reason. Members and
+  the transfer / NOTIFY settings for your own secondaries work as usual;
+  the zone is transferred on to them with the primary's data.
+- Not signed here: when the primary signs the zone, its DNSKEY, RRSIG and
+  NSEC / NSEC3 records are served exactly as transferred (positive answers
+  carry the primary's RRSIGs, negative answers its NSEC or NSEC3 proofs), so
+  validators see the primary's chain of trust. Limits: one RRSIG per RRset
+  is kept (the DNSKEY RRset's by a SEP key; other RRsets' by a non-SEP key
+  when the primary uses a KSK / ZSK split); NSEC3 opt-out delegations have
+  no NSEC3 and are answered without a proof; record types this server does
+  not serve (listed in the status) are not answered.
+- No automatic PTR answers from a secondary zone's addresses.
+- Status on this server: `GET /api/zones/{zone}/secondary` (serial, last
+  AXFR / IXFR, last refresh and error, expiry, NOTIFYs, signed or not), and
+  the *Secondary* tab of the zone in the console.
+
+**Replication.** The zone's *definition* (name, primaries, key) is ordinary
+zone data and replicates to standbys. Its *content* does not: every server,
+standbys included, is a secondary of the zone's primaries itself, exactly
+like several BIND secondaries of one primary. So the primary must allow
+transfers (and should send NOTIFY) to every rust-dns server of the pair.
+Each server keeps its last transfer in the local table
+`secondary_transfers` (never replicated), so a restart serves it until it
+expires. The changelog never carries transferred records.
+
 ## Standby / follow mode
 
 A second rust-dns can mirror the primary so that it answers **all DNS
@@ -1236,7 +1284,7 @@ ceiling is the OS loopback path, not the server. Resident memory stays around
   against them), automated key rollover through CDS/CDNSKEY (the wizard
   above needs the DS change done by hand), algorithms other than 13 and 15,
   automated algorithm rollovers (13 <-> 15, see DNSSEC).
-- Inbound NOTIFY / acting as a secondary for zones hosted elsewhere; automatic failover.
+- Automatic failover.
 - DNS over TLS/HTTPS.
 - Console sorting and bulk record tools, WebAuthn, static musl multi-arch
   publishing, Debian packaging, and a Homebrew formula.
