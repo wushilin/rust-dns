@@ -3798,3 +3798,761 @@ fn zone_settings_replicate_and_wait_for_old_standbys() {
     drop(p);
     let _ = std::fs::remove_dir_all(&root_dir);
 }
+
+/// O21 helpers: a standby's view of its replication, and a node's replicas.
+fn follow_state(n: &Node, a: &ureq::Agent) -> Value {
+    status(n, a)["follow"].clone()
+}
+
+fn replica_of(n: &Node, a: &ureq::Agent, id: &str) -> Value {
+    ok(
+        call(
+            &Auth::Session(a),
+            "GET",
+            &n.api("/replication/replicas"),
+            None,
+        ),
+        "replicas",
+    )["replicas"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["instance"] == id)
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+fn temp_root(tag: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let d = std::env::temp_dir().join(format!("rust-dns-{tag}-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+fn add_record(n: &Node, a: &ureq::Agent, zone: &str, name: &str, value: &str) {
+    ok(
+        call(
+            &Auth::Session(a),
+            "POST",
+            &n.api(&format!("/zones/{zone}/records")),
+            Some(json!({ "name": name, "type": "A", "value": value })),
+        ),
+        "record",
+    );
+}
+
+/// O21: cascading standbys. A -> B -> C: C follows B (a standby) with the
+/// same offsets and history; B lists C as its replica, A only B. Account
+/// changes reach C promptly. A standby with another [root] username, and
+/// a previous-release standby, are refused by B (not halted). Promoting B
+/// in the middle of the chain: C adopts B's new history and keeps
+/// following it.
+#[test]
+fn cascading_standbys_follow_and_survive_a_promotion_in_the_middle() {
+    let root_dir = temp_root("cascade");
+    let mut a = Node::new(&root_dir, "a", "rootpass-a");
+    let mut b = Node::new(&root_dir, "b", "rootpass-b");
+    let mut c = Node::new(&root_dir, "c", "rootpass-c");
+    a.configure("");
+    a.start();
+    let ar = a.root();
+    let token = ok(
+        call(
+            &Auth::Session(&ar),
+            "POST",
+            &a.api("/tokens"),
+            Some(json!({ "name": "repl" })),
+        ),
+        "token",
+    )["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    ok(
+        call(
+            &Auth::Session(&ar),
+            "POST",
+            &a.api("/zones"),
+            Some(json!({ "name": "c.test" })),
+        ),
+        "zone",
+    );
+    add_record(&a, &ar, "c.test", "www", "192.0.2.1");
+    b.configure(&follow_cfg(&a, "dns2", &token));
+    b.start();
+    let br = b.root();
+    wait_for("B has the data", 20, || {
+        record_names(&b, &br, "c.test") == vec!["www A 192.0.2.1".to_string()]
+    });
+    c.configure(&follow_cfg(&b, "dns3", &token));
+    c.start();
+    let cr = c.root();
+    wait_for("C has the data through B", 20, || {
+        record_names(&c, &cr, "c.test") == vec!["www A 192.0.2.1".to_string()]
+    });
+    // Same history and offsets down the chain.
+    add_record(&a, &ar, "c.test", "two", "192.0.2.2");
+    wait_for("C has the new record", 20, || {
+        answers(c.dns, "two.c.test.", RecordType::A).1.len() == 1
+    });
+    let (sa, sb, sc) = (status(&a, &ar), status(&b, &br), status(&c, &cr));
+    assert_eq!(sc["history"]["history_id"], sa["history"]["history_id"]);
+    assert_eq!(sb["history"]["history_id"], sa["history"]["history_id"]);
+    wait_for("same head on all three", 10, || {
+        let h = status(&a, &ar)["head"].clone();
+        status(&b, &br)["head"] == h && status(&c, &cr)["head"] == h
+    });
+    assert_eq!(sc["follow"]["primary"], b.url().as_str());
+    assert_eq!(sb["local_root"], "root", "a standby names its root: {sb}");
+    assert!(sa.get("local_root").is_none(), "only standbys do: {sa}");
+    // B tracks C; A tracks only B.
+    wait_for("B lists dns3 up to date", 15, || {
+        replica_of(&b, &br, "dns3")["state"] == "up_to_date"
+    });
+    assert!(replica_of(&a, &ar, "dns3").is_null());
+    assert_eq!(replica_of(&a, &ar, "dns2")["state"], "up_to_date");
+    // C reconciles against B.
+    wait_for("C reconciled with B", 15, || {
+        follow_state(&c, &cr)["last_reconcile_result"]
+            .as_str()
+            .is_some_and(|r| r.starts_with("ok"))
+    });
+    // An account change reaches C promptly (B wakes its long-polls).
+    ok(
+        call(
+            &Auth::Session(&ar),
+            "POST",
+            &a.api("/users"),
+            Some(json!({ "username": "carol", "password": "carolpass123" })),
+        ),
+        "user",
+    );
+    let t0 = Instant::now();
+    wait_for("carol can sign in on C", 15, || {
+        call(
+            &Auth::None,
+            "POST",
+            &c.api("/auth/login"),
+            Some(json!({ "username": "carol", "password": "carolpass123" })),
+        )
+        .0 == 200
+    });
+    assert!(t0.elapsed() < Duration::from_secs(10), "{:?}", t0.elapsed());
+
+    // A standby with another [root] username is refused (not halted).
+    {
+        let mut d = Node::new(&root_dir, "d", "rootpass-d");
+        d.configure(&follow_cfg(&b, "dns4", &token));
+        let cfg = std::fs::read_to_string(d.config_path()).unwrap();
+        std::fs::write(
+            d.config_path(),
+            cfg.replace("username = \"root\"", "username = \"admin\""),
+        )
+        .unwrap();
+        d.start();
+        let dr = d.login("admin", "rootpass-d");
+        wait_for("D refused", 15, || {
+            follow_state(&d, &dr)["state"] == "refused"
+        });
+        let f = follow_state(&d, &dr);
+        assert!(f["halted"].is_null(), "{f}");
+        assert!(
+            f["last_error"]
+                .as_str()
+                .unwrap()
+                .contains("same [root] username"),
+            "{f}"
+        );
+        assert!(record_names(&d, &dr, "c.test").is_empty());
+    }
+    // A previous-release standby cannot follow a standby: refused, not halted.
+    if let Some(prev) = prev_bin() {
+        let mut e = Node::new(&root_dir, "e", "rootpass-e");
+        e.bin = prev;
+        e.configure(&follow_cfg(&b, "dns5", &token));
+        e.start();
+        let er = e.root();
+        wait_for("old E refused", 15, || {
+            follow_state(&e, &er)["state"] == "refused"
+        });
+        assert!(follow_state(&e, &er)["halted"].is_null());
+        assert!(record_names(&e, &er, "c.test").is_empty());
+    }
+
+    // Promotion in the middle: A goes away, B is promoted, C follows B's
+    // new history.
+    let old_history = sa["history"]["history_id"].as_str().unwrap().to_string();
+    a.stop();
+    let r = ok(
+        call(
+            &Auth::Session(&br),
+            "POST",
+            &b.api("/replication/promote"),
+            Some(json!({ "confirm": true, "force": true })),
+        ),
+        "promote B",
+    );
+    let new_history = r["history"]["history_id"].as_str().unwrap().to_string();
+    assert_eq!(r["history"]["parent_history_id"], old_history.as_str());
+    add_record(&b, &br, "c.test", "three", "192.0.2.3");
+    wait_for("C follows promoted B", 30, || {
+        answers(c.dns, "three.c.test.", RecordType::A).1.len() == 1
+    });
+    let sc = status(&c, &cr);
+    assert_eq!(sc["history"]["history_id"], new_history.as_str(), "{sc}");
+    assert!(sc["follow"]["halted"].is_null(), "{sc}");
+    assert!(
+        c.log().contains("continuing in its history"),
+        "C adopted B's history"
+    );
+    assert_eq!(status(&b, &br)["head"], sc["head"]);
+    wait_for("dns3 up to date on promoted B", 15, || {
+        replica_of(&b, &br, "dns3")["state"] == "up_to_date"
+    });
+    drop((a, b, c));
+    let _ = std::fs::remove_dir_all(&root_dir);
+}
+
+/// O21: a standby whose upstream standby halts halts too
+/// (`upstream_halted`), at once (B wakes its long-polls), and stays halted
+/// after B is rebuilt and follows again: its copy came from B. Rebuilt
+/// itself, it follows B again.
+#[test]
+fn a_standby_of_a_halted_standby_halts_too() {
+    let root_dir = temp_root("cascade-halt");
+    let mut a = Node::new(&root_dir, "a", "rootpass-a");
+    let mut b = Node::new(&root_dir, "b", "rootpass-b");
+    let mut c = Node::new(&root_dir, "c", "rootpass-c");
+    a.configure("");
+    a.start();
+    let ar = a.root();
+    let token = ok(
+        call(
+            &Auth::Session(&ar),
+            "POST",
+            &a.api("/tokens"),
+            Some(json!({ "name": "repl" })),
+        ),
+        "token",
+    )["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    ok(
+        call(
+            &Auth::Session(&ar),
+            "POST",
+            &a.api("/zones"),
+            Some(json!({ "name": "h.test" })),
+        ),
+        "zone",
+    );
+    add_record(&a, &ar, "h.test", "www", "192.0.2.1");
+    b.configure(&follow_cfg(&a, "dns2", &token));
+    b.start();
+    let br = b.root();
+    wait_for("B has the data", 20, || {
+        record_names(&b, &br, "h.test") == vec!["www A 192.0.2.1".to_string()]
+    });
+    // C's own reconcile is far away: only B's halt can stop it.
+    c.configure(&follow_cfg(&b, "dns3", &token).replace(
+        "reconcile_interval_secs = 2",
+        "reconcile_interval_secs = 3600",
+    ));
+    c.start();
+    let cr = c.root();
+    wait_for("C has the data", 20, || {
+        record_names(&c, &cr, "h.test") == vec!["www A 192.0.2.1".to_string()]
+    });
+    wait_for("C following", 10, || {
+        follow_state(&c, &cr)["state"] == "following"
+    });
+
+    // B's data diverges behind its back; it halts at its next reconcile.
+    b.stop();
+    {
+        let db = rusqlite::Connection::open(b.dir.join("data.db")).unwrap();
+        db.execute(
+            "UPDATE records SET value = '192.0.2.250' WHERE name = 'www'",
+            [],
+        )
+        .unwrap();
+    }
+    b.start();
+    let br = b.root();
+    wait_for("B halts", 20, || follow_state(&b, &br)["state"] == "halted");
+    let t0 = Instant::now();
+    wait_for("C halts too", 20, || {
+        follow_state(&c, &cr)["state"] == "halted"
+    });
+    assert!(t0.elapsed() < Duration::from_secs(15), "{:?}", t0.elapsed());
+    let h = follow_state(&c, &cr)["halted"].clone();
+    assert_eq!(h["reason"], "upstream_halted", "{h}");
+    assert!(h["detail"].as_str().unwrap().contains(&b.url()), "{h}");
+    assert!(std::path::Path::new(h["report_file"].as_str().unwrap()).is_file());
+    assert!(c.log().contains("REPLICATION HALTED"));
+    wait_for("B shows dns3 halted", 15, || {
+        replica_of(&b, &br, "dns3")["state"] == "halted"
+    });
+    // B refuses to serve, with the code its followers act on.
+    let r = ureq::get(&format!("{}?after=0", b.api("/replication/changes")))
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("X-Rust-DNS-Instance", "probe")
+        .call();
+    match r {
+        Err(ureq::Error::Status(409, resp)) => {
+            let v: Value = resp.into_json().unwrap();
+            assert_eq!(v["code"], "replication_halted", "{v}");
+        }
+        other => panic!("halted B must refuse with 409: {other:?}"),
+    }
+
+    // A moves on; B is rebuilt and follows again. C stays halted.
+    add_record(&a, &ar, "h.test", "new", "192.0.2.2");
+    b.stop();
+    let run = Command::new(env!("CARGO_BIN_EXE_rust-dns"))
+        .args(["--prepare-standby", "--yes", "--config"])
+        .arg(b.config_path())
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    b.start();
+    let br = b.root();
+    wait_for("rebuilt B follows", 20, || {
+        answers(b.dns, "new.h.test.", RecordType::A).1.len() == 1
+    });
+    std::thread::sleep(Duration::from_secs(4));
+    assert_eq!(follow_state(&c, &cr)["state"], "halted");
+    assert!(
+        answers(c.dns, "new.h.test.", RecordType::A).1.is_empty(),
+        "a halted standby does not follow its rebuilt upstream"
+    );
+    // Rebuilt, C follows B again.
+    c.stop();
+    let run = Command::new(env!("CARGO_BIN_EXE_rust-dns"))
+        .args(["--prepare-standby", "--yes", "--config"])
+        .arg(c.config_path())
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    c.start();
+    let cr = c.root();
+    wait_for("rebuilt C follows B", 20, || {
+        record_names(&c, &cr, "h.test")
+            == vec!["new A 192.0.2.2".to_string(), "www A 192.0.2.1".to_string()]
+    });
+    assert!(follow_state(&c, &cr)["halted"].is_null());
+    let _ = &br;
+    drop((a, b, c));
+    let _ = std::fs::remove_dir_all(&root_dir);
+}
+
+/// O22: the log line of `message` with `field` (e.g. `gzip=true`), if any.
+fn log_has(n: &Node, message: &str, field: &str) -> bool {
+    n.log()
+        .lines()
+        .any(|l| l.contains(message) && l.split_whitespace().any(|w| w == field))
+}
+
+/// A raw HTTP/1.1 GET (headers lower-cased, body as sent: no decoding).
+fn raw_get(n: &Node, path: &str, headers: &[(&str, &str)]) -> (String, Vec<u8>) {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", n.web)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n");
+    for (k, v) in headers {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    req.push_str("\r\n");
+    s.write_all(req.as_bytes()).unwrap();
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf).unwrap();
+    let split = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    let head = String::from_utf8_lossy(&buf[..split]).to_lowercase();
+    let mut body = buf[split + 4..].to_vec();
+    if head.contains("transfer-encoding: chunked") {
+        let mut out = Vec::new();
+        let mut i = 0;
+        loop {
+            let eol = i + body[i..].windows(2).position(|w| w == b"\r\n").unwrap();
+            let len = usize::from_str_radix(std::str::from_utf8(&body[i..eol]).unwrap().trim(), 16)
+                .unwrap();
+            if len == 0 {
+                break;
+            }
+            out.extend_from_slice(&body[eol + 2..eol + 2 + len]);
+            i = eol + 2 + len + 2;
+        }
+        body = out;
+    }
+    (head, body)
+}
+
+/// O22: snapshots are gzip-compressed when the standby asks for it
+/// (`Accept-Encoding: gzip`), identical once decompressed, and plain
+/// otherwise. Mixed versions both ways: a previous-release standby (does
+/// not ask) gets plain JSON from this primary, and a standby of this
+/// version loads a previous-release primary's plain snapshot.
+#[test]
+fn snapshots_are_gzip_compressed_when_the_standby_asks() {
+    use std::io::Read;
+    let root_dir = temp_root("gzip");
+    let mut p = Node::new(&root_dir, "primary", "rootpass-p");
+    let mut s = Node::new(&root_dir, "standby", "rootpass-s");
+    p.configure("");
+    p.start();
+    let pr = p.root();
+    let token = ok(
+        call(
+            &Auth::Session(&pr),
+            "POST",
+            &p.api("/tokens"),
+            Some(json!({ "name": "repl" })),
+        ),
+        "token",
+    )["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    ok(
+        call(
+            &Auth::Session(&pr),
+            "POST",
+            &p.api("/zones"),
+            Some(json!({ "name": "gz.test" })),
+        ),
+        "zone",
+    );
+    for i in 0..40 {
+        add_record(
+            &p,
+            &pr,
+            "gz.test",
+            &format!("host{i}"),
+            &format!("192.0.2.{}", i + 1),
+        );
+    }
+    s.configure(&follow_cfg(&p, "dns2", &token));
+    s.start();
+    let sr = s.root();
+    wait_for("standby has the zone", 20, || {
+        record_names(&s, &sr, "gz.test").len() == 40
+    });
+    assert!(
+        log_has(&p, "replication snapshot served", "gzip=true"),
+        "{}",
+        p.log()
+    );
+    assert!(log_has(&s, "snapshot received", "gzip=true"), "{}", s.log());
+
+    // The same document either way; compressed only when asked.
+    let auth = format!("Bearer {token}");
+    let hdrs = |gz: bool| {
+        let mut v = vec![
+            ("Authorization", auth.as_str()),
+            ("X-Rust-DNS-Instance", "probe"),
+        ];
+        if gz {
+            v.push(("Accept-Encoding", "gzip"));
+        }
+        v
+    };
+    let (h_plain, plain) = raw_get(&p, "/api/replication/snapshot", &hdrs(false));
+    let (h_gz, gz) = raw_get(&p, "/api/replication/snapshot", &hdrs(true));
+    assert!(h_plain.starts_with("http/1.1 200"), "{h_plain}");
+    assert!(!h_plain.contains("content-encoding"), "{h_plain}");
+    assert!(h_gz.contains("content-encoding: gzip"), "{h_gz}");
+    assert!(h_gz.contains("cache-control: no-store"), "{h_gz}");
+    let mut unzipped = Vec::new();
+    flate2::read::GzDecoder::new(&gz[..])
+        .read_to_end(&mut unzipped)
+        .unwrap();
+    let mut a: Value = serde_json::from_slice(&plain).unwrap();
+    let mut b: Value = serde_json::from_slice(&unzipped).unwrap();
+    // Read twice: only the time it was taken differs.
+    a["taken_at"] = Value::Null;
+    b["taken_at"] = Value::Null;
+    assert_eq!(a, b, "same snapshot");
+    assert!(
+        gz.len() * 3 < plain.len(),
+        "compressed {} of {}",
+        gz.len(),
+        plain.len()
+    );
+
+    if let Some(prev) = prev_bin() {
+        // A previous-release standby of this primary: plain JSON.
+        let mut o = Node::new(&root_dir, "old-standby", "rootpass-o");
+        o.bin = prev.clone();
+        o.configure(&follow_cfg(&p, "dns3", &token));
+        o.start();
+        let or = o.root();
+        wait_for("old standby has the zone", 20, || {
+            record_names(&o, &or, "gz.test").len() == 40
+        });
+        assert!(
+            log_has(&p, "replication snapshot served", "gzip=false"),
+            "{}",
+            p.log()
+        );
+        drop(o);
+        // A standby of this version of a previous-release primary: plain.
+        let mut op = Node::new(&root_dir, "old-primary", "rootpass-op");
+        let mut n = Node::new(&root_dir, "new-standby", "rootpass-n");
+        op.bin = prev;
+        op.configure("");
+        op.start();
+        let opr = op.root();
+        let t2 = ok(
+            call(
+                &Auth::Session(&opr),
+                "POST",
+                &op.api("/tokens"),
+                Some(json!({ "name": "repl" })),
+            ),
+            "token",
+        )["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        ok(
+            call(
+                &Auth::Session(&opr),
+                "POST",
+                &op.api("/zones"),
+                Some(json!({ "name": "old.test" })),
+            ),
+            "zone",
+        );
+        add_record(&op, &opr, "old.test", "www", "192.0.2.9");
+        n.configure(&follow_cfg(&op, "dns4", &t2));
+        n.start();
+        let nr = n.root();
+        wait_for("new standby has the old primary's zone", 20, || {
+            record_names(&n, &nr, "old.test") == vec!["www A 192.0.2.9".to_string()]
+        });
+        assert!(
+            log_has(&n, "snapshot received", "gzip=false"),
+            "{}",
+            n.log()
+        );
+    }
+    drop((p, s));
+    let _ = std::fs::remove_dir_all(&root_dir);
+}
+
+/// O23: test certificates (tests/fixtures/tls, ECDSA P-256, valid until
+/// 2126): `ca.pem` signed `server.pem` (SAN 127.0.0.1, localhost; key
+/// `server.key`); `other-ca.pem` is an unrelated CA. Made with openssl:
+/// `ecparam -genkey`, `req -x509 -addext basicConstraints=critical,CA:TRUE`
+/// for the CAs, `x509 -req -extfile` (serverAuth, the SANs) for the leaf.
+fn tls_fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/tls")
+        .join(name)
+}
+
+/// O23: an HTTPS endpoint (the fixture certificate) in front of the plain
+/// HTTP port `target`, for as long as the test process runs. Its port.
+fn tls_proxy(target: u16) -> u16 {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use tokio_rustls::rustls;
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let certs: Vec<CertificateDer<'static>> =
+        CertificateDer::pem_file_iter(tls_fixture("server.pem"))
+            .unwrap()
+            .map(|c| c.unwrap())
+            .collect();
+    let key = PrivateKeyDer::from_pem_file(tls_fixture("server.key")).unwrap();
+    let cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(cfg));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let l = tokio::net::TcpListener::from_std(listener).unwrap();
+            loop {
+                let Ok((tcp, _)) = l.accept().await else {
+                    continue;
+                };
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acceptor.accept(tcp).await else {
+                        return;
+                    };
+                    let Ok(mut up) = tokio::net::TcpStream::connect(("127.0.0.1", target)).await
+                    else {
+                        return;
+                    };
+                    let _ = tokio::io::copy_bidirectional(&mut tls, &mut up).await;
+                });
+            }
+        });
+    });
+    port
+}
+
+/// O23: `[follow].ca_file` / `[peer].ca_file`. A standby follows a primary
+/// whose HTTPS certificate a private CA signed when `ca_file` names that CA;
+/// without it (system trust store) or with another CA it refuses the
+/// certificate and copies nothing. `[peer]` fencing checks reach an HTTPS
+/// standby the same way. `--check` rejects a missing or non-PEM file.
+#[test]
+fn a_private_ca_from_ca_file_is_trusted_for_the_primary_and_the_peer() {
+    let root_dir = temp_root("ca-file");
+    let mut p = Node::new(&root_dir, "primary", "rootpass-p");
+    p.configure("");
+    p.start();
+    let pr = p.root();
+    let token = ok(
+        call(
+            &Auth::Session(&pr),
+            "POST",
+            &p.api("/tokens"),
+            Some(json!({ "name": "repl" })),
+        ),
+        "token",
+    )["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    ok(
+        call(
+            &Auth::Session(&pr),
+            "POST",
+            &p.api("/zones"),
+            Some(json!({ "name": "ca.test" })),
+        ),
+        "zone",
+    );
+    add_record(&p, &pr, "ca.test", "www", "192.0.2.1");
+    let https = format!("https://127.0.0.1:{}", tls_proxy(p.web));
+    let follow_https = |id: &str, ca: Option<&Path>| {
+        let mut c = format!(
+            "[follow]\nprimary = \"{https}\"\ninstance_id = \"{id}\"\ntoken = \"{token}\"\nreconcile_interval_secs = 2\ntimeout_secs = 5\n"
+        );
+        if let Some(ca) = ca {
+            c.push_str(&format!("ca_file = \"{}\"\n", ca.display()));
+        }
+        c
+    };
+    // The private CA: follows over HTTPS.
+    let mut s = Node::new(&root_dir, "standby", "rootpass-s");
+    s.configure(&follow_https("dns2", Some(&tls_fixture("ca.pem"))));
+    s.start();
+    let sr = s.root();
+    wait_for("standby follows over HTTPS", 20, || {
+        record_names(&s, &sr, "ca.test") == vec!["www A 192.0.2.1".to_string()]
+    });
+    add_record(&p, &pr, "ca.test", "two", "192.0.2.2");
+    wait_for("and keeps following", 20, || {
+        answers(s.dns, "two.ca.test.", RecordType::A).1.len() == 1
+    });
+    // No ca_file (system trust store) or an unrelated CA: refused certificate.
+    for (id, ca) in [("dns3", None), ("dns4", Some(tls_fixture("other-ca.pem")))] {
+        let mut n = Node::new(
+            &root_dir,
+            if ca.is_some() { "other-ca" } else { "no-ca" },
+            "rootpass-n",
+        );
+        n.configure(&follow_https(id, ca.as_deref()));
+        n.start();
+        let nr = n.root();
+        wait_for("certificate refused", 20, || {
+            follow_state(&n, &nr)["last_error"]
+                .as_str()
+                .is_some_and(|e| e.to_lowercase().contains("certificate"))
+        });
+        let f = follow_state(&n, &nr);
+        assert!(f["halted"].is_null(), "{f}");
+        assert!(
+            record_names(&n, &nr, "ca.test").is_empty(),
+            "{id} copied nothing"
+        );
+    }
+    // --check: the file must exist and hold a PEM certificate.
+    let check = |extra: &str| {
+        let n = Node::new(&root_dir, "check", "rootpass-c");
+        n.configure(&format!("{}{extra}", follow_https("dns5", None)));
+        let out = Command::new(env!("CARGO_BIN_EXE_rust-dns"))
+            .args(["--check", "--config"])
+            .arg(n.config_path())
+            .output()
+            .unwrap();
+        (
+            out.status.success(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        )
+    };
+    let missing = root_dir.join("missing.pem");
+    let (good, out) = check(&format!("ca_file = \"{}\"\n", missing.display()));
+    assert!(
+        !good && out.contains("[follow].ca_file") && out.contains("cannot be read"),
+        "{out}"
+    );
+    let (good, out) = check(&format!(
+        "ca_file = \"{}\"\n",
+        tls_fixture("server.key").display()
+    ));
+    assert!(!good && out.contains("no PEM certificate"), "{out}");
+    let (good, out) = check(&format!(
+        "ca_file = \"{}\"\n",
+        tls_fixture("ca.pem").display()
+    ));
+    assert!(good, "{out}");
+
+    // [peer]: the primary checks its standby over HTTPS with the private CA.
+    let peer_https = format!("https://127.0.0.1:{}", tls_proxy(s.web));
+    for (ca, want) in [
+        (Some(tls_fixture("ca.pem")), "ok: peer is"),
+        (None, "peer not reachable"),
+    ] {
+        p.stop();
+        let mut extra = format!("[peer]\nurl = \"{peer_https}\"\ncheck_interval_secs = 1\n");
+        if let Some(ca) = &ca {
+            extra.push_str(&format!("ca_file = \"{}\"\n", ca.display()));
+        }
+        p.configure(&extra);
+        p.start();
+        let pr = p.root();
+        wait_for("peer checked", 15, || {
+            status(&p, &pr)["peer"]["last_result"]
+                .as_str()
+                .is_some_and(|r| r.starts_with(want))
+        });
+        let r = status(&p, &pr)["peer"]["last_result"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        if ca.is_none() {
+            assert!(r.to_lowercase().contains("certificate"), "{r}");
+        }
+        assert_eq!(status(&p, &pr)["writable"], true);
+    }
+    drop((p, s));
+    let _ = std::fs::remove_dir_all(&root_dir);
+}

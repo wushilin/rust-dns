@@ -630,7 +630,11 @@ at a time, and no automatic failover.
    use). The replication stream carries password hashes, TOTP secrets, token
    hashes and TSIG secrets, so a plain `http://` primary URL is refused unless
    `allow_insecure_http = true` (loopback addresses are always allowed).
-   Certificates are checked against the operating system's trust store.
+   Certificates are checked against the operating system's trust store,
+   or, when the primary's certificate comes from a private CA, against
+   that CA only: `ca_file = "/etc/rust-dns/primary-ca.pem"` in `[follow]`
+   (PEM, one or more CA certificates; `[peer]` takes a `ca_file` too, for
+   the standby's certificate). `--check` refuses a missing or non-PEM file.
 3. On the second server, start from a normal config (see
    `examples/config/standby.toml`) and add:
 
@@ -656,6 +660,30 @@ timeout_secs = 30
    old primary that comes back after a failover accepts writes (split brain).
 
 `rust-dns --check` prints the role a config gives the server.
+
+Snapshots are sent gzip-compressed when the standby asks for it
+(`Accept-Encoding: gzip`, which this version does); older standbys and
+primaries simply exchange plain JSON.
+
+### Cascading standbys
+
+A standby can serve other standbys: point a third server's `[follow]
+primary` at the standby's URL (with a token of an administrator, which the
+standby has as a copy of the primary's accounts). It copies the standby's
+data with the primary's offsets and history, and the standby lists it under
+*Admin -> Replication* (*Standbys following this standby*). Rules through
+the chain:
+
+- A standby serves standbys only once it has loaded its primary's data,
+  and never while halted. When it halts, the standbys that follow it halt
+  too (`upstream_halted`): their copy came from it. Rebuild the upstream
+  standby first, then them (`--prepare-standby --yes`).
+- Promoting a standby in the middle of a chain works as for a standby of a
+  primary: the standbys that follow it adopt its new history and continue.
+- A standby that follows another standby must use the same `[root]
+  username` (each server keeps its own root account local); otherwise it
+  is refused with that explanation. Versions before this one do not serve
+  standbys and cannot follow one (refused, not halted).
 
 ### What is replicated
 
@@ -875,7 +903,8 @@ instead of repairing it silently. It halts on:
 - `txn_mismatch`: on connecting, its change at its head offset is not the
   primary's (same history, different data);
 - `ahead_of_primary`: it has offsets the primary does not (a primary restored
-  from an older backup).
+  from an older backup);
+- `upstream_halted`: it follows another standby, and that standby halted.
 
 Network errors, timeouts and 5xx are ordinary reconnects, and a pruned
 offset (`gap`) within the same history is the automatic snapshot case; none
@@ -901,8 +930,10 @@ data; rebuild it first unless the primary is gone.
 
 All under `/api/replication/`, admin only (`replicate`) except `identity`:
 `GET status` (both roles), `GET snapshot` (logical entities),
-`GET changes?after=&limit=&wait=` (long-poll), `GET checksum` (served only by
-a writable primary; 409 otherwise), `POST promote`, and the public
+`GET changes?after=&limit=&wait=` (long-poll), `GET checksum` (the data
+endpoints are served by a writable primary and by a standby that has loaded
+its primary's data; 409 otherwise, with the code `replication_halted` from a
+halted standby), `POST promote`, and the public
 `GET identity` (role and history ids, no data) used by the `[peer]` check.
 Metrics: `rustdns_replication_writable`, `rustdns_replication_standby`, and on
 a standby `rustdns_replication_connected`, `rustdns_replication_lag_changes`,

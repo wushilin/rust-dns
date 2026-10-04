@@ -58,6 +58,8 @@ mimalloc = { version = "0.1", default-features = false, features = ["no_thp"] }
 [dev-dependencies]
 ureq = { version = "2", features = ["json", "cookies"] }
 jsonschema = { version = "0.58", default-features = false }
+# O23: a TLS endpoint with a private CA in front of a test server.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 
 # O20: run as a Windows service (pure Rust, over windows-sys).
 [target.'cfg(windows)'.dependencies]

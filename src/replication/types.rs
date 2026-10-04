@@ -452,6 +452,11 @@ pub struct ReplicationStatus {
     /// A warning to show prominently (e.g. `[follow]` left in the config after promotion).
     #[schema(required = true)]
     pub warning: Option<String>,
+    /// O21, on a standby: the username of its own `[root]` (a local
+    /// account). A standby that follows this standby (cascading) must use
+    /// the same `[root]` username. Absent on other roles and before O21.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_root: Option<String>,
 }
 
 /// `POST /replication/promote`.

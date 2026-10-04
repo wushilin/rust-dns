@@ -48,6 +48,7 @@ token = "rdns_..."                         # API token of an ADMINISTRATOR on th
 reconcile_interval_secs = 3600             # compare checksums with the primary
 allow_insecure_http = false                # never true across an untrusted network
 timeout_secs = 30
+# ca_file = "/etc/rust-dns/primary-ca.pem" # only if a private CA signed the primary's certificate
 
 # On the PRIMARY (not here), add the peer check so a returning old primary
 # stays read-only after this standby was promoted:

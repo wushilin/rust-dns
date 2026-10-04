@@ -84,6 +84,10 @@ pub struct FollowConfig {
     pub allow_insecure_http: bool,
     /// Timeout of one request to the primary (the snapshot gets at least 120 s).
     pub timeout_secs: u64,
+    /// O23: PEM file with the CA certificate(s) that signed the primary's
+    /// HTTPS certificate (a private CA). When set, only these are trusted
+    /// for the primary (not the system's trust store). Empty: system store.
+    pub ca_file: String,
 }
 
 impl Default for FollowConfig {
@@ -95,6 +99,7 @@ impl Default for FollowConfig {
             reconcile_interval_secs: 3600,
             allow_insecure_http: false,
             timeout_secs: 30,
+            ca_file: String::new(),
         }
     }
 }
@@ -107,6 +112,9 @@ pub struct PeerConfig {
     pub url: String,
     pub check_interval_secs: u64,
     pub allow_insecure_http: bool,
+    /// O23: PEM CA file for the standby's HTTPS certificate (as
+    /// `[follow].ca_file`). Empty: the system's trust store.
+    pub ca_file: String,
 }
 
 impl Default for PeerConfig {
@@ -115,8 +123,21 @@ impl Default for PeerConfig {
             url: String::new(),
             check_interval_secs: 60,
             allow_insecure_http: false,
+            ca_file: String::new(),
         }
     }
+}
+
+/// O23: the CA certificates of a `ca_file` (PEM, at least one), for
+/// [`crate::replication::https_client`]. `key` names the setting.
+pub fn load_ca_file(key: &str, path: &str) -> Result<Vec<reqwest::Certificate>> {
+    let pem = std::fs::read(path).with_context(|| format!("{key} '{path}' cannot be read"))?;
+    let certs = reqwest::Certificate::from_pem_bundle(&pem)
+        .map_err(|e| anyhow::anyhow!("{key} '{path}' is not a PEM certificate file: {e}"))?;
+    if certs.is_empty() {
+        anyhow::bail!("{key} '{path}' contains no PEM certificate (-----BEGIN CERTIFICATE-----)");
+    }
+    Ok(certs)
 }
 
 /// Problems with a replication URL (`key` names it in messages).
@@ -817,6 +838,7 @@ compress = true          # gzip rotated files
 # reconcile_interval_secs = 3600             # compare serials/checksums with the primary
 # allow_insecure_http = false                # plain http only on a trusted network (loopback always allowed)
 # timeout_secs = 30
+# ca_file = "/etc/rust-dns/primary-ca.pem"   # private CA of the primary's certificate (only it is trusted)
 
 # On the primary: the standby to ask whether it has been promoted, so a returning
 # old primary stays read-only instead of accepting writes (split brain).
@@ -824,6 +846,7 @@ compress = true          # gzip rotated files
 # url = "https://dns2.example.net:8053"
 # check_interval_secs = 60
 # allow_insecure_http = false
+# ca_file = ""                               # private CA of the standby's certificate
 
 # On a primary: how its standbys (replicas) are judged (reloadable).
 [replication]
@@ -1266,6 +1289,11 @@ pub fn validate(cfg: &Config) -> Result<()> {
         if f.timeout_secs == 0 {
             errs.push("[follow].timeout_secs must be greater than zero".into());
         }
+        if !f.ca_file.trim().is_empty() {
+            if let Err(e) = load_ca_file("[follow].ca_file", f.ca_file.trim()) {
+                errs.push(format!("{e:#}"));
+            }
+        }
         if cfg.peer.is_some() {
             errs.push(
                 "[peer] is for a primary; remove it from a standby (a [follow] config)".into(),
@@ -1284,6 +1312,11 @@ pub fn validate(cfg: &Config) -> Result<()> {
         }
         if p.check_interval_secs == 0 {
             errs.push("[peer].check_interval_secs must be greater than zero".into());
+        }
+        if !p.ca_file.trim().is_empty() {
+            if let Err(e) = load_ca_file("[peer].ca_file", p.ca_file.trim()) {
+                errs.push(format!("{e:#}"));
+            }
         }
     }
 

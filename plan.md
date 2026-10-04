@@ -922,11 +922,11 @@ Group 4: packaging
   (Cross-compiled here; the runner test runs in CI only: see the Log.)
 
 Group 5: replication extras
-- [ ] O21. Cascading standbys (a standby may serve replication to another
+- [x] O21. Cascading standbys (a standby may serve replication to another
   standby; lineage, offsets and halt rules hold through the chain; tests
   with three servers incl. promotion in the middle).
-- [ ] O22. Gzip snapshots (negotiated by header; old peers unaffected).
-- [ ] O23. Custom CA file for the primary's certificate ([follow] ca_file).
+- [x] O22. Gzip snapshots (negotiated by header; old peers unaffected).
+- [x] O23. Custom CA file for the primary's certificate ([follow] ca_file).
 
 Group 6: DNS protocol depth (all OFF by default; live zone not switched)
 - [ ] O24. NSEC3 (RFC 5155 with RFC 9276 defaults: 0 iterations, no salt),
@@ -1109,6 +1109,33 @@ Final
   (the old binary would serve the zone with the server's transfer ACL and
   NOTIFY targets). Zone clones and the JSON export/import do not carry
   them (they need `server_admin`). O14 is CI-only (no runtime change).
+
+- After phase O, group 5 (this session; not deployed): protocol 2, no new
+  change kind, no new column, fixture untouched. O21: a standby now serves
+  the replication data endpoints (snapshot, changes, checksum) once it has
+  loaded its primary's data and while it has not halted (admin token,
+  `replicate`, as on a primary: the same secrets a primary serves, to the
+  same administrators); a halted one answers 409 `replication_halted`, and
+  its followers halt (`upstream_halted`). New optional field `local_root`
+  in `GET /replication/status` (standbys only); new error code
+  `replication_halted`; a standby accepts `POST /replication/replicas/{id}/
+  report` (local replica list). Nothing changes for a pair: baba2 behind
+  gate keeps working in either upgrade order. A d32d67f standby cannot
+  follow a standby (it is refused, not halted: test `cascading_standbys_
+  follow_and_survive_a_promotion_in_the_middle`, real previous binary);
+  build chains only after every node runs this version. O22: snapshots are
+  gzip-compressed only when the standby sends `Accept-Encoding: gzip`
+  (this version does; d32d67f does not and gets plain JSON; a standby of
+  this version reads a d32d67f primary's plain answer: test `snapshots_are_
+  gzip_compressed_when_the_standby_asks`, both directions). Either order.
+  O23: new optional `[follow].ca_file` and `[peer].ca_file` (PEM; when set
+  only that CA is trusted for that peer, verified by webpki on every OS).
+  `[follow]` and `[peer]` deny unknown keys, so an older binary refuses to
+  start with `ca_file` set: add it only after the upgrade, and remove it
+  before a downgrade. gate and baba2 use the system trust store today:
+  nothing to change.
+</content>
+</invoke>
 
 - After O13a (this session; not deployed): no replication, data or config
   change. The Linux release binaries (static musl) allocate with mimalloc
@@ -2127,3 +2154,62 @@ Final
   unit `rebuilt_signed_zones_hold_only_the_current_rrsets` (300 chained
   re-signs: signatures, cache, NSEC chain and index sized to the current
   zone). Not used: dns-test or any other machine.
+- 2026-10-04 (phase O): O21 done. A standby serves the replication data
+  endpoints (snapshot, changes, checksum) once it has loaded its primary's
+  data (`following` recorded) and while it has not halted
+  (`Replication::source_refusal`); its changelog is the primary's (same
+  offsets, transaction ids, history), so a standby of it tails it with the
+  existing lineage rules. A halted standby answers 409 with the new code
+  `replication_halted`, and wakes its long-polls when it halts; a standby
+  that gets it (or sees `follow.halted` in the upstream's status) halts
+  itself with `upstream_halted` (its copy came from there) and stays
+  halted after the upstream is rebuilt. A standby following a standby must
+  use the same `[root]` username (each keeps its root local; otherwise the
+  checksums would compare different local rows): the upstream publishes it
+  as `local_root` in its status, a mismatch is refused (not halted). A
+  standby keeps its own replica list (loaded and pruned like a primary's);
+  `POST /replication/replicas/{id}/report` is allowed on a standby (local
+  bookkeeping), forgetting stays primary-only (a fenced server refuses it,
+  as before). Applying a batch now wakes downstream long-polls (account
+  changes are not on the bus). Console: on a standby, *Standbys following
+  this standby* lists them. Tests (follow): `cascading_standbys_follow_and_
+  survive_a_promotion_in_the_middle` (A -> B -> C: same history, offsets
+  and head; B lists C, A only B; C reconciles against B; an account change
+  reaches C within 10 s; a standby with another root name and a
+  previous-release standby are refused, not halted; B promoted with A
+  stopped: C adopts B's new history and gets B's next write) and
+  `a_standby_of_a_halted_standby_halts_too` (B diverges and halts; C halts
+  with `upstream_halted` within 15 s although its own reconcile is an hour
+  away; B lists C as halted; a halted B refuses with
+  `replication_halted`; B rebuilt follows again while C stays halted;
+  C rebuilt follows B). Unit: `ui_tests` (allowlist and console controls),
+  OpenAPI snapshot. No browser flow: the panel needs a chain of servers,
+  which the browser suite does not start.
+- 2026-10-04 (phase O): O22 done. The primary gzips the snapshot when the
+  request accepts gzip (`Accept-Encoding`, `q` > 0; `Vary`,
+  `Content-Encoding`); standbys of this version ask for it and decode it
+  (off the async workers), and read a plain answer as before. Logs:
+  `replication snapshot served ... bytes gzip` on the primary, `snapshot
+  received bytes json_bytes gzip` on the standby. Tests: unit
+  `gzip_is_negotiated_by_accept_encoding`; follow `snapshots_are_gzip_
+  compressed_when_the_standby_asks` (a 40-record zone: gzip both sides,
+  the raw answers with and without `Accept-Encoding` decode to the same
+  document, compressed under a third; a previous-release standby of this
+  primary gets plain JSON; a standby of this version follows a
+  previous-release primary from its plain snapshot; passes with d32d67f
+  and 3884ba8).
+- 2026-10-04 (phase O): O23 done. `[follow].ca_file` and `[peer].ca_file`
+  (PEM, one or more CA certificates): when set, only those CAs are trusted
+  for that peer (reqwest `tls_certs_only`, webpki: the same on every OS;
+  the platform verifier would add Apple's own TLS policies on macOS);
+  empty keeps the system trust store. Used by following, the `[peer]`
+  fencing check and `--prepare-standby`'s identity request. `--check`
+  (and startup) refuse a file that cannot be read or holds no PEM
+  certificate. Tests: follow `a_private_ca_from_ca_file_is_trusted_for_
+  the_primary_and_the_peer` (a TLS terminator, tokio-rustls with
+  `tests/fixtures/tls`, in front of the primary and of the standby: the
+  CA's standby follows; no ca_file or an unrelated CA: the certificate is
+  refused and nothing copied, not halted; `--check` with a missing file,
+  a key instead of a certificate, the CA; `[peer]` with the CA reports
+  "ok: peer is ...", without it "peer not reachable ... certificate").
+  New dev-dependency `tokio-rustls` (ring, already in the lock).

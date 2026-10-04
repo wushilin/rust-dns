@@ -26,12 +26,20 @@ use utoipa::IntoParams;
 
 type St = State<Arc<AppState>>;
 
-/// Replication sources must be writable primaries.
-fn require_primary(s: &AppState) -> ApiResult<()> {
-    match s.repl.read_only_reason() {
+/// Replication sources: writable primaries, and (O21) standbys that hold
+/// their primary's data and have not halted. A halted standby answers with
+/// the code `replication_halted`: the standbys that follow it halt too.
+fn require_source(s: &AppState) -> ApiResult<()> {
+    match s.repl.source_refusal() {
         None => Ok(()),
-        Some(why) => Err(ApiError::read_only(format!(
-            "this server does not serve replication: {why}"
+        Some(r) if r.halted => Err(ApiError::conflict(format!(
+            "this server does not serve replication: {}",
+            r.message
+        ))
+        .with_code(super::error::ErrorCode::ReplicationHalted)),
+        Some(r) => Err(ApiError::read_only(format!(
+            "this server does not serve replication: {}",
+            r.message
         ))),
     }
 }
@@ -83,10 +91,6 @@ fn note(s: &AppState, caller: &Caller, h: &ReplicaHeaders, report: Report) {
         },
         report,
     );
-}
-
-fn no_store<T: serde::Serialize>(v: T) -> Response {
-    ([(header::CACHE_CONTROL, "no-store")], Json(v)).into_response()
 }
 
 #[utoipa::path(
@@ -145,7 +149,7 @@ pub async fn status(
         ("X-Rust-DNS-Session" = Option<String>, Header, description = "Random per standby process (detects two processes with one instance id).", example = "k3v9x2m1q8p0"),
     ),
     summary = "Consistent copy of all replicated data (admin, contains secrets)",
-    description = "Zones, records (with expiry state), zone members, users (password hashes, MFA secrets and last TOTP step, recovery code hashes), API token hashes and tags, console settings, TSIG keys, the history and the changelog offset it corresponds to, all read in one transaction. A standby loads it to start and whenever it cannot continue from the changelog (afterwards every change, account changes included, arrives through `/replication/changes`). Needs `replicate`; refused (409) on a server that is not a writable primary.",
+    description = "Zones, records (with expiry state), zone members, users (password hashes, MFA secrets and last TOTP step, recovery code hashes), API token hashes and tags, console settings, TSIG keys, the history and the changelog offset it corresponds to, all read in one transaction. A standby loads it to start and whenever it cannot continue from the changelog (afterwards every change, account changes included, arrives through `/replication/changes`). Sent gzip-compressed (`Content-Encoding: gzip`) when the request accepts it (`Accept-Encoding: gzip`; standbys of this version do, older ones get plain JSON). Needs `replicate`; refused (409) on a server that is not a writable primary or a standby that serves standbys (O21: one that loaded its primary's data; `replication_halted` when its replication halted).",
     responses(
         (status = 200, description = "Snapshot.", body = Snapshot),
         (status = 400, response = InvalidRequest),
@@ -156,15 +160,93 @@ pub async fn status(
 )]
 pub async fn snapshot(State(s): St, caller: Caller, headers: HeaderMap) -> ApiResult<Response> {
     s.require(&caller, GlobalPerm::Replicate)?;
-    require_primary(&s)?;
+    require_source(&s)?;
     let rh = replica_headers(&headers, true)?.expect("required");
     note(&s, &caller, &rh, Report::Bootstrapping);
     let storage = s.storage.clone();
-    let snap = tokio::task::spawn_blocking(move || storage.read_tx(data::snapshot))
-        .await
-        .map_err(ApiError::internal)??;
-    tracing::info!(user = %caller.user.username, ip = %caller.ip, offset = snap.offset, entities = snap.entities.len(), "replication snapshot served");
-    Ok(no_store(snap))
+    let gzip = accepts_gzip(&headers);
+    // O22: serialized (and compressed when the standby accepts gzip) off
+    // the async workers: a snapshot is the whole database.
+    let (offset, entities, body) = tokio::task::spawn_blocking(move || -> ApiResult<_> {
+        let snap = storage.read_tx(data::snapshot)?;
+        let json = serde_json::to_vec(&snap).map_err(ApiError::internal)?;
+        let body = if gzip {
+            use std::io::Write;
+            let mut enc = flate2::write::GzEncoder::new(
+                Vec::with_capacity(json.len() / 4),
+                flate2::Compression::default(),
+            );
+            enc.write_all(&json).map_err(ApiError::internal)?;
+            enc.finish().map_err(ApiError::internal)?
+        } else {
+            json
+        };
+        Ok((snap.offset, snap.entities.len(), body))
+    })
+    .await
+    .map_err(ApiError::internal)??;
+    tracing::info!(user = %caller.user.username, ip = %caller.ip, offset, entities, bytes = body.len(), gzip, "replication snapshot served");
+    let mut resp = (
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::CONTENT_TYPE, "application/json"),
+            (header::VARY, "accept-encoding"),
+        ],
+        body,
+    )
+        .into_response();
+    if gzip {
+        resp.headers_mut().insert(
+            header::CONTENT_ENCODING,
+            header::HeaderValue::from_static("gzip"),
+        );
+    }
+    Ok(resp)
+}
+
+/// O22: does the request accept a gzip body (`Accept-Encoding`, `q` > 0)?
+/// Standbys of this version send it for snapshots; older ones do not and
+/// get plain JSON, as before.
+fn accepts_gzip(h: &HeaderMap) -> bool {
+    h.get_all(header::ACCEPT_ENCODING)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|item| {
+            let mut parts = item.split(';').map(str::trim);
+            let coding = parts.next().unwrap_or("");
+            let q_zero = parts.any(|p| {
+                p.strip_prefix("q=")
+                    .and_then(|q| q.trim().parse::<f32>().ok())
+                    .is_some_and(|q| q <= 0.0)
+            });
+            coding.eq_ignore_ascii_case("gzip") && !q_zero
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::accepts_gzip;
+    use axum::http::{header, HeaderMap, HeaderValue};
+
+    #[test]
+    fn gzip_is_negotiated_by_accept_encoding() {
+        let h = |v: &[&str]| {
+            let mut m = HeaderMap::new();
+            for x in v {
+                m.append(header::ACCEPT_ENCODING, HeaderValue::from_str(x).unwrap());
+            }
+            accepts_gzip(&m)
+        };
+        assert!(!h(&[]), "nothing sent: plain (older standbys)");
+        assert!(h(&["gzip"]));
+        assert!(h(&["br, GZIP;q=0.8"]));
+        assert!(h(&["identity", "gzip"]));
+        assert!(!h(&["gzip;q=0"]));
+        assert!(!h(&["gzip; q=0.0, identity"]));
+        assert!(!h(&["deflate, br"]));
+        assert!(!h(&["x-gzip-not"]));
+    }
 }
 
 #[derive(Deserialize, IntoParams)]
@@ -192,7 +274,7 @@ pub struct ChangesQuery {
     tag = "Replication",
     operation_id = "get_replication_changes",
     summary = "Changes after an offset, long-poll (admin)",
-    description = "Committed changelog entries after `after`, DNS and account changes in one sequence (account changes carry password hashes, TOTP and TSIG secrets and appear nowhere else), whole transactions only, with the history id and the latest offset. The `after` of each request is recorded as the standby's applied offset (a standby commits a batch before asking for the next), unless `probe=true`. With `wait`, an answer without changes is held until a change commits or the wait ends. `gap: true`: entries after `after` were pruned or scrubbed; load a snapshot. Needs `replicate`; refused (409) on a server that is not a writable primary.",
+    description = "Committed changelog entries after `after`, DNS and account changes in one sequence (account changes carry password hashes, TOTP and TSIG secrets and appear nowhere else), whole transactions only, with the history id and the latest offset. The `after` of each request is recorded as the standby's applied offset (a standby commits a batch before asking for the next), unless `probe=true`. With `wait`, an answer without changes is held until a change commits or the wait ends. `gap: true`: entries after `after` were pruned or scrubbed; load a snapshot. Needs `replicate`; refused (409) on a server that is not a writable primary or a standby that serves standbys (O21: one that loaded its primary's data; `replication_halted` when its replication halted).",
     params(
         ChangesQuery,
         ("X-Rust-DNS-Instance" = String, Header, description = "The standby's `[follow].instance_id` (a-z, 0-9, '-'; 1-63). Required.", example = "dns2"),
@@ -214,7 +296,7 @@ pub async fn changes(
     Query(q): Query<ChangesQuery>,
 ) -> ApiResult<Json<ChangesResponse>> {
     s.require(&caller, GlobalPerm::Replicate)?;
-    require_primary(&s)?;
+    require_source(&s)?;
     let rh = replica_headers(&headers, true)?.expect("required");
     let after = q.after.unwrap_or(0);
     if after < 0 {
@@ -285,7 +367,7 @@ pub async fn changes(
             _ = tokio::time::sleep_until(deadline) => {}
         }
         // Stop serving if this server stopped being a primary meanwhile.
-        require_primary(&s)?;
+        require_source(&s)?;
     }
 }
 
@@ -303,7 +385,7 @@ pub struct ChecksumQuery {
     tag = "Replication",
     operation_id = "get_replication_checksum",
     summary = "Checksums of every replicated table and zone (admin)",
-    description = "SHA-256 of every replicated table (per-server columns such as token last use left out, and the rows of the account named `exclude_user`: the standby's own root, which is local there) and serial and SHA-256 of every zone, at one changelog offset. A standby compares them periodically (`[follow].reconcile_interval_secs`) and re-bootstraps on a mismatch. Needs `replicate`; refused (409) on a server that is not a writable primary.",
+    description = "SHA-256 of every replicated table (per-server columns such as token last use left out, and the rows of the account named `exclude_user`: the standby's own root, which is local there) and serial and SHA-256 of every zone, at one changelog offset. A standby compares them periodically (`[follow].reconcile_interval_secs`) and re-bootstraps on a mismatch. Needs `replicate`; refused (409) on a server that is not a writable primary or a standby that serves standbys (O21: one that loaded its primary's data; `replication_halted` when its replication halted).",
     params(
         ChecksumQuery,
         ("X-Rust-DNS-Instance" = String, Header, description = "The standby's `[follow].instance_id` (a-z, 0-9, '-'; 1-63). Required.", example = "dns2"),
@@ -325,7 +407,7 @@ pub async fn checksum(
     Query(q): Query<ChecksumQuery>,
 ) -> ApiResult<Json<Checksums>> {
     s.require(&caller, GlobalPerm::Replicate)?;
-    require_primary(&s)?;
+    require_source(&s)?;
     let rh = replica_headers(&headers, true)?.expect("required");
     note(&s, &caller, &rh, Report::Alive);
     let storage = s.storage.clone();

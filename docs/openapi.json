@@ -4509,7 +4509,7 @@
           "Replication"
         ],
         "summary": "Consistent copy of all replicated data (admin, contains secrets)",
-        "description": "Zones, records (with expiry state), zone members, users (password hashes, MFA secrets and last TOTP step, recovery code hashes), API token hashes and tags, console settings, TSIG keys, the history and the changelog offset it corresponds to, all read in one transaction. A standby loads it to start and whenever it cannot continue from the changelog (afterwards every change, account changes included, arrives through `/replication/changes`). Needs `replicate`; refused (409) on a server that is not a writable primary.",
+        "description": "Zones, records (with expiry state), zone members, users (password hashes, MFA secrets and last TOTP step, recovery code hashes), API token hashes and tags, console settings, TSIG keys, the history and the changelog offset it corresponds to, all read in one transaction. A standby loads it to start and whenever it cannot continue from the changelog (afterwards every change, account changes included, arrives through `/replication/changes`). Sent gzip-compressed (`Content-Encoding: gzip`) when the request accepts it (`Accept-Encoding: gzip`; standbys of this version do, older ones get plain JSON). Needs `replicate`; refused (409) on a server that is not a writable primary or a standby that serves standbys (O21: one that loaded its primary's data; `replication_halted` when its replication halted).",
         "operationId": "get_replication_snapshot",
         "parameters": [
           {
@@ -4581,7 +4581,7 @@
           "Replication"
         ],
         "summary": "Changes after an offset, long-poll (admin)",
-        "description": "Committed changelog entries after `after`, DNS and account changes in one sequence (account changes carry password hashes, TOTP and TSIG secrets and appear nowhere else), whole transactions only, with the history id and the latest offset. The `after` of each request is recorded as the standby's applied offset (a standby commits a batch before asking for the next), unless `probe=true`. With `wait`, an answer without changes is held until a change commits or the wait ends. `gap: true`: entries after `after` were pruned or scrubbed; load a snapshot. Needs `replicate`; refused (409) on a server that is not a writable primary.",
+        "description": "Committed changelog entries after `after`, DNS and account changes in one sequence (account changes carry password hashes, TOTP and TSIG secrets and appear nowhere else), whole transactions only, with the history id and the latest offset. The `after` of each request is recorded as the standby's applied offset (a standby commits a batch before asking for the next), unless `probe=true`. With `wait`, an answer without changes is held until a change commits or the wait ends. `gap: true`: entries after `after` were pruned or scrubbed; load a snapshot. Needs `replicate`; refused (409) on a server that is not a writable primary or a standby that serves standbys (O21: one that loaded its primary's data; `replication_halted` when its replication halted).",
         "operationId": "get_replication_changes",
         "parameters": [
           {
@@ -4700,7 +4700,7 @@
           "Replication"
         ],
         "summary": "Checksums of every replicated table and zone (admin)",
-        "description": "SHA-256 of every replicated table (per-server columns such as token last use left out, and the rows of the account named `exclude_user`: the standby's own root, which is local there) and serial and SHA-256 of every zone, at one changelog offset. A standby compares them periodically (`[follow].reconcile_interval_secs`) and re-bootstraps on a mismatch. Needs `replicate`; refused (409) on a server that is not a writable primary.",
+        "description": "SHA-256 of every replicated table (per-server columns such as token last use left out, and the rows of the account named `exclude_user`: the standby's own root, which is local there) and serial and SHA-256 of every zone, at one changelog offset. A standby compares them periodically (`[follow].reconcile_interval_secs`) and re-bootstraps on a mismatch. Needs `replicate`; refused (409) on a server that is not a writable primary or a standby that serves standbys (O21: one that loaded its primary's data; `replication_halted` when its replication halted).",
         "operationId": "get_replication_checksum",
         "parameters": [
           {
@@ -4991,9 +4991,6 @@
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
-          },
-          "409": {
-            "$ref": "#/components/responses/ReadOnly"
           }
         }
       }
@@ -6305,7 +6302,7 @@
               },
               {
                 "$ref": "#/components/schemas/ErrorCode",
-                "description": "Machine-readable reason when one applies: `login_required`,\n`mfa_required`, `enroll_required` (401) or `csrf` (403, cookie write\nwithout `X-Requested-With: rust-dns`). `invalid_request`: the request\ncould not be parsed (malformed JSON, wrong field type or value,\nunparsable path or query parameter, missing JSON content type).\n`read_only_standby` (409): this server is a read-only standby; write\nto the primary named in the message. `ds_published` (409): DNSSEC\nsigning cannot be turned off while the parent publishes a DS."
+                "description": "Machine-readable reason when one applies: `login_required`,\n`mfa_required`, `enroll_required` (401) or `csrf` (403, cookie write\nwithout `X-Requested-With: rust-dns`). `invalid_request`: the request\ncould not be parsed (malformed JSON, wrong field type or value,\nunparsable path or query parameter, missing JSON content type).\n`read_only_standby` (409): this server is a read-only standby; write\nto the primary named in the message. `ds_published` (409): DNSSEC\nsigning cannot be turned off while the parent publishes a DS.\n`replication_halted` (409): a standby asked for replication data\nfrom a standby whose replication halted."
               }
             ]
           }
@@ -6325,7 +6322,8 @@
           "csrf",
           "invalid_request",
           "read_only_standby",
-          "ds_published"
+          "ds_published",
+          "replication_halted"
         ]
       },
       "ExportDoc": {
@@ -8813,6 +8811,13 @@
               "null"
             ],
             "description": "A warning to show prominently (e.g. `[follow]` left in the config after promotion)."
+          },
+          "local_root": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "O21, on a standby: the username of its own `[root]` (a local\naccount). A standby that follows this standby (cascading) must use\nthe same `[root]` username. Absent on other roles and before O21."
           }
         }
       },

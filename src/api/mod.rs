@@ -88,6 +88,9 @@ pub const STANDBY_WRITABLE: &[(&str, &str)] = &[
     ("POST", "/blocklists/test"),
     ("POST", "/tsig/keys/{name}/reveal"),
     ("POST", "/replication/promote"),
+    // O21: standbys that follow this standby report a halt to it (local
+    // replica list, not replicated).
+    ("POST", "/replication/replicas/{id}/report"),
 ];
 
 /// [`STANDBY_WRITABLE`] as published in `GET /status` (`replication.standby_writable`),

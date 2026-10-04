@@ -103,7 +103,26 @@ pub struct Replication {
     reconnects: AtomicU64,
     rebootstraps: AtomicU64,
     reconcile_mismatches: AtomicU64,
+    /// To the primary (`[follow]`, its `ca_file`).
     http: reqwest::Client,
+    /// To the standby of `[peer]` (its `ca_file`).
+    peer_http: reqwest::Client,
+}
+
+/// The HTTPS client of a replication peer. O23: with a `ca_file` (PEM),
+/// only the CA certificates in it are trusted for that peer (a private
+/// CA; verified by webpki the same way on every OS); without one, the
+/// system's trust store.
+pub fn https_client(ca_file: Option<&str>, key: &str) -> Result<reqwest::Client> {
+    ensure_crypto();
+    let mut b = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .user_agent(concat!("rust-dns/", env!("CARGO_PKG_VERSION"), " standby"))
+        .https_only(false);
+    if let Some(path) = ca_file.map(str::trim).filter(|p| !p.is_empty()) {
+        b = b.tls_certs_only(crate::config::load_ca_file(key, path)?);
+    }
+    b.build().map_err(|e| anyhow!("HTTP client ({key}): {e}"))
 }
 
 pub(crate) fn ensure_crypto() {
@@ -121,12 +140,17 @@ impl Replication {
     ) -> Arc<Self> {
         ensure_crypto();
         let cfg = reloader.current.load_full();
-        let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .user_agent(concat!("rust-dns/", env!("CARGO_PKG_VERSION"), " standby"))
-            .https_only(false)
-            .build()
-            .expect("HTTP client");
+        // The CA files were checked with the rest of the configuration.
+        let http = https_client(
+            cfg.follow.as_ref().map(|f| f.ca_file.as_str()),
+            "[follow].ca_file",
+        )
+        .expect("HTTP client for [follow]");
+        let peer_http = https_client(
+            cfg.peer.as_ref().map(|p| p.ca_file.as_str()),
+            "[peer].ca_file",
+        )
+        .expect("HTTP client for [peer]");
         let follow_status = FollowStatus {
             primary: cfg
                 .follow
@@ -169,6 +193,7 @@ impl Replication {
             rebootstraps: AtomicU64::new(0),
             reconcile_mismatches: AtomicU64::new(0),
             http,
+            peer_http,
         })
     }
 
@@ -189,6 +214,55 @@ impl Replication {
     /// The message for refused writes, when read-only.
     pub fn read_only_reason(&self) -> Option<String> {
         self.gate.read_only().then(|| self.gate.reason())
+    }
+
+    /// O21: why this server does not serve replication data (snapshot,
+    /// changes, checksums) to a standby right now; `None`: it does. A
+    /// writable primary serves. So does a standby (cascading standbys) once
+    /// it holds a copy of its primary's history (it loaded a snapshot), as
+    /// long as its replication has not halted: a halted standby's data is
+    /// not trusted, and its followers halt too (`halted`).
+    pub fn source_refusal(&self) -> Option<SourceRefusal> {
+        if self.writable() {
+            return None;
+        }
+        if self.role() != Role::Standby {
+            return Some(SourceRefusal {
+                halted: false,
+                message: self.gate.reason(),
+            });
+        }
+        let halted = self
+            .follow_status
+            .lock()
+            .unwrap()
+            .halted
+            .clone()
+            .or_else(|| crate::mutation::replica::halted(&self.storage));
+        if let Some(h) = halted {
+            return Some(SourceRefusal {
+                halted: true,
+                message: format!(
+                    "this standby's replication halted ({}: {}); the standbys that follow it must stop too and be rebuilt (rust-dns --prepare-standby --yes) after it",
+                    h.reason, h.detail
+                ),
+            });
+        }
+        let copied = self
+            .storage
+            .replication_state()
+            .map(|st| st.contains_key(K_FOLLOWING))
+            .unwrap_or(false);
+        if !copied {
+            return Some(SourceRefusal {
+                halted: false,
+                message: format!(
+                    "this standby has not loaded the data of its primary {} yet; try again later",
+                    self.primary_url()
+                ),
+            });
+        }
+        None
     }
 
     fn primary_url(&self) -> String {
@@ -227,6 +301,8 @@ impl Replication {
                 *self.warning.write().unwrap() = Some(w);
             }
             tracing::info!(primary = %url, "standby mode: mirroring the primary, writes refused");
+            // O21: standbys may follow this one; keep their list too.
+            self.start_replica_tracking();
             let me = self.clone();
             *self.follower.lock().unwrap() =
                 Some(tokio::spawn(async move { me.run_follower().await }));
@@ -385,6 +461,7 @@ impl Replication {
             peer: self.peer_status.lock().unwrap().clone(),
             replicas: self.replica_list(),
             warning: self.warning.read().unwrap().clone(),
+            local_root: (role == Role::Standby).then(|| self.local_root().username),
         }
     }
 
@@ -558,13 +635,45 @@ impl Replication {
         path: &str,
         timeout: Duration,
     ) -> std::result::Result<T, CallError> {
+        self.get_with(&self.http, base, token, path, timeout).await
+    }
+
+    async fn get_with<T: serde::de::DeserializeOwned>(
+        &self,
+        http: &reqwest::Client,
+        base: &str,
+        token: Option<&str>,
+        path: &str,
+        timeout: Duration,
+    ) -> std::result::Result<T, CallError> {
+        let (body, _) = self
+            .get_bytes(http, base, token, path, timeout, false)
+            .await?;
+        serde_json::from_slice(&body)
+            .map_err(|e| CallError::Other(format!("bad answer from {base}{path}: {e}")))
+    }
+
+    /// A GET's body; with `gzip` (O22, snapshots) it asks for a compressed
+    /// answer and returns whether it got one (an older primary answers
+    /// plain JSON). The body is still compressed then.
+    async fn get_bytes(
+        &self,
+        http: &reqwest::Client,
+        base: &str,
+        token: Option<&str>,
+        path: &str,
+        timeout: Duration,
+        gzip: bool,
+    ) -> std::result::Result<(Vec<u8>, bool), CallError> {
         let url = format!("{base}{path}");
-        let mut req = self
-            .http
+        let mut req = http
             .get(&url)
             .timeout(timeout)
             .header(replicas::HEADER_VERSION, replicas::VERSION_WITH_FEATURES)
             .header(replicas::HEADER_SESSION, &self.session);
+        if gzip {
+            req = req.header(reqwest::header::ACCEPT_ENCODING, "gzip");
+        }
         if let Some(f) = &self.follow {
             req = req.header(replicas::HEADER_INSTANCE, f.instance_id.trim());
         }
@@ -577,13 +686,27 @@ impl Replication {
             .map_err(|e| CallError::Other(format!("cannot reach {base}: {}", error_chain(&e))))?;
         let status = resp.status();
         if status.is_success() {
-            return resp
-                .json::<T>()
+            let compressed = resp
+                .headers()
+                .get(reqwest::header::CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.trim().eq_ignore_ascii_case("gzip"));
+            if compressed && !gzip {
+                return Err(CallError::Other(format!(
+                    "bad answer from {base}{path}: compressed without being asked"
+                )));
+            }
+            let body = resp
+                .bytes()
                 .await
-                .map_err(|e| CallError::Other(format!("bad answer from {base}{path}: {e}")));
+                .map_err(|e| CallError::Other(format!("bad answer from {base}{path}: {e}")))?;
+            return Ok((body.to_vec(), compressed));
         }
         let body: serde_json::Value = resp.json().await.unwrap_or_default();
         let msg = body["error"].as_str().unwrap_or("").to_string();
+        if status.as_u16() == 409 && body["code"] == "replication_halted" {
+            return Err(upstream_halted(base, &msg));
+        }
         Err(match status.as_u16() {
             401 => CallError::Auth(format!(
                 "the primary rejected the replication token ({msg}); create a new API token of an administrator on the primary and put it in [follow].token"
@@ -604,7 +727,8 @@ impl Replication {
     async fn check_peer(&self, p: &PeerConfig) {
         let base = p.url.trim().trim_end_matches('/').to_string();
         let r: std::result::Result<Identity, _> = self
-            .get(
+            .get_with(
+                &self.peer_http,
                 &base,
                 None,
                 "/api/replication/identity",
@@ -708,7 +832,6 @@ impl Replication {
             .map_err(|e| (500, format!("recording the promotion failed: {e}; the config no longer has [follow], so a restart completes the promotion")))?;
         // 4. Writable now; standbys will report to this server.
         self.set_role(Role::Promoted);
-        self.start_replica_tracking();
         self.gate.open();
         self.update(|s| {
             s.state = "stopped".into();
@@ -811,10 +934,31 @@ impl Replication {
             )));
         }
         if !remote.writable {
-            return Err(CallError::Refused(format!(
-                "{base} is not a writable primary (role {:?}); a standby can only follow a primary",
-                remote.role
-            )));
+            match remote.role {
+                // O21: cascading standbys. Its data is ours to copy only while
+                // it follows its own primary without having halted.
+                Role::Standby => {
+                    if let Some(h) = remote.follow.as_ref().and_then(|f| f.halted.as_ref()) {
+                        return Err(upstream_halted(&base, &format!("{}: {}", h.reason, h.detail)));
+                    }
+                    let mine = self.local_root().username;
+                    match remote.local_root.as_deref() {
+                        Some(r) if r == mine => {}
+                        Some(r) => return Err(CallError::Refused(format!(
+                            "{base} is a standby whose [root] username is '{r}' and this server's is '{mine}': a standby that follows another standby must use the same [root] username (each keeps its own root account local)"
+                        ))),
+                        None => return Err(CallError::Refused(format!(
+                            "{base} is a standby of a version that does not serve standbys; follow its primary, or upgrade it"
+                        ))),
+                    }
+                }
+                _ => {
+                    return Err(CallError::Refused(format!(
+                        "{base} is not a writable primary or a standby (role {:?}); a standby can only follow a primary or another standby",
+                        remote.role
+                    )))
+                }
+            }
         }
         self.contact_ok();
         self.update(|s| s.last_error = None);
@@ -973,6 +1117,9 @@ impl Replication {
         if runtime {
             self.after_accounts_change();
         }
+        // O21: standbys following this one wait for it (account changes are
+        // not on the event bus).
+        self.changelog_appended();
         tracing::debug!(changes = n, head, "replication: applied");
         self.update(|s| s.last_applied_at = Some(now_rfc3339()));
         Ok(())
@@ -1050,10 +1197,7 @@ impl Replication {
                 .unwrap_or(30)
                 .max(120),
         );
-        let snap: Snapshot = match self
-            .get(base, Some(token), "/api/replication/snapshot", timeout)
-            .await
-        {
+        let snap: Snapshot = match self.get_snapshot(base, token, timeout).await {
             Ok(s) => s,
             Err(e) => {
                 self.update(|s| {
@@ -1108,6 +1252,46 @@ impl Replication {
                 )))
             }
         }
+    }
+
+    /// O22: the snapshot, gzip-compressed when the primary supports it
+    /// (negotiated with `Accept-Encoding`; an older primary sends plain JSON).
+    async fn get_snapshot(
+        &self,
+        base: &str,
+        token: &str,
+        timeout: Duration,
+    ) -> std::result::Result<Snapshot, CallError> {
+        let path = "/api/replication/snapshot";
+        let (body, gzip) = self
+            .get_bytes(&self.http, base, Some(token), path, timeout, true)
+            .await?;
+        let received = body.len();
+        let base_ = base.to_string();
+        tokio::task::spawn_blocking(move || {
+            let json = if gzip {
+                use std::io::Read;
+                let mut out = Vec::with_capacity(received.saturating_mul(4));
+                flate2::read::GzDecoder::new(&body[..])
+                    .read_to_end(&mut out)
+                    .map_err(|e| {
+                        CallError::Other(format!("bad answer from {base_}{path}: gzip: {e}"))
+                    })?;
+                out
+            } else {
+                body
+            };
+            tracing::info!(
+                bytes = received,
+                json_bytes = json.len(),
+                gzip,
+                "replication: snapshot received"
+            );
+            serde_json::from_slice(&json)
+                .map_err(|e| CallError::Other(format!("bad answer from {base_}{path}: {e}")))
+        })
+        .await
+        .map_err(|e| CallError::Other(e.to_string()))?
     }
 
     /// Settings and TSIG keys may have changed: apply them to DNS now.
@@ -1274,6 +1458,9 @@ impl Replication {
         if let Err(e) = self.mutator.replica_halt(info.clone()).await {
             tracing::error!(error = %e, "cannot record the halt in the database (it is re-detected at the next start)");
         }
+        self.update(|s| s.halted = Some(info.clone()));
+        // O21: standbys long-polling this one learn it now (they halt too).
+        self.changelog_appended();
         info
     }
 
@@ -1324,6 +1511,26 @@ impl Replication {
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(Duration::from_secs(300));
         }
+    }
+}
+
+/// O21: why [`Replication::source_refusal`] refuses.
+#[derive(Debug, Clone)]
+pub struct SourceRefusal {
+    /// The standby's replication halted (its followers halt too).
+    pub halted: bool,
+    pub message: String,
+}
+
+/// O21: the standby this server follows halted. Its data (and so ours,
+/// copied from it) is not trusted: stop for good, like any divergence.
+fn upstream_halted(base: &str, detail: &str) -> CallError {
+    CallError::Halt {
+        reason: "upstream_halted",
+        detail: format!(
+            "the standby this server follows ({base}) halted its own replication ({detail}); this server's copy came from it"
+        ),
+        evidence: serde_json::json!({ "upstream": base, "upstream_detail": detail }),
     }
 }
 
@@ -1498,9 +1705,8 @@ pub async fn prepare_standby_offline(config_path: &std::path::Path, yes: bool) -
     // Divergence report: the local changes the primary does not have.
     let mut divergence = None;
     if rows > 0 {
-        ensure_crypto();
         let base = follow.primary.trim().trim_end_matches('/').to_string();
-        let remote = reqwest::Client::new()
+        let remote = https_client(Some(&follow.ca_file), "[follow].ca_file")?
             .get(format!("{base}/api/replication/identity"))
             .timeout(Duration::from_secs(5))
             .send()
