@@ -2052,3 +2052,11 @@ Final
   and 15.5 -> 44.0 MiB (standby), roughly linear, growth after warm-up
   168% / 153% against the 50% limit: the soak's FAIL. Note: the script's
   `cpu_s` stayed at 1.0 throughout (its CPU reading looks broken).
+- 2026-10-04 (phase O): checkpoint gates. Group 3 on 2257b18 and Group 4
+  on a8e36f6, then the final one on dd90ef3 (O0c; orphan checks added):
+  all PASS with both previous binaries (d32d67f and 3884ba8, 327 tests
+  each, `--no-fail-fast`), no orphaned test server before, between or
+  after, UI duration / access / browser tests, OpenAPI snapshot and
+  validator, conformance, smoke, cargo-audit (only `paste`). O0 stress on
+  dd90ef3 (15 min, same load): `json_import_and_record_paging` 0 of 208,
+  forwarding test 0 of 624, 0 orphans after.
