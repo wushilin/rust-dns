@@ -310,6 +310,18 @@ fn view(s: &AppState, z: &Zone) -> ApiResult<RolloverView> {
         }
         RolloverStage::Switched => {
             let old = key_view(&apex, &other);
+            // The new DS must stay: without it the zone is no longer
+            // validated (insecure), even though nothing fails.
+            if v.parent.as_ref().is_some_and(|p| {
+                p.servers
+                    .iter()
+                    .any(|s| s.error.is_none() && !s.ds.iter().any(|d| d.matches == "new"))
+            }) {
+                v.instructions.push(format!(
+                    "Warning: a parent server returns no DS for the new key {}. Keep (or add back) the new DS at the registrar; only the old one is to be deleted.",
+                    me.key_tag
+                ));
+            }
             if r.parent_ok_at.is_none() {
                 v.next = "remove_old_ds".into();
                 v.instructions.push(format!(
