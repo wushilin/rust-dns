@@ -5,7 +5,11 @@ gate, update this file, continue. `wushilin.net` is live and DNSSEC-signed, so
 every step must keep answers and signatures valid; nothing here is deployed
 until the whole plan has passed the gate.
 
-Gate: `cargo fmt --check`, `cargo clippy --all-targets -D warnings`,
+Gate: `cargo fmt --check`, `cargo clippy --all-targets -D warnings` with
+the Homebrew toolchain AND with the rustup stable one that CI's
+`dtolnay/rust-toolchain@stable` uses (`bash -c 'PATH=$HOME/.rustup/
+toolchains/stable-aarch64-apple-darwin/bin:$PATH cargo clippy --all-targets
+-- -D warnings'`; their lint sets differ, see the 2026-10-04 Log entry),
 `REQUIRE_BIND_TOOLS=1 REQUIRE_PREV_BIN=1 RUST_DNS_PREV_BIN=<prev> cargo test
 --no-fail-fast -- --test-threads=1` (for each previous binary; `--no-fail-fast`
 so one failing suite does not hide later ones), `scripts/check-orphans.sh`
@@ -2222,3 +2226,11 @@ Final
   on macOS), cargo-audit (only `paste`). Both musl targets build with
   O13a (zigbuild). Not run here: the long Linux soak of O13a (owner, see
   the item).
+- 2026-10-04 (phase O): CI clippy fix. The rustup stable clippy (1.94,
+  what CI's `dtolnay/rust-toolchain@stable` installs) flags three lints the
+  Homebrew clippy (1.98) does not: `overly_complex_bool_expr` in
+  `model::check_label` (a dead `... && false` branch for `*` inside a
+  label, removed: a `*` is valid only as the whole label, handled above
+  it), `nonminimal_bool` in `accounts.rs` (`!is_some_and(..)` ->
+  `is_none_or(..)`) and in a replica.rs test assertion. Behaviour
+  unchanged. The gate now runs both clippies (header of this file).

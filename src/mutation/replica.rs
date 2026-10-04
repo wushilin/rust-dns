@@ -1112,7 +1112,7 @@ mod tests {
         assert!(!admin.is_root, "only the local root is root on a standby");
         // Restart: syncing the config root again changes nothing else.
         sa.sync_root("root", STANDBY_ROOT_HASH, false).unwrap();
-        assert!(!ss.get_user(1).unwrap().unwrap().disabled_at.is_some());
+        assert!(ss.get_user(1).unwrap().unwrap().disabled_at.is_none());
     }
 
     #[tokio::test]

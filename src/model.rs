@@ -960,11 +960,10 @@ fn validate_label(
         }
         return invalid("wildcard label not allowed here");
     }
-    for (i, c) in label.chars().enumerate() {
-        let ok = c.is_ascii_alphanumeric()
-            || c == '-'
-            || (allow_underscore && c == '_')
-            || (i == 0 && c == '*' && allow_wildcard && false);
+    for c in label.chars() {
+        // A '*' inside a longer label is never valid (only the whole label
+        // "*", handled above).
+        let ok = c.is_ascii_alphanumeric() || c == '-' || (allow_underscore && c == '_');
         if !ok {
             return invalid(format!("label '{label}' contains invalid character '{c}'"));
         }

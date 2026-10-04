@@ -759,7 +759,7 @@ impl<'a> AuditTx<'a> {
 
     pub fn revoke_token(&mut self, owner: &User, t: &TokenInfo) -> Result<bool> {
         let current = db::get_token(self.conn, t.id)?;
-        if !current.is_some_and(|c| c.revoked_at.is_none()) {
+        if current.is_none_or(|c| c.revoked_at.is_some()) {
             return Ok(false);
         }
         self.record(SecretChange::TokenRevoked {
