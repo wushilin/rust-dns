@@ -48,7 +48,7 @@ pub(super) fn apply_zone_input(z: &mut Zone, input: &ZoneInput) -> Result<(), In
         if let Some(p) = &p {
             p.validate()?;
         }
-        z.record_policy = p;
+        z.record_policy = p.map(Box::new);
     }
     Ok(())
 }

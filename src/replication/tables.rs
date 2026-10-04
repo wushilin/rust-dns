@@ -198,9 +198,9 @@ pub fn dump(
         .collect();
     let rows = stmt.query_map(params![skip_root], |r| {
         let mut v = Vec::with_capacity(n);
-        for i in 0..n {
+        for (i, &opt) in optional.iter().enumerate() {
             let value = r.get_ref(i)?;
-            if optional[i] && value == rusqlite::types::ValueRef::Null {
+            if opt && value == rusqlite::types::ValueRef::Null {
                 continue;
             }
             v.push(match value {

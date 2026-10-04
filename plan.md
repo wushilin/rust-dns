@@ -1320,3 +1320,9 @@ what the registrar's DS must match on the live zone; plan it separately.
 - 2026-10-04 (phase M): M3 done (TSIG replay protection; BIND secondary
   interop test).
 - 2026-10-04 (phase M): M4 done (headless Chrome console flows; CI step).
+- 2026-10-04 (phase M): the M1-M3 gate on 3b0e96b failed at clippy (I had
+  run tests but not clippy per item): type complexity in `ReplayGuard`, a
+  needless borrow and a range loop, and `Change::Dns` grown past clippy's
+  variant-size limit by the inline `RecordPolicy` in `Zone`. Fixed: type
+  alias, `Zone.record_policy` boxed like `override` (no wire or JSON
+  change), iterator loop. Gate re-run on the fix.

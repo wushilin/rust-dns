@@ -169,8 +169,8 @@ pub struct Zone {
     /// Expiry policy for records below the apex (M2, self-registration
     /// zones); absent: none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub record_policy: Option<RecordPolicy>,
+    #[schema(nullable = false, value_type = Option<RecordPolicy>)]
+    pub record_policy: Option<Box<RecordPolicy>>,
 }
 
 /// Longest record lifetime a policy may name (100 years, as `expires_in`).
@@ -209,7 +209,7 @@ impl RecordPolicy {
         ] {
             if let Some(v) = v {
                 if v == 0 || v > MAX_POLICY_SECS {
-                    return invalid(&format!("{what} must be between 1 second and 100 years"));
+                    return invalid(format!("{what} must be between 1 second and 100 years"));
                 }
             }
         }

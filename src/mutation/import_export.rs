@@ -308,7 +308,7 @@ impl Mutator {
                         apply_zone_input(&mut z, &input)?;
                         if let Some(p) = ez.record_policy.as_ref().filter(|p| !p.is_empty()) {
                             p.validate()?;
-                            z.record_policy = Some(p.clone());
+                            z.record_policy = Some(Box::new(p.clone()));
                         }
                         apply_override(&mut z, &input, true)?;
                         if let Some(s) = ez.serial {
@@ -416,7 +416,7 @@ pub fn export_zone(zd: &crate::cache::ZoneData) -> ExportZone {
         default_ttl: Some(z.default_ttl),
         owner: None,
         overrides: z.overrides.as_deref().cloned(),
-        record_policy: z.record_policy.clone(),
+        record_policy: z.record_policy.as_deref().cloned(),
         records,
     }
 }

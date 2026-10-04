@@ -1125,7 +1125,8 @@ fn row_to_zone(r: &Row<'_>) -> rusqlite::Result<Zone> {
             .map(Box::new),
         record_policy: r
             .get::<_, Option<String>>(16)?
-            .and_then(|j| serde_json::from_str(&j).ok()),
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .map(Box::new),
     })
 }
 

@@ -624,8 +624,11 @@ pub fn verify(
 /// per key.
 #[derive(Default)]
 pub struct ReplayGuard {
-    last: std::sync::Mutex<std::collections::HashMap<String, (u64, Vec<Vec<u8>>)>>,
+    last: std::sync::Mutex<std::collections::HashMap<String, Newest>>,
 }
+
+/// Per key: the newest Time Signed and the MACs seen in that second.
+type Newest = (u64, Vec<Vec<u8>>);
 
 /// MACs remembered for one key and second (more requests than this in one
 /// second: the oldest are forgotten).
