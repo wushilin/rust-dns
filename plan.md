@@ -941,7 +941,7 @@ Group 6: DNS protocol depth (all OFF by default; live zone not switched)
   alongside per-client limits.
 - [x] O27. Acting as a secondary for zones hosted elsewhere (AXFR/IXFR in,
   NOTIFY in, TSIG, refresh/retry/expire timers, served read-only).
-- [ ] O28. Record types hickory's text parser lacks (LOC and others that
+- [x] O28. Record types hickory's text parser lacks (LOC and others that
   matter), via presentation-format parsing.
 - [ ] O29. DNS over TLS and DNS over HTTPS, inbound (own certificate files,
   rustls) and upstream for forwarding; off by default.
@@ -1138,6 +1138,20 @@ Final
   start with `ca_file` set: add it only after the upgrade, and remove it
   before a downgrade. gate and baba2 use the system trust store today:
   nothing to change.
+
+- After phase O, O28 (record types; this session; not deployed): protocol
+  2, no new change kind, no new column, fixture untouched. Records may now
+  have the types LOC, RP, AFSDB, URI, SPF, EUI48 and EUI64 (a new VALUE of
+  `records.rtype` and of `type` in record changes). An older (d32d67f,
+  3884ba8) standby cannot deserialize such a change or snapshot row and
+  would halt, so standbys advertise `rrtypes-o28`, the primary refuses
+  (409 naming the standby) to create or update records of these types
+  (API, bulk paste, JSON import) while a known standby lacks it, and while
+  any such record exists the snapshot and change endpoints refuse such a
+  standby (409, `refused`, not halted; test `o28_record_types_replicate_
+  and_older_standbys_are_refused`, real d32d67f and 3884ba8). Upgrade baba2
+  first, then gate; add such records only after both run this version; no
+  downgrade while one exists.
 
 - After phase O, O27 (secondary zones; this session; not deployed):
   protocol 2, no new change kind, fixture untouched. New nullable column
@@ -2523,3 +2537,27 @@ Final
   zone -> Secondary (SOA fields hidden), the add-record control disabled
   "Secondary zone: ...", the Secondary tab shows the state; OpenAPI
   snapshot.
+- 2026-10-04 (phase O): O28 done. Record types hickory's text parser lacks,
+  parsed by rust-dns itself (`src/rrtext.rs`: presentation text <-> wire
+  RDATA, the canonical text is what is stored, served as raw RDATA): LOC
+  (RFC 1876: degrees / minutes / seconds with 3 decimals, hemispheres,
+  altitude, size and precisions in the mantissa-exponent form, defaults 1m
+  / 10000m / 10m), RP and AFSDB (RFC 1183), URI (RFC 7553), SPF (RFC 7208,
+  TXT syntax), EUI48 and EUI64 (RFC 7043). Types hickory parses but we do
+  not offer yet (CERT, OPENPGPKEY, SMIMEA, CSYNC) were left out (not asked;
+  one line each through `RData::try_from_str` when wanted). Secondary
+  zones (O27) now also serve these types when transferred. Console: type
+  list, value hints and descriptions. Compatibility (Rollout): feature
+  `rrtypes-o28`. Tests: unit `rrtext::tests::{wire_forms_match_dnspython,
+  invalid_values_are_refused}` (wire forms produced by dnspython 2.8,
+  canonical text round trips, dnspython's LOC text); hardening `o28_record_
+  types_round_trip_and_bind_reads_them` (API: any accepted input stored
+  canonically, invalid values 400; BIND `dig` prints EUI48 / RP / URI /
+  LOC as expected; `named-checkzone` loads the zone from our AXFR with
+  every new type); follow `o28_record_types_replicate_and_older_standbys_
+  are_refused` (identical answers on a new standby; previous release
+  refused while such records exist, follows once none do, then API and
+  bulk creation 409 naming it, other types allowed); conformance: 8 new
+  dnspython checks (each type's answer equals dnspython's parse of the
+  value, signed and valid in a signed zone; the AXFR parses with every
+  type): 158/158; OpenAPI snapshot.

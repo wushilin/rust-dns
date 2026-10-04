@@ -50,6 +50,19 @@ pub fn secondary_zones(c: &Connection) -> Result<Vec<String>> {
     Ok(names)
 }
 
+/// O28: zones holding records of the types added in O28 (a standby of an
+/// older version could not read them and would halt).
+pub fn o28_record_zones(c: &Connection) -> Result<Vec<String>> {
+    let mut st = c.prepare(
+        "SELECT DISTINCT z.name FROM records r JOIN zones z ON z.id = r.zone_id
+         WHERE r.rtype IN ('LOC', 'RP', 'AFSDB', 'URI', 'SPF', 'EUI48', 'EUI64') ORDER BY z.name",
+    )?;
+    let names = st
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(names)
+}
+
 /// The next offset that will be assigned minus one (0 for a fresh log).
 pub fn changelog_head(c: &Connection) -> Result<i64> {
     Ok(c.query_row(

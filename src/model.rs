@@ -41,10 +41,24 @@ pub enum RecordType {
     /// Delegation signer (RFC 4034): at a delegation point, the digest of a
     /// signed child zone's key.
     DS,
+    /// O28: types hickory's text parser lacks, parsed by `rrtext`:
+    /// location (RFC 1876).
+    LOC,
+    /// Responsible person (RFC 1183).
+    RP,
+    /// AFS database location (RFC 1183).
+    AFSDB,
+    /// URI (RFC 7553).
+    URI,
+    /// SPF (RFC 7208 §3.1; TXT syntax).
+    SPF,
+    /// EUI-48 / EUI-64 addresses (RFC 7043).
+    EUI48,
+    EUI64,
 }
 
 impl RecordType {
-    pub const ALL: [RecordType; 17] = [
+    pub const ALL: [RecordType; 24] = [
         RecordType::A,
         RecordType::AAAA,
         RecordType::CNAME,
@@ -62,7 +76,25 @@ impl RecordType {
         RecordType::NAPTR,
         RecordType::HINFO,
         RecordType::DS,
+        RecordType::LOC,
+        RecordType::RP,
+        RecordType::AFSDB,
+        RecordType::URI,
+        RecordType::SPF,
+        RecordType::EUI48,
+        RecordType::EUI64,
     ];
+
+    /// O28: the types added in O28 (a standby must advertise `rrtypes-o28`
+    /// before records of them may exist).
+    pub fn is_o28(self) -> bool {
+        crate::rrtext::handles(self)
+    }
+
+    /// The type code.
+    pub fn code(self) -> u16 {
+        u16::from(self.to_hickory())
+    }
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -83,6 +115,13 @@ impl RecordType {
             RecordType::NAPTR => "NAPTR",
             RecordType::HINFO => "HINFO",
             RecordType::DS => "DS",
+            RecordType::LOC => "LOC",
+            RecordType::RP => "RP",
+            RecordType::AFSDB => "AFSDB",
+            RecordType::URI => "URI",
+            RecordType::SPF => "SPF",
+            RecordType::EUI48 => "EUI48",
+            RecordType::EUI64 => "EUI64",
         }
     }
 
@@ -113,6 +152,13 @@ impl RecordType {
             RecordType::NAPTR => H::NAPTR,
             RecordType::HINFO => H::HINFO,
             RecordType::DS => H::DS,
+            RecordType::LOC => H::from(29),
+            RecordType::RP => H::from(17),
+            RecordType::AFSDB => H::from(18),
+            RecordType::URI => H::from(256),
+            RecordType::SPF => H::from(99),
+            RecordType::EUI48 => H::from(108),
+            RecordType::EUI64 => H::from(109),
         }
     }
 }
@@ -1173,6 +1219,14 @@ pub fn normalize_value(rtype: RecordType, value: &str) -> Result<String, Invalid
             let n = normalize_domain(v, true)?;
             Ok(format!("{n}."))
         }
+        t @ (RecordType::LOC
+        | RecordType::RP
+        | RecordType::AFSDB
+        | RecordType::URI
+        | RecordType::SPF
+        | RecordType::EUI48
+        | RecordType::EUI64) => crate::rrtext::normalize(t, v)
+            .map_err(|e| Invalid(format!("invalid {} value: {e}", t.as_str()))),
         RecordType::DS => {
             let (tag, alg, dt, digest) = crate::dnssec::wire::parse_ds_text(v).map_err(Invalid)?;
             Ok(crate::dnssec::wire::ds_text(tag, alg, dt, &digest))
@@ -1233,6 +1287,13 @@ pub fn value_hint(rtype: RecordType) -> &'static str {
         RecordType::NAPTR => "100 10 \"S\" \"SIP+D2U\" \"\" _sip._udp.example.com.",
         RecordType::HINFO => "\"x86_64\" \"Linux\"",
         RecordType::DS => "12345 13 2 <sha256 digest, 64 hex digits>",
+        RecordType::LOC => "52 22 23.000 N 4 53 32.000 E -2.00m 1m 10000m 10m",
+        RecordType::RP => "admin.example.com. info.example.com.",
+        RecordType::AFSDB => "1 afsdb.example.com.",
+        RecordType::URI => "10 1 \"https://example.com/\"",
+        RecordType::SPF => "\"v=spf1 -all\"",
+        RecordType::EUI48 => "00-00-5e-00-53-2a",
+        RecordType::EUI64 => "00-00-5e-ef-10-00-00-2a",
     }
 }
 

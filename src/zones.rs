@@ -120,6 +120,14 @@ pub fn to_rr(zone: &Zone, r: &StoredRecord, owner: &Name) -> Option<Record> {
         Rt::CAA | Rt::HTTPS | Rt::SVCB | Rt::TLSA | Rt::SSHFP | Rt::NAPTR | Rt::HINFO => {
             RData::try_from_str(r.rtype.to_hickory(), &r.value).ok()?
         }
+        t @ (Rt::LOC | Rt::RP | Rt::AFSDB | Rt::URI | Rt::SPF | Rt::EUI48 | Rt::EUI64) => {
+            return Some(wire::raw_record(
+                owner.clone(),
+                ttl,
+                t.code(),
+                crate::rrtext::parse(t, &r.value).ok()?,
+            ));
+        }
         Rt::DS => {
             let (tag, alg, dt, digest) = wire::parse_ds_text(&r.value).ok()?;
             return Some(wire::raw_record(

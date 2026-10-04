@@ -8613,7 +8613,14 @@
           "SSHFP",
           "NAPTR",
           "HINFO",
-          "DS"
+          "DS",
+          "LOC",
+          "RP",
+          "AFSDB",
+          "URI",
+          "SPF",
+          "EUI48",
+          "EUI64"
         ],
         "example": "A"
       },

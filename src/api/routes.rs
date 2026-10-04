@@ -611,6 +611,32 @@ pub async fn create_zone(
     ))
 }
 
+/// O28: records of the types added in O28 (LOC, RP, AFSDB, URI, SPF,
+/// EUI48, EUI64) are refused (409) while a standby of a version without
+/// them follows this server: it could not read the change and would halt.
+fn refuse_o28_types(
+    s: &AppState,
+    types: impl IntoIterator<Item = crate::model::RecordType>,
+) -> ApiResult<()> {
+    let new: Vec<&str> = types
+        .into_iter()
+        .filter(|t| t.is_o28())
+        .map(|t| t.as_str())
+        .collect();
+    if new.is_empty() {
+        return Ok(());
+    }
+    let blocked = standbys_without(s, "rrtypes-o28");
+    if blocked.is_empty() {
+        return Ok(());
+    }
+    Err(ApiError::conflict(format!(
+        "standbys of an older version follow this server and cannot store {} records (they would halt): {}. Upgrade them first (or forget a standby that no longer follows, on the Replication page)",
+        new.join(", "),
+        blocked.join(", ")
+    )))
+}
+
 /// O27: a secondary zone's TSIG key must exist and be allowed for it.
 fn check_secondary_key(
     s: &AppState,
@@ -1046,6 +1072,7 @@ pub async fn bulk_records(
 ) -> ApiResult<Json<BulkResult>> {
     let (z, _) = s.require_zone(&caller, &zone, ZonePerm::EditRecords)?;
     let (lines, parse_errors) = crate::mutation::bulk::parse_bulk(&b.add);
+    refuse_o28_types(&s, lines.iter().map(|l| l.rtype))?;
     if b.delete.is_empty() && lines.is_empty() && parse_errors.is_empty() {
         return Err(ApiError::bad_request(
             "nothing to do: give records to delete or lines to add",
@@ -1211,6 +1238,7 @@ pub async fn create_record(
     Json(input): Json<RecordInput>,
 ) -> ApiResult<(StatusCode, Json<Record>)> {
     let (z, _) = s.require_zone(&caller, &zone, ZonePerm::EditRecords)?;
+    refuse_o28_types(&s, input.rtype)?;
     let (record, renewed) = s
         .mutator
         .create_record(caller.actor(), &z.name, input)
@@ -1251,6 +1279,7 @@ pub async fn update_record(
     Json(input): Json<RecordInput>,
 ) -> ApiResult<Json<Record>> {
     let (z, _) = s.require_zone(&caller, &zone, ZonePerm::EditRecords)?;
+    refuse_o28_types(&s, input.rtype)?;
     Ok(Json(
         s.mutator
             .update_record(caller.actor(), &z.name, id, input)
@@ -1517,6 +1546,12 @@ pub async fn import(
     Query(q): Query<ImportQuery>,
     Json(doc): Json<ExportDoc>,
 ) -> ApiResult<Json<ImportSummary>> {
+    refuse_o28_types(
+        &s,
+        doc.zones
+            .iter()
+            .flat_map(|z| z.records.iter().map(|r| r.rtype)),
+    )?;
     let allowed = if s.has(&caller, GlobalPerm::CreateZones) {
         None
     } else {

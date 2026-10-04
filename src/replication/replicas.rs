@@ -41,7 +41,7 @@ pub const HEADER_VERSION: &str = "x-rust-dns-version";
 /// replication endpoints also refuse them while such a zone exists).
 pub const VERSION_WITH_FEATURES: &str = concat!(
     env!("CARGO_PKG_VERSION"),
-    "+dnssec-rollover.zone-rename.zone-settings.nsec3.ed25519.secondary-zones"
+    "+dnssec-rollover.zone-rename.zone-settings.nsec3.ed25519.secondary-zones.rrtypes-o28"
 );
 
 /// Whether a standby's reported version names `feature`.

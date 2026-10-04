@@ -12,7 +12,9 @@ Single static binary, one SQLite file, one TOML config. Zero JavaScript build.
 **DNS**
 - Authoritative for any number of zones, including `.` as a private root.
 - A, AAAA, CNAME, PTR, NS, MX, TXT, SRV, CAA, HTTPS/SVCB, TLSA, SSHFP, NAPTR,
-  HINFO, DNAME and DS. SOA and apex NS are synthesized from zone settings when
+  HINFO, DNAME and DS; and (parsed by rust-dns itself: hickory's text parser
+  lacks them) LOC (RFC 1876), RP and AFSDB (RFC 1183), URI (RFC 7553), SPF
+  (RFC 7208) and EUI48 / EUI64 (RFC 7043). SOA and apex NS are synthesized from zone settings when
   not set explicitly.
 - DNSSEC online signing per zone (off by default): ECDSA P-256 (or
   Ed25519) combined signing key, NSEC or NSEC3 denial, signatures renewed automatically, DS records for

@@ -93,6 +93,13 @@ fn unsignable_for(c: &rusqlite::Connection, h: &ReplicaHeaders) -> anyhow::Resul
                 .map(|z| format!("{z} (signed with Ed25519, DNSSEC algorithm 15)")),
         );
     }
+    if !has_feature(&h.version, "rrtypes-o28") {
+        out.extend(
+            data::o28_record_zones(c)?
+                .into_iter()
+                .map(|z| format!("{z} (LOC, RP, AFSDB, URI, SPF or EUI records)")),
+        );
+    }
     if !has_feature(&h.version, "secondary-zones") {
         out.extend(
             data::secondary_zones(c)?

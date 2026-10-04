@@ -54,6 +54,22 @@ pub fn relative_name(owner: &str, apex: &str) -> String {
 /// A record's value in presentation format, as the catalog keeps it (used
 /// for CNAME / DNAME targets and delegations).
 pub fn value_text(r: &Record) -> String {
+    // O28 types: their canonical text (hickory carries them as unknown).
+    let code = u16::from(r.record_type());
+    if let Some(t) = crate::model::RecordType::ALL
+        .iter()
+        .copied()
+        .find(|t| t.is_o28() && t.code() == code)
+    {
+        if let Some(s) = r
+            .data
+            .to_bytes()
+            .ok()
+            .and_then(|b| crate::rrtext::format(t, &b))
+        {
+            return s;
+        }
+    }
     if u16::from(r.record_type()) == 39 {
         if let Some(n) = crate::dnssec::wire::raw_rdata(r)
             .and_then(|b| crate::dnssec::wire::read_name(b, 0))

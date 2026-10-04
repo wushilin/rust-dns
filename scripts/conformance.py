@@ -893,6 +893,42 @@ if OV:
     check("rust-dns override zone: the signed parent still answers with signatures",
           any(rr.rdtype == dns.rdatatype.RRSIG for rr in r.answer), r.to_text())
 
+# --- O28: record types hickory's text parser lacks ---------------------------
+import dns.rdata
+import dns.zone
+O28 = os.environ.get("CONFORMANCE_O28")
+if O28:
+    z28 = dns.name.from_text(O28 + ".")
+    r = sq(z28, "DNSKEY")
+    k28 = r.get_rrset(r.answer, z28, IN, dns.rdatatype.DNSKEY)
+    for name, t, text in [("loc", "LOC", "52 22 23.000 N 4 53 32.000 E -2.00m 0.00m 10000m 10m"),
+                          ("rp", "RP", "admin.rrtypes.test. info.rrtypes.test."),
+                          ("afs", "AFSDB", "1 afs.rrtypes.test."),
+                          ("_http._tcp", "URI", '10 1 "https://example.com/"'),
+                          ("spf", "SPF", '"v=spf1 -all"'),
+                          ("mac", "EUI48", "00-00-5e-00-53-2a"),
+                          ("mac", "EUI64", "00-00-5e-ef-10-00-00-2a")]:
+        qn = dns.name.from_text(name, origin=z28)
+        r = sq(qn, t)
+        got = r.get_rrset(r.answer, qn, IN, dns.rdatatype.from_text(t))
+        sig = r.get_rrset(r.answer, qn, IN, RRSIG, dns.rdatatype.from_text(t))
+        want = dns.rdata.from_text(IN, t, text)
+        err = ""
+        try:
+            dns.dnssec.validate(got, sig, {z28: k28})
+        except Exception as e:
+            err = repr(e)
+        check(f"O28 {t} (RFC 1876 / 1183 / 7553 / 7208 / 7043): answer = dnspython's parse of the value, signed and valid",
+              got is not None and len(got) == 1 and got[0].to_wire() == want.to_wire() and not err, f"{got} {err}")
+    try:
+        zone = dns.zone.from_xfr(dns.query.xfr(IP, z28, port=PORT, timeout=5))
+        types = {rds.rdtype for _, rds in zone.iterate_rdatasets()}
+        ok28 = all(dns.rdatatype.from_text(t) in types for t in ("LOC", "RP", "AFSDB", "URI", "SPF", "EUI48", "EUI64"))
+        err = ""
+    except Exception as e:
+        ok28, err = False, repr(e)
+    check("O28: AXFR of the zone parses (dnspython) with every new type", ok28, err)
+
 failed = [n for n, ok, _ in results if not ok]
 print(f"\n{len(results) - len(failed)}/{len(results)} checks passed")
 sys.exit(1 if failed else 0)

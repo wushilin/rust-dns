@@ -74,6 +74,19 @@ def req(path, body):
     o.open(r, timeout=5).read()
 req("/api/auth/login", {"username": "root", "password": "ci-root-password"})
 req("/api/zones", {"name": "vpn.signed.test", "override": {"mode": "static"}})
+# O28: records of the types hickory's text parser lacks, in a signed zone.
+req("/api/zones", {"name": "rrtypes.test"})
+for name, t, v in [("loc", "LOC", "52 22 23.000 N 4 53 32.000 E -2.00m 0.00m 10000m 10m"),
+                   ("rp", "RP", "admin.rrtypes.test. info.rrtypes.test."),
+                   ("afs", "AFSDB", "1 afs.rrtypes.test."),
+                   ("_http._tcp", "URI", '10 1 "https://example.com/"'),
+                   ("spf", "SPF", '"v=spf1 -all"'),
+                   ("mac", "EUI48", "00-00-5e-00-53-2a"),
+                   ("mac", "EUI64", "00-00-5e-ef-10-00-00-2a")]:
+    req("/api/zones/rrtypes.test/records", {"name": name, "type": t, "value": v})
+r = urllib.request.Request(base + "/api/zones/rrtypes.test/dnssec", data=json.dumps({"enabled": True}).encode(), method="PUT",
+    headers={"Content-Type": "application/json", "X-Requested-With": "rust-dns", "X-CSRF-Token": next((c.value for c in jar if c.name in ("rdns_csrf", "__Host-rdns_csrf")), "")})
+o.open(r, timeout=5).read()
 req("/api/zones/vpn.signed.test/records", {"name": "gw", "type": "A", "value": "10.8.0.1"})
 # O24: a copy of signed.test signed with NSEC3 (CONFORMANCE_NSEC3).
 r = o.open(urllib.request.Request(base + "/api/zones/signed.test/export"), timeout=5).read()
@@ -102,7 +115,7 @@ r = urllib.request.Request(base + "/api/zones/ed25519.test/dnssec", data=json.du
 st = json.loads(o.open(r, timeout=5).read())
 assert st["state"] == "signing" and st["key"]["algorithm"] == 15, st
 PY
-CONFORMANCE_ED25519=ed25519.test CONFORMANCE_NSEC3=nsec3.test CONFORMANCE_OVERRIDE=vpn.signed.test python3 "$ROOT/scripts/conformance.py" "$ZONE" 127.0.0.1 "$DNS_PORT"
+CONFORMANCE_O28=rrtypes.test CONFORMANCE_ED25519=ed25519.test CONFORMANCE_NSEC3=nsec3.test CONFORMANCE_OVERRIDE=vpn.signed.test python3 "$ROOT/scripts/conformance.py" "$ZONE" 127.0.0.1 "$DNS_PORT"
 if [ "${RUN_COMPLIANCE:-0}" = "1" ]; then
   "$ROOT/scripts/compliance.sh" "$ZONE" 127.0.0.1 "$DNS_PORT"
 fi

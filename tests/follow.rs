@@ -469,7 +469,7 @@ fn primary_standby_failover_and_rejoin() {
     assert_eq!(
         r["version"],
         format!(
-            "{}+dnssec-rollover.zone-rename.zone-settings.nsec3.ed25519.secondary-zones",
+            "{}+dnssec-rollover.zone-rename.zone-settings.nsec3.ed25519.secondary-zones.rrtypes-o28",
             env!("CARGO_PKG_VERSION")
         )
     );
@@ -5076,5 +5076,111 @@ fn secondary_zones_replicate_their_definition_and_every_server_transfers_itself(
         drop(old);
     }
     drop((p, u));
+    let _ = std::fs::remove_dir_all(&root_dir);
+}
+
+/// O28: records of the new types (LOC, RP, AFSDB, URI, SPF, EUI48, EUI64)
+/// replicate to a standby of this version, which serves the same answers.
+/// A previous release cannot read them (it would fail to apply the change
+/// and halt): while such records exist its snapshot and change requests
+/// are refused (409, `refused`, never halted); once none exists it
+/// follows, and then creating one is refused naming it.
+#[test]
+fn o28_record_types_replicate_and_older_standbys_are_refused() {
+    let root_dir = temp_root("follow-o28");
+    let mut p = Node::new(&root_dir, "primary", "rootpass-primary");
+    let mut s = Node::new(&root_dir, "standby", "rootpass-standby");
+    p.configure("");
+    p.start();
+    let pr = p.root();
+    let post =
+        |path: &str, body: Value| call(&Auth::Session(&pr), "POST", &p.api(path), Some(body));
+    ok(post("/zones", json!({ "name": "rt.test" })), "zone");
+    let mut ids = Vec::new();
+    for (name, t, v) in [
+        ("loc", "LOC", "52 22 23 N 4 53 32 E -2m"),
+        ("rp", "RP", "admin.rt.test. info.rt.test."),
+        ("mac", "EUI48", "00-00-5e-00-53-2a"),
+        ("_http._tcp", "URI", "10 1 \"https://example.com/\""),
+    ] {
+        let r = ok(
+            post(
+                "/zones/rt.test/records",
+                json!({ "name": name, "type": t, "value": v }),
+            ),
+            t,
+        );
+        ids.push(r["id"].as_i64().unwrap());
+    }
+    let repl = ok(post("/tokens", json!({ "name": "repl" })), "token")["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    s.configure(&follow_cfg(&p, "dns2", &repl));
+    s.start();
+    let sr = s.root();
+    wait_reconciled(&p, &pr, &s, &sr, "O28 records");
+    for (n, t) in [
+        ("loc.rt.test.", RecordType::Unknown(29)),
+        ("rp.rt.test.", RecordType::Unknown(17)),
+        ("mac.rt.test.", RecordType::Unknown(108)),
+        ("_http._tcp.rt.test.", RecordType::Unknown(256)),
+    ] {
+        let a = answers(p.dns, n, t);
+        assert_eq!(a.1.len(), 1, "{n}: {a:?}");
+        assert_eq!(a, answers(s.dns, n, t), "{n}");
+    }
+    drop(s);
+    if let Some(prev) = prev_bin() {
+        let mut old = Node::new(&root_dir, "old", "rootpass-old");
+        old.bin = prev;
+        old.configure(&follow_cfg(&p, "dns3", &repl));
+        old.start();
+        let or = old.root();
+        wait_for("the old standby is refused", 30, || {
+            let st = status(&old, &or);
+            assert!(st["follow"]["halted"].is_null(), "not halted: {st}");
+            st["follow"]["state"] == "refused"
+                && st["follow"]["last_error"]
+                    .as_str()
+                    .is_some_and(|e| e.contains("LOC") && e.contains("rt.test"))
+        });
+        for id in &ids {
+            ok(
+                call(
+                    &Auth::Session(&pr),
+                    "DELETE",
+                    &p.api(&format!("/zones/rt.test/records/{id}")),
+                    None,
+                ),
+                "delete",
+            );
+        }
+        old.stop();
+        old.start();
+        let or = old.root();
+        wait_reconciled(&p, &pr, &old, &or, "old standby, no O28 record");
+        let (st, v) = post(
+            "/zones/rt.test/records",
+            json!({ "name": "loc", "type": "LOC", "value": "52 22 23 N 4 53 32 E -2m" }),
+        );
+        assert_eq!(st, 409, "{v}");
+        assert!(v["error"].as_str().unwrap().contains("dns3"), "{v}");
+        let (st, v) = post(
+            "/zones/rt.test/records/bulk",
+            json!({ "add": "x 300 EUI48 00-00-5e-00-53-2b" }),
+        );
+        assert_eq!(st, 409, "bulk: {v}");
+        ok(
+            post(
+                "/zones/rt.test/records",
+                json!({ "name": "www", "type": "A", "value": "192.0.2.1" }),
+            ),
+            "other types stay allowed",
+        );
+        wait_reconciled(&p, &pr, &old, &or, "old standby follows");
+        drop(old);
+    }
+    drop(p);
     let _ = std::fs::remove_dir_all(&root_dir);
 }

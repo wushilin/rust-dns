@@ -1126,3 +1126,147 @@ fn find_server_cookie(m: &[u8]) -> Option<Vec<u8>> {
     }
     None
 }
+
+fn bind_tool(name: &str) -> Option<std::path::PathBuf> {
+    let mut dirs: Vec<std::path::PathBuf> = [
+        "/opt/homebrew/opt/bind/bin",
+        "/opt/homebrew/opt/bind/sbin",
+        "/usr/local/opt/bind/bin",
+        "/usr/bin",
+        "/usr/sbin",
+    ]
+    .iter()
+    .map(std::path::PathBuf::from)
+    .collect();
+    if let Some(p) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&p));
+    }
+    let t = dirs.into_iter().map(|d| d.join(name)).find(|p| p.is_file());
+    assert!(
+        t.is_some() || std::env::var("REQUIRE_BIND_TOOLS").is_err(),
+        "{name} not found"
+    );
+    t
+}
+
+/// O28: LOC, RP, AFSDB, URI, SPF, EUI48 and EUI64 through the API (any
+/// accepted input form is stored in its canonical text; invalid values are
+/// 400), served on the wire, and accepted by BIND: `dig` prints every type
+/// and `named-checkzone` loads the zone as transferred from us.
+#[test]
+fn o28_record_types_round_trip_and_bind_reads_them() {
+    let s = Server::start("rrtypes", "", "", "[transfer]\nallow = [\"127.0.0.0/8\"]\n");
+    let a = login(&s.web, "root", "rootpass123");
+    let (st, v) = call(
+        &a,
+        "POST",
+        &format!("{}/api/zones", s.web),
+        Some(serde_json::json!({ "name": "rt.test" })),
+    );
+    assert!(st == 200 || st == 201, "{v}");
+    for (name, t, input, canonical) in [
+        (
+            "loc",
+            "LOC",
+            "42 21 54 N 71 06 18 W -24m 30m",
+            "42 21 54.000 N 71 6 18.000 W -24.00m 30.00m 10000.00m 10.00m",
+        ),
+        (
+            "rp",
+            "RP",
+            "Admin.RT.test info.rt.test.",
+            "admin.rt.test. info.rt.test.",
+        ),
+        ("afs", "AFSDB", "1 afs.rt.test", "1 afs.rt.test."),
+        (
+            "_http._tcp",
+            "URI",
+            "10 1 \"https://example.com/\"",
+            "10 1 \"https://example.com/\"",
+        ),
+        ("spf", "SPF", "v=spf1 -all", "\"v=spf1 -all\""),
+        ("mac", "EUI48", "00-00-5E-00-53-2A", "00-00-5e-00-53-2a"),
+        (
+            "mac",
+            "EUI64",
+            "00-00-5e-ef-10-00-00-2a",
+            "00-00-5e-ef-10-00-00-2a",
+        ),
+    ] {
+        let (st, v) = call(
+            &a,
+            "POST",
+            &format!("{}/api/zones/rt.test/records", s.web),
+            Some(serde_json::json!({ "name": name, "type": t, "value": input })),
+        );
+        assert!(st == 200 || st == 201, "{t}: {v}");
+        assert_eq!(v["value"], canonical, "{t}");
+    }
+    for (t, bad) in [
+        ("LOC", "91 0 0 N 0 0 0 E 0m"),
+        ("URI", "10 1 unquoted"),
+        ("EUI48", "00-00"),
+        ("RP", "one."),
+    ] {
+        let (st, v) = call(
+            &a,
+            "POST",
+            &format!("{}/api/zones/rt.test/records", s.web),
+            Some(serde_json::json!({ "name": "bad", "type": t, "value": bad })),
+        );
+        assert_eq!(st, 400, "{t} {bad}: {v}");
+    }
+    // The default NS needs an address for named-checkzone.
+    let (st, v) = call(
+        &a,
+        "POST",
+        &format!("{}/api/zones/rt.test/records", s.web),
+        Some(serde_json::json!({ "name": "ns1", "type": "A", "value": "192.0.2.53" })),
+    );
+    assert!(st == 200 || st == 201, "{v}");
+    let (Some(dig), Some(checkzone)) = (bind_tool("dig"), bind_tool("named-checkzone")) else {
+        return;
+    };
+    let port = s.dns.to_string();
+    let short = |name: &str, t: &str| {
+        let o = Command::new(&dig)
+            .args(["@127.0.0.1", "-p", &port, "+short", "+tries=1", name, t])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    };
+    assert_eq!(short("mac.rt.test", "EUI48"), "00-00-5e-00-53-2a");
+    assert_eq!(short("rp.rt.test", "RP"), "admin.rt.test. info.rt.test.");
+    assert_eq!(
+        short("_http._tcp.rt.test", "URI"),
+        "10 1 \"https://example.com/\""
+    );
+    assert!(short("loc.rt.test", "LOC").starts_with("42 21 54.000 N 71 6 18.000 W -24.00m 30m"));
+    let axfr = Command::new(&dig)
+        .args([
+            "@127.0.0.1",
+            "-p",
+            &port,
+            "+nocmd",
+            "+nostats",
+            "rt.test",
+            "AXFR",
+        ])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&axfr.stdout).to_string();
+    let file = s.dir.join("rt.test.zone");
+    std::fs::write(&file, &text).unwrap();
+    let o = Command::new(&checkzone)
+        .args(["-i", "local", "rt.test", file.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success() && out.contains("OK"), "{out}\n{text}");
+    for t in ["LOC", "RP", "AFSDB", "URI", "SPF", "EUI48", "EUI64"] {
+        assert!(
+            text.contains(&format!("\t{t}\t")),
+            "{t} in the AXFR: {text}"
+        );
+    }
+}

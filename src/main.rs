@@ -13,6 +13,7 @@ mod mutation;
 mod ratelimit;
 mod reload;
 mod replication;
+mod rrtext;
 mod secondary;
 mod storage;
 mod ui;
