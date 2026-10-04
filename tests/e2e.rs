@@ -144,7 +144,7 @@ fn post(a: &ureq::Agent, url: &str, body: serde_json::Value) -> (u16, serde_json
     match a
         .post(url)
         .set("X-Requested-With", "rust-dns")
-        .set("X-CSRF-Token", &csrf_of(&a))
+        .set("X-CSRF-Token", &csrf_of(a))
         .send_json(body)
     {
         Ok(r) => {
@@ -976,7 +976,7 @@ fn send(
     let req = a
         .request(method, url)
         .set("X-Requested-With", "rust-dns")
-        .set("X-CSRF-Token", &csrf_of(&a));
+        .set("X-CSRF-Token", &csrf_of(a));
     let r = match body {
         Some(b) => req.send_json(b),
         None => req.call(),

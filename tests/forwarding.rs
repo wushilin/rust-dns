@@ -256,7 +256,7 @@ fn call(
     let req = a
         .request(method, url)
         .set("X-Requested-With", "rust-dns")
-        .set("X-CSRF-Token", &csrf_of(&a));
+        .set("X-CSRF-Token", &csrf_of(a));
     let res = match body {
         Some(b) => req.send_json(b),
         None => req.call(),

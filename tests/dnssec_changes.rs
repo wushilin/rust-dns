@@ -63,7 +63,7 @@ fn call(a: &ureq::Agent, method: &str, url: &str, body: Option<Value>) -> Value 
     let req = a
         .request(method, url)
         .set("X-Requested-With", "rust-dns")
-        .set("X-CSRF-Token", &csrf_of(&a));
+        .set("X-CSRF-Token", &csrf_of(a));
     let r = match body {
         Some(b) => req.send_json(b),
         None => req.call(),
