@@ -64,6 +64,15 @@ def free_port():
 # ---- servers -------------------------------------------------------------------
 
 
+def csrf_of(opener):
+    """O7: the session's CSRF token (rdns_csrf cookie), sent with cookie writes."""
+    for h in opener.handlers:
+        for c in getattr(h, "cookiejar", None) or []:
+            if c.name in ("rdns_csrf", "__Host-rdns_csrf"):
+                return c.value
+    return ""
+
+
 class Server:
     def __init__(self, binary, workdir, name, password, extra=""):
         self.name, self.password = name, password
@@ -147,7 +156,8 @@ class Api:
     def call(self, method, path, body=None, timeout=15):
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(f"{self.base}/api{path}", data=data, method=method,
-                                     headers={"x-requested-with": "rust-dns", "content-type": "application/json"})
+                                     headers={"x-requested-with": "rust-dns", "content-type": "application/json",
+                                              "x-csrf-token": csrf_of(self.opener)})
         try:
             with self.opener.open(req, timeout=timeout) as r:
                 txt = r.read()

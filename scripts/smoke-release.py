@@ -154,6 +154,9 @@ level = "warn"
             data = json.dumps(body).encode() if body is not None else None
             req = urllib.request.Request(base + path, data=data, method=method)
             req.add_header("X-Requested-With", "rust-dns")
+            for c in jar:
+                if c.name in ("rdns_csrf", "__Host-rdns_csrf"):
+                    req.add_header("X-CSRF-Token", c.value)
             if data is not None:
                 req.add_header("Content-Type", "application/json")
             with opener.open(req, timeout=10) as r:

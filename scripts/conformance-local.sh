@@ -66,9 +66,11 @@ python3 "$ROOT/scripts/seed-conformance.py" "http://127.0.0.1:$WEB_PORT"
 python3 - "http://127.0.0.1:$WEB_PORT" <<'PY'
 import http.cookiejar, json, sys, urllib.request
 base = sys.argv[1]
-o = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+jar = http.cookiejar.CookieJar()
+o = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
 def req(path, body):
-    r = urllib.request.Request(base + path, data=json.dumps(body).encode(), headers={"Content-Type": "application/json", "X-Requested-With": "rust-dns"})
+    tok = next((c.value for c in jar if c.name in ("rdns_csrf", "__Host-rdns_csrf")), "")
+    r = urllib.request.Request(base + path, data=json.dumps(body).encode(), headers={"Content-Type": "application/json", "X-Requested-With": "rust-dns", "X-CSRF-Token": tok})
     o.open(r, timeout=5).read()
 req("/api/auth/login", {"username": "root", "password": "ci-root-password"})
 req("/api/zones", {"name": "vpn.signed.test", "override": {"mode": "static"}})

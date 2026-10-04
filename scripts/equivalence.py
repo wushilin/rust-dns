@@ -408,6 +408,15 @@ level = "warn"
 # Seeding through the HTTP API
 # --------------------------------------------------------------------------
 
+def csrf_of(opener):
+    """O7: the session's CSRF token (rdns_csrf cookie), sent with cookie writes."""
+    for h in opener.handlers:
+        for c in getattr(h, "cookiejar", None) or []:
+            if c.name in ("rdns_csrf", "__Host-rdns_csrf"):
+                return c.value
+    return ""
+
+
 class Api:
     def __init__(self, base):
         self.base = base.rstrip("/")
@@ -417,6 +426,7 @@ class Api:
     def req(self, path, payload=None, method=None):
         body = None if payload is None else json.dumps(payload).encode()
         h = dict(CSRF)
+        h["X-CSRF-Token"] = csrf_of(self.opener)
         if body is not None:
             h["Content-Type"] = "application/json"
         r = urllib.request.Request(self.base + path, data=body, headers=h, method=method)

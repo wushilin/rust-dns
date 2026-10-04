@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "rust-dns API",
-    "description": "Management API of the rust-dns authoritative DNS server.\n\n**Authentication.** Either\n* a cookie session: `POST /auth/login` (then `/auth/mfa` if MFA is enabled) sets the `rdns_session` cookie, which the browser sends automatically; or\n* an API token: `Authorization: Bearer rdns_...` (create one under *Tokens*; use the **Authorize** button).\n\n**CSRF guard.** Cookie-authenticated writes (POST/PUT/DELETE) must send the header `X-Requested-With: rust-dns`, otherwise they fail with 403 `code: csrf`. The Swagger UI in the web console adds this header automatically. Bearer-token requests do not need it.\n\n**Live server.** \"Try it out\" sends real requests to this server with the caller's permissions: changes are committed, logged and served over DNS immediately.\n\nErrors are JSON `{\"error\": \"...\", \"code\": null|\"...\"}`. Zones the caller cannot see return 404.\n\nThis document is generated from the server's code, so it always matches the running version.",
+    "description": "Management API of the rust-dns authoritative DNS server.\n\n**Authentication.** Either\n* a cookie session: `POST /auth/login` (then `/auth/mfa` if MFA is enabled) sets the `rdns_session` cookie, which the browser sends automatically; or\n* an API token: `Authorization: Bearer rdns_...` (create one under *Tokens*; use the **Authorize** button).\n\n**CSRF guard.** Cookie-authenticated writes (POST/PUT/DELETE) must send the header `X-Requested-With: rust-dns` and the session's CSRF token as `X-CSRF-Token` (the `csrf_token` of the sign-in response or of `GET /auth/session`, also in the `rdns_csrf` cookie), otherwise they fail with 403 `code: csrf`. `[web_console] csrf_token_required = false` drops the token check. The Swagger UI in the web console adds both automatically. Bearer-token requests need neither.\n\n**Live server.** \"Try it out\" sends real requests to this server with the caller's permissions: changes are committed, logged and served over DNS immediately.\n\nErrors are JSON `{\"error\": \"...\", \"code\": null|\"...\"}`. Zones the caller cannot see return 404.\n\nThis document is generated from the server's code, so it always matches the running version.",
     "license": {
       "name": "Apache-2.0",
       "identifier": "Apache-2.0"
@@ -7029,7 +7029,8 @@
         "required": [
           "status",
           "user",
-          "enroll"
+          "enroll",
+          "csrf_token"
         ],
         "properties": {
           "status": {
@@ -7049,9 +7050,15 @@
                 "description": "TOTP enrollment data; non-null only when `status` is `enroll_required`."
               }
             ]
+          },
+          "csrf_token": {
+            "type": "string",
+            "description": "O7: send this as `X-CSRF-Token` with every cookie-authenticated\nwrite of this session (also set as the `rdns_csrf` cookie, readable\nby the page).",
+            "example": "9f2c5d0b6a1e4f3c8d7b2a19e0f6c5d4b3a29180f7e6d5c4b3a2918f0e7d6c5b"
           }
         },
         "example": {
+          "csrf_token": "9f2c5d0b6a1e4f3c8d7b2a19e0f6c5d4b3a29180f7e6d5c4b3a2918f0e7d6c5b",
           "enroll": null,
           "status": "ok",
           "user": {
@@ -9015,9 +9022,14 @@
                 "description": "TOTP enrollment data; non-null only when `status` is `enroll_required`."
               }
             ]
+          },
+          "csrf_token": {
+            "type": "string",
+            "description": "O7: the session's CSRF token (send it as `X-CSRF-Token` with cookie\nwrites); absent without a session."
           }
         },
         "example": {
+          "csrf_token": "9f2c5d0b6a1e4f3c8d7b2a19e0f6c5d4b3a29180f7e6d5c4b3a2918f0e7d6c5b",
           "enroll": null,
           "status": "ok",
           "user": {
@@ -10891,7 +10903,7 @@
         }
       },
       "Forbidden": {
-        "description": "Not allowed, or cookie write without `X-Requested-With: rust-dns` (`code`: csrf).",
+        "description": "Not allowed, or cookie write without `X-Requested-With: rust-dns` or the session's `X-CSRF-Token` (`code`: csrf).",
         "content": {
           "application/json": {
             "schema": {
@@ -10992,7 +11004,7 @@
         "type": "apiKey",
         "in": "cookie",
         "name": "rdns_session",
-        "description": "Session cookie set by POST /auth/login (named `__Host-rdns_session` over HTTPS). Cookie writes also need `X-Requested-With: rust-dns`."
+        "description": "Session cookie set by POST /auth/login (named `__Host-rdns_session` over HTTPS). Cookie writes also need `X-Requested-With: rust-dns` and `X-CSRF-Token`."
       }
     }
   },

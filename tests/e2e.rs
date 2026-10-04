@@ -9,6 +9,15 @@ use std::net::{TcpStream, UdpSocket};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// O7: the session's CSRF token (from its cookie), sent with cookie writes.
+fn csrf_of(a: &ureq::Agent) -> String {
+    a.cookie_store()
+        .iter_unexpired()
+        .find(|c| c.name() == "rdns_csrf" || c.name() == "__Host-rdns_csrf")
+        .map(|c| c.value().to_string())
+        .unwrap_or_default()
+}
+
 struct Server {
     child: Child,
     dns_port: u16,
@@ -135,6 +144,7 @@ fn post(a: &ureq::Agent, url: &str, body: serde_json::Value) -> (u16, serde_json
     match a
         .post(url)
         .set("X-Requested-With", "rust-dns")
+        .set("X-CSRF-Token", &csrf_of(&a))
         .send_json(body)
     {
         Ok(r) => {
@@ -298,6 +308,7 @@ fn api_then_dns_roundtrip() {
     );
     a.put(&format!("{web}/api/zones/example.test/records/{www_id}"))
         .set("X-Requested-With", "rust-dns")
+        .set("X-CSRF-Token", &csrf_of(&a))
         .send_json(serde_json::json!({ "value": "10.0.0.2" }))
         .unwrap();
     let r = query_udp(p, "www.example.test.", RecordType::A);
@@ -308,6 +319,7 @@ fn api_then_dns_roundtrip() {
     let put = |body: serde_json::Value| -> serde_json::Value {
         a.put(&format!("{web}/api/zones/example.test/records/{www_id}"))
             .set("X-Requested-With", "rust-dns")
+            .set("X-CSRF-Token", &csrf_of(&a))
             .send_json(body)
             .unwrap()
             .into_json()
@@ -546,6 +558,7 @@ fn rbac_and_mfa_enrollment() {
     assert_eq!(s, 201);
     a.put(&format!("{web}/api/zones/corp.test/members/bob"))
         .set("X-Requested-With", "rust-dns")
+        .set("X-CSRF-Token", &csrf_of(&a))
         .send_json(serde_json::json!({ "role": "viewer" }))
         .unwrap();
 
@@ -630,6 +643,7 @@ fn rbac_and_mfa_enrollment() {
     // Promote to editor: writes allowed.
     a.put(&format!("{web}/api/zones/corp.test/members/bob"))
         .set("X-Requested-With", "rust-dns")
+        .set("X-CSRF-Token", &csrf_of(&a))
         .send_json(serde_json::json!({ "role": "editor" }))
         .unwrap();
     let (s, _) = post(
@@ -871,6 +885,7 @@ fn json_import_and_record_paging() {
     let r = a
         .post(&format!("{web}/api/import?mode=replace"))
         .set("X-Requested-With", "rust-dns")
+        .set("X-CSRF-Token", &csrf_of(&a))
         .send_json(doc)
         .unwrap();
     let v: serde_json::Value = r.into_json().unwrap();
@@ -938,6 +953,7 @@ fn json_import_and_record_paging() {
     let gone = a
         .post(&format!("{web}/api/zones/imp.test/import-bind"))
         .set("X-Requested-With", "rust-dns")
+        .set("X-CSRF-Token", &csrf_of(&a))
         .set("Content-Type", "text/plain")
         .send_string("$INCLUDE /etc/passwd\n");
     assert!(
@@ -957,7 +973,10 @@ fn send(
     url: &str,
     body: Option<serde_json::Value>,
 ) -> (u16, serde_json::Value) {
-    let req = a.request(method, url).set("X-Requested-With", "rust-dns");
+    let req = a
+        .request(method, url)
+        .set("X-Requested-With", "rust-dns")
+        .set("X-CSRF-Token", &csrf_of(&a));
     let r = match body {
         Some(b) => req.send_json(b),
         None => req.call(),
@@ -1260,6 +1279,7 @@ fn early_answers_reach_the_client_and_large_bodies_are_refused() {
             match a
                 .post(&format!("{}/api/zones", srv.web))
                 .set("X-Requested-With", "rust-dns")
+                .set("X-CSRF-Token", &csrf_of(&a))
                 .send_json(body)
             {
                 Err(ureq::Error::Status(401, r)) => {
@@ -1282,6 +1302,7 @@ fn early_answers_reach_the_client_and_large_bodies_are_refused() {
     match a
         .post(&format!("{}/api/auth/login", srv.web))
         .set("X-Requested-With", "rust-dns")
+        .set("X-CSRF-Token", &csrf_of(&a))
         .set("Content-Type", "application/json")
         .send_string(&big)
     {

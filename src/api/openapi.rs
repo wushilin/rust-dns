@@ -29,7 +29,7 @@ const DESCRIPTION: &str = "Management API of the rust-dns authoritative DNS serv
 * a cookie session: `POST /auth/login` (then `/auth/mfa` if MFA is enabled) sets the `rdns_session` cookie, which the browser sends automatically; or
 * an API token: `Authorization: Bearer rdns_...` (create one under *Tokens*; use the **Authorize** button).
 
-**CSRF guard.** Cookie-authenticated writes (POST/PUT/DELETE) must send the header `X-Requested-With: rust-dns`, otherwise they fail with 403 `code: csrf`. The Swagger UI in the web console adds this header automatically. Bearer-token requests do not need it.
+**CSRF guard.** Cookie-authenticated writes (POST/PUT/DELETE) must send the header `X-Requested-With: rust-dns` and the session's CSRF token as `X-CSRF-Token` (the `csrf_token` of the sign-in response or of `GET /auth/session`, also in the `rdns_csrf` cookie), otherwise they fail with 403 `code: csrf`. `[web_console] csrf_token_required = false` drops the token check. The Swagger UI in the web console adds both automatically. Bearer-token requests need neither.
 
 **Live server.** \"Try it out\" sends real requests to this server with the caller's permissions: changes are committed, logged and served over DNS immediately.
 
@@ -80,7 +80,7 @@ impl Modify for Security {
             "cookie",
             SecurityScheme::ApiKey(ApiKey::Cookie(ApiKeyValue::with_description(
                 super::session::COOKIE,
-                "Session cookie set by POST /auth/login (named `__Host-rdns_session` over HTTPS). Cookie writes also need `X-Requested-With: rust-dns`.",
+                "Session cookie set by POST /auth/login (named `__Host-rdns_session` over HTTPS). Cookie writes also need `X-Requested-With: rust-dns` and `X-CSRF-Token`.",
             ))),
         );
     }
@@ -130,7 +130,7 @@ error_response!(
 );
 error_response!(
     Forbidden,
-    "Not allowed, or cookie write without `X-Requested-With: rust-dns` (`code`: csrf).",
+    "Not allowed, or cookie write without `X-Requested-With: rust-dns` or the session's `X-CSRF-Token` (`code`: csrf).",
     Some(
         serde_json::json!({ "error": "missing X-Requested-With: rust-dns header", "code": "csrf" })
     )

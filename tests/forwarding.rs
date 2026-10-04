@@ -10,6 +10,15 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// O7: the session's CSRF token (from its cookie), sent with cookie writes.
+fn csrf_of(a: &ureq::Agent) -> String {
+    a.cookie_store()
+        .iter_unexpired()
+        .find(|c| c.name() == "rdns_csrf" || c.name() == "__Host-rdns_csrf")
+        .map(|c| c.value().to_string())
+        .unwrap_or_default()
+}
+
 const ANSWER: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 77);
 
 fn free_port() -> u16 {
@@ -244,7 +253,10 @@ fn call(
     url: &str,
     body: Option<serde_json::Value>,
 ) -> (u16, serde_json::Value) {
-    let req = a.request(method, url).set("X-Requested-With", "rust-dns");
+    let req = a
+        .request(method, url)
+        .set("X-Requested-With", "rust-dns")
+        .set("X-CSRF-Token", &csrf_of(&a));
     let res = match body {
         Some(b) => req.send_json(b),
         None => req.call(),

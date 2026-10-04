@@ -28,6 +28,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// O7: the session's CSRF token (from its cookie), sent with cookie writes.
+fn csrf_of(a: &ureq::Agent) -> String {
+    a.cookie_store()
+        .iter_unexpired()
+        .find(|c| c.name() == "rdns_csrf" || c.name() == "__Host-rdns_csrf")
+        .map(|c| c.value().to_string())
+        .unwrap_or_default()
+}
+
 const ZONE: &str = "wushilin.test";
 
 fn free_port() -> u16 {
@@ -274,7 +283,8 @@ impl Server {
         let req = self
             .agent
             .request(method, &format!("{}{path}", self.web))
-            .set("X-Requested-With", "rust-dns");
+            .set("X-Requested-With", "rust-dns")
+            .set("X-CSRF-Token", &csrf_of(&self.agent));
         let res = match body {
             Some(b) => req.send_json(b),
             None => req.call(),

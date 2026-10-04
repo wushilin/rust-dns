@@ -156,7 +156,13 @@ impl Harness {
         match cookie {
             // An API token instead of a session cookie.
             Some(c) if c.starts_with("Bearer ") => b = b.header("authorization", c),
-            Some(c) => b = b.header("cookie", c),
+            Some(c) => {
+                // O7: the session's CSRF token, as the console sends it.
+                if let Some(tok) = c.split_once('=').map(|(_, v)| v) {
+                    b = b.header("x-csrf-token", super::session::csrf_token(tok));
+                }
+                b = b.header("cookie", c)
+            }
             None => {}
         }
         let req = match body {
@@ -1773,3 +1779,99 @@ async fn password_policy_and_lockout() {
         "a reset lifts the lockout"
     );
 }
+
+/// O7: a cookie write needs the session's CSRF token in `X-CSRF-Token` as
+/// well as `X-Requested-With`; the token comes with the sign-in response,
+/// its cookie and `/auth/session`. Bearer tokens need neither. With
+/// `csrf_token_required = false` only `X-Requested-With` is checked.
+#[tokio::test]
+async fn cookie_writes_need_the_csrf_token() {
+    async fn raw(
+        h: &Harness,
+        cookie: &str,
+        csrf: Option<&str>,
+        bearer: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut b = HttpRequest::builder()
+            .method("POST")
+            .uri("/api/zones")
+            .header("x-requested-with", "rust-dns")
+            .header("content-type", "application/json");
+        if !cookie.is_empty() {
+            b = b.header("cookie", cookie);
+        }
+        if let Some(c) = csrf {
+            b = b.header("x-csrf-token", c);
+        }
+        if let Some(t) = bearer {
+            b = b.header("authorization", t);
+        }
+        let name = format!(
+            "c{}.test",
+            crate::auth::random_token(4).to_ascii_lowercase()
+        );
+        let req = b
+            .body(Body::from(serde_json::json!({ "name": name }).to_string()))
+            .unwrap();
+        let resp = h.app.clone().oneshot(req).await.unwrap();
+        let st = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (st, serde_json::from_slice(&bytes).unwrap_or_default())
+    }
+    let h = Harness::new();
+    h.state
+        .accounts
+        .sync_root(
+            "root",
+            &crate::auth::hash_password("root-password-1").unwrap(),
+            false,
+        )
+        .unwrap();
+    let r = h.login("root", "root-password-1").await;
+    let cookie = r.cookie.clone().unwrap();
+    let csrf = r.json["csrf_token"].as_str().unwrap().to_string();
+    let (st, v) = raw(&h, &cookie, None, None).await;
+    assert_eq!(
+        (st, v["code"].as_str()),
+        (StatusCode::FORBIDDEN, Some("csrf")),
+        "{v}"
+    );
+    let (st, _) = raw(&h, &cookie, Some("0000"), None).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "a wrong token");
+    let (st, v) = raw(&h, &cookie, Some(&csrf), None).await;
+    assert_eq!(st, StatusCode::CREATED, "{v}");
+    // The same token from /auth/session; another session's token is wrong.
+    let si = h.call("GET", "/auth/session", Some(&cookie), None).await;
+    assert_eq!(si.json["csrf_token"], csrf.as_str());
+    let other = h.login("root", "root-password-1").await;
+    let other_csrf = other.json["csrf_token"].as_str().unwrap();
+    assert_ne!(other_csrf, csrf);
+    let (st, _) = raw(&h, &cookie, Some(other_csrf), None).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "another session's token");
+    assert!(h
+        .call("GET", "/auth/session", None, None)
+        .await
+        .json
+        .get("csrf_token")
+        .is_none());
+    // Bearer tokens: no CSRF token needed.
+    let (t, _) = new_token(&h, &cookie, "csrf").await;
+    let (st, v) = raw(&h, "", None, Some(&t)).await;
+    assert_eq!(st, StatusCode::CREATED, "{v}");
+
+    let h = Harness::with_config(1000, "csrf_token_required = false");
+    h.state
+        .accounts
+        .sync_root(
+            "root",
+            &crate::auth::hash_password("root-password-1").unwrap(),
+            false,
+        )
+        .unwrap();
+    let cookie = h.login("root", "root-password-1").await.cookie.unwrap();
+    let (st, v) = raw(&h, &cookie, None, None).await;
+    assert_eq!(st, StatusCode::CREATED, "switched off: {v}");
+}
+

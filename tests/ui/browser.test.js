@@ -101,9 +101,10 @@ ${extra}
 async function apiLogin(srv, user, pw) {
   const r = await fetch(`${srv.url}/api/auth/login`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-requested-with': 'rust-dns' }, body: JSON.stringify({ username: user, password: pw }) });
   if (!r.ok) throw new Error(`login ${user}: ${r.status}`);
-  const cookie = r.headers.get('set-cookie').split(';')[0];
+  const cookie = r.headers.getSetCookie().find(c => /rdns_session=/.test(c)).split(';')[0];
+  const csrf = (await r.json()).csrf_token || '';
   return async (method, p, body) => {
-    const res = await fetch(`${srv.url}/api${p}`, { method, headers: { cookie, 'x-requested-with': 'rust-dns', ...(body ? { 'content-type': 'application/json' } : {}) }, body: body ? JSON.stringify(body) : undefined });
+    const res = await fetch(`${srv.url}/api${p}`, { method, headers: { cookie, 'x-requested-with': 'rust-dns', 'x-csrf-token': csrf, ...(body ? { 'content-type': 'application/json' } : {}) }, body: body ? JSON.stringify(body) : undefined });
     const text = await res.text();
     let json = null; try { json = JSON.parse(text); } catch {}
     return { status: res.status, json };
@@ -366,6 +367,12 @@ async function phaseO(b, p, rootApi, admin) {
   ok('O6: the console shows the policy refusal', /at least 14 characters/.test(perr), perr);
   await admin.eval(`document.querySelector('#modal [data-close]').click(); return true`);
   await rootApi('DELETE', '/settings/security');
+
+  // O7: the console sends the CSRF token; a cookie write without it is refused.
+  const csrf = await admin.eval(`const a = await fetch('/api/zones', { method: 'POST', headers: { 'x-requested-with': 'rust-dns', 'content-type': 'application/json' }, body: JSON.stringify({ name: 'nocsrf.test' }) });
+    return { status: a.status, code: (await a.json()).code };`);
+  ok('O7: a cookie write without the CSRF token is refused', csrf.status === 403 && csrf.code === 'csrf', JSON.stringify(csrf));
+
   return [olive];
 }
 

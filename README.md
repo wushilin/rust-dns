@@ -214,7 +214,12 @@ Before exposing rust-dns to the internet, note:
   (HttpOnly, SameSite=Lax), so LAN use keeps working. When a trusted proxy
   sends `X-Forwarded-Proto: https`, or `secure_cookies = true`, it is
   `__Host-rdns_session` with `Secure`. Existing `rdns_session` sessions keep
-  working until they expire. Send HSTS at the TLS proxy (rust-dns adds
+  working until they expire. Cookie-authenticated writes need the session's
+  CSRF token in `X-CSRF-Token` as well as `X-Requested-With: rust-dns`
+  (the console sends both; the token comes with the sign-in response,
+  `GET /api/auth/session` and the `rdns_csrf` cookie). Scripts that sign in
+  with a cookie must send it, or set `[web_console] csrf_token_required =
+  false`; API-token scripts are unaffected. Send HSTS at the TLS proxy (rust-dns adds
   `Strict-Transport-Security` itself only on requests a trusted proxy marks
   as HTTPS).
 - **Sign-in protection.** Per client (IPv4 address / IPv6 /64) request

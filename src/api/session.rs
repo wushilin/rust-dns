@@ -20,6 +20,28 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use utoipa::ToSchema;
 
+/// O7: the CSRF token cookie (not HttpOnly: the page reads it), and the
+/// header cookie writes must echo it in.
+pub const CSRF_COOKIE: &str = "rdns_csrf";
+pub const SECURE_CSRF_COOKIE: &str = "__Host-rdns_csrf";
+pub const CSRF_HEADER: &str = "x-csrf-token";
+
+/// O7: the CSRF token of the session whose cookie value is `session_token`:
+/// derived from it (nothing stored, same for the whole session), and it
+/// does not reveal it.
+pub fn csrf_token(session_token: &str) -> String {
+    auth::sha256_hex(&format!("rust-dns csrf\0{session_token}"))
+}
+
+/// Constant-time equality of two strings.
+fn same(a: &str, b: &str) -> bool {
+    a.len() == b.len()
+        && a.bytes()
+            .zip(b.bytes())
+            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+            == 0
+}
+
 /// Session cookie name on plain HTTP.
 pub const COOKIE: &str = "rdns_session";
 /// Session cookie name when it is `Secure` (HTTPS): the `__Host-` prefix
@@ -111,6 +133,16 @@ fn set_cookie(state: &AppState, https: bool, token: &str, max_age: i64) -> Heade
         )
     } else {
         format!("{COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}")
+    };
+    HeaderValue::from_str(&v).unwrap()
+}
+
+/// O7: the CSRF cookie for a session (`max_age` 0 clears it).
+fn set_csrf_cookie(state: &AppState, https: bool, token: &str, max_age: i64) -> HeaderValue {
+    let v = if state.cfg.web_console.secure_cookies || https {
+        format!("{SECURE_CSRF_COOKIE}={token}; Path=/; SameSite=Strict; Max-Age={max_age}; Secure")
+    } else {
+        format!("{CSRF_COOKIE}={token}; Path=/; SameSite=Strict; Max-Age={max_age}")
     };
     HeaderValue::from_str(&v).unwrap()
 }
@@ -213,6 +245,31 @@ impl FromRequestParts<Arc<AppState>> for Caller {
                         ApiError::forbidden("missing X-Requested-With: rust-dns header")
                             .with_code(ErrorCode::Csrf),
                     );
+                }
+                // O7: and the session's CSRF token (double submit: the
+                // page reads it from the sign-in response or its cookie).
+                if mutating
+                    && state
+                        .reloader
+                        .current
+                        .load()
+                        .web_console
+                        .csrf_token_required
+                {
+                    let sent = parts
+                        .headers
+                        .get(CSRF_HEADER)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    let want = session_token(&parts.headers)
+                        .map(|t| csrf_token(&t))
+                        .unwrap_or_default();
+                    if !same(sent.trim(), &want) {
+                        return Err(ApiError::forbidden(
+                            "missing or wrong X-CSRF-Token header (the session's csrf_token from sign-in or GET /api/auth/session)",
+                        )
+                        .with_code(ErrorCode::Csrf));
+                    }
                 }
                 let _ = state.storage.touch_session(sess.id);
                 Ok(Caller {
@@ -497,15 +554,21 @@ pub async fn login(
     };
     let (token, _) = new_session(&state, &user, ip, &headers, sstate, secret)?;
     tracing::info!(%ip, user = %user.username, status = ?status, "login");
+    let csrf = csrf_token(&token);
     let body = LoginResponse {
         status,
         user: public_user(&user),
         enroll,
+        csrf_token: csrf.clone(),
     };
     let mut resp = Json(body).into_response();
     resp.headers_mut().insert(
         header::SET_COOKIE,
         set_cookie(&state, https.0 .0, &token, max_age),
+    );
+    resp.headers_mut().append(
+        header::SET_COOKIE,
+        set_csrf_cookie(&state, https.0 .0, &csrf, max_age),
     );
     Ok(resp)
 }
@@ -688,6 +751,7 @@ pub async fn session_info(
             status: SessionStatus::Anonymous,
             user: None,
             enroll: None,
+            csrf_token: None,
         })),
         Some((sess, user)) => {
             let status = match sess.state.as_str() {
@@ -706,6 +770,7 @@ pub async fn session_info(
                 status,
                 user: Some(public_user(&user)),
                 enroll: Some(enroll),
+                csrf_token: session_token(&headers).map(|t| csrf_token(&t)),
             }))
         }
     }
@@ -745,6 +810,14 @@ pub async fn logout(
     h.append(
         header::SET_COOKIE,
         HeaderValue::from_static("rdns_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"),
+    );
+    h.append(
+        header::SET_COOKIE,
+        set_csrf_cookie(&state, https.0 .0, "", 0),
+    );
+    h.append(
+        header::SET_COOKIE,
+        HeaderValue::from_static("rdns_csrf=; Path=/; SameSite=Strict; Max-Age=0"),
     );
     Ok(resp)
 }

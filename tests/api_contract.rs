@@ -30,6 +30,15 @@ use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// O7: the session's CSRF token (from its cookie), sent with cookie writes.
+fn csrf_of(a: &ureq::Agent) -> String {
+    a.cookie_store()
+        .iter_unexpired()
+        .find(|c| c.name() == "rdns_csrf" || c.name() == "__Host-rdns_csrf")
+        .map(|c| c.value().to_string())
+        .unwrap_or_default()
+}
+
 const SPEC_SRC: &str = include_str!("../docs/openapi.json");
 /// Where a spec-side fix goes: the annotation or type the document is generated from.
 const SPEC_FILE: &str =
@@ -926,7 +935,9 @@ impl Contract {
             }
         }
         if csrf {
-            req = req.set("X-Requested-With", "rust-dns");
+            req = req
+                .set("X-Requested-With", "rust-dns")
+                .set("X-CSRF-Token", &csrf_of(a));
         }
         if let Some(t) = bearer {
             req = req.set("Authorization", &format!("Bearer {t}"));

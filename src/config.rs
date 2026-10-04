@@ -526,6 +526,11 @@ pub struct WebConfig {
     /// O1: API tokens may be created only from a signed-in browser session
     /// (not with another API token). Default false.
     pub token_creation_requires_session: bool,
+    /// O7: cookie-authenticated writes must also send `X-CSRF-Token` (the
+    /// session's CSRF token, given at sign-in and by `/auth/session`, also
+    /// in the `rdns_csrf` cookie). Default true; false keeps only the
+    /// `X-Requested-With` check (for old scripts that sign in with cookies).
+    pub csrf_token_required: bool,
     /// Seconds a client has to send a request's headers; also how long an
     /// idle keep-alive connection stays open.
     pub request_header_timeout_secs: u64,
@@ -651,6 +656,7 @@ impl Default for WebConfig {
             login_attempts_per_minute: 10,
             login_backoff_after: 5,
             token_creation_requires_session: false,
+            csrf_token_required: true,
             request_header_timeout_secs: 60,
             max_connections: 512,
         }
@@ -766,6 +772,7 @@ max_connections = 512    # concurrent web connections (websockets included)
 login_attempts_per_minute = 10  # sign-in requests per client address (IPv6: per /64) per minute
 login_backoff_after = 5  # failed attempts per account and network before waits start (account-wide: 4x, waits <= 1 min)
 token_creation_requires_session = false  # true: API tokens can only be created from a signed-in browser session, not with another token
+csrf_token_required = true  # cookie writes also send X-CSRF-Token (the console does); false: only X-Requested-With (old cookie scripts)
 
 [root]
 username = "root"

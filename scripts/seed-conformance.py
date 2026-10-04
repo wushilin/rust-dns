@@ -11,9 +11,20 @@ base = sys.argv[1].rstrip("/")
 opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
 
 
+def csrf_of(opener):
+    """O7: the session's CSRF token (rdns_csrf cookie), sent with cookie writes."""
+    for h in opener.handlers:
+        for c in getattr(h, "cookiejar", None) or []:
+            if c.name in ("rdns_csrf", "__Host-rdns_csrf"):
+                return c.value
+    return ""
+
+
 def request(path, payload=None, headers=None, method=None):
     body = None if payload is None else json.dumps(payload).encode()
     h = {} if headers is None else dict(headers)
+    if "X-Requested-With" in h:
+        h["X-CSRF-Token"] = csrf_of(opener)
     if body is not None:
         h["Content-Type"] = "application/json"
     req = urllib.request.Request(base + path, data=body, headers=h, method=method)

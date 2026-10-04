@@ -16,6 +16,15 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use tsig::{Algorithm, Chain, Key, ResponseError, ResponseVerifier, SignParams};
 
+/// O7: the session's CSRF token (from its cookie), sent with cookie writes.
+fn csrf_of(a: &ureq::Agent) -> String {
+    a.cookie_store()
+        .iter_unexpired()
+        .find(|c| c.name() == "rdns_csrf" || c.name() == "__Host-rdns_csrf")
+        .map(|c| c.value().to_string())
+        .unwrap_or_default()
+}
+
 const ZONE: &str = "example.test";
 
 fn free_port() -> u16 {
@@ -122,7 +131,10 @@ fn call(
     url: &str,
     body: Option<serde_json::Value>,
 ) -> (u16, serde_json::Value) {
-    let req = a.request(method, url).set("X-Requested-With", "rust-dns");
+    let req = a
+        .request(method, url)
+        .set("X-Requested-With", "rust-dns")
+        .set("X-CSRF-Token", &csrf_of(&a));
     let res = match body {
         Some(b) => req.send_json(b),
         None => req.call(),
@@ -380,6 +392,7 @@ fn tsig_keys_transfers_and_notify() {
     let r = root
         .post(&format!("{web}/api/import"))
         .set("X-Requested-With", "rust-dns")
+        .set("X-CSRF-Token", &csrf_of(&root))
         .send_json(serde_json::json!({
             "version": 1, "exported_at": "2026-01-01T00:00:00Z",
             "zones": [{ "name": ZONE, "records": records }]

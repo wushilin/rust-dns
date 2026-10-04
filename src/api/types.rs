@@ -173,7 +173,7 @@ pub enum LoginStatus {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
-#[schema(example = json!({ "status": "ok", "user": { "id": 1, "username": "root", "display_name": "", "is_admin": true, "is_root": true, "mfa_required": false, "mfa_enrolled": false, "totp_enrolled_at": null, "disabled_at": null, "created_at": "2026-01-15T09:30:00.000Z" }, "enroll": null }))]
+#[schema(example = json!({ "status": "ok", "user": { "id": 1, "username": "root", "display_name": "", "is_admin": true, "is_root": true, "mfa_required": false, "mfa_enrolled": false, "totp_enrolled_at": null, "disabled_at": null, "created_at": "2026-01-15T09:30:00.000Z" }, "enroll": null, "csrf_token": "9f2c5d0b6a1e4f3c8d7b2a19e0f6c5d4b3a29180f7e6d5c4b3a2918f0e7d6c5b" }))]
 pub struct LoginResponse {
     /// `ok`: signed in. `mfa_required`: POST /auth/mfa next.
     /// `enroll_required`: scan `enroll` and POST /auth/enroll.
@@ -182,6 +182,11 @@ pub struct LoginResponse {
     /// TOTP enrollment data; non-null only when `status` is `enroll_required`.
     #[schema(required = true)]
     pub enroll: Option<EnrollPayload>,
+    /// O7: send this as `X-CSRF-Token` with every cookie-authenticated
+    /// write of this session (also set as the `rdns_csrf` cookie, readable
+    /// by the page).
+    #[schema(example = "9f2c5d0b6a1e4f3c8d7b2a19e0f6c5d4b3a29180f7e6d5c4b3a2918f0e7d6c5b")]
+    pub csrf_token: String,
 }
 
 /// State of the cookie session.
@@ -196,7 +201,7 @@ pub enum SessionStatus {
 
 /// `user` and `enroll` are absent when `status` is `anonymous`.
 #[derive(Debug, Serialize, ToSchema)]
-#[schema(example = json!({ "status": "ok", "user": { "id": 1, "username": "root", "display_name": "", "is_admin": true, "is_root": true, "mfa_required": false, "mfa_enrolled": false, "totp_enrolled_at": null, "disabled_at": null, "created_at": "2026-01-15T09:30:00.000Z" }, "enroll": null }))]
+#[schema(example = json!({ "status": "ok", "user": { "id": 1, "username": "root", "display_name": "", "is_admin": true, "is_root": true, "mfa_required": false, "mfa_enrolled": false, "totp_enrolled_at": null, "disabled_at": null, "created_at": "2026-01-15T09:30:00.000Z" }, "enroll": null, "csrf_token": "9f2c5d0b6a1e4f3c8d7b2a19e0f6c5d4b3a29180f7e6d5c4b3a2918f0e7d6c5b" }))]
 pub struct SessionInfo {
     pub status: SessionStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -206,6 +211,11 @@ pub struct SessionInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<EnrollPayload>)]
     pub enroll: Option<Option<EnrollPayload>>,
+    /// O7: the session's CSRF token (send it as `X-CSRF-Token` with cookie
+    /// writes); absent without a session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub csrf_token: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]

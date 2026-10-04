@@ -23,6 +23,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// O7: the session's CSRF token (from its cookie), sent with cookie writes.
+fn csrf_of(a: &ureq::Agent) -> String {
+    a.cookie_store()
+        .iter_unexpired()
+        .find(|c| c.name() == "rdns_csrf" || c.name() == "__Host-rdns_csrf")
+        .map(|c| c.value().to_string())
+        .unwrap_or_default()
+}
+
 fn free_port() -> u16 {
     loop {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -172,7 +181,10 @@ impl Drop for Node {
 }
 
 fn call(a: &ureq::Agent, method: &str, url: &str, body: Option<Value>) -> (u16, Value) {
-    let req = a.request(method, url).set("X-Requested-With", "rust-dns");
+    let req = a
+        .request(method, url)
+        .set("X-Requested-With", "rust-dns")
+        .set("X-CSRF-Token", &csrf_of(&a));
     let res = match body {
         Some(b) => req.send_json(b),
         None => req.call(),

@@ -476,8 +476,17 @@ async function api(method, path, body, opts = {}) {
     const e = new Error(msg); e.status = 409; e.code = 'read_only_standby'; e.local = true; throw e;
   }
   const opt = { method, headers: { 'x-requested-with': 'rust-dns' } };
+  // O7: the session's CSRF token with every request (the server checks it on writes).
+  const csrf = csrfToken(); if (csrf) opt.headers['x-csrf-token'] = csrf;
   if (body !== undefined) { opt.headers['content-type'] = 'application/json'; opt.body = JSON.stringify(body); }
-  const r = await fetch('/api' + path, opt);
+  let r = await fetch('/api' + path, opt);
+  if (r.status === 403 && method !== 'GET' && !opts.retried && (r.headers.get('content-type') || '').includes('json')) {
+    const j = await r.clone().json().catch(() => null);
+    if (j && j.code === 'csrf') {
+      // A token from before a server upgrade or another sign-in: fetch the current one, retry once.
+      try { const si = await fetch('/api/auth/session').then(x => x.json()); if (si.csrf_token) { S.csrf = si.csrf_token; return api(method, path, body, { ...opts, retried: true }); } } catch {}
+    }
+  }
   let data = null;
   const ct = r.headers.get('content-type') || '';
   if (ct.includes('json')) data = await r.json(); else data = await r.text();
@@ -486,6 +495,11 @@ async function api(method, path, body, opts = {}) {
     const e = new Error((data && data.error) || `${r.status} ${r.statusText}`); e.status = r.status; e.code = data && data.code; throw e;
   }
   return opts.full ? { status: r.status, data } : data;
+}
+function csrfToken() {
+  if (S.csrf) return S.csrf;
+  const m = document.cookie.match(/(?:^|;\s*)(?:__Host-)?rdns_csrf=([^;]+)/);
+  return m ? m[1] : '';
 }
 const GET = p => api('GET', p), POST = (p, b) => api('POST', p, b ?? {}), PUT = (p, b) => api('PUT', p, b), DEL = p => api('DELETE', p);
 
@@ -609,6 +623,7 @@ function recoveryModal(codes, then) {
   });
 }
 async function handleAuthResult(r) {
+  if (r.csrf_token) S.csrf = r.csrf_token;
   if (r.status === 'ok' && r.recovery_codes) { $('#login').classList.add('hidden'); S.user = r.user; recoveryModal(r.recovery_codes, () => enterApp()); return; }
   if (r.status === 'ok') { S.user = r.user; if (r.used_recovery_code) toast(`Signed in with a recovery code; ${r.recovery_codes_left} left`, 'err'); await enterApp(); }
   else if (r.status === 'mfa_required') showLogin('mfa');
@@ -634,7 +649,7 @@ $('#enroll-btn').onclick = async () => {
 };
 $('#enroll-code').addEventListener('keydown', e => e.key === 'Enter' && $('#enroll-btn').click());
 $('#mfa-cancel').onclick = $('#enroll-cancel').onclick = async () => { await POST('/auth/logout').catch(() => {}); showLogin(); };
-$('#logout').onclick = async e => { e.preventDefault(); await POST('/auth/logout').catch(() => {}); S.user = null; showLogin(); };
+$('#logout').onclick = async e => { e.preventDefault(); await POST('/auth/logout').catch(() => {}); S.user = null; S.csrf = ''; showLogin(); };
 
 // ---------------------------------------------------------------------------
 // app shell + routing
@@ -2801,6 +2816,7 @@ async function viewAccount() {
 (async () => {
   try {
     const s = await GET('/auth/session');
+    S.csrf = s.csrf_token || '';
     if (s.status === 'ok') { S.user = s.user; await enterApp(); }
     else if (s.status === 'mfa_required') showLogin('mfa');
     else if (s.status === 'enroll_required') showEnroll(s.enroll);

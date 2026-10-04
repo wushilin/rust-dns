@@ -781,10 +781,25 @@ Group 1: security and accounts
   out of band; first-use enrollment without it is refused for that user.
 - [x] O6. Password policy (length, reuse of the last N, optional complexity)
   and account lockout options (beyond back-off), console-configured.
-- [ ] O7. Explicit CSRF token (double-submit or per-session token) in
+- [x] O7. Explicit CSRF token (double-submit or per-session token) in
   addition to the X-Requested-With check; console sends it automatically.
 - [ ] O8. WebAuthn / passkeys as a second factor (pure-Rust crate if one fits
   our deps, else document and stop; recovery codes still work).
+
+  O8 status (2026-10-04): NOT done, blocked. The only maintained pure-Rust
+  relying-party crate, `webauthn_rp` 0.3, depends unconditionally on `rsa`
+  0.9 (RS256 credentials), which carries the unpatched RUSTSEC-2023-0071
+  (Marvin): cargo-audit would fail the gate (only `paste` is accepted).
+  `webauthn-rs` needs OpenSSL. Proposed smaller scope (new item O8a):
+  passkeys as a second factor for ES256 (P-256) and EdDSA credentials
+  only, verified with `ring` (already a dependency), a minimal CBOR/COSE
+  reader for attestation `none` and assertions, credentials as a new
+  replicated table (`webauthn_credentials`, account-class changes, new
+  kinds appended to the fixture, protocol feature so older standbys keep
+  following), tested with a software authenticator in the browser suite
+  (Chrome DevTools `WebAuthn.addVirtualAuthenticator`). Estimated as large
+  as O5+O6 together and security-critical: give it its own phase slot.
+- [ ] O8a. Passkeys (ES256/EdDSA via ring, see the O8 note).
 
 Group 2: console productivity
 - [ ] O9. Search across all zones (name, value, type; respects rights) with
@@ -1686,3 +1701,26 @@ Final
   (d32d67f halts as designed), contract flow (PUT example with every
   field), browser flows "O6: password policy saved from the console",
   "O6: the console shows the policy refusal".
+- 2026-10-04 (phase O): O7 done. Each session has a CSRF token derived
+  from its cookie value (`sha256("rust-dns csrf\0" + token)`: nothing
+  stored, constant per session, reveals nothing about the cookie), given
+  as `csrf_token` in the sign-in response and `GET /auth/session` and as
+  the `rdns_csrf` cookie (`__Host-rdns_csrf` over HTTPS; not HttpOnly,
+  SameSite=Strict). Cookie-authenticated writes must send it as
+  `X-CSRF-Token` in addition to `X-Requested-With: rust-dns` (constant-
+  time compare; 403 `code: csrf`). Bearer tokens need neither (unchanged).
+  `[web_console] csrf_token_required` (default true) can switch the token
+  check off for old cookie scripts; local to each server, no replication.
+  The console and Swagger UI send it automatically (the console fetches
+  the current one and retries once on a `csrf` 403, e.g. after an
+  upgrade). All test clients, scripts (seed-conformance, conformance-local,
+  smoke-release, soak, equivalence) and the browser suite's API client
+  send it. Note for deployment: scripts that sign in with a cookie must
+  send the token (or set `csrf_token_required = false`); scripts with API
+  tokens are unaffected. Tests: `api::tests::cookie_writes_need_the_csrf_token`
+  (missing / wrong / other session's token refused, `/auth/session`,
+  bearer exempt, switch off), every suite's cookie client, browser flow
+  "O7: a cookie write without the CSRF token is refused".
+- 2026-10-04 (phase O): O8 not done (blocked, see the O8 note: the pure-Rust
+  crate pulls `rsa` with RUSTSEC-2023-0071; `webauthn-rs` needs OpenSSL).
+  New item O8a proposes an ES256/EdDSA-only implementation on `ring`.

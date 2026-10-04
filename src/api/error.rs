@@ -15,7 +15,8 @@ pub enum ErrorCode {
     MfaRequired,
     /// 401: the session still needs forced MFA enrollment (`POST /auth/enroll`).
     EnrollRequired,
-    /// 403: cookie-authenticated write without `X-Requested-With: rust-dns`.
+    /// 403: cookie-authenticated write without `X-Requested-With: rust-dns`
+    /// or the session's `X-CSRF-Token`.
     Csrf,
     /// 400: the request could not be parsed (malformed JSON, wrong field type
     /// or value, unparsable path or query parameter, missing JSON content type).
