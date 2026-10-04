@@ -956,7 +956,49 @@ scripts/compliance.sh <zone> <ip> <port>    # ISC DNS Compliance Testing (genrep
 scripts/e2e-dig.sh <zone> <ip> <port>       # human-readable dig walkthrough
 scripts/conformance-local.sh                # starts a temporary server, seeds it, runs all probes
 scripts/load-test-local.sh                  # short UDP load probe; intended for Linux
+scripts/soak.py --bin <binary> ...          # hours-long soak with a standby (see "Soak test")
 ```
+
+### Soak test
+
+`scripts/soak.py` (Python 3 standard library only) runs a primary and a
+standby of the given binary on free loopback ports with throwaway configs
+and databases in `--workdir`, seeds a DNSSEC-signed zone, and for
+`--duration` sends a mixed UDP query load to both (existing names, NODATA,
+NXDOMAIN, SOA/NS/TXT/DNSKEY, 30% with DO) while records on the primary are
+created, changed, deleted and given short expiries through the API. Every
+`--interval` it appends to `samples.jsonl`: per server RSS, CPU seconds,
+open file descriptors (Linux), p50/p95/p99/max latency, timeouts and wrong
+answers; the standby's lag, state and last reconcile. At the end it writes
+`summary.json` and exits 1 when the error rate exceeds `--max-error-rate`
+(default 0.1%; a name created a moment ago and queried on the standby
+before it arrived counts, so expect a handful), the standby halted or did
+not catch up, a server died, or RSS grew more than `--max-rss-growth`
+(default 50%) after warm-up.
+
+```
+cargo build --release
+scripts/soak.py --bin target/release/rust-dns --duration 6h --qps 500 --change-rate 6 --interval 60
+```
+
+On the test host (LXD `home:dns-test`, only with the owner's go-ahead):
+copy a release build there (e.g. the GitHub release artifact, or a
+`cargo zigbuild` musl build) to a scratch directory, not over
+`/opt/rust-dns`; the script binds only 127.0.0.1 on free high ports, so the
+installed instance and port 53 are untouched. Run it under `nohup` or
+`tmux` and watch `samples.jsonl`:
+
+```
+mkdir -p ~/soak && cd ~/soak    # rust-dns and soak.py copied here
+nohup python3 soak.py --bin ./rust-dns --duration 12h --qps 500 --change-rate 6 --workdir ~/soak/run > soak.out 2>&1 &
+tail -f soak.out                # one line per interval; summary at the end
+```
+
+What to look at: RSS flat after warm-up (no growth over hours), p99
+latency stable, zero timeouts, `lag` back to 0 between changes,
+`reconcile` "ok ...", `halted` null throughout. Python's sender sustains a
+few thousand queries per second per server; for more, run several copies
+against the same servers or use `scripts/load-test.py`.
 
 Current status: the Rust suite passes (unit tests, end-to-end tests in
 `tests/e2e.rs`, `tests/tsig.rs`, `tests/forwarding.rs` and

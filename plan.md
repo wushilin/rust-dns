@@ -641,10 +641,27 @@ contract tests, typed changes that replicate, tests, AGENT.md rules):
   dialog had already been saved and closed (fast typing/Enter); the
   focus now only touches an element still in the page. Locally 4/4 runs
   pass (~10 s); the CI step itself is untested until pushed.
-- [ ] M5. Soak/load script for dns-test (LXD home:dns-test): a release build
+- [x] M5. Soak/load script for dns-test (LXD home:dns-test): a release build
   run for N hours under a mixed query load with periodic record changes and
   a standby, reporting memory, latency percentiles, errors. A script plus
   instructions; running it on dns-test needs the owner's go-ahead.
+  Done: `scripts/soak.py` (stdlib only, so it runs on a bare host) and the
+  README section "Soak test" (parameters, outputs, pass criteria, how to
+  run it on dns-test in a scratch directory without touching
+  /opt/rust-dns or port 53). Primary + standby on free loopback ports,
+  DNSSEC-signed zone, paced UDP load to both, record create/update/delete
+  and short expiries through the API at `--change-rate`; per interval RSS,
+  CPU, fds (Linux), latency p50/p95/p99/max, timeouts, wrong answers,
+  standby lag/state/halted/reconcile; `summary.json` and exit status from
+  error rate, halt, catch-up, a dead server, RSS growth after warm-up.
+  Tested on this Mac only (debug build, 4 min, 150 qps per server, 30
+  changes/min): 36k queries per server, 0 timeouts, 1 wrong answer on the
+  standby (a fresh name queried before it replicated: counted, within the
+  0.1% budget), p99 1.2-2.4 ms, RSS 38.5 -> 39.5 MiB (+1.5% after
+  warm-up), 118 changes, lag 0, result ok. Two script bugs found by the
+  first runs and fixed (a sample key colliding with the server name
+  "standby"; names sent unqualified). Not run on dns-test (owner's
+  go-ahead needed).
 
 Not in this phase: automated DNSSEC key rollover (CDS/CDNSKEY) — it changes
 what the registrar's DS must match on the live zone; plan it separately.
@@ -1326,3 +1343,5 @@ what the registrar's DS must match on the live zone; plan it separately.
   variant-size limit by the inline `RecordPolicy` in `Zone`. Fixed: type
   alias, `Zone.record_policy` boxed like `override` (no wire or JSON
   change), iterator loop. Gate re-run on the fix.
+- 2026-10-04 (phase M): M5 done (scripts/soak.py + README; local 4-min run
+  clean; not run on dns-test).
