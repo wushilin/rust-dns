@@ -1474,6 +1474,8 @@ mod tests {
                         true,
                         step % 7 == 0,
                         [None, Some(true), Some(false)][step % 3],
+                        // O25: a new key may be Ed25519.
+                        (step % 7 == 0).then_some([13, 15][step % 2]),
                     )
                     .await
                     .map(|_| ()),

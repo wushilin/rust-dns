@@ -262,8 +262,14 @@ fn view(s: &AppState, z: &Zone) -> ApiResult<RolloverView> {
             .find(|d| d.recommended)
             .map(|d| {
                 format!(
-                    "key tag {}, algorithm {} (ECDSAP256SHA256), digest type {} ({}), digest {}  —  as one record: {}",
-                    d.key_tag, d.algorithm, d.digest_type, d.digest_name, d.digest, d.record
+                    "key tag {}, algorithm {} ({}), digest type {} ({}), digest {}  —  as one record: {}",
+                    d.key_tag,
+                    d.algorithm,
+                    crate::dnssec::algorithm_name(d.algorithm),
+                    d.digest_type,
+                    d.digest_name,
+                    d.digest,
+                    d.record
                 )
             })
             .unwrap_or_default()

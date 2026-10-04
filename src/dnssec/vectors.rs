@@ -209,3 +209,67 @@ fn wildcard_expansion_verifies_with_the_wildcard_signature() {
     let refs: Vec<&Record> = bad.iter().collect();
     assert!(verify_rrset(&refs, &sig, &apex, &info, fields.inception + 1).is_err());
 }
+
+/// O25: the Ed25519 examples of RFC 8080 §6.1 (the first key: DNSKEY,
+/// DS digest type 2, and the RRSIG over `example.com. 3600 IN MX 10
+/// mail.example.com.`). Ed25519 signatures are deterministic, so the
+/// signature made here equals the RFC's byte for byte.
+#[test]
+fn ed25519_matches_rfc8080_examples() {
+    use super::ED25519_ALGORITHM as ALG;
+    // PKCS#8 v1 (RFC 8410) around the RFC's private key (32-byte seed).
+    let seed = data_encoding::BASE64
+        .decode(b"ODIyNjAzODQ2MjgwODAxMjI2NDUxOTAyMDQxNDIyNjI=")
+        .unwrap();
+    let mut pkcs8 = hex::decode("302e020100300506032b657004220420").unwrap();
+    pkcs8.extend(&seed);
+    let public = "l02Woi0iS8Aa25FQkUd9RMzZHJpBoRQwAQEX1SxZJA4=";
+    let pk = data_encoding::BASE64.decode(public.as_bytes()).unwrap();
+    let stored = ReplDnssecKey {
+        zone_id: 1,
+        zone: "example.com".into(),
+        algorithm: ALG,
+        flags: 257,
+        key_tag: wire::key_tag(&wire::dnskey_rdata(257, ALG, &pk)),
+        public_key: public.into(),
+        private_key: Hidden(data_encoding::BASE64.encode(&pkcs8)),
+        created_at: String::new(),
+        rollover: None,
+    };
+    assert_eq!(stored.key_tag, 3613, "key tag of the RFC's DNSKEY");
+    let zk = ZoneKey::load(&stored).expect("the RFC's key loads; public key matches");
+    let info = KeyInfo::from_stored(&stored).unwrap();
+    assert_eq!(
+        hex::encode(info.ds("example.com.", 2).unwrap()),
+        "3aa5ab37efce57f737fc1627013fee07bdf241bd10f3b1964ab55c78e79a304b",
+        "DS 3613 15 2 of the RFC"
+    );
+    let owner = Name::from_ascii("example.com.").unwrap();
+    let mx = hickory_proto::rr::RData::MX(hickory_proto::rr::rdata::MX::new(
+        10,
+        Name::from_ascii("mail.example.com.").unwrap(),
+    ));
+    let rr = Record::from_rdata(owner.clone(), 3600, mx);
+    let fields = wire::RrsigFields {
+        type_covered: 15,
+        algorithm: ALG,
+        labels: 2,
+        original_ttl: 3600,
+        expiration: 1440021600,
+        inception: 1438207200,
+        key_tag: 3613,
+        signer: owner.clone(),
+    };
+    let data = signed_data(&fields, &owner, &[wire::canonical_rdata(&rr.data).unwrap()]);
+    let sig = zk.sign(&data).unwrap();
+    assert_eq!(
+        data_encoding::BASE64.encode(&sig),
+        "oL9krJun7xfBOIWcGHi7mag5/hdZrKWw15jPGrHpjQeRAvTdszaPD+QLs3fx8A4M3e23mRZ9VrbpMngwcrqNAg==",
+        "RRSIG signature of RFC 8080 §6.1"
+    );
+    let rrsig = wire::raw_record(owner.clone(), 3600, wire::T_RRSIG, fields.rdata(&sig));
+    verify_rrset(&[&rr], &rrsig, &owner, &info, 1438207200 + 1).unwrap();
+    let mut other = sig.clone();
+    other[0] ^= 1;
+    assert!(!super::verify(ALG, &pk, &data, &other));
+}

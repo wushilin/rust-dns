@@ -1595,7 +1595,7 @@ const secWhen = t => t ? `${esc(fmtTime(t))} <span class="hint">(${new Date(t) >
 function dsFields(d) {
   return `<div class="tw"><table><tbody>
     <tr><td class="hint">Key tag</td><td>${copyVal(String(d.key_tag))}</td></tr>
-    <tr><td class="hint">Algorithm</td><td>${copyVal(String(d.algorithm))} <span class="hint">ECDSA P-256 / SHA-256 (ECDSAP256SHA256)</span></td></tr>
+    <tr><td class="hint">Algorithm</td><td>${copyVal(String(d.algorithm))} <span class="hint">${algName(d.algorithm)}</span></td></tr>
     <tr><td class="hint">Digest type</td><td>${copyVal(String(d.digest_type))} <span class="hint">${esc(d.digest_name)}</span></td></tr>
     <tr><td class="hint">Digest</td><td>${copyVal(d.digest)}</td></tr></tbody></table></div>`;
 }
@@ -1626,7 +1626,7 @@ function dnssecHtml(z) {
   const badge = st.state === 'signing' ? '<span class="badge ok">signing</span>' : st.state === 'error' ? '<span class="badge bad">error: served unsigned</span>' : '<span class="badge muted">off</span>';
   const k = st.key, sig = st.signatures;
   const rec = (st.ds || []).find(x => x.recommended);
-  return `<p class="hint">DNSSEC lets resolvers verify that answers for <span class="mono">${esc(zn)}</span> come from you unchanged. This server signs the zone itself (ECDSA P-256, ${st.denial === 'nsec3' ? 'NSEC3' : 'NSEC'}). It protects anyone only once the parent zone publishes a <b>DS record</b> for it, which you add at your registrar.</p>
+  return `<p class="hint">DNSSEC lets resolvers verify that answers for <span class="mono">${esc(zn)}</span> come from you unchanged. This server signs the zone itself (${st.key && st.key.algorithm === 15 ? 'Ed25519' : 'ECDSA P-256'}, ${st.denial === 'nsec3' ? 'NSEC3' : 'NSEC'}). It protects anyone only once the parent zone publishes a <b>DS record</b> for it, which you add at your registrar.</p>
     <div class="facts">
       ${fact('Status', '', badge + (st.error ? `<div class="hint" style="margin-top:4px">${esc(st.error)}</div>` : ''), st.enabled ? 'Answers carry signatures for resolvers that ask for them (DO bit); zone transfers include DNSKEY, RRSIG and NSEC records.' : 'Answers are unsigned.')}
       ${k ? fact('Key', '', `tag <b class="mono">${k.key_tag}</b> · algorithm ${k.algorithm} (${esc(k.algorithm_name)}) · flags ${k.flags}`, `One combined signing key, created ${esc(fmtTime(k.created_at))}. The private key stays on this server (and its standbys).`) : ''}
@@ -1730,13 +1730,14 @@ async function afterDnssecChange(z, st) {
   await reloadZone(); await refreshZones();
   openZonePanel('dnssec');
 }
+function algName(a) { return a === 15 ? 'Ed25519 (ED25519)' : a === 13 ? 'ECDSA P-256 / SHA-256 (ECDSAP256SHA256)' : `algorithm ${a}`; }
 function dnssecOnModal(z, st) {
   const zn = noDot(z.fqdn);
   openModal(`<h2>Turn on DNSSEC signing</h2>
     <div id="so-step1">
       <p>This server signs <b class="mono">${esc(zn)}</b> from now on:</p>
       <ul class="hint" style="line-height:1.6;padding-left:18px;margin:6px 0">
-        <li>${st.key ? `The existing key (tag ${st.key.key_tag}) is used again.` : 'A signing key (ECDSA P-256) is generated and kept in this server\'s database; standbys receive it.'}</li>
+        <li>${st.key ? `The existing key (tag ${st.key.key_tag}, ${algName(st.key.algorithm)}) is used again.` : 'A signing key (ECDSA P-256 unless you choose Ed25519 below) is generated and kept in this server\'s database; standbys receive it.'}</li>
         <li>Resolvers that ask for DNSSEC data get signatures and proofs; answers for everyone else stay the same. The serial changes once.</li>
         <li><b>Nothing changes for validating resolvers until you publish the DS record at your registrar.</b> Before that, check the signatures here; turning signing off again is safe.</li>
         <li>After the DS is published, the zone depends on the signatures: every nameserver of the zone must serve it signed, and signing may only be turned off after the DS is removed again.</li>
@@ -1746,18 +1747,31 @@ function dnssecOnModal(z, st) {
     <div id="so-step2" class="hidden">
       <p><b>Confirm:</b> sign <span class="mono">${esc(zn)}</span> now. The change is recorded in the zone's change log.</p>
       ${st.key ? `<label style="display:flex;gap:8px;align-items:center;margin-top:10px"><input type="checkbox" id="so-new"> Use a new key instead of key ${st.key.key_tag} (its DS changes; only when no DS of the old key is published)</label>` : ''}
+      <label style="display:flex;gap:8px;align-items:center;margin-top:10px">Algorithm of a new key <select id="so-alg"><option value="13"${st.key && st.key.algorithm === 15 ? '' : ' selected'}>13: ECDSA P-256 / SHA-256 (default)</option><option value="15"${st.key && st.key.algorithm === 15 ? ' selected' : ''}>15: Ed25519</option></select></label>
       <label style="display:flex;gap:8px;align-items:center;margin-top:10px">Denial of existence <select id="so-denial"><option value="nsec"${st.denial === 'nsec3' ? '' : ' selected'}>NSEC</option><option value="nsec3"${st.denial === 'nsec3' ? ' selected' : ''}>NSEC3 (hashed names)</option></select></label>
     </div>
     <div class="error" id="so-err"></div>
     <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn" id="so-next" disabled data-perm="edit_settings" data-zone="${esc(z.name)}">Continue</button><button class="btn primary hidden" id="so-ok" data-perm="edit_settings" data-zone="${esc(z.name)}">Turn on signing</button></div>`, m => {
     const ack = m.querySelector('#so-ack'), next = m.querySelector('#so-next'), ok = m.querySelector('#so-ok');
     ack.onchange = () => { next.disabled = !ack.checked; };
+    // O25: the algorithm applies to a new key only; the kept key keeps its own.
+    const alg = m.querySelector('#so-alg'), nk0 = m.querySelector('#so-new');
+    const algState = () => {
+      const generates = !st.key || (nk0 && nk0.checked);
+      alg.disabled = !generates;
+      alg.title = generates ? '' : `The existing key ${st.key.key_tag} (${algName(st.key.algorithm)}) is used again; tick "Use a new key" to choose another algorithm (changing the algorithm of a published key is an algorithm rollover, not automated)`;
+      if (!generates) alg.value = String(st.key.algorithm);
+    };
+    if (nk0) nk0.onchange = algState;
+    algState();
     next.onclick = () => { m.querySelector('#so-step1').classList.add('hidden'); m.querySelector('#so-step2').classList.remove('hidden'); next.classList.add('hidden'); ok.classList.remove('hidden'); };
     ok.onclick = async () => {
       ok.disabled = true; m.querySelector('#so-err').textContent = '';
       const nk = m.querySelector('#so-new');
       const den = m.querySelector('#so-denial');
-      try { const r = await PUT(`/zones/${encodeURIComponent(z.name)}/dnssec`, { enabled: true, new_key: !!(nk && nk.checked), denial: den ? den.value : 'nsec' }); closeModal(); toast(`${zn} is signed (key ${r.key.key_tag})`, 'ok'); afterDnssecChange(z, r); }
+      const body = { enabled: true, new_key: !!(nk && nk.checked), denial: den ? den.value : 'nsec' };
+      if (!alg.disabled) body.algorithm = Number(alg.value);
+      try { const r = await PUT(`/zones/${encodeURIComponent(z.name)}/dnssec`, body); closeModal(); toast(`${zn} is signed (key ${r.key.key_tag})`, 'ok'); afterDnssecChange(z, r); }
       catch (e) { m.querySelector('#so-err').textContent = e.message; ok.disabled = false; }
     };
   });

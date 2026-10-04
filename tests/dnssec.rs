@@ -1330,3 +1330,126 @@ fn nsec3_validates_and_switching_denial_keeps_every_answer_valid() {
     assert_eq!(chk["ok"], true, "{chk:#}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// O25: a zone signed with an Ed25519 key (algorithm 15, RFC 8080)
+/// validates with BIND: the DS equals `dnssec-dsfromkey`, the AXFR passes
+/// `dnssec-verify`, every delv case (positive, wildcard, NXDOMAIN, NODATA,
+/// CNAME, DNAME, DS, TCP) is fully validated, also after switching to
+/// NSEC3, and a validating named when installed. The algorithm is chosen
+/// for a new key only: asking for another one with the existing key is
+/// refused (an algorithm rollover is not automated), unknown ones are 400.
+#[test]
+fn ed25519_zone_validates_with_independent_validators() {
+    let dir = tmpdir("ed25519");
+    let s = Server::new(dir.clone(), "");
+    s.import(ZONE, &records());
+    let put = |body: Value| s.api("PUT", &format!("/api/zones/{ZONE}/dnssec"), Some(body));
+    let (st, r) = put(json!({ "enabled": true, "algorithm": 8 }));
+    assert_eq!(st, 400, "unsupported algorithm: {r}");
+    let (st, r) = put(json!({ "enabled": false, "algorithm": 15 }));
+    assert_eq!(st, 400, "algorithm only with enabled: {r}");
+    let before = no_do_answers(s.dns);
+    let (st, on) = put(json!({ "enabled": true, "algorithm": 15 }));
+    assert_eq!(st, 200, "{on}");
+    assert_eq!(on["state"], "signing", "{on}");
+    assert_eq!(on["key"]["algorithm"], 15);
+    assert_eq!(on["key"]["algorithm_name"], "ED25519");
+    let pk = on["key"]["public_key"].as_str().unwrap();
+    assert_eq!(
+        data_encoding::BASE64.decode(pk.as_bytes()).unwrap().len(),
+        32,
+        "RFC 8080: 32-byte public key"
+    );
+    let dnskey_text = on["key"]["dnskey"].as_str().unwrap().to_string();
+    assert!(dnskey_text.contains(" 257 3 15 "), "{dnskey_text}");
+    let ds2 = on["ds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["digest_type"] == 2)
+        .unwrap()["record"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(ds2.contains(" DS ") && ds2.contains(" 15 2 "), "{ds2}");
+    // Another algorithm for the existing key: refused, whatever the state.
+    let (st, r) = put(json!({ "enabled": true, "algorithm": 13 }));
+    assert_eq!(st, 409, "{r}");
+    assert!(r.to_string().contains("algorithm rollover"), "{r}");
+    // RRSIGs carry algorithm 15.
+    let m = parse(&tcp(
+        s.dns,
+        &query_bytes("www.wushilin.test.", RecordType::A, Some(1232), true),
+    ));
+    let sig = m
+        .answers
+        .iter()
+        .find(|r| r.record_type() == RecordType::RRSIG)
+        .expect("RRSIG");
+    let raw = hickory_proto::serialize::binary::BinEncodable::to_bytes(&sig.data).unwrap();
+    assert_eq!(raw[2], 15, "RRSIG algorithm");
+    // Without DO nothing changed but the serial.
+    let after = no_do_answers(s.dns);
+    for ((what, a), (_, b)) in before.iter().zip(&after) {
+        assert!(
+            a == b || without_serial(a) == without_serial(b),
+            "{what}: answer without DO changed"
+        );
+    }
+    let (_, chk) = s.api("GET", &format!("/api/zones/{ZONE}/dnssec/check"), None);
+    assert_eq!(chk["ok"], true, "{chk:#}");
+
+    let (Some(dig), Some(verify), Some(delv), Some(dsfromkey)) = (
+        bind_tool("dig"),
+        bind_tool("dnssec-verify"),
+        bind_tool("delv"),
+        bind_tool("dnssec-dsfromkey"),
+    ) else {
+        return;
+    };
+    let kf = dir.join("K15.key");
+    std::fs::write(&kf, format!("{dnskey_text}\n")).unwrap();
+    let (ok, out) = run(&dsfromkey, &["-2", kf.to_str().unwrap()]);
+    assert!(ok, "{out}");
+    assert_eq!(out.trim(), ds2, "DS equals dnssec-dsfromkey -2");
+    let anchor = anchor_file(&dir, &dnskey_text, "anchor15.conf");
+    let mut failures = Vec::new();
+    for denial in ["nsec", "nsec3"] {
+        let (st, r) = put(json!({ "enabled": true, "denial": denial }));
+        assert_eq!(st, 200, "{r}");
+        assert_eq!(r["key"]["dnskey"].as_str().unwrap(), dnskey_text);
+        let axfr = axfr_verified(
+            &dig,
+            &verify,
+            &dir,
+            s.dns,
+            &format!("ed25519-{denial}.zone"),
+        );
+        assert!(
+            axfr.lines()
+                .filter(|l| l.split_whitespace().nth(3) == Some("RRSIG"))
+                .all(|l| l.split_whitespace().nth(5) == Some("15")),
+            "every RRSIG is algorithm 15"
+        );
+        failures.extend(
+            run_delv(&delv, s.dns, &anchor)
+                .into_iter()
+                .map(|f| format!("{denial}: {f}")),
+        );
+    }
+    // A validating named (NSEC3 now).
+    if let Some(named) = tool("named") {
+        failures.extend(run_named(&named, &dig, &dir, s.dns, &anchor));
+    }
+    assert!(
+        failures.is_empty(),
+        "Ed25519 zone, {} failures:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+    eprintln!(
+        "ed25519: dsfromkey, dnssec-verify (NSEC, NSEC3), {} delv cases x2 validated",
+        delv_cases().len()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

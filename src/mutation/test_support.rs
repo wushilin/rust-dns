@@ -179,6 +179,8 @@ pub(crate) async fn random_dns_op(
                 true,
                 step.is_multiple_of(5),
                 [None, Some(true), Some(false)][step % 3],
+                // O25: a new key may be Ed25519.
+                step.is_multiple_of(5).then_some([13, 15][step % 2]),
             )
             .await
             .map(|_| ()),

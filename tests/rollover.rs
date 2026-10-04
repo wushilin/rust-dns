@@ -333,7 +333,7 @@ fn validate(t: &Tools, root: &Path, parent: &Node, port: u16, what: &str) -> (Ve
             let pk = data_encoding::BASE64
                 .decode(f[3..].join("").as_bytes())
                 .ok()?;
-            let mut rd = vec![1u8, 1, 3, 13];
+            let mut rd = vec![1u8, 1, 3, f[2].parse::<u8>().ok()?];
             rd.extend(pk);
             Some(key_tag(&rd))
         })
@@ -382,6 +382,20 @@ fn serial(dig: &Path, port: u16) -> String {
 
 #[test]
 fn key_rollover_wizard_with_a_real_parent() {
+    rollover_wizard(13);
+}
+
+/// O25: the same wizard for an Ed25519 (algorithm 15) zone: the new key is
+/// Ed25519 too (same-algorithm rollover), validated by BIND at every stage.
+/// The mixed-version part is left out: a previous release cannot follow a
+/// primary that signs a zone with Ed25519 at all (refused, see
+/// `tests/follow.rs` `ed25519_replicates_and_older_standbys_are_refused`).
+#[test]
+fn ed25519_key_rollover_wizard_with_a_real_parent() {
+    rollover_wizard(15);
+}
+
+fn rollover_wizard(algorithm: u8) {
     let Some(dig) = tool("dig") else { return };
     let t = Tools {
         dig: dig.clone(),
@@ -466,10 +480,11 @@ fn key_rollover_wizard_with_a_real_parent() {
             &pr,
             "PUT",
             &p.api("/zones/roll.test/dnssec"),
-            Some(json!({ "enabled": true })),
+            Some(json!({ "enabled": true, "algorithm": algorithm })),
         ),
         "enable",
     );
+    assert_eq!(on["key"]["algorithm"], algorithm, "{on}");
     let old_tag = on["key"]["key_tag"].as_u64().unwrap() as u16;
     let old_ds = on["ds"]
         .as_array()
@@ -603,7 +618,12 @@ fn key_rollover_wizard_with_a_real_parent() {
     let mut digest = new_ds["digest"].as_str().unwrap().to_string();
     let last = digest.pop().unwrap();
     digest.push(if last == '0' { '1' } else { '0' });
-    let bad_id = prec(&par, "roll", "DS", &format!("{new_tag} 13 2 {digest}"));
+    let bad_id = prec(
+        &par,
+        "roll",
+        "DS",
+        &format!("{new_tag} {algorithm} 2 {digest}"),
+    );
     ok(
         call(
             &pr,
@@ -762,7 +782,9 @@ fn key_rollover_wizard_with_a_real_parent() {
     });
 
     // ---- mixed versions: a previous release following blocks the start ----
-    if let Some(prev) = std::env::var_os("RUST_DNS_PREV_BIN")
+    if algorithm != 13 {
+        // See ed25519_key_rollover_wizard_with_a_real_parent.
+    } else if let Some(prev) = std::env::var_os("RUST_DNS_PREV_BIN")
         .map(PathBuf::from)
         .filter(|p| p.is_file())
     {

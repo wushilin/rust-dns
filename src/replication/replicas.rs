@@ -36,9 +36,12 @@ pub const HEADER_VERSION: &str = "x-rust-dns-version";
 /// settings; older versions drop them and would halt at the reconcile).
 /// O24: `nsec3` (a zone signed with NSEC3; older versions would sign it
 /// with NSEC and halt at the reconcile).
+/// O25: `ed25519` (a zone signed with an Ed25519 key; older versions cannot
+/// load the key and would serve the zone unsigned without halting, so the
+/// replication endpoints also refuse them while such a zone exists).
 pub const VERSION_WITH_FEATURES: &str = concat!(
     env!("CARGO_PKG_VERSION"),
-    "+dnssec-rollover.zone-rename.zone-settings.nsec3"
+    "+dnssec-rollover.zone-rename.zone-settings.nsec3.ed25519"
 );
 
 /// Whether a standby's reported version names `feature`.

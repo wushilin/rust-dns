@@ -90,8 +90,19 @@ r = urllib.request.Request(base + "/api/zones/nsec3.test/dnssec", data=json.dump
     headers={"Content-Type": "application/json", "X-Requested-With": "rust-dns", "X-CSRF-Token": next((c.value for c in jar if c.name in ("rdns_csrf", "__Host-rdns_csrf")), "")})
 st = json.loads(o.open(r, timeout=5).read())
 assert st["state"] == "signing" and st["denial"] == "nsec3", st
+# O25: another copy signed with an Ed25519 key (CONFORMANCE_ED25519).
+z["name"] = "ed25519.test"
+for k in ("soa_mname", "soa_rname"):
+    z[k] = z[k].replace("nsec3.test", "ed25519.test")
+for rec in z["records"]:
+    rec["value"] = rec["value"].replace("nsec3.test", "ed25519.test")
+req("/api/import?mode=merge", doc)
+r = urllib.request.Request(base + "/api/zones/ed25519.test/dnssec", data=json.dumps({"enabled": True, "algorithm": 15}).encode(), method="PUT",
+    headers={"Content-Type": "application/json", "X-Requested-With": "rust-dns", "X-CSRF-Token": next((c.value for c in jar if c.name in ("rdns_csrf", "__Host-rdns_csrf")), "")})
+st = json.loads(o.open(r, timeout=5).read())
+assert st["state"] == "signing" and st["key"]["algorithm"] == 15, st
 PY
-CONFORMANCE_NSEC3=nsec3.test CONFORMANCE_OVERRIDE=vpn.signed.test python3 "$ROOT/scripts/conformance.py" "$ZONE" 127.0.0.1 "$DNS_PORT"
+CONFORMANCE_ED25519=ed25519.test CONFORMANCE_NSEC3=nsec3.test CONFORMANCE_OVERRIDE=vpn.signed.test python3 "$ROOT/scripts/conformance.py" "$ZONE" 127.0.0.1 "$DNS_PORT"
 if [ "${RUN_COMPLIANCE:-0}" = "1" ]; then
   "$ROOT/scripts/compliance.sh" "$ZONE" 127.0.0.1 "$DNS_PORT"
 fi

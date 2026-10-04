@@ -40,7 +40,7 @@
 use super::wire::{
     self, CanonKey, RrsigFields, T_DNSKEY, T_DS, T_NSEC, T_NSEC3, T_NSEC3PARAM, T_RRSIG,
 };
-use super::{Window, ZoneKey, ALGORITHM};
+use super::{Window, ZoneKey};
 use crate::cache::ZoneData;
 use crate::model::RecordType as Rt;
 use crate::replication::types::ReplDnssecKey;
@@ -327,7 +327,7 @@ impl SignedZone {
             let original_ttl = set.iter().map(|r| r.ttl).min().unwrap_or(0);
             let fields = RrsigFields {
                 type_covered: t,
-                algorithm: ALGORITHM,
+                algorithm: key.algorithm,
                 labels: wire::rrsig_labels(name),
                 original_ttl,
                 expiration,
@@ -793,10 +793,7 @@ impl SignedZone {
     /// this view's window and key tag. Returns the number verified.
     pub(crate) fn verify_all(&self, z: &ZoneData) -> usize {
         let key = wire::raw_rdata(&self.dnskey).expect("DNSKEY rdata");
-        let mut pk = vec![4u8];
-        pk.extend(&key[4..]);
-        let verifier =
-            ring::signature::UnparsedPublicKey::new(&ring::signature::ECDSA_P256_SHA256_FIXED, pk);
+        let (alg, pk) = (key[3], key[4..].to_vec());
         let apex = Name::from_ascii(&z.apex).unwrap();
         let mut verified = 0;
         for ((owner, t), sig) in &self.sigs {
@@ -845,9 +842,11 @@ impl SignedZone {
                 .map(|r| wire::canonical_rdata(&r.data).unwrap())
                 .collect();
             let data = wire::signed_data(&f, &name, &rdatas);
-            verifier
-                .verify(&data, &sigbytes)
-                .unwrap_or_else(|_| panic!("{owner} type {t}: signature does not verify"));
+            assert_eq!(f.algorithm, alg, "{owner} type {t}");
+            assert!(
+                crate::dnssec::verify(alg, &pk, &data, &sigbytes),
+                "{owner} type {t}: signature does not verify"
+            );
             verified += 1;
         }
         // Completeness: every owner of the chain has its NSEC signed, and
@@ -956,12 +955,16 @@ mod tests {
     }
 
     pub(crate) fn test_key() -> (ReplDnssecKey, ZoneKey) {
-        let k = super::super::generate_key().unwrap();
-        let rd = wire::dnskey_rdata(257, 13, &k.public_key);
+        test_key_for(13)
+    }
+
+    pub(crate) fn test_key_for(algorithm: u8) -> (ReplDnssecKey, ZoneKey) {
+        let k = super::super::generate_key_for(algorithm).unwrap();
+        let rd = wire::dnskey_rdata(257, algorithm, &k.public_key);
         let stored = ReplDnssecKey {
             zone_id: 1,
             zone: "example.net".into(),
-            algorithm: 13,
+            algorithm,
             flags: 257,
             key_tag: wire::key_tag(&rd),
             public_key: data_encoding::BASE64.encode(&k.public_key),
@@ -1411,10 +1414,6 @@ mod tests {
             expiration: 2000,
         };
         let s = SignedZone::build(z, &key, w, String::new(), None).unwrap();
-        let mut pk = vec![4u8];
-        pk.extend(&key.public_key);
-        let verifier =
-            ring::signature::UnparsedPublicKey::new(&ring::signature::ECDSA_P256_SHA256_FIXED, pk);
         // Re-derive the signed data for the apex SOA independently of `build`.
         let soa = soa_record(z, z.zone.default_ttl).unwrap();
         let sig = s.sig("example.net.", 6).unwrap();
@@ -1424,8 +1423,40 @@ mod tests {
             &Name::from_ascii("EXAMPLE.net.").unwrap(),
             &[wire::canonical_rdata(&soa.data).unwrap()],
         );
-        verifier.verify(&data, &sigbytes).unwrap();
+        assert!(crate::dnssec::verify(13, &key.public_key, &data, &sigbytes));
         assert_eq!((f.inception, f.expiration), (1000, 2000));
         assert_eq!(s.signed_rrsets, s.sigs.len());
+    }
+
+    /// O25: an Ed25519 (algorithm 15) zone, NSEC and NSEC3: every RRSIG
+    /// verifies and carries algorithm 15, and two independent builds
+    /// (another process, a standby) produce byte-identical signatures:
+    /// Ed25519 is deterministic.
+    #[test]
+    fn ed25519_zone_signs_deterministically() {
+        for nsec3 in [false, true] {
+            let c = sample_with(nsec3);
+            let zd = c.zones.get("example.net.").unwrap().clone();
+            let (stored, key) = test_key_for(15);
+            assert_eq!(key.public_key.len(), 32);
+            let w = Window {
+                inception: 1000,
+                expiration: 2000,
+            };
+            let a = SignedZone::build(&zd, &key, w, String::new(), None).unwrap();
+            assert_eq!(a.verify_all(&zd), a.signed_rrsets, "nsec3={nsec3}");
+            let again = ZoneKey::load(&stored).unwrap();
+            let b = SignedZone::build(&zd, &again, w, String::new(), None).unwrap();
+            assert_eq!(a.sigs.len(), b.sigs.len());
+            for (k, sig) in &a.sigs {
+                let (f, _) = wire::parse_rrsig(wire::raw_rdata(sig).unwrap()).unwrap();
+                assert_eq!(f.algorithm, 15);
+                assert_eq!(
+                    wire::raw_rdata(sig),
+                    wire::raw_rdata(&b.sigs[k]),
+                    "{k:?}: same key, same window, same RRSIG"
+                );
+            }
+        }
     }
 }

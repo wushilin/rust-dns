@@ -777,6 +777,102 @@ if N3:
         cur = chain[cur]
     check("5155 §7.1: NSEC3 chain: one per authoritative name and empty non-terminal, ordered ring by hash", set(chain) == want and len(walk) == len(chain) and walk == sorted(walk), f"{len(chain)} NSEC3, {len(want)} names")
 
+# --- Ed25519 (RFC 8080), O25; only where the harness seeded one ------------
+# The harness signs another copy of signed.test as ed25519.test with an
+# Ed25519 key (algorithm 15, NSEC). dnspython (with `cryptography`) does the
+# Ed25519 verification.
+ED = os.environ.get("CONFORMANCE_ED25519")
+if ED:
+    EZ = dns.name.from_text(ED + ".")
+
+    def eq(name, rtype):
+        if isinstance(name, str) and not name.endswith("."):
+            name = f"{name}.{ED}."
+        m = dns.message.make_query(name, rtype, want_dnssec=True)
+        m.use_edns(0, payload=4096, ednsflags=dns.flags.DO)
+        return dns.query.tcp(m, IP, port=PORT, timeout=3)
+
+    r = eq(EZ, "DNSKEY")
+    ekey = r.get_rrset(r.answer, EZ, IN, dns.rdatatype.DNSKEY)
+    EKEYS = {EZ: ekey} if ekey is not None else {}
+
+    def evalidate(r):
+        problems, sigs = [], 0
+        for sec in ("answer", "authority"):
+            rs = getattr(r, sec)
+            for rrset in rs:
+                if rrset.rdtype == RRSIG:
+                    sigs += sum(1 for s in rrset if s.algorithm != 15)
+                    continue
+                if not rrset.name.is_subdomain(EZ) or (rrset.rdtype == dns.rdatatype.NS and not (r.flags & dns.flags.AA)):
+                    continue
+                sig = r.get_rrset(rs, rrset.name, IN, RRSIG, rrset.rdtype)
+                if sig is None:
+                    problems.append(f"{rrset.name} {dns.rdatatype.to_text(rrset.rdtype)}: no RRSIG")
+                    continue
+                try:
+                    dns.dnssec.validate(rrset, sig, EKEYS)
+                except Exception as e:
+                    problems.append(f"{rrset.name} {dns.rdatatype.to_text(rrset.rdtype)}: {e!r}")
+        if sigs:
+            problems.append(f"{sigs} RRSIGs not of algorithm 15")
+        return problems
+
+    p = evalidate(r)
+    check("8080 §3: DNSKEY algorithm 15 (ED25519) with a 32-byte public key, self-signed",
+          ekey is not None and len(ekey) == 1 and ekey[0].algorithm == 15 and len(ekey[0].key) == 32 and not p, str(p))
+    ds = dns.dnssec.make_ds(EZ, ekey[0], "SHA256") if ekey is not None else None
+    check("8080 §3 / 4509: a DS of the Ed25519 DNSKEY is algorithm 15, digest type 2 (dnspython computes it)",
+          ds is not None and ds.algorithm == 15 and ds.digest_type == 2 and ds.key_tag == dns.dnssec.key_id(ekey[0]))
+    r = eq("www", "A")
+    p = evalidate(r)
+    check("8080 §4: positive answer: RRSIG algorithm 15 validates", r.answer and not p, str(p))
+    a1 = [s.to_text() for s in (r.get_rrset(r.answer, dns.name.from_text(f"www.{ED}."), IN, RRSIG, dns.rdatatype.A) or [])]
+    r2 = eq("www", "A")
+    a2 = [s.to_text() for s in (r2.get_rrset(r2.answer, dns.name.from_text(f"www.{ED}."), IN, RRSIG, dns.rdatatype.A) or [])]
+    check("8032 §5.1.6: Ed25519 signatures are deterministic (same RRSIG twice)", a1 and a1 == a2)
+    r = eq("nope", "A")
+    p = evalidate(r)
+    check("8080 + 4035 §3.1.3.2: NXDOMAIN proof (NSEC) signed with Ed25519 validates",
+          r.rcode() == dns.rcode.NXDOMAIN and nsecs(r) and not p, str(p))
+    r = eq("www", "MX")
+    p = evalidate(r)
+    check("8080 + 4035 §3.1.3.1: NODATA proof signed with Ed25519 validates",
+          r.rcode() == dns.rcode.NOERROR and not r.answer and nsecs(r) and not p, str(p))
+    r = eq("host.gate", "A")
+    p = evalidate(r)
+    check("8080 + 4035 §3.1.3.3: wildcard answer signed with Ed25519 validates", r.answer and not p, str(p))
+    axfr = []
+    for msg in dns.query.xfr(IP, ED, port=PORT, timeout=5, relativize=False):
+        axfr.extend(msg.answer)
+    zr = {}
+    for rr in axfr:
+        k = (rr.name, rr.rdtype, rr.covers if rr.rdtype == RRSIG else 0)
+        if k in zr:
+            zr[k].union_update(rr)
+        else:
+            zr[k] = rr
+    cuts = [dns.name.from_text(f"sub.{ED}."), dns.name.from_text(f"secure.{ED}.")]
+    problems, ok = [], 0
+    for (name, rdtype, _), rrset in zr.items():
+        if rdtype == RRSIG:
+            if any(s.algorithm != 15 for s in rrset):
+                problems.append(f"{name}: RRSIG not algorithm 15")
+            continue
+        below = any(name.is_subdomain(c) and name != c for c in cuts)
+        if below or (rdtype == dns.rdatatype.NS and name != EZ):
+            continue
+        sig = zr.get((name, RRSIG, rdtype))
+        if sig is None:
+            problems.append(f"{name} {dns.rdatatype.to_text(rdtype)} unsigned")
+            continue
+        try:
+            dns.dnssec.validate(rrset, sig, EKEYS)
+            ok += 1
+        except Exception as e:
+            problems.append(f"{name} {dns.rdatatype.to_text(rdtype)}: {e!r}")
+    check("8080 + 5936: AXFR of an Ed25519 zone: every authoritative RRset validates, every RRSIG is algorithm 15", ok > 20 and not problems, str(problems[:3]))
+
 # --- override zones (I1); only where the harness seeded one -----------------
 OV = os.environ.get("CONFORMANCE_OVERRIDE")
 if OV:

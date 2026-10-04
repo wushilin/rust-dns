@@ -14,8 +14,8 @@ Single static binary, one SQLite file, one TOML config. Zero JavaScript build.
 - A, AAAA, CNAME, PTR, NS, MX, TXT, SRV, CAA, HTTPS/SVCB, TLSA, SSHFP, NAPTR,
   HINFO, DNAME and DS. SOA and apex NS are synthesized from zone settings when
   not set explicitly.
-- DNSSEC online signing per zone (off by default): ECDSA P-256 combined
-  signing key, NSEC or NSEC3 denial, signatures renewed automatically, DS records for
+- DNSSEC online signing per zone (off by default): ECDSA P-256 (or
+  Ed25519) combined signing key, NSEC or NSEC3 denial, signatures renewed automatically, DS records for
   the registrar and a pre-publication check in the console (see
   [DNSSEC](#dnssec)).
 - CNAME chasing, RFC 4592 wildcards, delegations with glue, RFC 2308 negative
@@ -435,8 +435,9 @@ changes; the only protocol difference in this version for every zone is that
 the DO bit of a query is now copied into the response (RFC 3225).
 
 **What is signed.** One combined signing key per zone (flags 257, SEP,
-algorithm 13 = ECDSA P-256 / SHA-256), generated on this server the first time
-signing is turned on. Denial of existence is NSEC by default, or NSEC3 per
+algorithm 13 = ECDSA P-256 / SHA-256 by default, or 15 = Ed25519, see
+**Ed25519** below), generated on this server the first time signing is
+turned on. Denial of existence is NSEC by default, or NSEC3 per
 zone (see **NSEC3** below). Every
 authoritative RRset is signed: SOA, apex NS, DNSKEY, every record set and
 every NSEC; a DS RRset at a delegation point is signed (DS records can be
@@ -493,6 +494,41 @@ sign the zone with NSEC); upgrade standbys first. NSEC3 hides names from
 casual zone walking but not from an offline dictionary attack on the hashes
 (RFC 9276); it is not a secrecy feature.
 
+**Ed25519.** The algorithm is chosen for a **new key**: the first time
+signing is turned on, or when it is turned on again with a new key
+(console: the "Algorithm of a new key" choice in the turn-on dialog; API:
+`PUT /api/zones/{zone}/dnssec` with `{"enabled": true, "algorithm": 15}`,
+plus `"new_key": true` to replace a kept key). 13 (ECDSA P-256 / SHA-256)
+stays the default; a replaced key keeps the old key's algorithm unless
+another is given. 15 is Ed25519 (RFC 8080): a 32-byte public key, 64-byte
+deterministic signatures (a standby's RRSIGs are byte-identical to the
+primary's), DS digest type 2 as usual. Both validate with current
+resolvers (RFC 8624: 13 and 15 are MUST/RECOMMENDED to validate); check that
+the registrar accepts algorithm 15 DS records before choosing it. The key
+rollover wizard rolls to a new key of the **same** algorithm, for 13 and 15
+alike. Asking for another algorithm than the existing key's is refused
+(409). Choosing Ed25519 is refused (409) while a standby of an older
+version follows (it cannot load the key and would serve the zone
+unsigned); while a zone is signed with Ed25519, such a standby is refused
+by the replication endpoints too (it stays `refused`, keeps its data and
+does not halt). Upgrade standbys first.
+
+**Algorithm rollover (13 <-> 15) is not automated.** Changing the algorithm
+of a zone whose DS is published needs a double-signature rollover (RFC 6781
+section 4.1.4, RFC 7583 section 3.3.4): the zone must be signed with BOTH
+algorithms (every RRset carries an RRSIG of each, RFC 4035 section 2.2 /
+RFC 6840 section 5.11) before the new DNSKEY and DS appear, and the old
+algorithm's signatures may only go after the old DS is gone from every
+cache. This server signs a zone with one key, so the safe ways are:
+1. **Without a DS published** (or after removing it and waiting the DS
+   TTL, so the zone is insecure for a while): turn signing off, turn it on
+   with `{"enabled": true, "new_key": true, "algorithm": 15}`, check
+   (DNSSEC -> Check), publish the new DS.
+2. **Without an insecure period**: move the zone's DNS to a signer that
+   supports multi-algorithm signing for the rollover, or ask for it to be
+   added here; replacing the key in place while the old DS is published
+   makes the zone fail for validating resolvers.
+
 **Signatures and re-signing.** The zone is signed in memory whenever the
 catalog is built after a change, and the signed view is cached until the zone
 changes. Inception = one hour before the zone's last change (`updated_at`),
@@ -514,8 +550,8 @@ resign_before_days = 7        # 1..(validity - 1)
 in the changelog API, the websocket, the audit log or the logs; scrubbed after
 `account_retention_days`) and the re-sign serial bumps, and sign in memory
 with their own copy of the key. ECDSA signatures are randomised, so a
-standby's RRSIGs differ from the primary's, but both verify with the same
-DNSKEY and every response is self-consistent, which is all resolvers and
+standby's RRSIGs differ from the primary's (Ed25519 ones are identical),
+but both verify with the same DNSKEY and every response is self-consistent, which is all resolvers and
 AXFR/IXFR secondaries need. A standby never writes or re-signs by itself; its
 replicated-table checksums do not include signatures. **Upgrade every standby
 before turning signing on** (an older standby cannot apply the new change
@@ -1179,7 +1215,8 @@ ceiling is the OS loopback path, not the server. Resident memory stays around
 
 - DNSSEC: NSEC3 opt-out and salts / extra iterations (RFC 9276 advises
   against them), automated key rollover through CDS/CDNSKEY (the wizard
-  above needs the DS change done by hand), algorithms other than 13.
+  above needs the DS change done by hand), algorithms other than 13 and 15,
+  automated algorithm rollovers (13 <-> 15, see DNSSEC).
 - Inbound NOTIFY / acting as a secondary for zones hosted elsewhere; automatic failover.
 - DNS over TLS/HTTPS, response tuple rate limiting (RRL by answer), and per-zone forwarding,
   reverse-zone, transfer ACL, and NOTIFY overrides.

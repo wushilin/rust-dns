@@ -12,7 +12,6 @@ use super::KeyInfo;
 use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, Record, RecordType};
 use hickory_proto::serialize::binary::BinDecodable;
-use ring::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_FIXED};
 
 /// Same DNS name, ignoring letter case.
 pub fn same_name(a: &Name, b: &Name) -> bool {
@@ -86,11 +85,11 @@ pub fn verify_rrset(
         .collect::<Option<Vec<_>>>()
         .ok_or("RDATA does not encode")?;
     let data = wire::signed_data(&f, &owner, &rdatas);
-    let mut pk = vec![4u8];
-    pk.extend_from_slice(&key.public_key);
-    UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, pk)
-        .verify(&data, &sig)
-        .map_err(|_| "signature does not verify".to_string())
+    if super::verify(key.algorithm, &key.public_key, &data, &sig) {
+        Ok(())
+    } else {
+        Err("signature does not verify".to_string())
+    }
 }
 
 /// Every RRset of `section` (except RRSIGs and, when `skip_ns`, an

@@ -570,6 +570,40 @@ async function rolloverWalk(b) {
   await sp.wait('standby panel shows NSEC3', `return (document.querySelector('.facts')?.textContent || '').includes('NSEC3')`, 15000);
   const sd = await sp.eval(`const b = document.querySelector('#sec-denial'); return b ? { disabled: b.disabled, title: b.title } : null`);
   ok('nsec3: the standby\'s switch is disabled with the reason', sd && sd.disabled && /standby/i.test(sd.title), JSON.stringify(sd));
+
+  // O25: an Ed25519 zone from the turn-on dialog; with a kept key the
+  // algorithm choice is disabled with the reason until "Use a new key".
+  const edz = await rpApi('POST', '/zones', { name: 'ed.test' });
+  ok('ed25519: zone created', edz.status === 201, JSON.stringify(edz));
+  await rpApi('POST', '/zones/ed.test/records', { name: '@', type: 'NS', value: 'ns1.roll.test.' });
+  const openOn = async () => {
+    // A full load: the console learns of a zone created through the API
+    // from its live feed, which may not have arrived yet.
+    // (a new query string: a hash-only change would not reload).
+    await pg.goto(rp.url + '/?load=' + Date.now() + '#/zones/ed.test');
+    await pg.wait('zone page', `return !!document.querySelector('[data-panel=dnssec]')`);
+    await pg.eval(`document.querySelector('[data-panel=dnssec]').click(); return true`);
+    await pg.wait('turn-on button', `return !!document.querySelector('#sec-on')`);
+    await pg.click('#sec-on');
+    await pg.wait('turn-on dialog', `return !!document.querySelector('#so-ack')`);
+    await pg.click('#so-ack');
+    await pg.click('#so-next');
+    await pg.wait('step 2', `return !!document.querySelector('#so-alg') && !document.querySelector('#so-ok').classList.contains('hidden')`);
+  };
+  await openOn();
+  ok('ed25519: a first key offers the algorithm choice', await pg.eval(`return !document.querySelector('#so-alg').disabled && document.querySelector('#so-alg').value === '13'`));
+  await pg.eval(`document.querySelector('#so-alg').value = '15'; return true`);
+  await pg.click('#so-ok');
+  await waitUntil('primary signs ed.test with Ed25519', async () => (await rpApi('GET', '/zones/ed.test/dnssec')).json.key?.algorithm === 15);
+  await pg.wait('the panel shows Ed25519', `return (document.querySelector('.facts')?.textContent || '').includes('ED25519')`);
+  ok('ed25519: signed from the console with algorithm 15', (await rpApi('GET', '/zones/ed.test/dnssec')).json.state === 'signing');
+  await rpApi('PUT', '/zones/ed.test/dnssec', { enabled: false, force: true });
+  await openOn();
+  const kept = await pg.eval(`const a = document.querySelector('#so-alg'); return { disabled: a.disabled, title: a.title, value: a.value }`);
+  ok('ed25519: with the kept key the choice is disabled with the reason', kept.disabled && kept.value === '15' && /Use a new key/.test(kept.title), JSON.stringify(kept));
+  await pg.click('#so-new');
+  ok('ed25519: "Use a new key" enables the choice', await pg.eval(`return !document.querySelector('#so-alg').disabled`));
+  await pg.eval(`document.querySelector('[data-close]').click(); return true`);
   return [pg, sp];
 }
 

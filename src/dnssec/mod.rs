@@ -1,8 +1,9 @@
 //! DNSSEC online signing (RFC 4033-4035).
 //!
 //! Per zone and off by default. A zone with signing on has one Combined
-//! Signing Key (flags 257, SEP) of algorithm 13 (ECDSA P-256 / SHA-256) and
-//! NSEC denial of existence. The key is generated when signing is first
+//! Signing Key (flags 257, SEP) of algorithm 13 (ECDSA P-256 / SHA-256, the
+//! default) or (O25) 15 (Ed25519, RFC 8080), chosen when the key is
+//! generated, and NSEC (or, O24, NSEC3) denial of existence. The key is generated when signing is first
 //! turned on, stored in `dnssec_keys` and replicated as an account-class
 //! change (the private key never appears in the user-facing changelog, the
 //! audit log or the logs).
@@ -24,7 +25,8 @@
 //! epoch and a serial bump through a `Tx`) once the signatures expire
 //! within `resign_before_days`; a standby never writes, and signs in memory
 //! with its own copy of the key (ECDSA signatures are randomised, so its
-//! RRSIGs differ from the primary's but verify with the same DNSKEY). If a
+//! RRSIGs differ from the primary's but verify with the same DNSKEY;
+//! Ed25519 signatures are deterministic, so they are byte-identical). If a
 //! window gets close to expiry without a re-sign (a stopped primary, a
 //! disconnected standby), the node signs from the current hour instead.
 
@@ -40,14 +42,49 @@ use crate::replication::types::ReplDnssecKey;
 use anyhow::{anyhow, Context, Result};
 use hickory_proto::rr::Name;
 use ring::rand::SystemRandom;
-use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
+use ring::signature::{
+    EcdsaKeyPair, Ed25519KeyPair, KeyPair, UnparsedPublicKey, ECDSA_P256_SHA256_FIXED,
+    ECDSA_P256_SHA256_FIXED_SIGNING, ED25519,
+};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
 pub use signed::SignedZone;
 
-/// ECDSA Curve P-256 with SHA-256 (RFC 6605).
+/// ECDSA Curve P-256 with SHA-256 (RFC 6605): the default algorithm.
 pub const ALGORITHM: u8 = 13;
+/// O25: Ed25519 (RFC 8080).
+pub const ED25519_ALGORITHM: u8 = 15;
+/// The algorithms a zone key can be generated with.
+pub const ALGORITHMS: [u8; 2] = [ALGORITHM, ED25519_ALGORITHM];
+
+/// The mnemonic of a supported algorithm (RFC 8624 names).
+pub fn algorithm_name(alg: u8) -> &'static str {
+    match alg {
+        ALGORITHM => "ECDSAP256SHA256",
+        ED25519_ALGORITHM => "ED25519",
+        _ => "unsupported",
+    }
+}
+
+/// Verify a DNSSEC signature with a DNSKEY public key (its RDATA form:
+/// x || y for algorithm 13, the 32-byte key for 15).
+pub fn verify(algorithm: u8, public_key: &[u8], data: &[u8], sig: &[u8]) -> bool {
+    match algorithm {
+        ALGORITHM => {
+            let mut pk = Vec::with_capacity(65);
+            pk.push(4u8);
+            pk.extend_from_slice(public_key);
+            UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, pk)
+                .verify(data, sig)
+                .is_ok()
+        }
+        ED25519_ALGORITHM => UnparsedPublicKey::new(&ED25519, public_key)
+            .verify(data, sig)
+            .is_ok(),
+        _ => false,
+    }
+}
 /// Zone Key + Secure Entry Point: one key signs everything (CSK).
 pub const CSK_FLAGS: u16 = 257;
 /// Signatures start this long before the zone's signing epoch (clock skew).
@@ -55,8 +92,8 @@ pub const INCEPTION_MARGIN_SECS: i64 = 3600;
 /// DS digest types offered: SHA-256 (use this) and SHA-384.
 pub const DS_DIGEST_TYPES: [u8; 2] = [2, 4];
 
-/// A freshly generated key: PKCS#8 private key and the 64-byte public key
-/// (x || y, the DNSKEY form).
+/// A freshly generated key: PKCS#8 private key and the public key in its
+/// DNSKEY form (64 bytes x || y for algorithm 13, 32 bytes for 15).
 pub struct NewKey {
     pub pkcs8: Vec<u8>,
     pub public_key: Vec<u8>,
@@ -68,8 +105,28 @@ impl std::fmt::Debug for NewKey {
     }
 }
 
+/// A new key of the default algorithm (13).
+#[cfg(test)]
 pub fn generate_key() -> Result<NewKey> {
+    generate_key_for(ALGORITHM)
+}
+
+/// A new key of `algorithm` (13 or 15).
+pub fn generate_key_for(algorithm: u8) -> Result<NewKey> {
     let rng = SystemRandom::new();
+    if algorithm == ED25519_ALGORITHM {
+        let doc = Ed25519KeyPair::generate_pkcs8(&rng)
+            .map_err(|_| anyhow!("Ed25519 key generation failed"))?;
+        let pair = Ed25519KeyPair::from_pkcs8(doc.as_ref())
+            .map_err(|_| anyhow!("generated key does not load"))?;
+        return Ok(NewKey {
+            pkcs8: doc.as_ref().to_vec(),
+            public_key: pair.public_key().as_ref().to_vec(),
+        });
+    }
+    if algorithm != ALGORITHM {
+        anyhow::bail!("unsupported DNSSEC algorithm {algorithm}");
+    }
     let doc = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng)
         .map_err(|_| anyhow!("ECDSA P-256 key generation failed"))?;
     let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, doc.as_ref(), &rng)
@@ -86,10 +143,15 @@ pub struct ZoneKey {
     pub algorithm: u8,
     pub flags: u16,
     pub key_tag: u16,
-    /// 64 bytes: x || y.
+    /// The DNSKEY form: 64 bytes x || y (13), 32 bytes (15).
     pub public_key: Vec<u8>,
-    pair: EcdsaKeyPair,
+    pair: Pair,
     rng: SystemRandom,
+}
+
+enum Pair {
+    Ecdsa(EcdsaKeyPair),
+    Ed25519(Ed25519KeyPair),
 }
 
 impl std::fmt::Debug for ZoneKey {
@@ -103,16 +165,27 @@ impl std::fmt::Debug for ZoneKey {
 
 impl ZoneKey {
     pub fn load(k: &ReplDnssecKey) -> Result<Self> {
-        if k.algorithm != ALGORITHM {
-            anyhow::bail!("unsupported DNSSEC algorithm {}", k.algorithm);
-        }
         let pkcs8 = data_encoding::BASE64
             .decode(k.private_key.0.as_bytes())
             .context("private key is not base64")?;
         let rng = SystemRandom::new();
-        let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &pkcs8, &rng)
-            .map_err(|_| anyhow!("private key does not load"))?;
-        let public_key = pair.public_key().as_ref()[1..].to_vec();
+        let (pair, public_key) = match k.algorithm {
+            ALGORITHM => {
+                let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &pkcs8, &rng)
+                    .map_err(|_| anyhow!("private key does not load"))?;
+                let pk = pair.public_key().as_ref()[1..].to_vec();
+                (Pair::Ecdsa(pair), pk)
+            }
+            ED25519_ALGORITHM => {
+                // v2 documents (what `generate_key_for` writes) are checked
+                // against their public key; a v1 document (seed only) loads too.
+                let pair = Ed25519KeyPair::from_pkcs8_maybe_unchecked(&pkcs8)
+                    .map_err(|_| anyhow!("private key does not load"))?;
+                let pk = pair.public_key().as_ref().to_vec();
+                (Pair::Ed25519(pair), pk)
+            }
+            a => anyhow::bail!("unsupported DNSSEC algorithm {a}"),
+        };
         let stored = data_encoding::BASE64
             .decode(k.public_key.as_bytes())
             .context("public key is not base64")?;
@@ -141,14 +214,18 @@ impl ZoneKey {
         wire::dnskey_rdata(self.flags, self.algorithm, &self.public_key)
     }
 
-    /// 64-byte r || s signature (RFC 6605 §4).
+    /// The signature field of an RRSIG: 64-byte r || s (RFC 6605 §4) for
+    /// algorithm 13 (randomised), the 64-byte Ed25519 signature (RFC 8080
+    /// §4, deterministic) for 15.
     pub fn sign(&self, data: &[u8]) -> Result<Vec<u8>> {
-        Ok(self
-            .pair
-            .sign(&self.rng, data)
-            .map_err(|_| anyhow!("ECDSA signing failed"))?
-            .as_ref()
-            .to_vec())
+        match &self.pair {
+            Pair::Ecdsa(p) => Ok(p
+                .sign(&self.rng, data)
+                .map_err(|_| anyhow!("ECDSA signing failed"))?
+                .as_ref()
+                .to_vec()),
+            Pair::Ed25519(p) => Ok(p.sign(data).as_ref().to_vec()),
+        }
     }
 }
 
@@ -452,5 +529,35 @@ mod tests {
         let mut bad = stored.clone();
         bad.key_tag ^= 1;
         assert!(ZoneKey::load(&bad).is_err());
+    }
+
+    #[test]
+    fn generated_ed25519_key_loads_and_signs() {
+        let k = generate_key_for(ED25519_ALGORITHM).unwrap();
+        assert_eq!(k.public_key.len(), 32);
+        let rd = wire::dnskey_rdata(CSK_FLAGS, ED25519_ALGORITHM, &k.public_key);
+        let stored = ReplDnssecKey {
+            zone_id: 1,
+            zone: "example.com".into(),
+            algorithm: ED25519_ALGORITHM,
+            flags: CSK_FLAGS,
+            key_tag: wire::key_tag(&rd),
+            public_key: data_encoding::BASE64.encode(&k.public_key),
+            private_key: crate::replication::types::Hidden(data_encoding::BASE64.encode(&k.pkcs8)),
+            created_at: "t".into(),
+            rollover: None,
+        };
+        let zk = ZoneKey::load(&stored).unwrap();
+        let sig = zk.sign(b"hello").unwrap();
+        assert_eq!(sig.len(), 64);
+        assert_eq!(sig, zk.sign(b"hello").unwrap(), "deterministic");
+        assert!(verify(ED25519_ALGORITHM, &k.public_key, b"hello", &sig));
+        assert!(!verify(ALGORITHM, &k.public_key, b"hello", &sig));
+        // A key stored under the wrong algorithm does not load.
+        let mut wrong = stored.clone();
+        wrong.algorithm = ALGORITHM;
+        assert!(ZoneKey::load(&wrong).is_err());
+        assert!(generate_key_for(8).is_err());
+        assert_eq!(algorithm_name(15), "ED25519");
     }
 }

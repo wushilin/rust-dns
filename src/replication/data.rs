@@ -22,6 +22,21 @@ pub fn history(c: &Connection) -> Result<History> {
     })
 }
 
+/// O25: zones signed with Ed25519 (algorithm 15) now, by name. A standby
+/// that does not advertise `ed25519` cannot load such a key and would
+/// serve the zone unsigned: the replication endpoints refuse it while one
+/// exists.
+pub fn ed25519_signed_zones(c: &Connection) -> Result<Vec<String>> {
+    let mut st = c.prepare(
+        "SELECT z.name FROM zones z JOIN dnssec_keys k ON k.zone_id = z.id
+         WHERE z.dnssec = 1 AND k.algorithm = 15 ORDER BY z.name",
+    )?;
+    let names = st
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(names)
+}
+
 /// The next offset that will be assigned minus one (0 for a fresh log).
 pub fn changelog_head(c: &Connection) -> Result<i64> {
     Ok(c.query_row(

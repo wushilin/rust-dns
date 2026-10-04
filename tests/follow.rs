@@ -469,7 +469,7 @@ fn primary_standby_failover_and_rejoin() {
     assert_eq!(
         r["version"],
         format!(
-            "{}+dnssec-rollover.zone-rename.zone-settings.nsec3",
+            "{}+dnssec-rollover.zone-rename.zone-settings.nsec3.ed25519",
             env!("CARGO_PKG_VERSION")
         )
     );
@@ -4713,6 +4713,202 @@ fn nsec3_replicates_and_waits_for_old_standbys() {
         add_record(&p, &pr, "n3.test", "late", "192.0.2.90");
         wait_reconciled(&p, &pr, &old, &or, "old standby after a change");
         verify_zone(&root_dir, old.dns, "n3.test", "old standby nsec");
+        drop(old);
+    }
+    drop(p);
+    let _ = std::fs::remove_dir_all(&root_dir);
+}
+
+/// O25: a zone signed with Ed25519 (algorithm 15) on the primary is signed
+/// identically by the standby: Ed25519 is deterministic and both use the
+/// replicated signing epoch, so every signed answer (RRSIGs included) is
+/// byte-identical on both servers, with NSEC and with NSEC3; the standby's
+/// zone passes dnssec-verify and delv. A previous release cannot sign it
+/// (it would drop the key and serve the zone unsigned without halting), so:
+/// while an Ed25519 zone is signed, its snapshot and change requests are
+/// refused (409; it stays `refused`, not halted, and serves nothing of
+/// it); once no zone is signed with Ed25519 it follows, and then turning
+/// Ed25519 signing on (kept key or a new zone) is refused naming it, while
+/// algorithm 13 stays allowed.
+#[test]
+fn ed25519_replicates_and_older_standbys_are_refused() {
+    let root_dir = temp_root("follow-ed25519");
+    let mut p = Node::new(&root_dir, "primary", "rootpass-primary");
+    let mut s = Node::new(&root_dir, "standby", "rootpass-standby");
+    let xfer = "[transfer]\nallow = [\"127.0.0.0/8\"]\n";
+    p.configure(xfer);
+    p.start();
+    let pr = p.root();
+    let post =
+        |path: &str, body: Value| call(&Auth::Session(&pr), "POST", &p.api(path), Some(body));
+    let put = |zone: &str, body: Value| {
+        call(
+            &Auth::Session(&pr),
+            "PUT",
+            &p.api(&format!("/zones/{zone}/dnssec")),
+            Some(body),
+        )
+    };
+    ok(post("/zones", json!({ "name": "ed.test" })), "zone");
+    for (name, t, v) in [
+        ("@", "NS", "ns1.ed.test."),
+        ("ns1", "A", "192.0.2.53"),
+        ("www", "A", "192.0.2.80"),
+        ("*.wild", "A", "192.0.2.81"),
+        ("a.b.deep", "TXT", "below empty non-terminals"),
+    ] {
+        ok(
+            post(
+                "/zones/ed.test/records",
+                json!({ "name": name, "type": t, "value": v }),
+            ),
+            "record",
+        );
+    }
+    let on = ok(
+        put("ed.test", json!({ "enabled": true, "algorithm": 15 })),
+        "Ed25519 signing on",
+    );
+    assert_eq!(on["key"]["algorithm"], 15, "{on}");
+    let dnskey = on["key"]["dnskey"].as_str().unwrap().to_string();
+    let repl = ok(post("/tokens", json!({ "name": "repl" })), "token")["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    s.configure(&format!("{xfer}{}", follow_cfg(&p, "dns2", &repl)));
+    s.start();
+    let sr = s.root();
+    wait_reconciled(&p, &pr, &s, &sr, "Ed25519");
+
+    // Whole signed answers, RRSIGs included, as bytes per record.
+    let probes = [
+        ("www.ed.test.", RecordType::A),
+        ("ed.test.", RecordType::DNSKEY),
+        ("ed.test.", RecordType::SOA),
+        ("nope.ed.test.", RecordType::A),
+        ("www.ed.test.", RecordType::MX),
+        ("deep.ed.test.", RecordType::A),
+        ("q.wild.ed.test.", RecordType::A),
+        ("q.wild.ed.test.", RecordType::AAAA),
+    ];
+    let signed = |port: u16| -> Vec<Vec<String>> {
+        probes
+            .iter()
+            .map(|(n, t)| {
+                let m = dnssec_query(port, n, *t);
+                let mut v: Vec<String> = m
+                    .answers
+                    .iter()
+                    .chain(m.authorities.iter())
+                    .map(|r| {
+                        let rd = hickory_proto::serialize::binary::BinEncodable::to_bytes(&r.data);
+                        format!(
+                            "{} {} {} {}",
+                            r.name,
+                            r.ttl,
+                            r.record_type(),
+                            hex::encode(rd.unwrap())
+                        )
+                    })
+                    .collect();
+                v.sort();
+                v.insert(0, format!("{:?}", m.metadata.response_code));
+                v
+            })
+            .collect()
+    };
+    let rrsigs = |v: &[Vec<String>]| -> usize {
+        // RRSIG RDATA: type covered (2 bytes), then the algorithm.
+        v.iter()
+            .flatten()
+            .filter(|l| {
+                let f: Vec<&str> = l.split_whitespace().collect();
+                f.len() == 4 && f[2] == "RRSIG" && &f[3][4..6] == "0f"
+            })
+            .count()
+    };
+    let a = signed(p.dns);
+    assert_eq!(a, signed(s.dns), "byte-identical signed answers (NSEC)");
+    assert!(rrsigs(&a) >= probes.len(), "algorithm-15 RRSIGs: {a:?}");
+    verify_zone(&root_dir, s.dns, "ed.test", "standby ed25519 nsec");
+    let cases = [
+        ("www.ed.test", "A", "; fully validated"),
+        ("q.wild.ed.test", "A", "; fully validated"),
+        ("nope.ed.test", "A", "; negative response, fully validated"),
+        ("deep.ed.test", "A", "; negative response, fully validated"),
+    ];
+    delv_all(&root_dir, &dnskey, "ed.test", s.dns, &cases);
+    ok(
+        put("ed.test", json!({ "enabled": true, "denial": "nsec3" })),
+        "NSEC3",
+    );
+    wait_reconciled(&p, &pr, &s, &sr, "Ed25519 + NSEC3");
+    let b = signed(p.dns);
+    assert_eq!(b, signed(s.dns), "byte-identical signed answers (NSEC3)");
+    assert_ne!(a, b);
+    verify_zone(&root_dir, s.dns, "ed.test", "standby ed25519 nsec3");
+    delv_all(&root_dir, &dnskey, "ed.test", s.dns, &cases);
+    let st = dnssec_status(&s, &sr, "ed.test");
+    assert_eq!(st["key"]["algorithm"], 15, "{st}");
+    drop(s);
+
+    if let Some(prev) = prev_bin() {
+        // 1. An Ed25519 zone is signed: the old standby is refused.
+        let mut old = Node::new(&root_dir, "old", "rootpass-old");
+        old.bin = prev;
+        old.configure(&format!("{xfer}{}", follow_cfg(&p, "dns3", &repl)));
+        old.start();
+        let or = old.root();
+        wait_for("the old standby is refused", 30, || {
+            let st = status(&old, &or);
+            assert!(st["follow"]["halted"].is_null(), "not halted: {st}");
+            st["follow"]["state"] == "refused"
+                && st["follow"]["last_error"]
+                    .as_str()
+                    .is_some_and(|e| e.contains("Ed25519") && e.contains("ed.test"))
+        });
+        let m = dnssec_query(old.dns, "www.ed.test.", RecordType::A);
+        assert!(m.answers.is_empty(), "the old standby serves nothing of it");
+        // 2. No Ed25519 zone signed (and back to NSEC, which it can
+        // represent, O24): it follows.
+        ok(
+            put("ed.test", json!({ "enabled": true, "denial": "nsec" })),
+            "NSEC",
+        );
+        ok(
+            put("ed.test", json!({ "enabled": false, "force": true })),
+            "signing off",
+        );
+        old.stop();
+        old.start();
+        let or = old.root();
+        wait_reconciled(&p, &pr, &old, &or, "old standby, no Ed25519 zone");
+        // 3. Ed25519 signing is refused while it follows, naming it.
+        let (st, v) = put("ed.test", json!({ "enabled": true }));
+        assert_eq!(st, 409, "kept Ed25519 key: {v}");
+        assert!(v["error"].as_str().unwrap().contains("dns3"), "{v}");
+        ok(post("/zones", json!({ "name": "ed2.test" })), "zone 2");
+        add_record(&p, &pr, "ed2.test", "www", "192.0.2.91");
+        ok(
+            call(
+                &Auth::Session(&pr),
+                "POST",
+                &p.api("/zones/ed2.test/records"),
+                Some(json!({ "name": "@", "type": "NS", "value": "ns1.ed.test." })),
+            ),
+            "NS",
+        );
+        let (st, v) = put("ed2.test", json!({ "enabled": true, "algorithm": 15 }));
+        assert_eq!(st, 409, "new Ed25519 zone: {v}");
+        assert!(v["error"].as_str().unwrap().contains("dns3"), "{v}");
+        assert_eq!(dnssec_status(&p, &pr, "ed2.test")["enabled"], false);
+        let on13 = ok(
+            put("ed2.test", json!({ "enabled": true, "algorithm": 13 })),
+            "algorithm 13 stays allowed",
+        );
+        assert_eq!(on13["key"]["algorithm"], 13);
+        wait_reconciled(&p, &pr, &old, &or, "old standby, ECDSA zone");
+        verify_zone(&root_dir, old.dns, "ed2.test", "old standby ecdsa");
         drop(old);
     }
     drop(p);

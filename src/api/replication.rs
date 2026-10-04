@@ -79,6 +79,34 @@ fn replica_headers(h: &HeaderMap, required: bool) -> ApiResult<Option<ReplicaHea
     }))
 }
 
+/// O25: the zones a standby of this version could not sign (Ed25519 ones,
+/// for a standby that does not advertise `ed25519`), read in the same
+/// transaction as the answer.
+fn unsignable_for(c: &rusqlite::Connection, h: &ReplicaHeaders) -> anyhow::Result<Vec<String>> {
+    if crate::replication::replicas::has_feature(&h.version, "ed25519") {
+        return Ok(Vec::new());
+    }
+    data::ed25519_signed_zones(c)
+}
+
+/// O25: refuse (409: the standby keeps its data and retries, it does not
+/// halt) a standby whose version cannot sign a zone this server signs with
+/// Ed25519: it would load the zone and serve it unsigned (an older binary
+/// logs "unsupported DNSSEC algorithm" and serves the zone without
+/// signatures, which validating resolvers reject once a DS is published).
+fn refuse_unsignable(zones: &[String], h: &ReplicaHeaders) -> ApiResult<()> {
+    if zones.is_empty() {
+        return Ok(());
+    }
+    tracing::warn!(standby = %h.instance, version = %h.version, zones = %zones.join(","), "replication refused: the standby cannot sign Ed25519 zones");
+    Err(ApiError::conflict(format!(
+        "this server signs {} with Ed25519 (DNSSEC algorithm 15), which standby '{}' (version {}) cannot sign; upgrade the standby",
+        zones.join(", "),
+        h.instance,
+        if h.version.is_empty() { "unknown" } else { &h.version }
+    )))
+}
+
 fn note(s: &AppState, caller: &Caller, h: &ReplicaHeaders, report: Report) {
     let address = caller.ip.to_string();
     s.repl.note_replica(
@@ -167,8 +195,15 @@ pub async fn snapshot(State(s): St, caller: Caller, headers: HeaderMap) -> ApiRe
     let gzip = accepts_gzip(&headers);
     // O22: serialized (and compressed when the standby accepts gzip) off
     // the async workers: a snapshot is the whole database.
+    let rh2 = ReplicaHeaders {
+        instance: rh.instance.clone(),
+        version: rh.version.clone(),
+        session: String::new(),
+    };
     let (offset, entities, body) = tokio::task::spawn_blocking(move || -> ApiResult<_> {
-        let snap = storage.read_tx(data::snapshot)?;
+        let (snap, unsignable) =
+            storage.read_tx(|c| Ok((data::snapshot(c)?, unsignable_for(c, &rh2)?)))?;
+        refuse_unsignable(&unsignable, &rh2)?;
         let json = serde_json::to_vec(&snap).map_err(ApiError::internal)?;
         let body = if gzip {
             use std::io::Write;
@@ -322,14 +357,16 @@ pub async fn changes(
     tick.borrow_and_update();
     let deadline = tokio::time::Instant::now() + wait;
     loop {
-        let (history_id, head, oldest, mut events) = s.storage.read_tx(|c| {
+        let (history_id, head, oldest, mut events, unsignable) = s.storage.read_tx(|c| {
             Ok((
                 data::history(c)?.history_id,
                 data::changelog_head(c)?,
                 data::changelog_oldest(c)?,
                 data::changes_after(c, after, limit)?,
+                unsignable_for(c, &rh)?,
             ))
         })?;
+        refuse_unsignable(&unsignable, &rh)?;
         // A needed account change whose payload was scrubbed after
         // `[changelog].account_retention_days` is gone too.
         let scrubbed = events.iter().any(|e| e.payload["kind"] == "scrubbed");
