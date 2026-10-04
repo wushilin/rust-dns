@@ -755,6 +755,93 @@ what the registrar's DS must match on the live zone; plan it separately.
   priority) with the reason (public PTRs belong to the address holder;
   matters only for private/VPN reverse zones).
 
+## Phase O: the whole backlog (owner, 2026-10-04: "do all in a single phase")
+
+One phase, worked in this order (value first, risky protocol work last).
+Checkpoint = full gate + commit + Log line after each group. Everything
+follows AGENT.md (typed, replicated changes; standby never writes; rights
+only through the Caller; K2 console rules). Defaults never change live
+answers: every new protocol feature is OFF until configured. Nothing is
+deployed by this phase; the live zone (wushilin.net) is never switched to a
+new DNSSEC mode by it.
+
+Group 1: security and accounts
+- [ ] O1. Revoke a user's API tokens on password change (option, default
+  off, per user choice in the change-password dialog + admin reset); token
+  creation only from a browser session (config switch, default off).
+- [ ] O2. Instant websocket cut-off: publish session/token revocation and
+  user disable/scope change on the bus; sockets close at once (keep the 10 s
+  re-check as a backstop).
+- [ ] O3. Login back-off counters survive restarts (local table, classified
+  Local, pruned).
+- [ ] O4. Login audit view in the console (sign-ins, failures, MFA, from the
+  audit log; filter by user/IP/result).
+- [ ] O5. Admin-initiated MFA enrollment (L13): admin sets "MFA required" and
+  generates a one-time enrollment link/QR shown once to the admin, delivered
+  out of band; first-use enrollment without it is refused for that user.
+- [ ] O6. Password policy (length, reuse of the last N, optional complexity)
+  and account lockout options (beyond back-off), console-configured.
+- [ ] O7. Explicit CSRF token (double-submit or per-session token) in
+  addition to the X-Requested-With check; console sends it automatically.
+- [ ] O8. WebAuthn / passkeys as a second factor (pure-Rust crate if one fits
+  our deps, else document and stop; recovery codes still work).
+
+Group 2: console productivity
+- [ ] O9. Search across all zones (name, value, type; respects rights) with
+  jump-to-record.
+- [ ] O10. Bulk record editing: multi-select delete, paste-many (one
+  transaction, preview, per-line errors).
+- [ ] O11. Zone cloning and rename (rename is a typed change; DNSSEC-signed
+  zones: refuse rename while a DS may be published, explain why).
+- [ ] O12. Records table column sorting and keyboard shortcuts.
+
+Group 3: operations
+- [ ] O13. Soak test on dns-test (owner approved by "do all"): build release,
+  run scripts/soak.py on the LXD container home:dns-test for a few hours,
+  with a standby; record numbers in plan.md. Do not touch its /opt/rust-dns
+  service; use separate ports and a scratch directory; stop everything after.
+  This is the ONLY container/remote machine this phase may use.
+- [ ] O14. Live updates through a reverse proxy: CI job on Linux with nginx
+  in front of the console (websocket upgrade works, live feed receives an
+  event); locally skipped when nginx is missing.
+- [ ] O15. Rate limiting: exempt clients presenting a valid server cookie
+  from the UDP cap; rate-limit modes configurable from the console.
+- [ ] O16. Per-zone settings: auto-PTR toggle, transfer ACL, NOTIFY targets
+  (replicated; console; AXFR/NOTIFY tests incl. TSIG).
+- [ ] O17. utoipa 6 / utoipa-axum 0.3 upgrade if it builds cleanly and the
+  generated spec stays equivalent (diff the snapshot; contract tests).
+
+Group 4: packaging
+- [ ] O18. Multi-arch Docker image (linux/amd64, linux/arm64) built and
+  published to GHCR from the release workflow (private repo: private image).
+- [ ] O19. Debian package (.deb from the release workflow, systemd unit,
+  user, config in /etc) and a Homebrew formula (tap in this repo or a
+  generated formula file).
+- [ ] O20. Windows service wrapper (windows-service crate if pure Rust),
+  tested on the Windows CI runner (install, start, answer a query, stop).
+
+Group 5: replication extras
+- [ ] O21. Cascading standbys (a standby may serve replication to another
+  standby; lineage, offsets and halt rules hold through the chain; tests
+  with three servers incl. promotion in the middle).
+- [ ] O22. Gzip snapshots (negotiated by header; old peers unaffected).
+- [ ] O23. Custom CA file for the primary's certificate ([follow] ca_file).
+
+Group 6: DNS protocol depth (all OFF by default; live zone not switched)
+- [ ] O24. NSEC3 (RFC 5155 with RFC 9276 defaults: 0 iterations, no salt),
+  per-zone choice; independent validation with BIND/dnspython.
+- [ ] O25. Ed25519 (algorithm 15) as a per-zone choice for new keys and for
+  the rollover wizard (algorithm rollover documented, not automated).
+- [ ] O26. Response rate limiting per response tuple (RRL with slip),
+  alongside per-client limits.
+- [ ] O27. Acting as a secondary for zones hosted elsewhere (AXFR/IXFR in,
+  NOTIFY in, TSIG, refresh/retry/expire timers, served read-only).
+- [ ] O28. Record types hickory's text parser lacks (LOC and others that
+  matter), via presentation-format parsing.
+- [ ] O29. DNS over TLS and DNS over HTTPS, inbound (own certificate files,
+  rustls) and upstream for forwarding; off by default.
+- [ ] O30. Signing auto-PTR answers (low priority; private reverse zones only).
+
 ## Rollout (after everything above passes)
 
 - Build on GitHub; upgrade baba2 first, then gate (new change kinds / columns).
@@ -1470,3 +1557,7 @@ what the registrar's DS must match on the live zone; plan it separately.
   which asserted the standby's bare version; N1 now reports
   `0.1.0+dnssec-rollover` on purpose (test updated in 8fb3da0). Nothing
   pushed, tagged or deployed.
+- 2026-10-04: Phases M and N verified by the coordinating session (gate on
+  93fc047, suites run against both d32d67f and 3884ba8, browser test, conformance
+  127). Not deployed. Phase O added: the whole backlog in one phase, 6 groups,
+  ordered by value and risk, protocol features off by default.
