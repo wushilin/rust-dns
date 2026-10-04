@@ -100,6 +100,11 @@ divergence. Divergence halts the standby.
 - A new column that older versions do not have and that changes what a row
   means (a token's scope) goes in `optional_columns` (in the table checksum
   only where set), so an older standby halts rather than serving it wrong.
+- A process the standby must represent while it runs (N1: a DNSKEY
+  rollover) is refused on the primary while a following standby does not
+  advertise it (`replicas::VERSION_WITH_FEATURES`, the `+feature` build
+  metadata of its version header): the older standby keeps following
+  instead of halting. Add a feature name there for the next such case.
 
 ## 6. Before a change is done
 

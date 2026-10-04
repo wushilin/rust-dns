@@ -193,6 +193,14 @@ pub struct DnssecConfig {
     /// The primary re-signs a zone (a serial bump, so secondaries transfer
     /// fresh signatures) when its signatures expire within this many days.
     pub resign_before_days: u32,
+    /// Key rollover (N1): how often the primary asks the parent's servers
+    /// while it waits for a DS change, seconds.
+    pub rollover_check_secs: u64,
+    /// Testing only: cap every rollover wait (DNSKEY and DS TTLs) at this
+    /// many seconds. 0 = the real TTLs (always, in production).
+    pub rollover_max_wait_secs: u64,
+    /// Testing only: the port the parent's name servers are asked on.
+    pub parent_port: u16,
 }
 
 impl Default for DnssecConfig {
@@ -200,6 +208,9 @@ impl Default for DnssecConfig {
         DnssecConfig {
             signature_validity_days: 14,
             resign_before_days: 7,
+            rollover_check_secs: 300,
+            rollover_max_wait_secs: 0,
+            parent_port: 53,
         }
     }
 }
@@ -768,6 +779,7 @@ sweep_interval_secs = 60 # upper bound on the sweeper's sleep; it also wakes at 
 # Signing is off by default and turned on per zone (console: zone -> DNSSEC).
 signature_validity_days = 14  # each RRSIG is valid this long (from 1 h before the zone's last change)
 resign_before_days = 7        # the primary re-signs (serial bump) when signatures expire within this
+rollover_check_secs = 300     # key rollover: how often the parent's servers are asked while a DS change is awaited
 
 [logging]
 format = "text"          # "text" or "json"
@@ -990,6 +1002,12 @@ pub fn dnssec_problems(d: &DnssecConfig) -> Vec<String> {
     let mut errs = Vec::new();
     if !(2..=365).contains(&d.signature_validity_days) {
         errs.push("[dnssec].signature_validity_days must be between 2 and 365".into());
+    }
+    if d.rollover_check_secs == 0 {
+        errs.push("[dnssec].rollover_check_secs must be at least 1 (default 300)".into());
+    }
+    if d.parent_port == 0 {
+        errs.push("[dnssec].parent_port must not be 0 (default 53)".into());
     }
     if d.resign_before_days == 0 || d.resign_before_days >= d.signature_validity_days {
         errs.push("[dnssec].resign_before_days must be at least 1 and less than signature_validity_days (default 7 of 14)".into());

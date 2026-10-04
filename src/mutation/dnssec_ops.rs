@@ -41,6 +41,11 @@ impl Mutator {
                     if !z.dnssec {
                         return Ok((z.name, false, false));
                     }
+                    if t.dnssec_key(z.id)?.is_some_and(|k| k.rollover.is_some()) {
+                        return Err(MutationError::Conflict(
+                            "a key rollover is in progress: finish or cancel it first".into(),
+                        ));
+                    }
                     let mut after = z.clone();
                     after.dnssec = false;
                     t.update_zone(z.clone(), after)?;
@@ -75,6 +80,7 @@ impl Mutator {
                             data_encoding::BASE64.encode(&k.pkcs8),
                         ),
                         created_at: now_rfc3339(),
+                        rollover: None,
                     })?;
                     generated = true;
                 }
@@ -194,6 +200,222 @@ impl Mutator {
                 tokio::time::sleep(std::time::Duration::from_secs(next as u64)).await;
             }
         });
+    }
+}
+
+/// N1: what moves a rollover on (the primary's driver, from the parent's
+/// answers and the clock).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RolloverStep {
+    /// Every parent server now shows what the stage waits for (the new DS
+    /// in `ds_check`, no old DS in `switched`), with this DS TTL: start
+    /// the DS TTL wait. Idempotent.
+    ParentOk { ds_ttl: u32 },
+    /// The parent no longer shows it everywhere: the wait starts again.
+    ParentNotOk,
+    /// `ds_check` after its wait: the new key signs from now on.
+    Switch,
+    /// `switched` after its wait: the old key is unpublished; done.
+    Finish,
+}
+
+fn plus_secs(secs: u64) -> String {
+    (chrono::Utc::now() + chrono::Duration::seconds(secs.min(i64::MAX as u64) as i64))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+impl Mutator {
+    /// Start a key rollover (N1): a new key of the same algorithm is
+    /// published next to the current one, which keeps signing; the
+    /// DNSKEY TTL wait starts. A serial bump (the DNSKEY RRset changed).
+    pub async fn rollover_start(
+        &self,
+        actor: Actor,
+        zone_name: &str,
+    ) -> MResult<crate::replication::types::ReplDnssecKey> {
+        let zone_name = zone_name.to_string();
+        let now = now_rfc3339();
+        let this = self.clone_for_closure();
+        self.execute(actor, "start_key_rollover", move |t| {
+            let z = t.require_zone(&normalize_zone_name(&zone_name)?)?;
+            if !z.dnssec {
+                return Err(MutationError::Conflict("signing is off for this zone".into()));
+            }
+            let mut key = t.dnssec_key(z.id)?.ok_or_else(|| {
+                MutationError::Conflict("the zone has no DNSSEC key".into())
+            })?;
+            if key.rollover.is_some() {
+                return Err(MutationError::Conflict("a key rollover is already in progress".into()));
+            }
+            let k = crate::dnssec::generate_key()?;
+            let rdata = crate::dnssec::wire::dnskey_rdata(key.flags, key.algorithm, &k.public_key);
+            let tag = crate::dnssec::wire::key_tag(&rdata);
+            if tag == key.key_tag {
+                return Err(MutationError::Conflict(
+                    "the new key has the same key tag as the current one (rare); start the rollover again".into(),
+                ));
+            }
+            key.rollover = Some(crate::replication::types::Rollover {
+                stage: crate::replication::types::RolloverStage::Prepublish,
+                key: crate::replication::types::RolloverKey {
+                    key_tag: tag,
+                    public_key: data_encoding::BASE64.encode(&k.public_key),
+                    private_key: crate::replication::types::Hidden(
+                        data_encoding::BASE64.encode(&k.pkcs8),
+                    ),
+                    created_at: now.clone(),
+                },
+                started_at: now.clone(),
+                stage_at: now.clone(),
+                dnskey_ttl: z.default_ttl,
+                ds_ttl: None,
+                parent_ok_at: None,
+                wait_until: Some(plus_secs(this(z.default_ttl as u64))),
+            });
+            t.set_dnssec_key(key.clone())?;
+            t.touch_zone(&z);
+            Ok(key)
+        })
+        .await
+    }
+
+    /// The owner added the new DS at the registrar (after the DNSKEY TTL
+    /// wait): the primary starts asking the parent's servers.
+    pub async fn rollover_ds_added(&self, actor: Actor, zone_name: &str) -> MResult<()> {
+        use crate::replication::types::RolloverStage;
+        let zone_name = zone_name.to_string();
+        self.execute(actor, "key_rollover_ds_added", move |t| {
+            let z = t.require_zone(&normalize_zone_name(&zone_name)?)?;
+            let mut key = t.dnssec_key(z.id)?.filter(|k| k.rollover.is_some()).ok_or_else(|| {
+                MutationError::Conflict("no key rollover is in progress".into())
+            })?;
+            let r = key.rollover.as_mut().expect("checked");
+            if r.stage != RolloverStage::Prepublish {
+                return Err(MutationError::Conflict(
+                    "the new DS was already reported as added".into(),
+                ));
+            }
+            if r.wait_until.as_deref().is_some_and(|w| *w > *now_rfc3339()) {
+                return Err(MutationError::Conflict(format!(
+                    "wait until {} (the DNSKEY TTL) before adding the new DS, so every resolver has the new key",
+                    r.wait_until.as_deref().unwrap_or_default()
+                )));
+            }
+            r.stage = RolloverStage::DsCheck;
+            r.stage_at = now_rfc3339();
+            r.parent_ok_at = None;
+            r.wait_until = None;
+            t.set_dnssec_key(key)?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Cancel a rollover before the switch: the new key is dropped (the
+    /// old one never stopped signing). A serial bump.
+    pub async fn rollover_cancel(&self, actor: Actor, zone_name: &str) -> MResult<()> {
+        use crate::replication::types::RolloverStage;
+        let zone_name = zone_name.to_string();
+        self.execute(actor, "cancel_key_rollover", move |t| {
+            let z = t.require_zone(&normalize_zone_name(&zone_name)?)?;
+            let mut key = t.dnssec_key(z.id)?.filter(|k| k.rollover.is_some()).ok_or_else(|| {
+                MutationError::Conflict("no key rollover is in progress".into())
+            })?;
+            if key.rollover.as_ref().is_some_and(|r| r.stage == RolloverStage::Switched) {
+                return Err(MutationError::Conflict(
+                    "the new key already signs: the rollover cannot be cancelled now; remove the old DS at the registrar to finish it".into(),
+                ));
+            }
+            key.rollover = None;
+            t.set_dnssec_key(key)?;
+            t.touch_zone(&z);
+            Ok(())
+        })
+        .await
+    }
+
+    /// Move a rollover on (the primary's driver). Returns whether anything
+    /// was written. Steps that do not apply to the current stage (or a
+    /// wait not over yet) write nothing.
+    pub async fn rollover_step(&self, zone_name: &str, step: RolloverStep) -> MResult<bool> {
+        use crate::replication::types::RolloverStage;
+        let zone_name = zone_name.to_string();
+        let this = self.clone_for_closure();
+        self.execute(
+            Actor {
+                name: "system".into(),
+                ip: "dnssec-rollover".into(),
+            },
+            "key_rollover_step",
+            move |t| {
+                let Some(z) = t.zone(&zone_name)? else {
+                    return Ok(false);
+                };
+                let Some(mut key) = t.dnssec_key(z.id)?.filter(|k| k.rollover.is_some()) else {
+                    return Ok(false);
+                };
+                let now = now_rfc3339();
+                let r = key.rollover.as_mut().expect("checked");
+                let waiting = matches!(r.stage, RolloverStage::DsCheck | RolloverStage::Switched);
+                let wait_over = r.wait_until.as_deref().is_some_and(|w| *w <= *now);
+                match step {
+                    RolloverStep::ParentOk { ds_ttl } if waiting && r.parent_ok_at.is_none() => {
+                        r.parent_ok_at = Some(now);
+                        r.ds_ttl = Some(ds_ttl);
+                        r.wait_until = Some(plus_secs(this(ds_ttl as u64)));
+                        t.set_dnssec_key(key)?;
+                    }
+                    RolloverStep::ParentNotOk if waiting && r.parent_ok_at.is_some() => {
+                        r.parent_ok_at = None;
+                        r.wait_until = None;
+                        t.set_dnssec_key(key)?;
+                    }
+                    RolloverStep::Switch
+                        if r.stage == RolloverStage::DsCheck
+                            && r.parent_ok_at.is_some()
+                            && wait_over =>
+                    {
+                        // The new key becomes the row's key (it signs); the
+                        // old one stays published as the rollover's key.
+                        let old = crate::replication::types::RolloverKey {
+                            key_tag: key.key_tag,
+                            public_key: key.public_key.clone(),
+                            private_key: key.private_key.clone(),
+                            created_at: key.created_at.clone(),
+                        };
+                        let new = std::mem::replace(&mut r.key, old);
+                        r.stage = RolloverStage::Switched;
+                        r.stage_at = now;
+                        r.parent_ok_at = None;
+                        r.wait_until = None;
+                        key.key_tag = new.key_tag;
+                        key.public_key = new.public_key;
+                        key.private_key = new.private_key;
+                        key.created_at = new.created_at;
+                        t.set_dnssec_key(key)?;
+                        t.touch_zone(&z);
+                    }
+                    RolloverStep::Finish
+                        if r.stage == RolloverStage::Switched
+                            && r.parent_ok_at.is_some()
+                            && wait_over =>
+                    {
+                        key.rollover = None;
+                        t.set_dnssec_key(key)?;
+                        t.touch_zone(&z);
+                    }
+                    _ => return Ok(false),
+                }
+                Ok(true)
+            },
+        )
+        .await
+    }
+
+    /// The wait function for closures run in a transaction (`Send`).
+    fn clone_for_closure(&self) -> impl Fn(u64) -> u64 + Send + 'static {
+        let cap = self.signer.config().rollover_max_wait_secs;
+        move |ttl| if cap == 0 { ttl } else { ttl.min(cap) }
     }
 }
 

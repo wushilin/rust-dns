@@ -305,6 +305,8 @@ async fn main() -> anyhow::Result<()> {
         repl: repl.clone(),
     });
     let web_task = tokio::spawn(api::serve(state.clone()));
+    // N1: the key rollover driver (acts only while this server is writable).
+    api::rollover::spawn_driver(state.clone());
 
     // Query logging subscriber.
     if cfg.logging.log_queries {

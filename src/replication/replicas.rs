@@ -26,6 +26,18 @@ use utoipa::ToSchema;
 
 pub const HEADER_INSTANCE: &str = "x-rust-dns-instance";
 pub const HEADER_VERSION: &str = "x-rust-dns-version";
+/// What a standby of this build can follow, as semver build metadata on
+/// its version header (`0.1.0+dnssec-rollover`): the primary refuses to
+/// start what a following standby could not represent (N1: a DNSKEY
+/// rollover). Older standbys send the bare version.
+pub const VERSION_WITH_FEATURES: &str = concat!(env!("CARGO_PKG_VERSION"), "+dnssec-rollover");
+
+/// Whether a standby's reported version names `feature`.
+pub fn has_feature(version: &str, feature: &str) -> bool {
+    version
+        .split_once('+')
+        .is_some_and(|(_, meta)| meta.split(['.', '+']).any(|f| f == feature))
+}
 pub const HEADER_SESSION: &str = "x-rust-dns-session";
 
 /// `[follow].instance_id` rules: a hostname label.
@@ -371,6 +383,17 @@ impl Tracker {
 
 #[cfg(test)]
 mod tests {
+
+    /// N1: this build advertises the rollover; older version strings do not.
+    #[test]
+    fn the_version_header_names_the_features() {
+        assert!(has_feature(VERSION_WITH_FEATURES, "dnssec-rollover"));
+        assert!(VERSION_WITH_FEATURES.starts_with(env!("CARGO_PKG_VERSION")));
+        assert!(!has_feature("0.1.0", "dnssec-rollover"));
+        assert!(!has_feature("", "dnssec-rollover"));
+        assert!(has_feature("0.2.0+x.dnssec-rollover", "dnssec-rollover"));
+        assert!(!has_feature("0.2.0+dnssec-rollover-v0", "dnssec-rollover"));
+    }
     use super::*;
 
     fn cfg() -> ReplicationConfig {

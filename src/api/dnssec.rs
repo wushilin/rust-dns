@@ -165,7 +165,7 @@ pub struct DsList {
 }
 
 /// One query of the self-check.
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct DnssecCheckItem {
     /// e.g. `example.com. DNSKEY`.
     pub query: String,
@@ -174,7 +174,7 @@ pub struct DnssecCheckItem {
 }
 
 /// This server's own signed answers, validated with the zone's key.
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 #[schema(example = json!({ "zone": "example.com", "ok": true, "key_tag": 12345, "checked_at": "2026-01-15T09:30:00.000Z",
     "checks": [{ "query": "example.com. DNSKEY", "ok": true, "detail": "NOERROR, 1 answer and 0 authority RRsets verified" }],
     "note": "These are this server's answers only; validating resolvers start checking once the DS is published at the parent." }))]
@@ -231,7 +231,7 @@ fn key_info(s: &AppState, z: &Zone) -> ApiResult<Option<(KeyInfo, String)>> {
     }
 }
 
-fn ds_views(apex: &str, k: &KeyInfo) -> Vec<DsRecordView> {
+pub(crate) fn ds_views(apex: &str, k: &KeyInfo) -> Vec<DsRecordView> {
     sec::DS_DIGEST_TYPES
         .iter()
         .filter_map(|dt| {
@@ -448,10 +448,17 @@ pub async fn check_dnssec(
     Path(ZonePath { zone }): Path<ZonePath>,
 ) -> ApiResult<Json<DnssecCheck>> {
     let (z, _) = s.require_zone(&caller, &zone, ZonePerm::View)?;
+    Ok(Json(self_check(&s, &z).await?))
+}
+
+/// Query this server for a sample of the zone's RRsets and validate each
+/// answer with the zone's signing key (also run by the key rollover after
+/// the switch to the new key).
+pub async fn self_check(s: &AppState, z: &Zone) -> ApiResult<DnssecCheck> {
     if !z.dnssec {
         return Err(ApiError::conflict("signing is off for this zone"));
     }
-    let Some((key, _)) = key_info(&s, &z)? else {
+    let Some((key, _)) = key_info(s, z)? else {
         return Err(ApiError::conflict("the zone has no DNSSEC key"));
     };
     let apex_s = z.fqdn();
@@ -529,14 +536,14 @@ pub async fn check_dnssec(
             detail: result.unwrap_or_else(|e| e),
         });
     }
-    Ok(Json(DnssecCheck {
+    Ok(DnssecCheck {
         zone: z.name.clone(),
         ok: checks.iter().all(|c| c.ok),
         key_tag: key.key_tag,
         checked_at: crate::model::now_rfc3339(),
         checks,
         note,
-    }))
+    })
 }
 
 /// Ask the first forwarding upstream for the zone's DS (RD, CD, DO).

@@ -563,7 +563,7 @@ impl Replication {
             .http
             .get(&url)
             .timeout(timeout)
-            .header(replicas::HEADER_VERSION, env!("CARGO_PKG_VERSION"))
+            .header(replicas::HEADER_VERSION, replicas::VERSION_WITH_FEATURES)
             .header(replicas::HEADER_SESSION, &self.session);
         if let Some(f) = &self.follow {
             req = req.header(replicas::HEADER_INSTANCE, f.instance_id.trim());
@@ -1305,7 +1305,7 @@ impl Replication {
                 .timeout(timeout)
                 .bearer_auth(&token)
                 .header(replicas::HEADER_INSTANCE, f.instance_id.trim())
-                .header(replicas::HEADER_VERSION, env!("CARGO_PKG_VERSION"))
+                .header(replicas::HEADER_VERSION, replicas::VERSION_WITH_FEATURES)
                 .header(replicas::HEADER_SESSION, &self.session)
                 .json(&body)
                 .send()

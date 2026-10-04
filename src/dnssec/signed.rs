@@ -57,8 +57,12 @@ pub struct SignedZone {
     pub key_tag: u16,
     pub inception: u32,
     pub expiration: u32,
-    /// The apex DNSKEY RRset (one key).
+    /// The signing key's DNSKEY.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub dnskey: Record,
+    /// The apex DNSKEY RRset: the signing key, plus the other key of a
+    /// rollover in progress (N1).
+    pub dnskey_set: Vec<Record>,
     /// RRsets signed, NSEC RRsets included.
     pub signed_rrsets: usize,
     /// Of those, signatures computed by this build ...
@@ -152,6 +156,7 @@ pub fn fingerprint(z: &ZoneData, key: &ReplDnssecKey, w: &Window) -> String {
         "zone": z.zone,
         "records": recs,
         "key": [key.key_tag.to_string(), key.public_key.clone(), key.algorithm.to_string()],
+        "also_published": key.rollover.as_ref().map(|r| r.key.public_key.clone()),
         "window": [w.inception, w.expiration],
     });
     hex::encode(Sha256::digest(v.to_string().as_bytes()))
@@ -171,9 +176,24 @@ fn code(r: &Record) -> u16 {
 impl SignedZone {
     /// Sign `z`. `prev`: the zone's previous signed view, whose signatures
     /// are reused for RRsets that are signed over the same octets.
+    #[cfg(test)]
     pub fn build(
         z: &ZoneData,
         key: &ZoneKey,
+        w: Window,
+        fingerprint: String,
+        prev: Option<&SignedZone>,
+    ) -> Result<Self> {
+        Self::build_with(z, key, None, w, fingerprint, prev)
+    }
+
+    /// [`Self::build`] with another DNSKEY published next to the signing
+    /// key's (`also_published`: its RDATA; a rollover, N1). The DNSKEY
+    /// RRset holds both and is signed, like everything else, by `key`.
+    pub fn build_with(
+        z: &ZoneData,
+        key: &ZoneKey,
+        also_published: Option<Vec<u8>>,
         w: Window,
         fingerprint: String,
         prev: Option<&SignedZone>,
@@ -183,6 +203,15 @@ impl SignedZone {
         // NSEC TTL: as the SOA of negative answers (RFC 9077).
         let nsec_ttl = zone.minimum.min(zone.default_ttl);
         let dnskey = wire::raw_record(apex.clone(), zone.default_ttl, T_DNSKEY, key.dnskey_rdata());
+        let mut dnskey_set = vec![dnskey.clone()];
+        if let Some(rd) = also_published.filter(|rd| *rd != key.dnskey_rdata()) {
+            dnskey_set.push(wire::raw_record(
+                apex.clone(),
+                zone.default_ttl,
+                T_DNSKEY,
+                rd,
+            ));
+        }
 
         let mut owners: BTreeMap<CanonKey, OwnerSets> = BTreeMap::new();
         // Apex: SOA, NS (explicit or synthesized), DNSKEY, then its records.
@@ -192,7 +221,10 @@ impl SignedZone {
         for ns in apex_ns(z) {
             apex_sets.entry(code(&ns)).or_default().push(ns);
         }
-        apex_sets.entry(T_DNSKEY).or_default().push(dnskey.clone());
+        apex_sets
+            .entry(T_DNSKEY)
+            .or_default()
+            .extend(dnskey_set.iter().cloned());
         owners.insert(
             wire::canon_key(&apex),
             OwnerSets {
@@ -330,6 +362,7 @@ impl SignedZone {
             inception,
             expiration,
             dnskey,
+            dnskey_set,
             signed_rrsets,
             fresh_signatures: fresh,
             reused_signatures: reused,
@@ -397,7 +430,7 @@ impl SignedZone {
 
     /// DNSSEC records a zone transfer adds: DNSKEY, every RRSIG and NSEC.
     pub fn transfer_records(&self) -> Vec<Record> {
-        let mut out = vec![self.dnskey.clone()];
+        let mut out = self.dnskey_set.clone();
         for e in &self.chain {
             out.push(e.record.clone());
             for t in &e.types {
@@ -437,7 +470,7 @@ impl SignedZone {
                     .record
                     .clone()]
             } else if *t == T_DNSKEY {
-                vec![self.dnskey.clone()]
+                self.dnskey_set.clone()
             } else if owner == &z.apex && *t == 6 {
                 vec![soa_record(z, z.zone.default_ttl).unwrap()]
             } else if owner == &z.apex && *t == 2 {
@@ -566,6 +599,7 @@ mod tests {
             public_key: data_encoding::BASE64.encode(&k.public_key),
             private_key: crate::replication::types::Hidden(data_encoding::BASE64.encode(&k.pkcs8)),
             created_at: "t".into(),
+            rollover: None,
         };
         let zk = ZoneKey::load(&stored).unwrap();
         (stored, zk)

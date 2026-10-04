@@ -666,6 +666,86 @@ contract tests, typed changes that replicate, tests, AGENT.md rules):
 Not in this phase: automated DNSSEC key rollover (CDS/CDNSKEY) — it changes
 what the registrar's DS must match on the live zone; plan it separately.
 
+## Phase N: DNSSEC key rollover wizard (owner, 2026-10-04, after phase M)
+
+- [x] N1. Rollover wizard with manual DS steps (the registrar has no API;
+  `.net` does not scan CDS): a "Rollover" action on the zone's DNSSEC tab
+  starts a staged, replicated process; at every step the console says
+  exactly what to configure and the server verifies before moving on.
+  (1) pre-publish the new CSK (alg 13), old key signs, wait the DNSKEY
+  TTL; (2) show the new DS (fields + record, "do not remove the old DS
+  yet"), owner confirms; (3) check every parent server (NS set via the
+  forwarding upstream, each asked with RD=0) until all return the new DS,
+  report a mistyped DS field by field, then wait the parent's DS TTL;
+  (4) switch signing to the new key, old DNSKEY stays, self-check with the
+  new key; (5) show the old DS to delete; when no parent server returns it
+  and the DS TTL passed, retire the old key. Cancel before (4) only. Every
+  step a typed replicated change; the standby signs with the same key set
+  and never advances the wizard; state survives restarts; disabling
+  signing stays blocked; timers from real TTLs with a test hook.
+  Done:
+  - State: `ReplDnssecKey.rollover` (optional, serde default; new nullable
+    column `dnssec_keys.rollover`, in `optional_columns`): stage
+    (`prepublish` / `ds_check` / `switched`), the other key (new before the
+    switch, old after; its private key a secret like the signing key),
+    started/stage times, DNSKEY TTL, DS TTL, `parent_ok_at`, `wait_until`.
+    The row's own key always signs; the other key is published in the
+    DNSKEY RRset (`SignedZone::build_with`). Every transition is a
+    `dnssec_key_set` of the whole row (a fact) in a `Tx`, with a serial
+    bump when the DNSKEY RRset changes (start, switch, retire, cancel).
+    No new change kind; fixture untouched; protocol 2.
+  - Driver (`api::rollover::spawn_driver`, every node, acts only while
+    writable): per zone with a rollover, asks the parent's servers
+    (`dnssec::parent::probe`) in `ds_check` / `switched`, records
+    `ParentOk { ds_ttl }` / `ParentNotOk`, and switches / finishes when the
+    wait is over and the parent still agrees (re-checked). In-memory last
+    probe and self-check for the console (asked again after a restart).
+  - API: `GET/POST /zones/{zone}/dnssec/rollover`, `POST .../ds-added`
+    (refused before the DNSKEY wait ends), `.../cancel` (refused after the
+    switch), `.../check` (ask now; primary only). `GET` returns stage,
+    `next`, numbered instructions, timers, new/old key with DS fields,
+    every parent server's DS (`matches` new/old/none + `differs`), the
+    post-switch self-check, and `blocked_by`.
+  - Mixed versions: a standby of this build sends
+    `X-Rust-DNS-Version: 0.1.0+dnssec-rollover`; the primary refuses to
+    START a rollover while any known standby lacks it (409 naming it), so
+    an older standby is never asked to represent one and keeps following
+    (if one were attached during a rollover anyway, the optional column
+    makes it halt at its next reconcile rather than serve a wrong key set).
+  - Config: `[dnssec] rollover_check_secs` (300), test hooks
+    `rollover_max_wait_secs` (0 = real TTLs) and `parent_port` (53).
+  - Console: Key rollover section in the DNSSEC tab (step badges,
+    instructions, countdown, DS fields with copy buttons, parent servers
+    table with mismatch details, self-check, "I've added it", "Ask the
+    parent now", "Cancel rollover…" (two-step), "Start key rollover…"
+    blocked with the standby names); every button declares
+    `data-perm="edit_settings"` + zone (K2), read-only on a standby with a
+    note; "Turn off signing" blocked during a rollover; auto-refresh every
+    3 s while the tab is open.
+  Tests: `tests/rollover.rs` `key_rollover_wizard_with_a_real_parent`
+  (PARENT rust-dns hosting `test.` with the delegation and DS records
+  edited through its API; PRIMARY + STANDBY; delv with the parent's live DS
+  set as trust anchor + dnssec-verify of the AXFR on BOTH servers at every
+  step: before, pre-publish, mistyped DS, old+new DS, switched, only new
+  DS, done, second rollover, cancelled; key tags served and signer
+  checked; ds-added refused during the wait; standby refuses ds-added and
+  check; disable refused; restart in `ds_check`; no cancel after the
+  switch; self-check ok; standby not halted, reconcile ok; with
+  `RUST_DNS_PREV_BIN` an old standby (d32d67f and 3884ba8 both run) blocks
+  the start with 409 naming it and keeps following, reconcile ok);
+  unit `dnssec::parent::tests::classify_names_the_differing_field`,
+  `replication::replicas::tests::the_version_header_names_the_features`,
+  replay test runs a full rollover and a cancelled one (replay equality),
+  secrecy test covers the rollover's private key (not in logs, audit or
+  the changelog API; replicated); contract test exercises start /
+  ds-added / cancel / refusals; browser test walks every step in Chrome
+  with 2 s timers (start dialog, DNSKEY wait, DS fields, standby read-only
+  view, mistyped DS shown "differs: digest", switch + self-check, no
+  cancel, done) with no page errors; screenshots checked by eye.
+- [x] N2. pending.md: "signing auto-PTR answers" moved to the bottom (Low
+  priority) with the reason (public PTRs belong to the address holder;
+  matters only for private/VPN reverse zones).
+
 ## Rollout (after everything above passes)
 
 - Build on GitHub; upgrade baba2 first, then gate (new change kinds / columns).
@@ -746,6 +826,15 @@ what the registrar's DS must match on the live zone; plan it separately.
   the standby (baba2) first, then the primary (gate); create scoped
   tokens only after both run this version. Do not downgrade once a scoped
   token exists (the old binary would ignore the scope).
+- After phase N (N1): protocol 2, no new change kind, fixture untouched.
+  New nullable column `dnssec_keys.rollover` (added NULL). Standbys now send
+  `X-Rust-DNS-Version: 0.1.0+dnssec-rollover`. Upgrade baba2 first, then
+  gate; the console refuses to start a rollover while baba2 runs an older
+  version (it is named). Before the first real rollover on wushilin.net:
+  gate needs a forwarding upstream (it finds the `.net` servers through
+  it) and outbound DNS to them; the waits are real (DNSKEY TTL of the zone,
+  then 86400 s DS TTL twice), so a rollover takes 2+ days. Do not
+  downgrade during a rollover.
 - After phase M (M2): new nullable column `zones.record_policy`
   (`compat_columns`; in the zone row JSON only when set). An older standby
   follows while no zone has a policy; the first policy makes it halt
@@ -1358,3 +1447,5 @@ what the registrar's DS must match on the live zone; plan it separately.
   untouched; upgrade baba2 (standby) first, then gate; create scoped
   tokens and zone record policies only after both run this version (an
   older standby halts on them by design; see Rollout).
+- 2026-10-04 (phase N): N1 (rollover wizard) and N2 (pending note) done;
+  see Phase N.

@@ -380,11 +380,12 @@ fn delete_setting(c: &Connection, key: &str) -> Result<()> {
 
 fn put_dnssec_key(c: &Connection, k: &crate::replication::types::ReplDnssecKey) -> Result<()> {
     c.execute(
-        "INSERT INTO dnssec_keys (zone_id, zone, algorithm, flags, key_tag, public_key, private_key, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "INSERT INTO dnssec_keys (zone_id, zone, algorithm, flags, key_tag, public_key, private_key, created_at, rollover)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT(zone_id) DO UPDATE SET zone = excluded.zone, algorithm = excluded.algorithm,
             flags = excluded.flags, key_tag = excluded.key_tag, public_key = excluded.public_key,
-            private_key = excluded.private_key, created_at = excluded.created_at",
+            private_key = excluded.private_key, created_at = excluded.created_at,
+            rollover = excluded.rollover",
         params![
             k.zone_id,
             k.zone,
@@ -393,7 +394,8 @@ fn put_dnssec_key(c: &Connection, k: &crate::replication::types::ReplDnssecKey) 
             k.key_tag as i64,
             k.public_key,
             k.private_key.0,
-            k.created_at
+            k.created_at,
+            k.rollover.as_ref().map(serde_json::to_string).transpose()?,
         ],
     )?;
     Ok(())

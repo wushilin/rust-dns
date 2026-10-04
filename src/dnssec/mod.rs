@@ -29,6 +29,7 @@
 //! disconnected standby), the node signs from the current hour instead.
 
 pub mod check;
+pub mod parent;
 pub mod signed;
 #[cfg(test)]
 mod vectors;
@@ -310,8 +311,19 @@ impl Signer {
                 return Some(s.clone());
             }
         }
-        let result =
-            ZoneKey::load(key).and_then(|k| SignedZone::build(z, &k, w, fp, prev.as_deref()));
+        // N1: the other key of a rollover is published too (never signs).
+        let also = match &key.rollover {
+            Some(r) => match data_encoding::BASE64.decode(r.key.public_key.as_bytes()) {
+                Ok(pk) => Some(wire::dnskey_rdata(key.flags, key.algorithm, &pk)),
+                Err(_) => {
+                    tracing::error!(zone = %z.zone.name, "DNSSEC: the rollover key's public key is not base64");
+                    None
+                }
+            },
+            None => None,
+        };
+        let result = ZoneKey::load(key)
+            .and_then(|k| SignedZone::build_with(z, &k, also, w, fp, prev.as_deref()));
         match result {
             Ok(s) => {
                 let s = Arc::new(s);
@@ -426,6 +438,7 @@ mod tests {
             public_key: data_encoding::BASE64.encode(&k.public_key),
             private_key: crate::replication::types::Hidden(data_encoding::BASE64.encode(&k.pkcs8)),
             created_at: "t".into(),
+            rollover: None,
         };
         let zk = ZoneKey::load(&stored).unwrap();
         let sig = zk.sign(b"hello").unwrap();

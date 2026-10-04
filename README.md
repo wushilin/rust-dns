@@ -465,21 +465,45 @@ DS TTL has passed, then turn signing off. The API accepts `force: true` to skip
 the check (the console does not offer it). The key is kept when signing is
 turned off; turning it on again reuses it.
 
-**Key rollover (manual; not automated yet).** A "go insecure" rollover with
-one key per zone:
-1. Remove the DS at the registrar; wait for the parent's DS TTL (and the
-   DNSKEY TTL) to pass. `GET .../dnssec/parent` must say `absent`.
-2. Turn signing off (`PUT .../dnssec {"enabled": false}`).
-3. Turn it on with a new key (`PUT .../dnssec {"enabled": true, "new_key": true}`;
-   the console offers "Use a new key" in the dialog).
-4. Run the check, publish the new DS, confirm with the parent lookup.
-The zone is unsigned for resolvers between steps 1 and 4. A double-signature
-rollover without that gap is listed in `pending.md`.
+**Key rollover wizard** (zone -> DNSSEC -> Key rollover; `GET/POST
+/api/zones/{zone}/dnssec/rollover`, `.../ds-added`, `.../cancel`,
+`.../check`). A pre-publish rollover of the combined signing key for
+registrars without an API: the DS change is always done by hand, and the
+wizard says exactly what to change and verifies it before moving on. The
+zone never depends on a DS the parent does not serve.
+1. **Start**: a new key (same algorithm) is published next to the old one,
+   which keeps signing (a serial bump). Wait the DNSKEY TTL (the zone's
+   default TTL; the console counts down).
+2. **Add the new DS** shown (key tag, algorithm, digest type and digest as
+   separate fields with copy buttons, plus the one-line record) at the
+   registrar NEXT TO the old one; do not remove the old DS. Press "I've
+   added it".
+3. The primary asks every server of the parent zone directly (it finds them
+   through the forwarding upstream, then asks each with RD=0, every
+   `[dnssec].rollover_check_secs`, default 300 s) until all return the new
+   DS. A DS that matches neither key is shown with the field that differs.
+   Then it waits the parent's DS TTL (read from the answers; 86400 for
+   `.net`).
+4. **Switch**: the new key signs; the old DNSKEY stays published. The
+   self-check runs with the new key. No cancel from here on.
+5. **Delete the old DS** shown at the registrar. Once no parent server
+   returns it and the DS TTL has passed, the old key is unpublished (a
+   serial bump): done.
+Cancel is possible until the switch (the new key is dropped; remove its DS
+at the registrar if you added it). Signing cannot be turned off during a
+rollover. Every stage is a `dnssec_key_set` of the key row (the other key
+inside, a secret like the signing key), so a standby signs with the same
+key set; only the primary moves stages on, and the state survives
+restarts. Starting is refused while a following standby is too old to
+represent a rollover (its version lacks `+dnssec-rollover`). Needs a
+forwarding upstream (to find the parent's servers). Test-only knobs:
+`[dnssec] rollover_max_wait_secs` (caps the waits) and `parent_port`.
 
 **API** (all with `#[utoipa::path]`, see `/docs`): `GET /api/zones/{zone}/dnssec`
 (status, key, DS, signature window), `PUT /api/zones/{zone}/dnssec`
 (`enabled`, `force`, `new_key`; owner role), `GET /api/zones/{zone}/dnssec/ds`,
-`GET /api/zones/{zone}/dnssec/check`, `GET /api/zones/{zone}/dnssec/parent`.
+`GET /api/zones/{zone}/dnssec/check`, `GET /api/zones/{zone}/dnssec/parent`,
+and the rollover endpoints above.
 
 ## Securing zone transfers with TSIG
 
@@ -1035,8 +1059,8 @@ ceiling is the OS loopback path, not the server. Resident memory stays around
 
 ## Not yet
 
-- DNSSEC: NSEC3, automated key rollover (double signature / CDS/CDNSKEY),
-  algorithms other than 13.
+- DNSSEC: NSEC3, automated key rollover through CDS/CDNSKEY (the wizard
+  above needs the DS change done by hand), algorithms other than 13.
 - Inbound NOTIFY / acting as a secondary for zones hosted elsewhere; automatic failover.
 - DNS over TLS/HTTPS, response tuple rate limiting (RRL by answer), and per-zone forwarding,
   reverse-zone, transfer ACL, and NOTIFY overrides.

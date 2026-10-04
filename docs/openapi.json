@@ -1605,6 +1605,243 @@
         }
       }
     },
+    "/zones/{zone}/dnssec/rollover": {
+      "get": {
+        "tags": [
+          "DNSSEC"
+        ],
+        "summary": "Key rollover state and next step",
+        "description": "The rollover wizard's state: stage, timers (from the real DNSKEY and DS TTLs), the new or old DS with every field, what every parent server returned, and exactly what to do next. Needs the viewer role.",
+        "operationId": "get_key_rollover",
+        "parameters": [
+          {
+            "name": "zone",
+            "in": "path",
+            "description": "Zone name, e.g. `example.com`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "example.com"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "State.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RolloverView"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "DNSSEC"
+        ],
+        "summary": "Start a key rollover",
+        "description": "Generates a new key of the same algorithm and publishes it next to the current one, which keeps signing (a serial bump). Then follow `GET .../rollover`. Refused (409) when signing is off, a rollover runs already, or a following standby is too old to represent it. Needs the owner role.",
+        "operationId": "start_key_rollover",
+        "parameters": [
+          {
+            "name": "zone",
+            "in": "path",
+            "description": "Zone name, e.g. `example.com`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "example.com"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Started.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RolloverView"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/ConflictOrReadOnly"
+          }
+        }
+      }
+    },
+    "/zones/{zone}/dnssec/rollover/ds-added": {
+      "post": {
+        "tags": [
+          "DNSSEC"
+        ],
+        "summary": "The new DS is added at the registrar",
+        "description": "Confirms that the new DS was added next to the old one (allowed once the DNSKEY TTL wait is over). The primary then checks every parent server until all return it. Needs the owner role.",
+        "operationId": "key_rollover_ds_added",
+        "parameters": [
+          {
+            "name": "zone",
+            "in": "path",
+            "description": "Zone name, e.g. `example.com`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "example.com"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Checking the parent.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RolloverView"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/ConflictOrReadOnly"
+          }
+        }
+      }
+    },
+    "/zones/{zone}/dnssec/rollover/cancel": {
+      "post": {
+        "tags": [
+          "DNSSEC"
+        ],
+        "summary": "Cancel a key rollover (before the switch)",
+        "description": "Drops the new key (the old one never stopped signing; a serial bump). If the new DS was already added at the registrar, remove it there. Refused (409) after the switch to the new key. Needs the owner role.",
+        "operationId": "cancel_key_rollover",
+        "parameters": [
+          {
+            "name": "zone",
+            "in": "path",
+            "description": "Zone name, e.g. `example.com`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "example.com"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Cancelled.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RolloverView"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/ConflictOrReadOnly"
+          }
+        }
+      }
+    },
+    "/zones/{zone}/dnssec/rollover/check": {
+      "post": {
+        "tags": [
+          "DNSSEC"
+        ],
+        "summary": "Ask the parent's servers now",
+        "description": "Runs the rollover's parent check at once instead of waiting for the next round (`[dnssec].rollover_check_secs`), and moves the rollover on when it can. Primary only. Needs the owner role.",
+        "operationId": "check_key_rollover",
+        "parameters": [
+          {
+            "name": "zone",
+            "in": "path",
+            "description": "Zone name, e.g. `example.com`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "example.com"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "State after the check.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RolloverView"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/ConflictOrReadOnly"
+          }
+        }
+      }
+    },
     "/zones/{zone}/export": {
       "get": {
         "tags": [
@@ -3604,7 +3841,7 @@
           {
             "name": "X-Rust-DNS-Version",
             "in": "header",
-            "description": "The standby's rust-dns version.",
+            "description": "The standby's rust-dns version, with what it can follow as build metadata (`+dnssec-rollover`).",
             "required": false,
             "schema": {
               "type": [
@@ -3612,7 +3849,7 @@
                 "null"
               ]
             },
-            "example": "0.1.0"
+            "example": "0.1.0+dnssec-rollover"
           },
           {
             "name": "X-Rust-DNS-Session",
@@ -3723,7 +3960,7 @@
           {
             "name": "X-Rust-DNS-Version",
             "in": "header",
-            "description": "The standby's rust-dns version.",
+            "description": "The standby's rust-dns version, with what it can follow as build metadata (`+dnssec-rollover`).",
             "required": false,
             "schema": {
               "type": [
@@ -3731,7 +3968,7 @@
                 "null"
               ]
             },
-            "example": "0.1.0"
+            "example": "0.1.0+dnssec-rollover"
           },
           {
             "name": "X-Rust-DNS-Session",
@@ -3805,7 +4042,7 @@
           {
             "name": "X-Rust-DNS-Version",
             "in": "header",
-            "description": "The standby's rust-dns version.",
+            "description": "The standby's rust-dns version, with what it can follow as build metadata (`+dnssec-rollover`).",
             "required": false,
             "schema": {
               "type": [
@@ -3813,7 +4050,7 @@
                 "null"
               ]
             },
-            "example": "0.1.0"
+            "example": "0.1.0+dnssec-rollover"
           },
           {
             "name": "X-Rust-DNS-Session",
@@ -4012,7 +4249,7 @@
           {
             "name": "X-Rust-DNS-Version",
             "in": "header",
-            "description": "The standby's rust-dns version.",
+            "description": "The standby's rust-dns version, with what it can follow as build metadata (`+dnssec-rollover`).",
             "required": false,
             "schema": {
               "type": [
@@ -4020,7 +4257,7 @@
                 "null"
               ]
             },
-            "example": "0.1.0"
+            "example": "0.1.0+dnssec-rollover"
           },
           {
             "name": "X-Rust-DNS-Session",
@@ -6798,6 +7035,75 @@
           "unknown"
         ]
       },
+      "ParentProbe": {
+        "type": "object",
+        "description": "The probe's result: the parent zone and every server's answer.",
+        "required": [
+          "parent",
+          "servers",
+          "checked_at"
+        ],
+        "properties": {
+          "parent": {
+            "type": "string",
+            "description": "The parent zone (lower case, trailing dot)."
+          },
+          "servers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ParentServer"
+            }
+          },
+          "checked_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "ParentServer": {
+        "type": "object",
+        "description": "One parent server's answer.",
+        "required": [
+          "ns",
+          "address",
+          "ds",
+          "ttl",
+          "error"
+        ],
+        "properties": {
+          "ns": {
+            "type": "string",
+            "description": "The name server's host name."
+          },
+          "address": {
+            "type": "string",
+            "description": "The address asked (`ip:port`)."
+          },
+          "ds": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SeenDs"
+            },
+            "description": "DS records for the zone in its answer (empty: none)."
+          },
+          "ttl": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The DS RRset's TTL (absent when there was none).",
+            "minimum": 0
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why it could not be asked (timeout, error rcode); the server then\ncounts as \"not confirmed\"."
+          }
+        }
+      },
       "PasswordBody": {
         "type": "object",
         "required": [
@@ -7905,6 +8211,270 @@
           "owner",
           "member"
         ]
+      },
+      "RolloverKeyView": {
+        "type": "object",
+        "description": "One key of a rollover with the DS records it needs at the parent.",
+        "required": [
+          "key_tag",
+          "algorithm",
+          "dnskey",
+          "ds"
+        ],
+        "properties": {
+          "key_tag": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "algorithm": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "dnskey": {
+            "type": "string",
+            "description": "The DNSKEY record in zone-file form."
+          },
+          "ds": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DsRecordView"
+            },
+            "description": "The DS records for this key (publish the SHA-256 one)."
+          }
+        }
+      },
+      "RolloverStage": {
+        "type": "string",
+        "enum": [
+          "prepublish",
+          "ds_check",
+          "switched"
+        ]
+      },
+      "RolloverView": {
+        "type": "object",
+        "description": "A rollover's state and exactly what to do next.",
+        "required": [
+          "zone",
+          "active",
+          "stage",
+          "next",
+          "instructions",
+          "started_at",
+          "stage_at",
+          "wait_until",
+          "wait_remaining_secs",
+          "dnskey_ttl",
+          "ds_ttl",
+          "parent_ok_at",
+          "signing_key_tag",
+          "new_key",
+          "old_key",
+          "can_cancel",
+          "parent",
+          "parent_error",
+          "self_check",
+          "blocked_by"
+        ],
+        "properties": {
+          "zone": {
+            "type": "string"
+          },
+          "active": {
+            "type": "boolean",
+            "description": "A rollover is in progress."
+          },
+          "stage": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RolloverStage"
+              }
+            ]
+          },
+          "next": {
+            "type": "string",
+            "description": "What happens next: `start`, `wait_dnskey_ttl`, `add_new_ds`,\n`wait_parent_new_ds`, `wait_ds_ttl_then_switch`, `remove_old_ds`,\n`wait_ds_ttl_then_retire`."
+          },
+          "instructions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Step-by-step instructions for the owner, in order."
+          },
+          "started_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "stage_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "wait_until": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "End of the current wait."
+          },
+          "wait_remaining_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Seconds left of the current wait (0 when over)."
+          },
+          "dnskey_ttl": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "ds_ttl": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "parent_ok_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When every parent server first showed what the stage waits for."
+          },
+          "signing_key_tag": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The key that signs now.",
+            "minimum": 0
+          },
+          "new_key": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RolloverKeyView",
+                "description": "The new key (before the switch): its DS goes to the registrar."
+              }
+            ]
+          },
+          "old_key": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RolloverKeyView",
+                "description": "The old key (after the switch): its DS must be removed."
+              }
+            ]
+          },
+          "can_cancel": {
+            "type": "boolean",
+            "description": "Cancelling is possible (before the switch)."
+          },
+          "parent": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ParentProbe",
+                "description": "The last answer of every parent server (this server's memory; the\nprimary asks every `[dnssec].rollover_check_secs` while waiting)."
+              }
+            ]
+          },
+          "parent_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "self_check": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DnssecCheck",
+                "description": "The self-check run after the switch (every RRset validates with the\nnew key)."
+              }
+            ]
+          },
+          "blocked_by": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Standbys that cannot follow a rollover (older versions): starting\nis refused until they are upgraded (or removed from the list)."
+          }
+        }
+      },
+      "SeenDs": {
+        "type": "object",
+        "description": "One DS record as published, and which of our keys it matches.",
+        "required": [
+          "key_tag",
+          "algorithm",
+          "digest_type",
+          "digest",
+          "matches"
+        ],
+        "properties": {
+          "key_tag": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "algorithm": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "digest_type": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "digest": {
+            "type": "string",
+            "description": "Upper-case hex."
+          },
+          "matches": {
+            "type": "string",
+            "description": "`new`, `old` or `none` (matches neither key)."
+          },
+          "differs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "For a DS that matches neither key: which fields differ from the\nexpected DS of the key it is closest to (key tag, algorithm, digest\ntype, digest)."
+          }
+        }
       },
       "ServerStatus": {
         "type": "object",

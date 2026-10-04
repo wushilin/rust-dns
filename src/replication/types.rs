@@ -193,6 +193,62 @@ pub struct ReplDnssecKey {
     pub public_key: String,
     pub private_key: Hidden<String>,
     pub created_at: String,
+    /// N1: a key rollover in progress; absent otherwise (every row written
+    /// before N1). Carries the other key's private key: same secrecy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollover: Option<Rollover>,
+}
+
+/// N1: a staged CSK rollover with manual DS steps at the registrar. The
+/// key row's own key always signs; `key` is the other one, also published
+/// in the DNSKEY RRset: the new key before the switch, the old one after.
+/// Every stage change is a `dnssec_key_set` of the whole row (a fact), so a
+/// standby signs with the same key set; only the primary advances it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Rollover {
+    pub stage: RolloverStage,
+    pub key: RolloverKey,
+    pub started_at: String,
+    /// When the current stage began.
+    pub stage_at: String,
+    /// The DNSKEY TTL the waits use (the zone's TTL at the start).
+    pub dnskey_ttl: u32,
+    /// The parent's DS TTL, read from its answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ds_ttl: Option<u32>,
+    /// `ds_check`: when every parent server returned the new DS;
+    /// `switched`: when none returned the old one any more.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_ok_at: Option<String>,
+    /// The end of the stage's wait (DNSKEY TTL in `prepublish`, DS TTL
+    /// after `parent_ok_at`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_until: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RolloverStage {
+    /// Both DNSKEYs published, the old key signs; wait the DNSKEY TTL, then
+    /// the owner adds the new DS next to the old one.
+    Prepublish,
+    /// The owner said the new DS is added: the primary checks every parent
+    /// server until all return it, then waits the DS TTL and switches.
+    DsCheck,
+    /// The new key signs, the old DNSKEY stays published; the owner removes
+    /// the old DS; once no parent server returns it and the DS TTL passed,
+    /// the old key is retired (the rollover ends).
+    Switched,
+}
+
+/// The rollover's other key (same algorithm and flags as the row's).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RolloverKey {
+    pub key_tag: u16,
+    /// base64, 64 bytes (x || y).
+    pub public_key: String,
+    pub private_key: Hidden<String>,
+    pub created_at: String,
 }
 
 /// A consistent copy of everything replicated, read in one transaction,

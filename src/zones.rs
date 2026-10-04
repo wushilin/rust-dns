@@ -610,9 +610,10 @@ fn resolve_into(
     // name of its chain.
     if let Some(s) = signed {
         if is_apex && (qtype == RecordType::DNSKEY || qtype == RecordType::ANY) {
-            let mut r = s.dnskey.clone();
-            r.name = qname.clone();
-            ans.answers.push(r);
+            for mut r in s.dnskey_set.iter().cloned() {
+                r.name = qname.clone();
+                ans.answers.push(r);
+            }
         }
         if wildcard.is_none() && qtype == RecordType::NSEC {
             if let Some(e) = s.nsec_at(key) {

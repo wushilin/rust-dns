@@ -293,8 +293,94 @@ async function main() {
   await admin.eval(`document.querySelector('#modal [data-close]').click(); return true`);
   await admin.wait('token listed with its scope', `return document.querySelector('#main')?.textContent.includes('≤ viewer')`);
 
-  for (const pg of [admin, viewer, st]) ok(`no page errors (${pg.label})`, pg.errors.length === 0, JSON.stringify(pg.errors));
+  // ---- N1: the key rollover wizard, every step, with shortened timers ----
+  const pages = [admin, viewer, st];
+  pages.push(...(await rolloverWalk(b, rootApi)));
+
+  for (const pg of pages) ok(`no page errors (${pg.label})`, pg.errors.length === 0, JSON.stringify(pg.errors));
   b.ws.close();
+}
+
+// Screenshots of the drawer when SCREENSHOT_DIR is set (for a human look).
+async function shot(page, name) {
+  if (!process.env.SCREENSHOT_DIR) return;
+  await page.eval(`document.querySelector('#sec-roll')?.previousElementSibling?.scrollIntoView(); return true`);
+  const r = await page.send('Page.captureScreenshot', { format: 'png' });
+  fs.writeFileSync(path.join(process.env.SCREENSHOT_DIR, `${name}.png`), Buffer.from(r.data, 'base64'));
+}
+
+// A parent server hosting `test.` (its DS records edited through its API,
+// as at a registrar), a primary signing `roll.test.` that finds the parent
+// through forwarding, and a standby. Waits capped at 2 s.
+async function rolloverWalk(b) {
+  const dnsPort = srv => Number(fs.readFileSync(path.join(tmp, srv.name, 'rust-dns.toml'), 'utf8').match(/^port = (\d+)/m)[1]);
+  const par = await startServer('rparent', 'rootpass-parent');
+  const parApi = await apiLogin(par, 'root', 'rootpass-parent');
+  const pport = dnsPort(par);
+  await parApi('POST', '/zones', { name: 'test' });
+  const prec = async (name, type, value) => (await parApi('POST', '/zones/test/records', { name, type, value })).json.id;
+  await prec('@', 'NS', 'ns1.test.'); await prec('ns1', 'A', '127.0.0.1');
+  await prec('roll', 'NS', 'ns1.roll.test.'); await prec('ns1.roll', 'A', '127.0.0.1');
+  const rp = await startServer('rprimary', 'rootpass-rp', `[forwarding]\nupstreams = ["127.0.0.1:${pport}"]\nallowed_clients = ["127.0.0.0/8"]\n[dnssec]\nrollover_check_secs = 1\nrollover_max_wait_secs = 2\nparent_port = ${pport}\n`);
+  const rpApi = await apiLogin(rp, 'root', 'rootpass-rp');
+  await rpApi('POST', '/zones', { name: 'roll.test' });
+  for (const [n, t, v] of [['@', 'NS', 'ns1.roll.test.'], ['ns1', 'A', '127.0.0.1'], ['www', 'A', '192.0.2.80']]) await rpApi('POST', '/zones/roll.test/records', { name: n, type: t, value: v });
+  const on = (await rpApi('PUT', '/zones/roll.test/dnssec', { enabled: true })).json;
+  const dsOf = r => r.record.split(' IN DS ')[1];
+  const oldDsId = await prec('roll', 'DS', dsOf(on.ds.find(d => d.recommended)));
+  const repl = (await rpApi('POST', '/tokens', { name: 'repl' })).json.token;
+  const rs = await startServer('rstandby', 'rootpass-rs', `[follow]\nprimary = "${rp.url}"\ninstance_id = "dns2"\ntoken = "${repl}"\nreconcile_interval_secs = 2\ntimeout_secs = 5\n`);
+
+  const pg = await b.page('rollover@primary');
+  await pg.signIn(rp, 'root', 'rootpass-rp');
+  const openTab = async (page) => {
+    await page.route('#/zones/roll.test', `return !!document.querySelector('[data-panel=dnssec]')`);
+    await page.eval(`document.querySelector('[data-panel=dnssec]').click(); return true`);
+    await page.wait('DNSSEC tab with the rollover section', `return !!document.querySelector('#sec-roll')`);
+  };
+  const text = page => page.eval(`return document.querySelector('#sec-roll')?.textContent || ''`);
+  await openTab(pg);
+  await pg.click('#roll-start');
+  await pg.wait('confirm', `return !!document.querySelector('#cf-ok')`);
+  await pg.click('#cf-ok');
+  await pg.wait('step 1 shown', `return (document.querySelector('#sec-roll')?.textContent || '').includes('1. New key published')`);
+  ok('rollover: started from the console', (await rpApi('GET', '/zones/roll.test/dnssec/rollover')).json.stage === 'prepublish');
+  const early = await pg.eval(`const b = document.querySelector('#roll-added'); return b ? { disabled: b.disabled, title: b.title, text: document.querySelector('#sec-roll').textContent } : null`);
+  ok('rollover: "I\'ve added it" waits for the DNSKEY TTL', early && (!early.text.includes('Wait ') || (early.disabled && /DNSKEY TTL/.test(early.title))), JSON.stringify(early).slice(0, 300));
+  await shot(pg, 'rollover-1-prepublish');
+  await pg.wait('the new DS to add is shown', `return (document.querySelector('#sec-roll')?.textContent || '').includes('ADD this DS') && !document.querySelector('#roll-added').disabled`, 15000);
+  await shot(pg, 'rollover-2-add-ds');
+  const r1 = (await rpApi('GET', '/zones/roll.test/dnssec/rollover')).json;
+  const shown = await text(pg);
+  const nd = r1.new_key.ds.find(d => d.recommended);
+  ok('rollover: every DS field shown with the record', shown.includes(nd.digest) && shown.includes(String(nd.key_tag)) && shown.includes('do not remove the old DS'), shown.slice(0, 300));
+
+  // The standby: same stage, read-only.
+  const sp = await b.page('rollover@standby');
+  await sp.signIn(rs, 'root', 'rootpass-rs');
+  await waitUntil('standby has the rollover', async () => (await (await apiLogin(rs, 'root', 'rootpass-rs'))('GET', '/zones/roll.test/dnssec/rollover')).json?.stage === 'prepublish', 20000);
+  await openTab(sp);
+  const sv = await sp.eval(`return { text: document.querySelector('#sec-roll').textContent, buttons: [...document.querySelectorAll('#sec-roll [id^=roll-]')].map(b => b.id) }`);
+  ok('rollover: the standby shows the stage, no wizard buttons', sv.text.includes('New key published') && sv.text.includes('the primary runs the wizard') && sv.buttons.length === 0, JSON.stringify(sv).slice(0, 300));
+
+  // A mistyped DS at the "registrar": the console names the field.
+  const bad = nd.digest.slice(0, -1) + (nd.digest.endsWith('0') ? '1' : '0');
+  const badId = await prec('roll', 'DS', `${nd.key_tag} 13 2 ${bad}`);
+  await pg.click('#roll-added');
+  await pg.wait('the mistyped DS is reported', `return [...document.querySelectorAll('#sec-roll .badge.bad')].some(e => e.textContent === 'matches neither key')`, 20000);
+  const mt = await text(pg);
+  ok('rollover: mistyped DS names the differing field', mt.includes('differs: digest'), mt.slice(mt.indexOf('Parent server')));
+  await parApi('DELETE', `/zones/test/records/${badId}`);
+  await prec('roll', 'DS', dsOf(nd));
+  await pg.wait('switched: the old DS to delete is shown', `return (document.querySelector('#sec-roll')?.textContent || '').includes('DELETE this DS')`, 30000);
+  await shot(pg, 'rollover-4-switched');
+  const t4 = await text(pg);
+  ok('rollover: after the switch the self-check passed and cancel is gone', t4.includes('Self-check after the switch') && !(await pg.eval(`return !!document.querySelector('#roll-cancel')`)), t4.slice(0, 300));
+  await parApi('DELETE', `/zones/test/records/${oldDsId}`);
+  await pg.wait('done: back to "Start key rollover"', `return !!document.querySelector('#roll-start')`, 30000);
+  const fin = (await rpApi('GET', '/zones/roll.test/dnssec')).json;
+  ok('rollover: done, the new key signs', fin.key.key_tag === nd.key_tag, JSON.stringify(fin.key));
+  return [pg, sp];
 }
 
 main().then(() => {

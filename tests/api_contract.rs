@@ -682,6 +682,9 @@ password = "rootpass123"
 level = "warn"
 [backup]
 dir = ""
+# N1: the rollover's waits capped (test hook) so the flow can go through it.
+[dnssec]
+rollover_max_wait_secs = 1
 {extra}
 "#,
         db = dir.join("test.db").display()
@@ -1310,6 +1313,64 @@ fn live_api_matches_spec() {
         c.failures
             .push(format!("DNSSEC self-check did not pass: {}", r.text));
     }
+    // N1: a key rollover: start, the new DS reported added (after the
+    // capped DNSKEY wait), cancel before the switch; signing cannot be
+    // turned off while one runs.
+    let r = c.call(
+        Auth::Session(&root),
+        "post",
+        "/zones/{zone}/dnssec/rollover",
+        &[],
+        "",
+        Body::None,
+    );
+    c.expect("start a key rollover", &r, 200);
+    let r = c.call(
+        Auth::Session(&root),
+        "post",
+        "/zones/{zone}/dnssec/rollover",
+        &[],
+        "",
+        Body::None,
+    );
+    c.expect("a second rollover at once", &r, 409);
+    let r = c.call(
+        Auth::Session(&root),
+        "put",
+        "/zones/{zone}/dnssec",
+        &[],
+        "",
+        Body::Json(&json!({ "enabled": false, "force": true })),
+    );
+    c.expect("turning DNSSEC off during a rollover", &r, 409);
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let r = c.call(
+        Auth::Session(&root),
+        "post",
+        "/zones/{zone}/dnssec/rollover/ds-added",
+        &[],
+        "",
+        Body::None,
+    );
+    c.expect("the new DS reported added", &r, 200);
+    let r = c.call(
+        Auth::Session(&root),
+        "post",
+        "/zones/{zone}/dnssec/rollover/cancel",
+        &[],
+        "",
+        Body::None,
+    );
+    c.expect("cancel a rollover before the switch", &r, 200);
+    let r = c.call(
+        Auth::Session(&root),
+        "post",
+        "/zones/{zone}/dnssec/rollover/cancel",
+        &[],
+        "",
+        Body::None,
+    );
+    c.expect("cancel without a rollover", &r, 409);
     let r = c.call(
         Auth::Session(&root),
         "put",

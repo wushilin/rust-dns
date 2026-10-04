@@ -35,7 +35,7 @@ mod tx;
 // The module's public names, as before the split (some are named only by
 // tests or through other items' signatures).
 #[allow(unused_imports)]
-pub use dnssec_ops::DnssecChange;
+pub use dnssec_ops::{DnssecChange, RolloverStep};
 pub use gate::WriteGate;
 #[allow(unused_imports)]
 pub use import_export::{

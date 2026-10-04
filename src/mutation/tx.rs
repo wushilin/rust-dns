@@ -798,6 +798,12 @@ impl<'a> Tx<'a> {
         Ok(())
     }
 
+    /// The zone's published data changed without a record or zone row
+    /// change (N1: its DNSKEY RRset): the serial is bumped at commit.
+    pub fn touch_zone(&mut self, zone: &Zone) {
+        self.touched.insert(zone.id, zone.name.clone());
+    }
+
     /// Re-sign: record why; at commit the serial is bumped and the signing
     /// epoch moves to the commit time (a new signature window).
     pub fn resign_zone(&mut self, zone: &Zone, key_tag: u16) -> MResult<()> {
@@ -1572,6 +1578,52 @@ mod tests {
             "the sequence should include rejected operations (rollbacks)"
         );
         assert!(!s.list_zones().unwrap().is_empty());
+
+        // N1: a whole key rollover (every stage is a `dnssec_key_set` of
+        // the row, with the other key inside) and a cancelled one.
+        {
+            let mut cfg = m.signer.config();
+            cfg.rollover_max_wait_secs = 1;
+            m.signer.set_config(cfg);
+            m.create_zone(actor(), zone_input("rr.test"), None)
+                .await
+                .unwrap();
+            m.set_dnssec(actor(), "rr.test", true, false).await.unwrap();
+            m.rollover_start(actor(), "rr.test").await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+            m.rollover_ds_added(actor(), "rr.test").await.unwrap();
+            assert!(m
+                .rollover_step("rr.test", RolloverStep::ParentOk { ds_ttl: 3600 })
+                .await
+                .unwrap());
+            assert!(
+                !m.rollover_step("rr.test", RolloverStep::Switch)
+                    .await
+                    .unwrap(),
+                "wait first"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+            assert!(m
+                .rollover_step("rr.test", RolloverStep::Switch)
+                .await
+                .unwrap());
+            assert!(
+                m.rollover_cancel(actor(), "rr.test").await.is_err(),
+                "no cancel after the switch"
+            );
+            assert!(m
+                .rollover_step("rr.test", RolloverStep::ParentOk { ds_ttl: 3600 })
+                .await
+                .unwrap());
+            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+            assert!(m
+                .rollover_step("rr.test", RolloverStep::Finish)
+                .await
+                .unwrap());
+            m.rollover_start(actor(), "rr.test").await.unwrap();
+            m.rollover_cancel(actor(), "rr.test").await.unwrap();
+            m.rollover_start(actor(), "rr.test").await.unwrap(); // left running
+        }
 
         // Replay the whole changelog into an empty database.
         let target = Storage::open_memory().unwrap();

@@ -141,7 +141,7 @@ pub async fn status(
     operation_id = "get_replication_snapshot",
     params(
         ("X-Rust-DNS-Instance" = String, Header, description = "The standby's `[follow].instance_id` (a-z, 0-9, '-'; 1-63). Required.", example = "dns2"),
-        ("X-Rust-DNS-Version" = Option<String>, Header, description = "The standby's rust-dns version.", example = "0.1.0"),
+        ("X-Rust-DNS-Version" = Option<String>, Header, description = "The standby's rust-dns version, with what it can follow as build metadata (`+dnssec-rollover`).", example = "0.1.0+dnssec-rollover"),
         ("X-Rust-DNS-Session" = Option<String>, Header, description = "Random per standby process (detects two processes with one instance id).", example = "k3v9x2m1q8p0"),
     ),
     summary = "Consistent copy of all replicated data (admin, contains secrets)",
@@ -196,7 +196,7 @@ pub struct ChangesQuery {
     params(
         ChangesQuery,
         ("X-Rust-DNS-Instance" = String, Header, description = "The standby's `[follow].instance_id` (a-z, 0-9, '-'; 1-63). Required.", example = "dns2"),
-        ("X-Rust-DNS-Version" = Option<String>, Header, description = "The standby's rust-dns version.", example = "0.1.0"),
+        ("X-Rust-DNS-Version" = Option<String>, Header, description = "The standby's rust-dns version, with what it can follow as build metadata (`+dnssec-rollover`).", example = "0.1.0+dnssec-rollover"),
         ("X-Rust-DNS-Session" = Option<String>, Header, description = "Random per standby process (detects two processes with one instance id).", example = "k3v9x2m1q8p0"),
     ),
     responses(
@@ -307,7 +307,7 @@ pub struct ChecksumQuery {
     params(
         ChecksumQuery,
         ("X-Rust-DNS-Instance" = String, Header, description = "The standby's `[follow].instance_id` (a-z, 0-9, '-'; 1-63). Required.", example = "dns2"),
-        ("X-Rust-DNS-Version" = Option<String>, Header, description = "The standby's rust-dns version.", example = "0.1.0"),
+        ("X-Rust-DNS-Version" = Option<String>, Header, description = "The standby's rust-dns version, with what it can follow as build metadata (`+dnssec-rollover`).", example = "0.1.0+dnssec-rollover"),
         ("X-Rust-DNS-Session" = Option<String>, Header, description = "Random per standby process (detects two processes with one instance id).", example = "k3v9x2m1q8p0"),
     ),
     responses(
@@ -462,7 +462,7 @@ pub async fn forget_replica(
     params(
         ReplicaPath,
         ("X-Rust-DNS-Instance" = String, Header, description = "The standby's `[follow].instance_id`; must equal `id`.", example = "dns2"),
-        ("X-Rust-DNS-Version" = Option<String>, Header, description = "The standby's rust-dns version.", example = "0.1.0"),
+        ("X-Rust-DNS-Version" = Option<String>, Header, description = "The standby's rust-dns version, with what it can follow as build metadata (`+dnssec-rollover`).", example = "0.1.0+dnssec-rollover"),
         ("X-Rust-DNS-Session" = Option<String>, Header, description = "Random per standby process.", example = "k3v9x2m1q8p0"),
     ),
     request_body(content = ReplicaReport, example = json!({ "state": "halted", "reason": "diverged", "detail": "reconcile at offset 1834 found data that differs from the primary: table users: differs (3 rows here, 3 on the primary)" })),

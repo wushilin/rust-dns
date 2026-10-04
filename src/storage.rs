@@ -204,7 +204,10 @@ CREATE TABLE IF NOT EXISTS dnssec_keys (
     key_tag     INTEGER NOT NULL,
     public_key  TEXT NOT NULL,
     private_key TEXT NOT NULL,
-    created_at  TEXT NOT NULL
+    created_at  TEXT NOT NULL,
+    -- N1: a key rollover in progress (JSON of replication::types::Rollover,
+    -- with the other key's private key); NULL otherwise.
+    rollover    TEXT
 );
 -- Replication (standby / follow mode) state: this database's history id and
 -- lineage, and standby bookkeeping. Written only by src/mutation/replica.rs
@@ -387,6 +390,14 @@ fn migrate(conn: &Connection) -> Result<()> {
     // is rewritten.
     if !zcols.is_empty() && !zcols.iter().any(|c| c == "override_spec") {
         conn.execute_batch("ALTER TABLE zones ADD COLUMN override_spec TEXT")?;
+    }
+    // N1: NULL for every existing key (no rollover); nothing rewritten.
+    let kcols: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('dnssec_keys')")?
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    if !kcols.is_empty() && !kcols.iter().any(|c| c == "rollover") {
+        conn.execute_batch("ALTER TABLE dnssec_keys ADD COLUMN rollover TEXT")?;
     }
     // M2: NULL for every existing zone (no policy); nothing rewritten.
     if !zcols.is_empty() && !zcols.iter().any(|c| c == "record_policy") {
@@ -858,6 +869,18 @@ impl Storage {
     }
 
     /// A zone's DNSSEC key (private key included: callers must not expose it).
+    /// N1: zones with a key rollover in progress.
+    pub fn rollover_zones(&self) -> Result<Vec<String>> {
+        self.with_read(|c| {
+            let mut stmt = c.prepare(
+                "SELECT z.name FROM dnssec_keys k JOIN zones z ON z.id = k.zone_id
+                 WHERE k.rollover IS NOT NULL ORDER BY z.name",
+            )?;
+            let rows = stmt.query_map([], |r| r.get(0))?;
+            Ok(rows.collect::<Result<Vec<String>, _>>()?)
+        })
+    }
+
     pub fn get_dnssec_key(
         &self,
         zone_id: i64,
@@ -1781,7 +1804,7 @@ fn row_to_tsig_key(r: &Row) -> rusqlite::Result<StoredTsigKey> {
 }
 
 const DNSSEC_KEY_COLS: &str =
-    "zone_id, zone, algorithm, flags, key_tag, public_key, private_key, created_at";
+    "zone_id, zone, algorithm, flags, key_tag, public_key, private_key, created_at, rollover";
 
 fn row_to_dnssec_key(r: &Row<'_>) -> rusqlite::Result<crate::replication::types::ReplDnssecKey> {
     Ok(crate::replication::types::ReplDnssecKey {
@@ -1793,6 +1816,19 @@ fn row_to_dnssec_key(r: &Row<'_>) -> rusqlite::Result<crate::replication::types:
         public_key: r.get(5)?,
         private_key: crate::replication::types::Hidden(r.get(6)?),
         created_at: r.get(7)?,
+        // An unreadable value is an error, never "no rollover".
+        rollover: r
+            .get::<_, Option<String>>(8)?
+            .map(|j| {
+                serde_json::from_str(&j).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        8,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })
+            })
+            .transpose()?,
     })
 }
 

@@ -9,6 +9,7 @@ pub mod openapi;
 pub mod proxy;
 pub mod replication;
 pub mod resolver;
+pub mod rollover;
 pub mod routes;
 pub mod session;
 pub mod settings;
@@ -368,6 +369,10 @@ fn api_router() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(dnssec::get_ds))
         .routes(routes!(dnssec::check_dnssec))
         .routes(routes!(dnssec::get_parent_ds))
+        .routes(routes!(rollover::get_rollover, rollover::start_rollover))
+        .routes(routes!(rollover::rollover_ds_added))
+        .routes(routes!(rollover::cancel_rollover))
+        .routes(routes!(rollover::check_rollover))
         .routes(routes!(routes::export_zone))
         .routes(routes!(routes::export_all))
         .routes(routes!(routes::import))

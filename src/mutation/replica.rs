@@ -1431,7 +1431,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn replication_never_logs_or_audits_secrets() {
-        let (ps, _pm, _pa) = populated_primary().await;
+        let (ps, pm, _pa) = populated_primary().await;
         let (ss, sm, _sa) = standby_node();
         let cap = Captured::default();
         let w = cap.clone();
@@ -1454,6 +1454,8 @@ mod tests {
             t.set_mfa(u.id, Some("ALICETOTPSECRET2"))
         })
         .unwrap();
+        // N1: a key rollover carries a second private key.
+        pm.rollover_start(actor(), "a.test").await.unwrap();
         tail(&ps, &ss, &sm).await;
         let logs = String::from_utf8(cap.0.lock().unwrap().clone()).unwrap();
         assert!(
@@ -1467,10 +1469,18 @@ mod tests {
         let audit = serde_json::to_string(&ss.audit_after(0, 1000).unwrap()).unwrap();
         let tsig_b64 = data_encoding::BASE64.encode(b"tsig-secret-bytes");
         let pz = ps.get_zone("a.test").unwrap().unwrap();
-        let dnssec_key = ps.get_dnssec_key(pz.id).unwrap().unwrap().private_key.0;
+        let stored = ps.get_dnssec_key(pz.id).unwrap().unwrap();
+        let dnssec_key = stored.private_key.0.clone();
+        let rollover_key = stored.rollover.as_ref().unwrap().key.private_key.0.clone();
+        assert_eq!(
+            ss.get_dnssec_key(pz.id).unwrap().unwrap(),
+            stored,
+            "replicated"
+        );
         assert!(!visible.contains("dnssec_key_set"));
         for secret in [
             dnssec_key.as_str(),
+            rollover_key.as_str(),
             "alice-hash",
             PRIMARY_ROOT_HASH,
             STANDBY_ROOT_HASH,

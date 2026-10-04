@@ -132,6 +132,7 @@ fn key() -> (ReplDnssecKey, KeyInfo) {
         public_key: data_encoding::BASE64.encode(&public),
         private_key: Hidden(PKCS8.into()),
         created_at: String::new(),
+        rollover: None,
     };
     let info = KeyInfo::from_stored(&stored).unwrap();
     (stored, info)

@@ -1365,7 +1365,11 @@ async function openZonePanel(tab) {
   markPanelChip();
   if (tab === 'dnssec' && (!S.dnssec || S.dnssec.zone !== z.name || S.dnssec.serial !== z.serial)) {
     const prev = S.dnssec && S.dnssec.zone === z.name ? S.dnssec : {};
-    try { const st = await GET(`/zones/${encodeURIComponent(z.name)}/dnssec`); S.dnssec = { zone: z.name, serial: z.serial, st, check: prev.check || null, parent: prev.parent || null }; }
+    try {
+      const st = await GET(`/zones/${encodeURIComponent(z.name)}/dnssec`);
+      const roll = st.enabled ? await GET(`/zones/${encodeURIComponent(z.name)}/dnssec/rollover`).catch(() => null) : null;
+      S.dnssec = { zone: z.name, serial: z.serial, st, roll, check: prev.check || null, parent: prev.parent || null };
+    }
     catch (e) { S.dnssec = { zone: z.name, serial: z.serial, err: e.message }; }
     if (S.panel && S.panel.zone === z.name && S.panel.tab === 'dnssec') openZonePanel('dnssec');
     return;
@@ -1512,9 +1516,52 @@ function dnssecHtml(z) {
           <div class="row" style="margin-top:6px"><button class="btn" id="sec-parent" data-ro-ok>Look up the DS at the parent</button></div><div id="sec-parent-out">${parentHtml(d.parent, st)}</div></li>
       </ol>` : `<h3>Is a DS published at the parent?</h3><p class="hint">With signing off the parent must not publish a DS for this zone.</p>
       <div class="row"><button class="btn" id="sec-parent" data-ro-ok>Look up the DS at the parent</button></div><div id="sec-parent-out">${parentHtml(d.parent, st)}</div>`}
+    ${st.enabled && d.roll ? `<h3>Key rollover</h3><div id="sec-roll">${rolloverHtml(z, d.roll, st)}</div>` : ''}
     ${owner && !st.standby ? `<h3>${st.enabled ? 'Turn signing off' : 'Turn signing on'}</h3>
-      <div class="row">${st.enabled ? `<button class="btn danger" id="sec-off" data-perm="edit_settings" data-zone="${esc(z.name)}">Turn off signing…</button>` : `<button class="btn primary" id="sec-on" data-perm="edit_settings" data-zone="${esc(z.name)}">Turn on signing…</button>`}</div>` : ''}
-    <p class="hint" style="margin-top:14px">Signed zones do not synthesize automatic PTR answers. To replace the key: remove the DS at the registrar, wait for its TTL, turn signing off, then on again with a new key (see the README).</p>`;
+      <div class="row">${st.enabled ? `<button class="btn danger" id="sec-off" data-perm="edit_settings" data-zone="${esc(z.name)}"${blockAttr(d.roll && d.roll.active && 'A key rollover is in progress: finish or cancel it first')}>Turn off signing…</button>` : `<button class="btn primary" id="sec-on" data-perm="edit_settings" data-zone="${esc(z.name)}">Turn on signing…</button>`}</div>` : ''}
+    <p class="hint" style="margin-top:14px">Signed zones do not synthesize automatic PTR answers. To replace the key, use the key rollover above: it never leaves the zone without a valid DS.</p>`;
+}
+// N1: the key rollover wizard (state and instructions come from the server).
+const ROLL_STEPS = [['prepublish', 'New key published'], ['add_new_ds', 'Add the new DS'], ['ds_check', 'Parent shows the new DS'], ['switched', 'New key signs; remove the old DS'], ['done', 'Old key retired']];
+function rolloverHtml(z, r, st) {
+  const left = s => s == null ? '' : s >= 86400 ? `${Math.floor(s / 86400)}d ${Math.floor(s % 86400 / 3600)}h` : s >= 3600 ? `${Math.floor(s / 3600)}h ${Math.floor(s % 3600 / 60)}m` : s >= 60 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${s}s`;
+  const instr = `<ol class="hint" style="padding-left:18px;line-height:1.6">${r.instructions.map(x => `<li style="list-style:none;margin-left:-18px">${esc(x)}</li>`).join('')}</ol>`;
+  if (!r.active) {
+    const why = r.blocked_by.length ? `Upgrade these standbys first: ${r.blocked_by.join(', ')}` : '';
+    return `${instr}${st.standby ? '' : `<div class="row"><button class="btn" id="roll-start" data-perm="edit_settings" data-zone="${esc(z.name)}"${blockAttr(why)}>Start key rollover…</button></div>`}`;
+  }
+  const cur = r.stage === 'switched' ? 3 : r.stage === 'ds_check' ? 2 : r.next === 'add_new_ds' ? 1 : 0;
+  const steps = `<div class="row" style="gap:6px;flex-wrap:wrap;margin:6px 0">${ROLL_STEPS.map(([, label], i) => `<span class="badge ${i < cur ? 'ok' : i === cur ? '' : 'muted'}">${i + 1}. ${esc(label)}</span>`).join('')}</div>`;
+  const wait = r.wait_remaining_secs > 0 ? `<div class="note info">${ico('info', 's')}<span>Waiting <b>${left(r.wait_remaining_secs)}</b> (until ${esc(fmtTime(r.wait_until))}).</span></div>` : '';
+  const dsBox = (k, what) => { const rec = k && k.ds.find(x => x.recommended); return rec ? `<div style="margin-top:8px"><div class="hint">${what}</div>${dsFields(rec)}${snip(rec.record, 'Copy DS record')}</div>` : ''; };
+  const newDs = r.new_key && (r.next === 'add_new_ds' || r.stage === 'ds_check') ? dsBox(r.new_key, `<b>ADD</b> this DS (key ${r.new_key.key_tag}) next to the old one — do not remove the old DS yet:`) : '';
+  const oldDs = r.old_key && r.next === 'remove_old_ds' ? dsBox(r.old_key, `<b>DELETE</b> this DS (the old key ${r.old_key.key_tag}); keep the new one:`) : '';
+  const servers = r.parent ? `<div class="tw" style="margin-top:8px"><table><thead><tr><th>Parent server (${esc(r.parent.parent)})</th><th>DS returned</th></tr></thead><tbody>${r.parent.servers.map(sv => `<tr><td><div class="mono">${esc(sv.ns)}</div><div class="hint">${esc(sv.address)}</div></td><td>${sv.error ? `<span class="badge bad">${esc(sv.error)}</span>` : sv.ds.length ? sv.ds.map(x => `<div><span class="badge ${x.matches === 'none' ? 'bad' : x.matches === 'new' ? 'ok' : 'muted'}">${x.matches === 'none' ? 'matches neither key' : x.matches + ' key'}</span> <span class="mono" style="font-size:12px">${x.key_tag} ${x.algorithm} ${x.digest_type} ${esc(x.digest.slice(0, 16))}…</span>${x.differs && x.differs.length ? `<div class="hint" style="color:var(--bad)">differs: ${esc(x.differs.join('; '))}</div>` : ''}</div>`).join('') : '<span class="hint">no DS</span>'}</td></tr>`).join('')}</tbody></table><div class="hint">Asked ${esc(fmtTime(r.parent.checked_at))}, without recursion, one by one.</div></div>` : '';
+  const perr = r.parent_error ? `<div class="note warn">${ico('warn', 's')}<span>${esc(r.parent_error)}</span></div>` : '';
+  const check = r.self_check ? `<div style="margin-top:8px"><div class="hint">Self-check after the switch:</div>${checkHtml(r.self_check)}</div>` : '';
+  const btns = st.standby ? '' : `<div class="row" style="margin-top:8px">
+      ${r.stage === 'prepublish' ? `<button class="btn primary" id="roll-added" data-perm="edit_settings" data-zone="${esc(z.name)}"${blockAttr(r.next !== 'add_new_ds' && `Wait for the DNSKEY TTL first (${left(r.wait_remaining_secs)})`)}>I've added it</button>` : ''}
+      ${r.stage !== 'prepublish' ? `<button class="btn" id="roll-check" data-perm="edit_settings" data-zone="${esc(z.name)}">Ask the parent now</button>` : ''}
+      ${r.can_cancel ? `<button class="btn danger" id="roll-cancel" data-perm="edit_settings" data-zone="${esc(z.name)}">Cancel rollover…</button>` : ''}</div>`;
+  const ro = st.standby ? `<div class="note info">${ico('servers', 's')}<span>Read-only standby: the primary runs the wizard (it asks the parent and switches keys); this server signs with the same key set.</span></div>` : '';
+  return `${steps}${ro}${instr}${wait}${newDs}${oldDs}${perr}${servers}${check}${btns}`;
+}
+function wireRollover(z) {
+  const zq = encodeURIComponent(z.name);
+  const redraw = r => { if (!S.dnssec || S.dnssec.zone !== z.name) return; S.dnssec.roll = r; const el = $('#sec-roll'); if (el) { el.innerHTML = rolloverHtml(z, r, S.dnssec.st); wireRollover(z); } };
+  const run = async (b, fn) => { b.disabled = true; try { redraw(await fn()); reloadZone(); } catch (e) { toast(e.message, 'err'); b.disabled = false; } };
+  if ($('#roll-added')) $('#roll-added').onclick = () => run($('#roll-added'), () => POST(`/zones/${zq}/dnssec/rollover/ds-added`));
+  if ($('#roll-check')) $('#roll-check').onclick = () => run($('#roll-check'), () => POST(`/zones/${zq}/dnssec/rollover/check`));
+  const st = $('#roll-start');
+  if (st) $('#roll-start').onclick = async () => { if (await confirmModal('Start a key rollover', `A new key is published next to key ${S.dnssec.st.key.key_tag} (which keeps signing). Then the wizard shows exactly when to add the new DS at your registrar, waits until every parent server has it, switches, and tells you which old DS to delete. You can cancel until the switch.`, 'Start rollover', st)) { try { redraw(await POST(`/zones/${zq}/dnssec/rollover`)); reloadZone(); } catch (e) { toast(e.message, 'err'); } } };
+  const cn = $('#roll-cancel');
+  if (cn) $('#roll-cancel').onclick = async () => { if (await confirmModal('Cancel the key rollover', 'The new key is dropped; the old one never stopped signing. If you already added the new DS at the registrar, remove it there.', 'Cancel rollover', cn)) { try { redraw(await POST(`/zones/${zq}/dnssec/rollover/cancel`)); reloadZone(); } catch (e) { toast(e.message, 'err'); } } };
+  // While a rollover runs and the tab is open, follow it.
+  clearTimeout(wireRollover.timer);
+  if (S.dnssec && S.dnssec.roll && S.dnssec.roll.active) wireRollover.timer = setTimeout(async () => {
+    if (!$('#sec-roll') || !S.dnssec || S.dnssec.zone !== z.name) return;
+    try { redraw(await GET(`/zones/${zq}/dnssec/rollover`)); } catch {}
+  }, 3000);
 }
 function wireDnssec(z, d) {
   const st = S.dnssec && S.dnssec.zone === z.name ? S.dnssec.st : null; if (!st) return;
@@ -1531,6 +1578,7 @@ function wireDnssec(z, d) {
     if ($('#sec-parent-out')) { $('#sec-parent-out').innerHTML = parentHtml(S.dnssec.parent, st); pb.disabled = false; }
   };
   if ($('#sec-on', d)) $('#sec-on', d).onclick = () => dnssecOnModal(z, st);
+  if ($('#sec-roll', d)) wireRollover(z);
   if ($('#sec-off', d)) $('#sec-off', d).onclick = () => dnssecOffModal(z);
 }
 async function afterDnssecChange(z, st) {

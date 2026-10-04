@@ -140,7 +140,13 @@ pub const TABLES: &[Table] = &[
     ),
     replicated("tsig_keys", "name", ("TSIG key", "TSIG keys")),
     // Written by DnssecKeySet / DnssecKeyDeleted (account class: secrets).
-    replicated("dnssec_keys", "zone_id", ("DNSSEC key", "DNSSEC keys")),
+    Table {
+        // N1: `rollover` counted only while a rollover runs, so a version
+        // without the column matches until then (and halts if one starts;
+        // the primary refuses to start one while such a standby follows).
+        optional_columns: &["rollover"],
+        ..replicated("dnssec_keys", "zone_id", ("DNSSEC key", "DNSSEC keys"))
+    },
     // Sign-in sessions exist on the server where the user signed in.
     local("sessions"),
     // Each server audits its own actions.
