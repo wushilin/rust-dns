@@ -39,14 +39,8 @@ fn csrf_of(a: &ureq::Agent) -> String {
 
 const ZONE: &str = "wushilin.test";
 
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let p = l.local_addr().unwrap().port();
-    if UdpSocket::bind(("127.0.0.1", p)).is_err() {
-        return free_port();
-    }
-    p
-}
+mod common;
+use common::free_port;
 
 fn long_dkim() -> String {
     format!(
@@ -242,24 +236,35 @@ impl Server {
         s
     }
 
+    /// Start (or restart) the server; `self.dns` moves when its port was
+    /// taken (O0a).
     fn start(&mut self) {
-        self.child = Some(
-            Command::new(env!("CARGO_BIN_EXE_rust-dns"))
+        for attempt in 0.. {
+            assert!(
+                attempt < 5,
+                "the server never came up with all its listeners"
+            );
+            let mut child = Command::new(env!("CARGO_BIN_EXE_rust-dns"))
                 .arg("--config")
                 .arg(self.dir.join("t.toml"))
                 .stdout(Stdio::null())
                 .stderr(Stdio::inherit())
                 .spawn()
-                .unwrap(),
-        );
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while ureq::get(&format!("{}/api/health", self.web))
-            .timeout(Duration::from_millis(300))
-            .call()
-            .is_err()
-        {
-            assert!(Instant::now() < deadline, "server did not start");
-            std::thread::sleep(Duration::from_millis(100));
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while ureq::get(&format!("{}/api/health", self.web))
+                .timeout(Duration::from_millis(300))
+                .call()
+                .is_err()
+            {
+                assert!(Instant::now() < deadline, "server did not start");
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            if common::came_up(&mut child, self.dns) {
+                self.child = Some(child);
+                break;
+            }
+            self.dns = common::move_dns_port(&self.dir.join("t.toml"), self.dns);
         }
         self.agent = ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(30))

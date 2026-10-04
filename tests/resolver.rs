@@ -26,14 +26,8 @@ fn csrf_of(a: &ureq::Agent) -> String {
         .unwrap_or_default()
 }
 
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let p = l.local_addr().unwrap().port();
-    if UdpSocket::bind(("127.0.0.1", p)).is_err() {
-        return free_port();
-    }
-    p
-}
+mod common;
+use common::free_port;
 
 /// A fake upstream resolver (UDP). It answers A with its own address
 /// `tag`, AAAA with 2001:db8::77, and by the first label of the name:
@@ -189,23 +183,37 @@ impl Server {
             ),
         )
         .unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_rust-dns"))
-            .arg("--config")
-            .arg(dir.join("t.toml"))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+        let mut dns = dns;
         let web = format!("http://127.0.0.1:{web_port}");
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while ureq::get(&format!("{web}/api/health"))
-            .timeout(Duration::from_millis(300))
-            .call()
-            .is_err()
-        {
-            assert!(Instant::now() < deadline, "server did not start");
-            std::thread::sleep(Duration::from_millis(100));
-        }
+        let mut attempts = 0;
+        let child = loop {
+            attempts += 1;
+            assert!(
+                attempts <= 5,
+                "the server never came up with all its listeners"
+            );
+            let mut child = Command::new(env!("CARGO_BIN_EXE_rust-dns"))
+                .arg("--config")
+                .arg(dir.join("t.toml"))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while ureq::get(&format!("{web}/api/health"))
+                .timeout(Duration::from_millis(300))
+                .call()
+                .is_err()
+            {
+                assert!(Instant::now() < deadline, "server did not start");
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            if common::came_up(&mut child, dns) {
+                break child;
+            }
+            // O0a: the DNS port was taken; move it.
+            dns = common::move_dns_port(&dir.join("t.toml"), dns);
+        };
         let a = ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(20))
             .build();

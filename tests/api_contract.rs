@@ -650,10 +650,8 @@ impl Drop for Server {
     }
 }
 
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
-}
+mod common;
+use common::free_port;
 
 fn start() -> Server {
     start_with("")

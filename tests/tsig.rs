@@ -27,13 +27,8 @@ fn csrf_of(a: &ureq::Agent) -> String {
 
 const ZONE: &str = "example.test";
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
+mod common;
+use common::free_port;
 
 fn rand_id() -> u16 {
     (std::time::SystemTime::now()
@@ -79,10 +74,26 @@ file = "{log}"
 struct Server {
     child: Child,
     dir: PathBuf,
+    /// The DNS port in use: the configured one, or another when it was
+    /// taken at start (O0a).
+    dns: u16,
 }
 
 impl Server {
-    fn start(dir: PathBuf, web_port: u16) -> Server {
+    /// The config in `dir` names `dns`; use `srv.dns` afterwards.
+    fn start(dir: PathBuf, web_port: u16, dns: u16) -> Server {
+        let mut dns = dns;
+        for _ in 0..5 {
+            let mut srv = Server::spawn(dir.clone(), web_port, dns);
+            if common::came_up(&mut srv.child, dns) {
+                return srv;
+            }
+            dns = common::move_dns_port(&dir.join("t.toml"), dns);
+        }
+        panic!("the server never came up with all its listeners");
+    }
+
+    fn spawn(dir: PathBuf, web_port: u16, dns: u16) -> Server {
         let child = Command::new(env!("CARGO_BIN_EXE_rust-dns"))
             .arg("--config")
             .arg(dir.join("t.toml"))
@@ -100,7 +111,7 @@ impl Server {
             assert!(Instant::now() < deadline, "server did not start");
             std::thread::sleep(Duration::from_millis(100));
         }
-        Server { child, dir }
+        Server { child, dir, dns }
     }
 
     fn log(&self) -> String {
@@ -246,7 +257,8 @@ fn tsig_keys_transfers_and_notify() {
         .unwrap();
     let notify_port = notify_sock.local_addr().unwrap().port();
     write_config(&dir, dns, web_port, notify_port, false);
-    let srv = Server::start(dir.clone(), web_port);
+    let srv = Server::start(dir.clone(), web_port, dns);
+    let dns = srv.dns;
     let web = format!("http://127.0.0.1:{web_port}");
     let root = login(&web, "root", "rootpass123");
     let keys = format!("{web}/api/tsig/keys");
@@ -734,7 +746,8 @@ fn bind_interop_with_tsig_replay_protection() {
     let named_bin = find_tool("named", false);
     let (dns, web_port, named_port) = (free_port(), free_port(), free_port());
     write_config(&dir, dns, web_port, named_port, false);
-    let srv = Server::start(dir.clone(), web_port);
+    let srv = Server::start(dir.clone(), web_port, dns);
+    let dns = srv.dns;
     let web = format!("http://127.0.0.1:{web_port}");
     let root = login(&web, "root", "rootpass123");
     let (s, k) = call(

@@ -462,8 +462,7 @@ pub fn router(state: Arc<AppState>) -> Router {
                 .layer(middleware::from_fn_with_state(
                     state.clone(),
                     read_only_guard,
-                ))
-                .layer(middleware::from_fn(read_body_first)),
+                )),
         )
         .merge(root);
     if state.cfg.web_console.enabled {
@@ -474,10 +473,14 @@ pub fn router(state: Arc<AppState>) -> Router {
             .route("/docs/swagger-ui-bundle.js", get(swagger_js))
             .route("/docs/swagger-ui.css", get(swagger_css));
     }
+    // `read_body_first` wraps everything, the fallback (404) and the 405 of
+    // root and console routes included: an early answer anywhere resets
+    // the connection under load (O0b).
     app.layer(middleware::from_fn_with_state(
         state.clone(),
         client_ip_layer,
     ))
+    .layer(middleware::from_fn(read_body_first))
     .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY))
     .with_state(state)
 }

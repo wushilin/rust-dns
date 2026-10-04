@@ -21,13 +21,8 @@ fn csrf_of(a: &ureq::Agent) -> String {
 
 const ANSWER: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 77);
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
+mod common;
+use common::free_port;
 
 /// How a [`fake_upstream_with`] resolver behaves.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -183,7 +178,39 @@ impl Server {
     }
 
     /// `forwarding`: the body of `[forwarding]`.
+    /// The DNS port is changed when the server could not bind it (O0a,
+    /// [`common::dns_listening`]); use `srv.dns`.
     fn start_with(dir: PathBuf, dns: u16, web_port: u16, forwarding: &str) -> Server {
+        let (mut dns, mut web_port) = (dns, web_port);
+        for attempt in 0.. {
+            assert!(
+                attempt < 5,
+                "the server never came up with all its listeners"
+            );
+            let Some(mut srv) = Server::spawn(&dir, dns, web_port, forwarding) else {
+                eprintln!("web port {web_port} could not be bound; starting again on another");
+                (dns, web_port) = (free_port(), free_port());
+                continue;
+            };
+            let listening = common::dns_listening(srv.dns, Duration::from_secs(5));
+            if matches!(srv.child.try_wait(), Ok(Some(_))) {
+                // Exited: the health check reached another process.
+                eprintln!("the server exited at start; starting again on other ports");
+                (dns, web_port) = (free_port(), free_port());
+                continue;
+            }
+            if listening {
+                return srv;
+            }
+            eprintln!("DNS port {dns} could not be bound; starting again on another");
+            drop(srv);
+            dns = free_port();
+        }
+        unreachable!()
+    }
+
+    /// `None`: the server exited before it answered (a port was taken).
+    fn spawn(dir: &std::path::Path, dns: u16, web_port: u16, forwarding: &str) -> Option<Server> {
         let cfg = format!(
             r#"
 [server]
@@ -216,6 +243,7 @@ level = "warn"
             .stderr(Stdio::inherit())
             .spawn()
             .unwrap();
+        let mut child = child;
         let web = format!("http://127.0.0.1:{web_port}");
         let deadline = Instant::now() + Duration::from_secs(15);
         while ureq::get(&format!("{web}/api/health"))
@@ -223,10 +251,13 @@ level = "warn"
             .call()
             .is_err()
         {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return None;
+            }
             assert!(Instant::now() < deadline, "server did not start");
             std::thread::sleep(Duration::from_millis(100));
         }
-        Server { child, dns, web }
+        Some(Server { child, dns, web })
     }
 }
 
@@ -413,6 +444,7 @@ fn forwarding_is_managed_through_the_api() {
     );
 
     // The override survives a restart (stored in the database, not the process).
+    let dns = srv.dns;
     drop(srv);
     srv = Server::start(dir.clone(), dns, web_port);
     assert!(

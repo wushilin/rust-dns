@@ -28,15 +28,8 @@ fn csrf_of(a: &ureq::Agent) -> String {
         .unwrap_or_default()
 }
 
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let p = l.local_addr().unwrap().port();
-    // Also free for UDP (DNS listens on both).
-    if UdpSocket::bind(("127.0.0.1", p)).is_err() {
-        return free_port();
-    }
-    p
-}
+mod common;
+use common::free_port;
 
 struct Node {
     name: &'static str,
@@ -109,29 +102,41 @@ dir = ""
         std::fs::write(self.config_path(), cfg).unwrap();
     }
 
+    /// Start the node; `self.dns` moves when its port was taken (O0a).
     fn start(&mut self) {
         assert!(self.child.is_none());
-        let child = Command::new(&self.bin)
-            .arg("--config")
-            .arg(self.config_path())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn rust-dns");
-        self.child = Some(child);
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while ureq::get(&format!("{}/api/health", self.url()))
-            .timeout(Duration::from_millis(500))
-            .call()
-            .is_err()
-        {
+        for attempt in 0.. {
             assert!(
-                Instant::now() < deadline,
-                "{} did not come up; log:\n{}",
-                self.name,
-                self.log()
+                attempt < 5,
+                "{} never came up with all its listeners",
+                self.name
             );
-            std::thread::sleep(Duration::from_millis(100));
+            let mut child = Command::new(&self.bin)
+                .arg("--config")
+                .arg(self.config_path())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn rust-dns");
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while ureq::get(&format!("{}/api/health", self.url()))
+                .timeout(Duration::from_millis(500))
+                .call()
+                .is_err()
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "{} did not come up; log:\n{}",
+                    self.name,
+                    self.log()
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            if common::came_up(&mut child, self.dns) {
+                self.child = Some(child);
+                return;
+            }
+            self.dns = common::move_dns_port(&self.config_path(), self.dns);
         }
     }
 

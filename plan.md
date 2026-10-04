@@ -6,7 +6,9 @@ every step must keep answers and signatures valid; nothing here is deployed
 until the whole plan has passed the gate.
 
 Gate: `cargo fmt --check`, `cargo clippy --all-targets -D warnings`,
-`REQUIRE_BIND_TOOLS=1 cargo test -- --test-threads=1`, UI duration test,
+`REQUIRE_BIND_TOOLS=1 REQUIRE_PREV_BIN=1 RUST_DNS_PREV_BIN=<prev> cargo test
+--no-fail-fast -- --test-threads=1` (for each previous binary; `--no-fail-fast`
+so one failing suite does not hide later ones), UI duration test,
 OpenAPI snapshot + validator, conformance (123), smoke-release, cargo-audit.
 
 ## Phase A: small correctness fixes
@@ -764,6 +766,33 @@ only through the Caller; K2 console rules). Defaults never change live
 answers: every new protocol feature is OFF until configured. Nothing is
 deployed by this phase; the live zone (wushilin.net) is never switched to a
 new DNSSEC mode by it.
+
+Group 0: failures found by the Group 2 checkpoint gate (a6e2f6e)
+- [x] O0a. `forwarding::tcp_fallback_answers_are_truncated_for_udp_clients`
+  timed out (5 s) waiting for its UDP answer under load. Root cause: test
+  side. The suites picked the DNS port with a TCP-only (or check-then-use)
+  `free_port()`; when another process held (or took, before the server
+  bound it) the UDP port, the server logged `cannot bind UDP ... Address
+  already in use` to its stdout (discarded by the suites) and kept running
+  with TCP and the web console, so the health check passed and every UDP
+  query went to the other socket: no answer (5 s timeout), or the other
+  process's answer (`TC=1` assertion). The server's behaviour (one
+  listener failing is logged, the others serve) is unchanged. Fix: shared
+  `tests/common/mod.rs`: `free_port()` checks TCP and UDP and never gives
+  5353, and every suite's server start checks `came_up` (still running,
+  and a CHAOS `version.bind` probe answered with its own ID over UDP plus
+  a TCP connect) and starts again on another DNS port (or other ports when
+  the server exited because the web port was taken) when not.
+- [x] O0b. `e2e::json_import_and_record_paging` lost the answer of the
+  POST to the removed `/api/zones/imp.test/import-bind` under load. Root
+  cause: a server bug of the G2 class. `read_body_first` wrapped only the
+  matched routes of the nested `/api` router, so the 404 of unknown paths
+  (under `/api` and outside it) and the 405 of root and console routes
+  (`/metrics`, `/`, `/docs`) were answered as soon as the headers arrived;
+  when the body's segment came after the answer, the connection was reset
+  and the client lost the answer (`Transport(Io, "Error encountered in a
+  header", EINVAL)`, the G2 signature). Fix: `read_body_first` is now the
+  outermost layer of the whole app (fallback included).
 
 Group 1: security and accounts
 - [x] O1. Revoke a user's API tokens on password change (option, default
@@ -1786,3 +1815,26 @@ Final
   browser flows "O12: sorting by name, both directions", "O12: \"/\"
   focuses the filter", "O12: \"?\" lists the shortcuts" (and `n` opens
   the record dialog).
+- 2026-10-04 (phase O): O0a/O0b, the two failures of the Group 2 gate
+  (each passed alone, failed once in a full serial run). Reproduced with
+  `phaseo/stress.sh` (both tests in a loop while the resolver, hardening,
+  forwarding and e2e suites ran in parallel, 4 threads each), a6e2f6e
+  binaries: in ~15 minutes `json_import_and_record_paging` failed 5 of 231
+  runs, every time `Transport(Io, "Error encountered in a header", Os 22
+  EINVAL)` on the POST to the removed `import-bind` route (once as ureq's
+  panic "returning stream to pool: EINVAL", same reset), and the forwarding
+  test failed 10 of ~1,400 runs (5 s timeout, or `TC=1` missing). A
+  headers-only probe (`phaseo/early2.py`) showed the cause of the first:
+  `POST /api/zones/x/import-bind`, `POST /api/no-such`, `POST /nope`,
+  `POST /metrics`, `POST /`, `POST /docs` were answered before their body
+  was sent (the routes matched by the nested API router waited). With the
+  server's stdout kept (instrumented copy of the suite, `RUST_LOG=debug`),
+  every one of the 8 instrumented forwarding failures had `ERROR cannot bind
+  UDP addr=127.0.0.1:<port> error=Address already in use` at start. Fixes
+  as described in O0a / O0b. Tests: `e2e::early_answers_on_unknown_routes_
+  and_wrong_methods_reach_the_client` (headers alone get no answer on
+  each of those paths, then 8 threads x 120 requests with bodies, one
+  connection each, none lost; fails on a6e2f6e at the first path), the
+  existing `early_answers_reach_the_client_and_large_bodies_are_refused`,
+  and every suite now starting through `common::came_up`. The same stress
+  run on the fixed commit: see the next Log line.

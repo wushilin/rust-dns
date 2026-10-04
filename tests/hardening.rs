@@ -16,13 +16,8 @@ fn csrf_of(a: &ureq::Agent) -> String {
         .unwrap_or_default()
 }
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
+mod common;
+use common::free_port;
 
 fn tempdir(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!(
@@ -46,6 +41,16 @@ impl Server {
     /// `server_extra` goes into `[server]`, `web_extra` into
     /// `[web_console]`, `tail` after everything (whole sections).
     fn start(tag: &str, server_extra: &str, web_extra: &str, tail: &str) -> Server {
+        for _ in 0..5 {
+            if let Some(s) = Server::try_start(tag, server_extra, web_extra, tail) {
+                return s;
+            }
+        }
+        panic!("the server never came up with all its listeners");
+    }
+
+    /// `None`: a port was taken (O0a); start again.
+    fn try_start(tag: &str, server_extra: &str, web_extra: &str, tail: &str) -> Option<Server> {
         let dir = tempdir(tag);
         let dns = free_port();
         let web_port = free_port();
@@ -84,6 +89,7 @@ level = "warn"
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
+        let mut child = child;
         let web = format!("http://127.0.0.1:{web_port}");
         let deadline = Instant::now() + Duration::from_secs(20);
         while ureq::get(&format!("{web}/api/health"))
@@ -91,15 +97,21 @@ level = "warn"
             .call()
             .is_err()
         {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return None;
+            }
             assert!(Instant::now() < deadline, "server did not start");
             std::thread::sleep(Duration::from_millis(100));
         }
-        Server {
+        if !common::came_up(&mut child, dns) {
+            return None;
+        }
+        Some(Server {
             child,
             dns,
             web,
             dir,
-        }
+        })
     }
 }
 

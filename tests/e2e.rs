@@ -58,12 +58,20 @@ mod tempdir {
     }
 }
 
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
-}
+mod common;
+use common::free_port;
 
 fn start() -> Server {
+    for _ in 0..5 {
+        if let Some(s) = try_start() {
+            return s;
+        }
+    }
+    panic!("the server never came up with all its listeners");
+}
+
+/// `None`: a port was taken (O0a); start again.
+fn try_start() -> Option<Server> {
     let dir = tempdir::TempDir::new();
     let dns_port = free_port();
     let web_port = free_port();
@@ -104,6 +112,7 @@ dir = ""
         .stderr(Stdio::inherit())
         .spawn()
         .expect("spawn rust-dns");
+    let mut child = child;
     let web = format!("http://127.0.0.1:{web_port}");
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
@@ -114,15 +123,21 @@ dir = ""
         {
             break;
         }
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return None;
+        }
         assert!(Instant::now() < deadline, "server did not come up");
         std::thread::sleep(Duration::from_millis(100));
     }
-    Server {
+    if !common::came_up(&mut child, dns_port) {
+        return None;
+    }
+    Some(Server {
         child,
         dns_port,
         web,
         _dir: dir,
-    }
+    })
 }
 
 fn agent() -> ureq::Agent {
@@ -958,7 +973,7 @@ fn json_import_and_record_paging() {
         .send_string("$INCLUDE /etc/passwd\n");
     assert!(
         matches!(gone, Err(ureq::Error::Status(404 | 405, _))),
-        "import-bind is gone"
+        "import-bind is gone: {gone:?}"
     );
     assert!(matches!(
         a.get(&format!("{web}/api/zones/imp.test/export?format=bind"))
@@ -1312,6 +1327,96 @@ fn early_answers_reach_the_client_and_large_bodies_are_refused() {
         }
         other => panic!("expected 413, got {other:?}"),
     }
+}
+
+/// O0b: the 404 of unknown paths (under `/api` and outside it) and the
+/// 405 of root and console routes were answered before the body was read
+/// (`read_body_first` wrapped only the matched API routes), with the same
+/// effect as G2: under load the client sometimes lost the answer (`EINVAL`
+/// while reading its headers; seen on `json_import_and_record_paging`).
+/// Now nothing answers before the whole body is in: headers alone get no
+/// answer, and concurrent requests on every such path all arrive.
+#[test]
+fn early_answers_on_unknown_routes_and_wrong_methods_reach_the_client() {
+    use std::io::{Read, Write};
+    let srv = start();
+    let addr = srv.web.trim_start_matches("http://").to_string();
+    let paths = [
+        ("POST", "/api/zones/imp.test/import-bind", 404),
+        ("POST", "/api/no-such-thing", 404),
+        ("POST", "/no-such-page", 404),
+        ("POST", "/metrics", 405),
+        ("POST", "/", 405),
+        ("PUT", "/docs", 405),
+    ];
+    let body = "$INCLUDE /etc/passwd\n";
+    for (method, path, _) in paths {
+        // Headers only: the server must wait for the body.
+        let mut c = std::net::TcpStream::connect(&addr).unwrap();
+        c.set_read_timeout(Some(Duration::from_millis(400)))
+            .unwrap();
+        write!(
+            c,
+            "{method} {path} HTTP/1.1\r\nHost: x\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        let mut buf = [0u8; 256];
+        match c.read(&mut buf) {
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            other => panic!(
+                "{method} {path} answered before its body was sent: {:?}",
+                other.map(|n| String::from_utf8_lossy(&buf[..n]).to_string())
+            ),
+        }
+        // The body completes the request, which is then answered.
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c.write_all(body.as_bytes()).unwrap();
+        let n = c.read(&mut buf).unwrap();
+        assert!(
+            String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 4"),
+            "{method} {path}"
+        );
+    }
+    // Hammer: every path, from several threads, one connection per request.
+    let lost = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let threads: Vec<_> = (0..8)
+        .map(|t| {
+            let web = srv.web.clone();
+            let lost = lost.clone();
+            std::thread::spawn(move || {
+                let a = ureq::AgentBuilder::new()
+                    .timeout(Duration::from_secs(10))
+                    .max_idle_connections(0)
+                    .build();
+                for i in 0..120 {
+                    let (method, path, status) = paths[(i + t) % paths.len()];
+                    match a
+                        .request(method, &format!("{web}{path}"))
+                        .set("Content-Type", "text/plain")
+                        .send_string(&format!("{body}{}", "x".repeat(i % 40 * 50)))
+                    {
+                        Err(ureq::Error::Status(s, r)) if s == status => {
+                            let _ = r.into_string();
+                        }
+                        other => lost
+                            .lock()
+                            .unwrap()
+                            .push(format!("{method} {path}: {other:?}")),
+                    }
+                }
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+    let lost = lost.lock().unwrap();
+    assert!(lost.is_empty(), "{} lost: {:?}", lost.len(), lost.first());
 }
 
 /// L2: what the console's account dialogs and "Sign this user out

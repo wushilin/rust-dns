@@ -18,7 +18,6 @@
 //! a previous release as standby blocking the start (mixed version).
 
 use serde_json::{json, Value};
-use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -32,15 +31,8 @@ fn csrf_of(a: &ureq::Agent) -> String {
         .unwrap_or_default()
 }
 
-fn free_port() -> u16 {
-    loop {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let p = l.local_addr().unwrap().port();
-        if p != 5353 && UdpSocket::bind(("127.0.0.1", p)).is_ok() {
-            return p;
-        }
-    }
-}
+mod common;
+use common::free_port;
 
 fn tool(name: &str) -> Option<PathBuf> {
     let mut dirs: Vec<PathBuf> = [
@@ -134,23 +126,35 @@ dir = ""
         )
         .unwrap();
     }
+    /// Start the node; `self.dns` moves when its port was taken (O0a).
     fn start(&mut self) {
-        let child = Command::new(&self.bin)
-            .arg("--config")
-            .arg(self.dir.join("rust-dns.toml"))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        self.child = Some(child);
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while ureq::get(&format!("{}/api/health", self.url()))
-            .timeout(Duration::from_millis(500))
-            .call()
-            .is_err()
-        {
-            assert!(Instant::now() < deadline, "{} did not start", self.name);
-            std::thread::sleep(Duration::from_millis(100));
+        for attempt in 0.. {
+            assert!(
+                attempt < 5,
+                "{} never came up with all its listeners",
+                self.name
+            );
+            let mut child = Command::new(&self.bin)
+                .arg("--config")
+                .arg(self.dir.join("rust-dns.toml"))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while ureq::get(&format!("{}/api/health", self.url()))
+                .timeout(Duration::from_millis(500))
+                .call()
+                .is_err()
+            {
+                assert!(Instant::now() < deadline, "{} did not start", self.name);
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            if common::came_up(&mut child, self.dns) {
+                self.child = Some(child);
+                return;
+            }
+            self.dns = common::move_dns_port(&self.dir.join("rust-dns.toml"), self.dns);
         }
     }
     fn stop(&mut self) {
