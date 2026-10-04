@@ -54,7 +54,10 @@ CREATE TABLE IF NOT EXISTS users (
     disabled_at      TEXT,
     created_at       TEXT NOT NULL,
     updated_at       TEXT NOT NULL,
-    totp_last_step   INTEGER
+    totp_last_step   INTEGER,
+    -- O6: JSON array of previous password hashes (password history
+    -- policy); NULL when none are kept.
+    password_history TEXT
 );
 CREATE TABLE IF NOT EXISTS sessions (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -372,6 +375,10 @@ fn migrate_users(conn: &Connection) -> Result<()> {
     if !cols.is_empty() && !cols.iter().any(|c| c == "totp_last_step") {
         conn.execute_batch("ALTER TABLE users ADD COLUMN totp_last_step INTEGER")?;
     }
+    // O6: NULL for every existing user (no history kept); nothing rewritten.
+    if !cols.is_empty() && !cols.iter().any(|c| c == "password_history") {
+        conn.execute_batch("ALTER TABLE users ADD COLUMN password_history TEXT")?;
+    }
     Ok(())
 }
 
@@ -649,6 +656,18 @@ impl Storage {
             c.execute(
                 "DELETE FROM login_failures WHERE scope = ?1 AND key = ?2",
                 params![scope, key],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// O6: every counter of `username` (account and networks).
+    pub fn delete_login_failures_of(&self, username: &str) -> Result<()> {
+        self.bookkeeping(|c| {
+            c.execute(
+                "DELETE FROM login_failures WHERE (scope = 'account' AND key = ?1)
+                    OR (scope = 'network' AND substr(key, 1, length(?1) + 1) = ?1 || char(9))",
+                params![username],
             )?;
             Ok(())
         })

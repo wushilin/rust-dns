@@ -69,6 +69,19 @@ impl<K: std::hash::Hash + Eq + Clone> Table<K> {
     }
 
     fn fail(&mut self, k: K, now: Instant, free: u32, cap: Duration) -> u32 {
+        self.fail_locking(k, now, free, cap, None)
+    }
+
+    /// `lockout` (O6): from this many failures on, the wait is at least
+    /// this long.
+    fn fail_locking(
+        &mut self,
+        k: K,
+        now: Instant,
+        free: u32,
+        cap: Duration,
+        lockout: Option<(u32, Duration)>,
+    ) -> u32 {
         if self.map.len() >= MAX_ENTRIES && !self.map.contains_key(&k) {
             self.shrink(now);
         }
@@ -83,6 +96,11 @@ impl<K: std::hash::Hash + Eq + Clone> Table<K> {
         f.count = f.count.saturating_add(1);
         f.last = now;
         f.blocked_until = now + backoff(f.count, free, cap);
+        if let Some((after, d)) = lockout {
+            if f.count >= after {
+                f.blocked_until = f.blocked_until.max(now + d);
+            }
+        }
         f.count
     }
 
@@ -250,11 +268,29 @@ impl AttemptGuard {
     }
 
     /// Record a failed password or code for `username` from `ip`.
+    #[cfg(test)]
     pub fn failure(&self, username: &str, ip: IpAddr) {
         self.failure_at(username, ip, Instant::now())
     }
 
+    #[cfg(test)]
     pub fn failure_at(&self, username: &str, ip: IpAddr, now: Instant) {
+        self.failure_locking_at(username, ip, now, None)
+    }
+
+    /// O6: a failure that also counts toward the account lockout
+    /// (`(failures, duration)`; `None`: back-off only).
+    pub fn failure_locking(&self, username: &str, ip: IpAddr, lockout: Option<(u32, Duration)>) {
+        self.failure_locking_at(username, ip, Instant::now(), lockout)
+    }
+
+    pub fn failure_locking_at(
+        &self,
+        username: &str,
+        ip: IpAddr,
+        now: Instant,
+        lockout: Option<(u32, Duration)>,
+    ) {
         let (free_client, free_account) = (self.free_client, self.free_account);
         let net = crate::ratelimit::client_key(ip);
         let (client, account, n) = {
@@ -262,11 +298,18 @@ impl AttemptGuard {
             let ck = (username.to_string(), net);
             g.per_client
                 .fail(ck.clone(), now, free_client, MAX_CLIENT_DELAY);
-            let n = g
-                .per_account
-                .fail(username.to_string(), now, free_account, MAX_ACCOUNT_DELAY);
+            let n = g.per_account.fail_locking(
+                username.to_string(),
+                now,
+                free_account,
+                MAX_ACCOUNT_DELAY,
+                lockout,
+            );
             (g.per_client.map[&ck], g.per_account.map[username], n)
         };
+        if lockout.is_some_and(|(after, _)| n == after) {
+            tracing::warn!(user = %username, failures = n, "account locked after repeated failed sign-ins");
+        }
         if n == free_account + 1 {
             tracing::warn!(user = %username, "repeated failed sign-ins for this account; slowing down attempts from every address");
         }
@@ -285,6 +328,19 @@ impl AttemptGuard {
         let had = self.lock().per_client.clear(&(username.to_string(), net));
         if let (true, Some(store)) = (had, self.store.get()) {
             let _ = store.delete_login_failure(SCOPE_NETWORK, &network_key(username, net));
+        }
+    }
+
+    /// O6: forget every counter of `username` (an administrator reset its
+    /// password or re-enabled it): lifts a lockout.
+    pub fn clear_account(&self, username: &str) {
+        {
+            let mut g = self.lock();
+            g.per_account.map.remove(username);
+            g.per_client.map.retain(|(u, _), _| u != username);
+        }
+        if let Some(store) = self.store.get() {
+            let _ = store.delete_login_failures_of(username);
         }
     }
 
@@ -424,6 +480,44 @@ mod tests {
         assert!(g3.wait("bob", ip).is_none());
         let cut = unix_ms_now() - FORGET_AFTER.as_millis() as i64;
         assert_eq!(storage.prune_login_failures(cut, unix_ms_now()).unwrap(), 1);
+    }
+
+    /// O6: with a lockout, the account waits the whole lockout once it has
+    /// that many failures (from any network), beyond the capped back-off;
+    /// clearing the account lifts it.
+    #[test]
+    fn lockout_after_n_failures() {
+        let g = AttemptGuard::new(5);
+        let t0 = Instant::now();
+        let lock = Some((3, Duration::from_secs(600)));
+        for i in 0..2u32 {
+            let ip = IpAddr::from(std::net::Ipv4Addr::from(0x0a00_0001 + i));
+            g.failure_locking_at("alice", ip, t0, lock);
+        }
+        let fresh: IpAddr = "192.0.2.7".parse().unwrap();
+        assert!(
+            g.wait_at("alice", fresh, t0).is_none(),
+            "two failures: free"
+        );
+        g.failure_locking_at("alice", "10.9.9.9".parse().unwrap(), t0, lock);
+        assert_eq!(
+            g.wait_at("alice", fresh, t0),
+            Some(Duration::from_secs(600)),
+            "locked from everywhere"
+        );
+        assert!(g.wait_at("bob", fresh, t0).is_none());
+        g.clear_account("alice");
+        assert!(g.wait_at("alice", fresh, t0).is_none(), "lifted");
+        // Without a lockout the same failures only back off (capped).
+        let g = AttemptGuard::new(1);
+        for _ in 0..10 {
+            g.failure_at("carol", fresh, t0);
+        }
+        assert!(
+            g.wait_at("carol", "198.51.100.3".parse().unwrap(), t0)
+                .unwrap()
+                <= MAX_ACCOUNT_DELAY
+        );
     }
 
     #[test]

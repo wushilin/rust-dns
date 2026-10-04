@@ -144,7 +144,7 @@ fn members(c: &Connection, zone_id: Option<i64>) -> Result<Vec<ReplMember>> {
 
 const USER_COLS: &str =
     "id, username, password_hash, display_name, is_admin, is_root, mfa_required, totp_secret,
-                totp_enrolled_at, totp_last_step, disabled_at, created_at, updated_at";
+                totp_enrolled_at, totp_last_step, disabled_at, created_at, updated_at, password_history";
 
 /// One user, every column (None when absent).
 pub fn user_row(c: &Connection, id: i64) -> Result<Option<ReplUser>> {
@@ -182,6 +182,9 @@ fn users_where(c: &Connection, filter: &str, p: &[&dyn rusqlite::ToSql]) -> Resu
             disabled_at: r.get(10)?,
             created_at: r.get(11)?,
             updated_at: r.get(12)?,
+            password_history: r
+                .get::<_, Option<String>>(13)?
+                .and_then(|h| serde_json::from_str(&h).ok()),
         })
     })?;
     Ok(rows.collect::<Result<_, _>>()?)

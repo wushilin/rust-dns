@@ -190,13 +190,14 @@ fn put_user(c: &Connection, ctx: &Ctx, u: &ReplUser) -> Result<()> {
     let is_root = u.is_root && ctx.local_root.is_none();
     c.execute(
         "INSERT INTO users (id, username, password_hash, display_name, is_admin, is_root, mfa_required, totp_secret,
-                            totp_enrolled_at, totp_last_step, disabled_at, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                            totp_enrolled_at, totp_last_step, disabled_at, created_at, updated_at, password_history)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
          ON CONFLICT(id) DO UPDATE SET username = excluded.username, password_hash = excluded.password_hash,
             display_name = excluded.display_name, is_admin = excluded.is_admin, is_root = excluded.is_root,
             mfa_required = excluded.mfa_required, totp_secret = excluded.totp_secret,
             totp_enrolled_at = excluded.totp_enrolled_at, totp_last_step = excluded.totp_last_step,
-            disabled_at = excluded.disabled_at, created_at = excluded.created_at, updated_at = excluded.updated_at",
+            disabled_at = excluded.disabled_at, created_at = excluded.created_at, updated_at = excluded.updated_at,
+            password_history = excluded.password_history",
         params![
             u.id,
             u.username,
@@ -210,7 +211,11 @@ fn put_user(c: &Connection, ctx: &Ctx, u: &ReplUser) -> Result<()> {
             last_step,
             u.disabled_at,
             u.created_at,
-            u.updated_at
+            u.updated_at,
+            u.password_history
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?
         ],
     )?;
     if u.disabled_at.is_some() {

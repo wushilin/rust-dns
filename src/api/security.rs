@@ -1,5 +1,6 @@
-//! O5/O6: account security settings (console setting `security`) and
-//! administrator-initiated MFA enrollment.
+//! O5/O6: account security settings (console setting `security`: MFA
+//! enrollment, password policy, account lockout) and administrator-
+//! initiated MFA enrollment.
 
 use super::error::{ApiError, ApiResult};
 use super::openapi::{BadRequest, Forbidden, NotFound, Unauthorized};
@@ -55,7 +56,7 @@ fn security_view(s: &AppState) -> ApiResult<SecurityView> {
     tag = "Users",
     operation_id = "get_security_settings",
     summary = "Account security settings (admin)",
-    description = "Who may enroll MFA authenticators. Needs `manage_users`.",
+    description = "Who may enroll MFA authenticators, the password policy for new passwords (length, character classes, history) and the account lockout. Needs `manage_users`.",
     responses(
         (status = 200, description = "Settings in effect.", body = SecurityView),
         (status = 401, response = Unauthorized),
@@ -73,8 +74,8 @@ pub async fn get_security(State(s): St, caller: Caller) -> ApiResult<Json<Securi
     tag = "Users",
     operation_id = "update_security_settings",
     summary = "Change account security settings (admin)",
-    description = "Saves the settings; they apply at once and replicate to standbys. Omitted fields take their defaults. Audited as `settings.security.update`. Needs `manage_users`.",
-    request_body(content = SecuritySettings, example = json!({ "mfa_enrollment": "admin" })),
+    description = "Saves the settings; they apply at once and replicate to standbys. Omitted fields take their defaults. The password policy applies to new passwords only. A password history (`password_history` > 0) is stored with each user and replicated: set it only once every standby runs a version that knows it (an older standby halts). Audited as `settings.security.update`. Needs `manage_users`.",
+    request_body(content = SecuritySettings, example = json!({ "mfa_enrollment": "admin", "password_min_length": 12, "password_min_classes": 3, "password_history": 5, "lockout_after": 10, "lockout_minutes": 15 })),
     responses(
         (status = 200, description = "Saved.", body = SecurityView),
         (status = 400, response = BadRequest),
@@ -111,7 +112,7 @@ pub async fn update_security(
     tag = "Users",
     operation_id = "reset_security_settings",
     summary = "Use the default security settings again (admin)",
-    description = "Removes the saved settings (users enroll MFA themselves). Audited as `settings.security.reset`; no-op when nothing is saved. Needs `manage_users`.",
+    description = "Removes the saved settings: users enroll MFA themselves, passwords need 8 characters, no history, no lockout (stored histories are dropped at each user's next password change). Audited as `settings.security.reset`; no-op when nothing is saved. Needs `manage_users`.",
     responses(
         (status = 200, description = "Defaults in effect.", body = SecurityView),
         (status = 401, response = Unauthorized),

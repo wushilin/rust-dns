@@ -2555,9 +2555,20 @@ async function securityCard() {
   $('#sec-card').innerHTML = `<div class="row between"><h2>Account security</h2><div>${src}</div></div>
     <div class="field"><label>MFA enrollment</label><select id="sec-mfa"><option value="self" ${st.mfa_enrollment === 'self' ? 'selected' : ''}>Users enroll their own authenticator (at sign-in when MFA is required)</option><option value="admin" ${st.mfa_enrollment === 'admin' ? 'selected' : ''}>Only administrators enroll authenticators (Users -> Edit -> Set up MFA)</option></select>
       <span class="hint">Administrator-only enrollment stops someone who knows a password from enrolling their own authenticator. Root is exempt (its MFA is set in the configuration file).</span></div>
+    <h3 style="margin-top:14px">New passwords</h3>
+    <div class="grid two" style="gap:0 16px">
+      <div class="field"><label>Minimum length</label><input type="number" id="sec-len" min="8" max="128" value="${st.password_min_length}"></div>
+      <div class="field"><label>Character classes needed (0-4)</label><input type="number" id="sec-classes" min="0" max="4" value="${st.password_min_classes}"><span class="hint">Of: lower-case, upper-case, digits, other characters.</span></div>
+      <div class="field"><label>Previous passwords refused (0-24)</label><input type="number" id="sec-hist" min="0" max="24" value="${st.password_history}"><span class="hint">0 keeps no history. A history replicates with the user: only once every standby runs this version.</span></div>
+    </div>
+    <h3 style="margin-top:14px">Lockout</h3>
+    <div class="grid two" style="gap:0 16px">
+      <div class="field"><label>Lock an account after this many failed attempts (0 = never)</label><input type="number" id="sec-lock" min="0" max="1000" value="${st.lockout_after}"><span class="hint">From any address; on top of the usual back-off. Anyone who knows a user name can lock that user out: use with care. A password reset or re-enabling the account lifts it.</span></div>
+      <div class="field"><label>Lockout duration (minutes)</label><input type="number" id="sec-lockmin" min="1" max="1440" value="${st.lockout_minutes}"></div>
+    </div>
     <div class="error" id="sec-err"></div>
     <div class="row"><button class="btn primary" id="sec-save" data-perm="manage_users">Save</button>${v.source === 'console' ? '<button class="btn ghost" id="sec-reset" data-perm="manage_users">Use defaults</button>' : ''}</div>`;
-  $('#sec-save').onclick = async () => { $('#sec-err').textContent = ''; try { await PUT('/settings/security', { ...st, mfa_enrollment: $('#sec-mfa').value }); toast('Security settings saved', 'ok'); await securityCard(); } catch (e) { $('#sec-err').textContent = e.message; } };
+  $('#sec-save').onclick = async () => { $('#sec-err').textContent = ''; try { await PUT('/settings/security', { ...st, mfa_enrollment: $('#sec-mfa').value, password_min_length: Number($('#sec-len').value), password_min_classes: Number($('#sec-classes').value), password_history: Number($('#sec-hist').value), lockout_after: Number($('#sec-lock').value), lockout_minutes: Number($('#sec-lockmin').value) }); toast('Security settings saved', 'ok'); await securityCard(); } catch (e) { $('#sec-err').textContent = e.message; } };
   if ($('#sec-reset')) $('#sec-reset').onclick = async () => { try { await DEL('/settings/security'); toast('Defaults in effect', 'ok'); await securityCard(); } catch (e) { $('#sec-err').textContent = e.message; } };
   applyAccess();
 }

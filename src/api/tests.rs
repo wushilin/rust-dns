@@ -1654,3 +1654,122 @@ async fn administrators_enroll_mfa_for_users() {
     let r = h.login("quinn", "quinn-password-1").await;
     assert_eq!(r.json["status"], "enroll_required", "{}", r.json);
 }
+
+/// O6: the password policy (length, character classes, history) applies
+/// to new passwords (own change, administrator reset, new users); the
+/// lockout locks an account after N failures from anywhere, and an
+/// administrator's password reset lifts it.
+#[tokio::test]
+async fn password_policy_and_lockout() {
+    use serde_json::json;
+    let h = Harness::new();
+    let root_c = root_session(&h).await;
+    let r = h
+        .call(
+            "PUT",
+            "/settings/security",
+            Some(&root_c),
+            Some(json!({ "password_min_length": 7 })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "validated: {}", r.json);
+    let r = h
+        .call(
+            "PUT",
+            "/settings/security",
+            Some(&root_c),
+            Some(json!({ "password_min_length": 12, "password_min_classes": 3, "password_history": 2, "lockout_after": 3, "lockout_minutes": 10 })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.json);
+    // New users.
+    for (pw, why) in [("short-1A", "length"), ("longbutonlylower", "classes")] {
+        let r = h
+            .call(
+                "POST",
+                "/users",
+                Some(&root_c),
+                Some(json!({ "username": "rita", "password": pw })),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{why}: {}", r.json);
+    }
+    let r = h
+        .call(
+            "POST",
+            "/users",
+            Some(&root_c),
+            Some(json!({ "username": "rita", "password": "Rita-password-1" })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.json);
+    let rita_id = r.json["id"].as_i64().unwrap();
+    let c = h.login("rita", "Rita-password-1").await.cookie.unwrap();
+    let change = |cur: &str, new: &str| {
+        let (h, c) = (&h, c.clone());
+        let body = json!({ "current_password": cur, "new_password": new });
+        async move { h.call("PUT", "/me/password", Some(&c), Some(body)).await }
+    };
+    let r = change("Rita-password-1", "Rita-password-1").await;
+    assert_eq!(
+        r.status,
+        StatusCode::BAD_REQUEST,
+        "the current one: {}",
+        r.json
+    );
+    assert!(r.json["error"].as_str().unwrap().contains("used before"));
+    assert_eq!(
+        change("Rita-password-1", "Rita-password-2").await.status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        change("Rita-password-2", "Rita-password-1").await.status,
+        StatusCode::BAD_REQUEST,
+        "within the last 2"
+    );
+    assert_eq!(
+        change("Rita-password-2", "Rita-password-3").await.status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        change("Rita-password-3", "Rita-password-1").await.status,
+        StatusCode::OK,
+        "older than the last 2: allowed again"
+    );
+    // The administrator's reset follows the policy too.
+    let r = h
+        .call(
+            "PUT",
+            &format!("/users/{rita_id}"),
+            Some(&root_c),
+            Some(json!({ "password": "Rita-password-3" })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.json);
+
+    // Lockout: 3 failures (from different addresses) lock the account.
+    for _ in 0..3 {
+        assert_eq!(
+            h.login("rita", "wrong-password-X1").await.status,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    let r = h.login("rita", "Rita-password-1").await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS, "{}", r.json);
+    let wait: u64 = r.retry_after.unwrap().parse().unwrap();
+    assert!(wait > 500, "the lockout, not the back-off: {wait}");
+    let r = h
+        .call(
+            "PUT",
+            &format!("/users/{rita_id}"),
+            Some(&root_c),
+            Some(json!({ "password": "Rita-password-9" })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.json);
+    assert_eq!(
+        h.login("rita", "Rita-password-9").await.status,
+        StatusCode::OK,
+        "a reset lifts the lockout"
+    );
+}

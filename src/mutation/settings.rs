@@ -441,15 +441,111 @@ pub enum MfaEnrollment {
 /// Account security settings (console setting `security`). Every field
 /// has a default that keeps the behaviour before it existed; unknown
 /// fields are ignored (an older server stores the row and ignores it).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(default)]
 pub struct SecuritySettings {
     pub mfa_enrollment: MfaEnrollment,
+    /// O6: shortest password accepted for new passwords (8-128; default 8,
+    /// as before). Existing passwords are not affected.
+    #[schema(minimum = 8, maximum = 128, example = 12)]
+    pub password_min_length: u32,
+    /// O6: how many of these character classes a new password needs:
+    /// lower-case letters, upper-case letters, digits, others (0-4;
+    /// default 0: none).
+    #[schema(minimum = 0, maximum = 4, example = 3)]
+    pub password_min_classes: u32,
+    /// O6: a new password may not be any of this many previous ones (the
+    /// current one included; 0-24; default 0: no history kept). Root (its
+    /// password is in the config file) is exempt.
+    #[schema(minimum = 0, maximum = 24, example = 5)]
+    pub password_history: u32,
+    /// O6: lock an account for `lockout_minutes` after this many failed
+    /// passwords or codes (from any network, counted until 30 quiet
+    /// minutes pass; per server). 0 (default): never lock, only the
+    /// back-off. A lock can be used to keep a user out on purpose; an
+    /// administrator's password reset or re-enabling the account lifts it.
+    #[schema(minimum = 0, maximum = 1000, example = 10)]
+    pub lockout_after: u32,
+    /// O6: how long a lockout lasts, minutes (1-1440; default 15).
+    #[schema(minimum = 1, maximum = 1440, example = 15)]
+    pub lockout_minutes: u32,
+}
+
+impl Default for SecuritySettings {
+    fn default() -> Self {
+        SecuritySettings {
+            mfa_enrollment: MfaEnrollment::SelfService,
+            password_min_length: 8,
+            password_min_classes: 0,
+            password_history: 0,
+            lockout_after: 0,
+            lockout_minutes: 15,
+        }
+    }
 }
 
 impl SecuritySettings {
     pub fn validate(self) -> Result<Self, Vec<String>> {
-        Ok(self)
+        let mut errs = Vec::new();
+        if !(8..=128).contains(&self.password_min_length) {
+            errs.push("password_min_length must be between 8 and 128".into());
+        }
+        if self.password_min_classes > 4 {
+            errs.push("password_min_classes must be between 0 and 4".into());
+        }
+        if self.password_history > 24 {
+            errs.push("password_history must be between 0 and 24".into());
+        }
+        if self.lockout_after != 0 && !(3..=1000).contains(&self.lockout_after) {
+            errs.push("lockout_after must be 0 (off) or between 3 and 1000".into());
+        }
+        if !(1..=1440).contains(&self.lockout_minutes) {
+            errs.push("lockout_minutes must be between 1 and 1440".into());
+        }
+        if errs.is_empty() {
+            Ok(self)
+        } else {
+            Err(errs)
+        }
+    }
+
+    /// O6: what is wrong with `pw` as a new password (length and character
+    /// classes; the history is checked against the stored hashes).
+    pub fn password_problems(&self, pw: &str) -> Vec<String> {
+        let mut errs = Vec::new();
+        let n = pw.chars().count() as u32;
+        if n < self.password_min_length {
+            errs.push(format!(
+                "password must be at least {} characters",
+                self.password_min_length
+            ));
+        }
+        let classes = [
+            pw.chars().any(|c| c.is_lowercase()),
+            pw.chars().any(|c| c.is_uppercase()),
+            pw.chars().any(|c| c.is_ascii_digit()),
+            pw.chars().any(|c| !c.is_alphanumeric()),
+        ]
+        .iter()
+        .filter(|x| **x)
+        .count() as u32;
+        if classes < self.password_min_classes {
+            errs.push(format!(
+                "password must mix at least {} of: lower-case letters, upper-case letters, digits, other characters",
+                self.password_min_classes
+            ));
+        }
+        errs
+    }
+
+    /// O6: the lockout in effect, if any: (failures, duration).
+    pub fn lockout(&self) -> Option<(u32, std::time::Duration)> {
+        (self.lockout_after > 0).then(|| {
+            (
+                self.lockout_after,
+                std::time::Duration::from_secs(self.lockout_minutes.max(1) as u64 * 60),
+            )
+        })
     }
 }
 

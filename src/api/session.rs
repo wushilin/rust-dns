@@ -449,7 +449,7 @@ pub async fn login(
         }
     };
     if !ok {
-        state.guard.failure(&username, ip);
+        note_failure(&state, &username, ip);
         tracing::warn!(%ip, user = %username, "failed login");
         // O4: audited (who was tried, from where; never the password).
         let actor = Actor {
@@ -749,6 +749,13 @@ pub async fn logout(
     Ok(resp)
 }
 
+/// A failed password or code: back-off, and the account lockout when the
+/// security settings have one (O6).
+pub fn note_failure(state: &AppState, username: &str, ip: IpAddr) {
+    let lockout = crate::mutation::settings::security(&state.storage).lockout();
+    state.guard.failure_locking(username, ip, lockout);
+}
+
 /// O5: MFA enrollment is reserved to administrators (security settings).
 pub fn admin_enrollment_only(state: &AppState) -> bool {
     crate::mutation::settings::security(&state.storage).mfa_enrollment
@@ -775,7 +782,7 @@ pub fn account_wait(state: &AppState, username: &str, ip: IpAddr) -> ApiResult<(
 /// [`super::guard::MAX_CODE_ATTEMPTS`] the session is deleted (audited) and
 /// the error asks the user to sign in again.
 pub fn code_failed(state: &AppState, user: &User, sess: &Session, ip: IpAddr) -> ApiError {
-    state.guard.failure(&user.username, ip);
+    note_failure(state, &user.username, ip);
     // O4: audited (the session and its step; never the code).
     let actor = Actor {
         name: user.username.clone(),

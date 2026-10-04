@@ -20,7 +20,7 @@ use crate::replication::data;
 use crate::replication::types::{Hidden, ReplToken, ReplUser};
 use crate::storage::{self as db, Storage, TokenInfo};
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use std::sync::Arc;
 
@@ -151,6 +151,22 @@ impl<'a> AuditTx<'a> {
         )?)
     }
 
+    /// The security settings as stored in this transaction (O6).
+    pub(super) fn security(&self) -> Result<super::settings::SecuritySettings> {
+        let v: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![super::settings::SECURITY_KEY],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(match v {
+            Some(v) => serde_json::from_str(&v)?,
+            None => Default::default(),
+        })
+    }
+
     /// Tests: look at the transaction's state.
     #[cfg(test)]
     pub(super) fn conn(&self) -> &Connection {
@@ -197,6 +213,7 @@ impl<'a> AuditTx<'a> {
             disabled_at: None,
             created_at: now.clone(),
             updated_at: now,
+            password_history: None,
         };
         self.record(SecretChange::UserCreated { user: row.clone() })?;
         let user = to_user(&row);
@@ -268,9 +285,26 @@ impl<'a> AuditTx<'a> {
     }
 
     /// Write a user's new row (when it differs) and audit the difference.
+    /// O6: a new password pushes the previous one onto the password history
+    /// when the security settings keep one (`password_history` > 0; read in
+    /// this transaction), trimmed to that length; with none kept, a stored
+    /// history is dropped at the next password change. Root keeps none.
     fn update_row(&mut self, before: ReplUser, mut after: ReplUser) -> Result<User> {
         if after == before {
             return Ok(to_user(&after));
+        }
+        if after.password_hash != before.password_hash {
+            let keep = if after.is_root {
+                0
+            } else {
+                self.security()?.password_history as usize
+            };
+            after.password_history = (keep > 0).then(|| {
+                let mut h = vec![before.password_hash.clone()];
+                h.extend(before.password_history.clone().unwrap_or_default());
+                h.truncate(keep);
+                h
+            });
         }
         after.updated_at = now_rfc3339();
         self.record(SecretChange::UserUpdated {
@@ -409,6 +443,7 @@ impl<'a> AuditTx<'a> {
                     disabled_at: None,
                     created_at: now.clone(),
                     updated_at: now,
+                    password_history: None,
                 };
                 self.record(SecretChange::UserCreated { user: row })?;
                 Some(serde_json::json!({ "created": true }))
@@ -1111,6 +1146,87 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap(), AccessEvent::User(u.id));
         assert!(rx.try_recv().is_err(), "one signal per user and commit");
         assert!(AccessEvent::All.concerns(42) && !AccessEvent::User(1).concerns(2));
+    }
+
+    /// O6: with a password history kept, each new password pushes the
+    /// previous hash (newest first), trimmed to the setting; with none kept
+    /// the next change drops it; root keeps none. The secret change carries
+    /// the history (replicated with the row); without one the field is
+    /// absent (byte-identical to before O6).
+    #[test]
+    fn password_history_follows_the_setting() {
+        let s = Arc::new(Storage::open_memory().unwrap());
+        let a = Accounts::new(s.clone());
+        let u = a.create_user(&actor(), &new_user("alice")).unwrap();
+        let set = |n: u32| {
+            a.run(&actor(), "update_security", |t| {
+                let sec = super::super::settings::SecuritySettings {
+                    password_history: n,
+                    ..Default::default()
+                };
+                t.set_setting(
+                    super::super::settings::SECURITY_KEY,
+                    "settings.security.update",
+                    "tester",
+                    None::<&super::super::settings::SecuritySettings>,
+                    &sec,
+                )
+            })
+            .unwrap()
+        };
+        let pw = |h: &str| {
+            a.run(&actor(), "change_password", |t| t.set_password(u.id, h))
+                .unwrap()
+        };
+        let history = || {
+            s.read_tx(|c| data::user_row(c, u.id))
+                .unwrap()
+                .unwrap()
+                .password_history
+        };
+        pw("h1");
+        assert_eq!(history(), None, "nothing kept by default");
+        set(2);
+        pw("h2");
+        assert_eq!(history(), Some(vec!["h1".to_string()]));
+        pw("h3");
+        pw("h4");
+        assert_eq!(history(), Some(vec!["h3".to_string(), "h2".to_string()]));
+        let last: String = s
+            .read_tx(|c| {
+                Ok(c.query_row(
+                    "SELECT payload FROM changelog WHERE action = 'update' AND entity = 'user' ORDER BY offset DESC LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert!(
+            last.contains("\"password_history\":[\"h3\",\"h2\"]"),
+            "{last}"
+        );
+        set(0);
+        pw("h5");
+        assert_eq!(history(), None, "dropped when none are kept");
+        let last: String = s
+            .read_tx(|c| {
+                Ok(c.query_row(
+                    "SELECT payload FROM changelog WHERE action = 'update' AND entity = 'user' ORDER BY offset DESC LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert!(!last.contains("password_history"), "{last}");
+        set(3);
+        let root = a.sync_root("root", "r1", false).unwrap();
+        a.sync_root("root", "r2", false).unwrap();
+        let rh = s
+            .read_tx(|c| data::user_row(c, root.id))
+            .unwrap()
+            .unwrap()
+            .password_history;
+        assert_eq!(rh, None, "root keeps none");
     }
 
     #[test]

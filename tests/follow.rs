@@ -3435,3 +3435,91 @@ fn an_admin_enrolled_authenticator_works_on_the_standby() {
     drop(p);
     let _ = std::fs::remove_dir_all(&root_dir);
 }
+
+/// O6: the security settings and a user's password history replicate
+/// (reconcile stays ok: the history is part of the user row). With the previous
+/// release as standby: it follows while no history is kept, and halts
+/// (`diverged`) once one is (it would drop it): set a history only after
+/// every standby is upgraded (plan.md, Rollout).
+#[test]
+fn a_password_history_replicates_and_an_old_standby_halts_on_it() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root_dir = std::env::temp_dir().join(format!(
+        "rust-dns-follow-pwhist-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root_dir).unwrap();
+    let mut p = Node::new(&root_dir, "primary", "rootpass-primary");
+    let mut s = Node::new(&root_dir, "standby", "rootpass-standby");
+    p.configure("");
+    p.start();
+    let pr = p.root();
+    let send = |m: &str, path: &str, body: Value| {
+        ok(call(&Auth::Session(&pr), m, &p.api(path), Some(body)), path)
+    };
+    let u = send(
+        "POST",
+        "/users",
+        json!({ "username": "rita", "password": "Rita-password-1" }),
+    );
+    let repl = send("POST", "/tokens", json!({ "name": "repl" }))["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    s.configure(&follow_cfg(&p, "dns2", &repl));
+    s.start();
+    let sr = s.root();
+    wait_reconciled(&p, &pr, &s, &sr, "before a history");
+
+    // The previous release as a second standby, before any history.
+    let prev = prev_bin();
+    let mut old = prev.map(|b| {
+        let mut n = Node::new(&root_dir, "old", "rootpass-old");
+        n.bin = b;
+        n.configure(&follow_cfg(&p, "dns3", &repl));
+        n.start();
+        n
+    });
+    let or = old.as_ref().map(|n| n.root());
+    if let (Some(o), Some(oa)) = (&old, &or) {
+        wait_reconciled(&p, &pr, o, oa, "old standby, no history");
+    }
+
+    send(
+        "PUT",
+        "/settings/security",
+        json!({ "password_history": 3 }),
+    );
+    send(
+        "PUT",
+        &format!("/users/{}", u["id"]),
+        json!({ "password": "Rita-password-2" }),
+    );
+    wait_reconciled(&p, &pr, &s, &sr, "history kept");
+    let v = ok(
+        call(
+            &Auth::Session(&sr),
+            "GET",
+            &s.api("/settings/security"),
+            None,
+        ),
+        "standby settings",
+    );
+    assert_eq!(v["settings"]["password_history"], 3, "{v}");
+    if let (Some(o), Some(oa)) = (&old, &or) {
+        let mut last = Value::Null;
+        wait_for("the old standby halts on the password history", 30, || {
+            last = status(o, oa);
+            !last["follow"]["halted"].is_null()
+        });
+        assert_eq!(last["follow"]["halted"]["reason"], "diverged", "{last}");
+        eprintln!("old standby with a password history: {last}");
+    }
+    drop(old.take());
+    drop(s);
+    drop(p);
+    let _ = std::fs::remove_dir_all(&root_dir);
+}

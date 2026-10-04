@@ -102,6 +102,10 @@ pub const TABLES: &[Table] = &[
         // is_root: only the local root is root on a standby; totp_last_step:
         // a later step accepted on the standby is kept (replay protection).
         node_columns: &["is_root", "totp_last_step"],
+        // O6: NULL (no history kept, every user before O6) is left out, so
+        // an older version matches until a password history is kept; then
+        // it halts rather than lose the history (see plan.md, Rollout).
+        optional_columns: &["password_history"],
         fresh_keeps: Some(ROOT_USER),
         own_root_rows: Some(ROOT_USER),
         ..replicated(

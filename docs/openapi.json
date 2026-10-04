@@ -2685,7 +2685,7 @@
           "Users"
         ],
         "summary": "Account security settings (admin)",
-        "description": "Who may enroll MFA authenticators. Needs `manage_users`.",
+        "description": "Who may enroll MFA authenticators, the password policy for new passwords (length, character classes, history) and the account lockout. Needs `manage_users`.",
         "operationId": "get_security_settings",
         "responses": {
           "200": {
@@ -2711,7 +2711,7 @@
           "Users"
         ],
         "summary": "Change account security settings (admin)",
-        "description": "Saves the settings; they apply at once and replicate to standbys. Omitted fields take their defaults. Audited as `settings.security.update`. Needs `manage_users`.",
+        "description": "Saves the settings; they apply at once and replicate to standbys. Omitted fields take their defaults. The password policy applies to new passwords only. A password history (`password_history` > 0) is stored with each user and replicated: set it only once every standby runs a version that knows it (an older standby halts). Audited as `settings.security.update`. Needs `manage_users`.",
         "operationId": "update_security_settings",
         "requestBody": {
           "content": {
@@ -2720,7 +2720,12 @@
                 "$ref": "#/components/schemas/SecuritySettings"
               },
               "example": {
-                "mfa_enrollment": "admin"
+                "lockout_after": 10,
+                "lockout_minutes": 15,
+                "mfa_enrollment": "admin",
+                "password_history": 5,
+                "password_min_classes": 3,
+                "password_min_length": 12
               }
             }
           },
@@ -2756,7 +2761,7 @@
           "Users"
         ],
         "summary": "Use the default security settings again (admin)",
-        "description": "Removes the saved settings (users enroll MFA themselves). Audited as `settings.security.reset`; no-op when nothing is saved. Needs `manage_users`.",
+        "description": "Removes the saved settings: users enroll MFA themselves, passwords need 8 characters, no history, no lockout (stored histories are dropped at each user's next password change). Audited as `settings.security.reset`; no-op when nothing is saved. Needs `manage_users`.",
         "operationId": "reset_security_settings",
         "responses": {
           "200": {
@@ -8716,6 +8721,51 @@
               }
             ],
             "default": "self"
+          },
+          "password_min_length": {
+            "type": "integer",
+            "format": "int32",
+            "description": "O6: shortest password accepted for new passwords (8-128; default 8,\nas before). Existing passwords are not affected.",
+            "default": 8,
+            "example": 12,
+            "maximum": 128,
+            "minimum": 8
+          },
+          "password_min_classes": {
+            "type": "integer",
+            "format": "int32",
+            "description": "O6: how many of these character classes a new password needs:\nlower-case letters, upper-case letters, digits, others (0-4;\ndefault 0: none).",
+            "default": 0,
+            "example": 3,
+            "maximum": 4,
+            "minimum": 0
+          },
+          "password_history": {
+            "type": "integer",
+            "format": "int32",
+            "description": "O6: a new password may not be any of this many previous ones (the\ncurrent one included; 0-24; default 0: no history kept). Root (its\npassword is in the config file) is exempt.",
+            "default": 0,
+            "example": 5,
+            "maximum": 24,
+            "minimum": 0
+          },
+          "lockout_after": {
+            "type": "integer",
+            "format": "int32",
+            "description": "O6: lock an account for `lockout_minutes` after this many failed\npasswords or codes (from any network, counted until 30 quiet\nminutes pass; per server). 0 (default): never lock, only the\nback-off. A lock can be used to keep a user out on purpose; an\nadministrator's password reset or re-enabling the account lifts it.",
+            "default": 0,
+            "example": 10,
+            "maximum": 1000,
+            "minimum": 0
+          },
+          "lockout_minutes": {
+            "type": "integer",
+            "format": "int32",
+            "description": "O6: how long a lockout lasts, minutes (1-1440; default 15).",
+            "default": 15,
+            "example": 15,
+            "maximum": 1440,
+            "minimum": 1
           }
         }
       },

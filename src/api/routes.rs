@@ -1777,11 +1777,7 @@ pub async fn create_user(
     s.require(&caller, GlobalPerm::ManageUsers)?;
     let username = normalize_username(b.username.as_deref().unwrap_or(""))?;
     let password = b.password.as_deref().unwrap_or("");
-    if password.len() < 8 {
-        return Err(ApiError::bad_request(
-            "password must be at least 8 characters",
-        ));
-    }
+    check_new_password(&s, None, password).await?;
     if s.storage.get_user_by_name(&username)?.is_some() {
         return Err(ApiError::conflict(format!(
             "user '{username}' already exists"
@@ -1845,11 +1841,7 @@ pub async fn update_user(
                 "the root password is managed in the configuration file",
             ));
         }
-        if p.len() < 8 {
-            return Err(ApiError::bad_request(
-                "password must be at least 8 characters",
-            ));
-        }
+        check_new_password(&s, Some(&before), p).await?;
         ch.password_hash = Some(auth::hash_password_async(p).await??);
         revoke_sessions = true;
     }
@@ -1872,6 +1864,8 @@ pub async fn update_user(
         ch.disabled = Some(d);
         revoke_sessions |= d;
     }
+    // O6: a new password or re-enabling the account lifts a lockout.
+    let unlock = b.password.is_some() || b.disabled == Some(false);
     let revoke_tokens = b.revoke_tokens.unwrap_or(false);
     if revoke_tokens && b.password.is_none() {
         return Err(ApiError::bad_request(
@@ -1889,6 +1883,9 @@ pub async fn update_user(
         }
         Ok(u)
     })?;
+    if unlock {
+        s.guard.clear_account(&u.username);
+    }
     Ok(Json(public_user(&u)))
 }
 
@@ -2012,11 +2009,7 @@ pub async fn change_password(
     if !auth::verify_password_async(&b.current_password, &caller.user.password_hash).await? {
         return Err(wrong_secret(&s, &caller, "current password is incorrect"));
     }
-    if b.new_password.len() < 8 {
-        return Err(ApiError::bad_request(
-            "password must be at least 8 characters",
-        ));
-    }
+    check_new_password(&s, Some(&caller.user), &b.new_password).await?;
     let hash = auth::hash_password_async(&b.new_password).await??;
     // Only the password column is written, and every other session of the
     // user is signed out in the same transaction (this one stays). API
@@ -2033,6 +2026,36 @@ pub async fn change_password(
         Ok(())
     })?;
     Ok(Json(StatusResponse::ok()))
+}
+
+/// O6: a new password must meet the security settings (length, character
+/// classes) and, for an existing user with a password history kept, be
+/// none of the last `password_history` passwords (the current included).
+async fn check_new_password(s: &AppState, user: Option<&User>, pw: &str) -> ApiResult<()> {
+    let policy = crate::mutation::settings::security(&s.storage);
+    let errs = policy.password_problems(pw);
+    if !errs.is_empty() {
+        return Err(ApiError::bad_request(errs.join("; ")));
+    }
+    let keep = policy.password_history as usize;
+    if let Some(u) = user.filter(|_| keep > 0) {
+        let stored = s
+            .storage
+            .read_tx(|c| crate::replication::data::user_row(c, u.id))?
+            .and_then(|r| r.password_history)
+            .unwrap_or_default();
+        let mut hashes = vec![u.password_hash.clone()];
+        hashes.extend(stored);
+        hashes.truncate(keep);
+        for h in &hashes {
+            if auth::verify_password_async(pw, h).await? {
+                return Err(ApiError::bad_request(format!(
+                    "this password was used before: choose one that is not among the last {keep}"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Voluntary enrollment: hand out a secret and keep it on the session until confirmed.

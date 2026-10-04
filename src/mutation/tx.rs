@@ -1421,6 +1421,20 @@ mod tests {
                                 extra_users.push(u.id);
                             }
                             103 => {
+                                if step % 4 == 0 {
+                                    // O6: a password history kept (part of the user row).
+                                    let sec = settings::SecuritySettings {
+                                        password_history: (step % 3) as u32 + 1,
+                                        ..Default::default()
+                                    };
+                                    t.set_setting(
+                                        settings::SECURITY_KEY,
+                                        "settings.security.update",
+                                        "tester",
+                                        None::<&settings::SecuritySettings>,
+                                        &sec,
+                                    )?;
+                                }
                                 t.set_password(uid, &format!("p{step}"))?;
                             }
                             104 => {

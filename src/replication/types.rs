@@ -96,6 +96,10 @@ pub struct ReplUser {
     pub disabled_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// O6: hashes of the previous passwords (newest first) kept for the
+    /// password history policy; absent when none are kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_history: Option<Vec<String>>,
 }
 
 impl std::fmt::Debug for ReplUser {

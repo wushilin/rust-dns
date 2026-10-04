@@ -237,7 +237,15 @@ Before exposing rust-dns to the internet, note:
   "Only administrators enroll authenticators" (console setting
   `security`, `mfa_enrollment = "admin"`) refuses enrollment at sign-in
   and from the account page, so someone who only knows a password cannot
-  enroll their own authenticator. Root is exempt. TOTP codes are single-use (the last accepted time step
+  enroll their own authenticator. Root is exempt.
+- **Password policy and lockout** (Users -> Account security, same
+  setting): minimum length (default 8), character classes, a history of
+  previous passwords that may not be reused (stored with the user and
+  replicated; set it only once every standby runs this version), and an
+  optional account lockout after N failed attempts from anywhere (off by
+  default: anyone who knows a user name could lock that user out; an
+  administrator's password reset or re-enabling the account lifts it).
+  The policy applies to new passwords; root (config file) is exempt. TOTP codes are single-use (the last accepted time step
   is stored). Replacing an enrolled authenticator needs the current code or
   password. Changing your password signs out your other sessions; API tokens
   keep working unless you tick "Also revoke my API tokens" (`revoke_tokens`;

@@ -779,7 +779,7 @@ Group 1: security and accounts
 - [x] O5. Admin-initiated MFA enrollment (L13): admin sets "MFA required" and
   generates a one-time enrollment link/QR shown once to the admin, delivered
   out of band; first-use enrollment without it is refused for that user.
-- [ ] O6. Password policy (length, reuse of the last N, optional complexity)
+- [x] O6. Password policy (length, reuse of the last N, optional complexity)
   and account lockout options (beyond back-off), console-configured.
 - [ ] O7. Explicit CSRF token (double-submit or per-session token) in
   addition to the X-Requested-With check; console sends it automatically.
@@ -956,8 +956,18 @@ Final
   harmless (a standby does not accept enrollments or password changes of
   replicated accounts). Administrator MFA enrollment writes the existing
   `user_updated` / `recovery_codes_replaced` changes. New local table
-  `login_failures` (an older binary ignores it). Either upgrade order
-  works so far; standby (baba2) first as always.
+  `login_failures` (an older binary ignores it). O6: new nullable column
+  `users.password_history` (added NULL, nothing rewritten; in
+  `optional_columns`) and an optional `password_history` field in the
+  user row of `user_created` / `user_updated` and snapshots, present only
+  while the security setting keeps a history. An older (d32d67f) standby
+  follows while `password_history` is 0 (the default); the first password
+  change with a history kept makes it HALT (`diverged`; test
+  `a_password_history_replicates_and_an_old_standby_halts_on_it`, real
+  d32d67f binary), because it would drop the history. So: upgrade the
+  standby (baba2) first, then the primary (gate); set a password history
+  only after both run this version; do not downgrade once a history is
+  stored. Everything else in group 1 works in either order.
 
 ## Log
 
@@ -1650,3 +1660,29 @@ Final
   `update_security_settings`; login and enroll document 403), browser
   flows "O5: enrollment set to administrators only", "O5: the user now
   needs a code from the administrator's QR".
+- 2026-10-04 (phase O): O6 done. The `security` setting gained
+  `password_min_length` (8-128, default 8 = before), `password_min_classes`
+  (0-4), `password_history` (0-24) and `lockout_after` (0 = off, else
+  3-1000) / `lockout_minutes` (1-1440, default 15), validated. New
+  passwords (own change, administrator reset, new users; not root) must
+  meet length and classes and, with a history, none of the last N hashes
+  (current included; argon2-verified). The history is the new nullable
+  `users.password_history` (JSON, newest first, trimmed, root keeps none),
+  written by `AuditTx::update_row` from the setting read in the same
+  transaction, carried in the user row (`ReplUser.password_history`,
+  skipped when absent: payloads without it are byte-identical) and in the
+  table checksum only where set (`optional_columns`): an older standby
+  halts once a history exists (Rollout). Lockout: per-account failures
+  (any network, local counters) reaching `lockout_after` block the
+  account for `lockout_minutes`; an administrator's password reset or
+  re-enabling lifts it (`AttemptGuard::clear_account`). Console: the
+  Account security card has the policy and lockout fields. Tests:
+  `mutation::settings` validation through
+  `api::tests::password_policy_and_lockout`,
+  `api::guard::tests::lockout_after_n_failures`,
+  `mutation::accounts::tests::password_history_follows_the_setting`,
+  the randomized replay test now sets a history,
+  `follow::a_password_history_replicates_and_an_old_standby_halts_on_it`
+  (d32d67f halts as designed), contract flow (PUT example with every
+  field), browser flows "O6: password policy saved from the console",
+  "O6: the console shows the policy refusal".

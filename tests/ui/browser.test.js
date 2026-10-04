@@ -350,6 +350,22 @@ async function phaseO(b, p, rootApi, admin) {
   const lj = await login.json();
   ok('O5: the user now needs a code from the administrator\'s QR', lj.status === 'mfa_required' && !!secret, JSON.stringify(lj));
   await rootApi('DELETE', '/settings/security');
+
+  // O6: a password policy from the console; a too short password is refused.
+  await admin.route('#/users', `return !!document.querySelector('#sec-len') && document.querySelector('#sec-card').textContent.includes('defaults')`);
+  await admin.fill('#sec-len', '14'); await admin.fill('#sec-classes', '3'); await admin.fill('#sec-hist', '2');
+  await admin.click('#sec-save');
+  await admin.wait('policy saved', `return document.querySelector('#sec-card')?.textContent.includes('saved') && document.querySelector('#sec-len').value === '14'`);
+  const pol = await waitUntil('policy stored', async () => { const v = (await rootApi('GET', '/settings/security')).json.settings; return v.password_min_length === 14 ? v : null; }, 5000).catch(async () => (await rootApi('GET', '/settings/security')).json.settings);
+  ok('O6: password policy saved from the console', pol.password_min_length === 14 && pol.password_min_classes === 3 && pol.password_history === 2, JSON.stringify(pol));
+  await admin.click('#u-new');
+  await admin.wait('new user dialog', `return !!document.querySelector('#modal [name=username]')`);
+  await admin.fill('#modal [name=username]', 'shorty'); await admin.fill('#modal [name=password]', 'Short-pw-1');
+  await admin.click('#m-ok');
+  const perr = await admin.wait('policy error shown', `return document.querySelector('#m-err')?.textContent`);
+  ok('O6: the console shows the policy refusal', /at least 14 characters/.test(perr), perr);
+  await admin.eval(`document.querySelector('#modal [data-close]').click(); return true`);
+  await rootApi('DELETE', '/settings/security');
   return [olive];
 }
 
