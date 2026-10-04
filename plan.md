@@ -1458,3 +1458,15 @@ what the registrar's DS must match on the live zone; plan it separately.
   older standby halts on them by design; see Rollout).
 - 2026-10-04 (phase N): N1 (rollover wizard) and N2 (pending note) done;
   see Phase N.
+- 2026-10-04 (phase N): gate on 8fb3da0 (clean worktree): fmt, clippy
+  `-D warnings`, all tests with `REQUIRE_BIND_TOOLS=1 REQUIRE_PREV_BIN=1`
+  against d32d67f AND 3884ba8 (227 unit; api_contract 5, dnssec 3,
+  dnssec_changes 1, e2e 6, follow 11, forwarding 8, hardening 10, netlink
+  0 (Linux only), openapi_spec 8, resolver 8, rollover 1, tsig 9), UI
+  tests, browser test (incl. the rollover walk-through) with
+  `REQUIRE_BROWSER_TEST=1`, OpenAPI snapshot + validator, conformance
+  127/127, smoke, cargo-audit (only `paste`): all pass. An earlier gate
+  run on 2f13b59 failed in `follow::primary_standby_failover_and_rejoin`,
+  which asserted the standby's bare version; N1 now reports
+  `0.1.0+dnssec-rollover` on purpose (test updated in 8fb3da0). Nothing
+  pushed, tagged or deployed.
