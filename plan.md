@@ -855,6 +855,22 @@ Group 3: operations
 - [ ] O17. utoipa 6 / utoipa-axum 0.3 upgrade if it builds cleanly and the
   generated spec stays equivalent (diff the snapshot; contract tests).
 
+  O17 status (2026-10-04): NOT done, skipped as the item says. utoipa
+  6.0.0 + utoipa-axum 0.3.0 build with one change (operation parameters
+  are now `RefOr<Parameter>`: the oneOf-unwrapping in `openapi::finish`
+  must skip references), but the generated document is not equivalent
+  (diff of 250 lines against the snapshot): every nullable `oneOf` lists
+  `null` first (22 places, harmless), descriptions move onto nullable
+  `$ref` fields (harmless), and the three enum query parameters with a
+  default (`via` of the rights view, `format` of the export, `mode` of
+  the import) become `allOf: [{type: string, enum}, {type: object,
+  default}]`, a schema no value satisfies (string and object at once):
+  clients generated from it, the validator's semantics and our contract
+  test would all see a broken parameter. Not worth post-processing away
+  in `finish` for no functional gain; revisit when utoipa renders inline
+  enum defaults correctly (then: bump, apply the `RefOr` change, diff the
+  snapshot, run the contract test).
+
 Group 4: packaging
 - [ ] O18. Multi-arch Docker image (linux/amd64, linux/arm64) built and
   published to GHCR from the release workflow (private repo: private image).
@@ -1924,3 +1940,7 @@ Final
   setting, clearing allowed), contract test (example), browser flows
   "O16: zone transfer, NOTIFY and PTR settings saved", "O16: back to the
   server's settings".
+- 2026-10-04 (phase O): O17 skipped (see the item): utoipa 6 / utoipa-axum
+  0.3 build with one change but the spec is not equivalent (unsatisfiable
+  `allOf` for the three enum query parameters with a default). Tried in a
+  scratch copy; nothing of it is committed.
