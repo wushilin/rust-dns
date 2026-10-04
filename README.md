@@ -1069,6 +1069,13 @@ nohup python3 soak.py --bin ./rust-dns --duration 12h --qps 500 --change-rate 6 
 tail -f soak.out                # one line per interval; summary at the end
 ```
 
+Memory: the Linux release builds (static musl) use mimalloc as their
+allocator. With musl's own allocator the resident memory grew without a
+plateau under this load while the live heap stayed flat (fragmentation,
+found by the first soak; plan.md O13a). `/metrics` shows the allocator
+(`rustdns_build_info{allocator="mimalloc"}`) and, on Linux, the resident
+memory (`rustdns_process_resident_memory_bytes`).
+
 What to look at: RSS flat after warm-up (no growth over hours), p99
 latency stable, zero timeouts, `lag` back to 0 between changes,
 `reconcile` "ok ...", `halted` null throughout. Python's sender sustains a

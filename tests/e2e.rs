@@ -550,6 +550,29 @@ fn api_then_dns_roundtrip() {
         .into_string()
         .unwrap();
     assert!(metrics.contains("rustdns_queries_total"));
+    // O13a: the build names its allocator (mimalloc in the musl release
+    // builds); Linux also reports the resident memory.
+    let allocator = if cfg!(target_env = "musl") {
+        "mimalloc"
+    } else {
+        "system"
+    };
+    assert!(
+        metrics.contains(&format!(
+            "rustdns_build_info{{version=\"{}\",allocator=\"{allocator}\"}} 1",
+            env!("CARGO_PKG_VERSION")
+        )),
+        "build info in /metrics: {metrics}"
+    );
+    if cfg!(target_os = "linux") {
+        let rss: u64 = metrics
+            .lines()
+            .find_map(|l| l.strip_prefix("rustdns_process_resident_memory_bytes "))
+            .expect("resident memory on Linux")
+            .parse()
+            .unwrap();
+        assert!(rss > 1 << 20, "resident memory {rss}");
+    }
 }
 
 #[test]

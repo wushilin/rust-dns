@@ -24,6 +24,22 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// O13a: the static musl builds (the Linux release binaries) allocate with
+/// mimalloc. With musl's own allocator (mallocng) the resident memory grew
+/// steadily under sustained queries plus record changes while the live heap
+/// stayed flat (fragmentation, not a leak; plan.md O13a has the numbers).
+/// Every other target keeps the system allocator.
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// The allocator this build uses (`rustdns_build_info` in `/metrics`).
+pub const ALLOCATOR: &str = if cfg!(target_env = "musl") {
+    "mimalloc"
+} else {
+    "system"
+};
+
 #[derive(Parser, Debug)]
 #[command(
     name = "rust-dns",

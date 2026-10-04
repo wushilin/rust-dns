@@ -864,13 +864,25 @@ Group 3: operations
 
   O13 result (2026-10-04, run done; soak verdict FAIL on memory): see the
   Log. Follow-up needed: O13a below.
-- [ ] O13a. (found by O13) RSS of primary and standby grows steadily under
+- [x] O13a. (found by O13) RSS of primary and standby grows steadily under
   the soak (about 0.27 MiB per minute, 15 MiB -> 49 MiB in 2 h, no
   plateau) while the data stays small (0.7 MB database + 4 MB WAL, a
   bounded record pool). Find what grows (per change or per query: event
   bus history, changelog caches, rate-limiter / cookie / forward caches,
   signature cache of the signed zone, SQLite page cache per connection)
   with a heap profile on a long local run; fix or bound it; soak again.
+
+  O13a result (2026-10-04): not a leak. The live heap is flat; musl's
+  allocator (mallocng) fragments under the per-change allocation churn and
+  keeps mapping new groups. Fix: the musl (Linux release) builds use
+  mimalloc; flat under the same soak. Evidence and numbers in the Log.
+  To confirm on Linux for hours (owner, dns-test or any x86_64 host, a
+  musl build of this commit): `scripts/soak.py --bin ./rust-dns --duration
+  4h --qps 500 --change-rate 6 --interval 60 --workdir ~/soak/run`; pass =
+  RSS growth after warm-up under 10% (expected about 26-30 MiB, flat) and
+  `/metrics` `rustdns_build_info{...,allocator="mimalloc"}`. Optional
+  second run with `MIMALLOC_PURGE_DELAY=0` exported (no rebuild): starts
+  at about half the memory; judge whether it stays flat over hours.
 - [x] O14. Live updates through a reverse proxy: CI job on Linux with nginx
   in front of the console (websocket upgrade works, live feed receives an
   event); locally skipped when nginx is missing.
@@ -1097,6 +1109,17 @@ Final
   (the old binary would serve the zone with the server's transfer ACL and
   NOTIFY targets). Zone clones and the JSON export/import do not carry
   them (they need `server_admin`). O14 is CI-only (no runtime change).
+
+- After O13a (this session; not deployed): no replication, data or config
+  change. The Linux release binaries (static musl) allocate with mimalloc
+  (`no_thp`): resident memory starts higher (about 26 MiB instead of 16
+  under the soak load) but stays flat, where musl's allocator grew without
+  a plateau (49 MiB after 2 h on dns-test). macOS and Windows builds keep
+  the system allocator. New metrics `rustdns_build_info{version,
+  allocator}` and (Linux) `rustdns_process_resident_memory_bytes`. After
+  the upgrade, check `allocator="mimalloc"` on gate and baba2 and watch the
+  resident memory for a day (d32d67f sat at 6-8 MiB with light traffic;
+  expect a higher but flat value).
 
 - After phase O, group 4 (this session; not deployed): no replication,
   data or config change. Packaging only: `deploy/Dockerfile.release`,
@@ -2060,3 +2083,47 @@ Final
   validator, conformance, smoke, cargo-audit (only `paste`). O0 stress on
   dd90ef3 (15 min, same load): `json_import_and_record_paging` 0 of 208,
   forwarding test 0 of 624, 0 orphans after.
+- 2026-10-04 (phase O): O13a done. Cause: allocator fragmentation in
+  musl's malloc (mallocng), not a leak; present in d32d67f (the live
+  version) as much as in HEAD, so no commit introduced it. Reproduced
+  locally only (this Mac, and a local podman Linux VM, aarch64 musl
+  release builds by cargo zigbuild; `scripts/soak.py` at the O13 load: 500
+  q/s per server, 6 changes/min, signed zone, primary + standby, 30 s
+  samples). macOS (system allocator), HEAD and d32d67f, 20 min: RSS flat
+  about 17 MiB, live heap (`heap -s`) 2.80 -> 2.92 MB. Linux musl, HEAD and
+  d32d67f: both grow (anon RSS about +150 KiB/min). A scratch build with a
+  counting global allocator (live bytes/blocks every 30 s, plus
+  `sqlite3_memory_used`): live heap flat at about 2.05 MB / 3,500 blocks
+  once the soak's record pool filled (first 20 changes), SQLite 0.65-0.69
+  MB, while anon RSS rose 8.06 -> 12.2 MiB in 20 min and the mappings 66
+  -> 111 (new 64/128 KiB mallocng groups). Variables (musl): queries only
+  flat (live heap and RSS); changes only grow (+0.46 MiB in 5 min); both
+  grow faster (+1.35 MiB in 9 min); unsigned zone grows (8.04 -> 10.0 MiB
+  in 16 min); primary alone, no standby, grows (7.87 -> 9.34 MiB in 16
+  min). So per-change churn (catalog and signed-zone rebuilds, API,
+  replication) fragments the heap and query traffic interleaves with it;
+  nothing specific to signing or replication. Suspects checked and bounded:
+  per-RRset signature cache (rebuilt per build, entries no longer used
+  dropped), event-bus subscriptions (retired on drop), rebinding log (100),
+  forward cache (LRU; unused here), rate limiter (off here). 30-min
+  comparison, same load, concurrently: musl primary anon 7.96 -> 13.06 MiB
+  (+64%, mappings 65 -> 128, accelerating), RSS 15.8 -> 21.1 MiB; mimalloc
+  with THP noisy 26-39 MiB anon (2 MiB huge pages); mimalloc without THP
+  23.1 -> 20.2 MiB, mappings level at 75-77. The committed build: primary
+  RSS 27.3 -> 26.0 MiB, standby 25.2 -> 24.2 MiB over 30 min (anon 19.9 ->
+  18.0 MiB, mappings 59 -> 62), p99 median 0.30 / 0.27 ms, 0 errors on the
+  primary and 2 of 900,001 on the standby. Trade-off: about 10 MiB more at
+  start, flat; musl passes that within the first hour at this load and
+  keeps growing. `MIMALLOC_PURGE_DELAY=0` (env) starts at about 6.5 MiB
+  anon / 14 MiB RSS but still rose 1.1 MiB in its first 16 min: not
+  adopted, left to a long Linux soak. Both musl targets build (zigbuild,
+  no warnings). Fix: `mimalloc` (`no_thp`) as global allocator for
+  `target_env = "musl"`; `/metrics` reports `rustdns_build_info{version,
+  allocator}` and on Linux `rustdns_process_resident_memory_bytes`;
+  `scripts/smoke-release.py` requires `allocator="mimalloc"` from a static
+  ELF binary (the release workflow smoke-tests both musl builds; checked in
+  the container: the fix passes, the pre-fix musl build fails). Tests:
+  e2e `api_then_dns_roundtrip` (build info, resident memory on Linux),
+  unit `rebuilt_signed_zones_hold_only_the_current_rrsets` (300 chained
+  re-signs: signatures, cache, NSEC chain and index sized to the current
+  zone). Not used: dns-test or any other machine.

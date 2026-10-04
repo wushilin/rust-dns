@@ -49,6 +49,12 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # DNSSEC signing (ECDSA P-256, key generation): the same ring rustls uses.
 ring = "0.17"
 
+# O13a: the static musl release builds use mimalloc (musl's allocator kept
+# RSS growing under sustained load; see plan.md O13a). `no_thp`: no
+# transparent huge pages requested (about 10 MiB less resident memory).
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = { version = "0.1", default-features = false, features = ["no_thp"] }
+
 [dev-dependencies]
 ureq = { version = "2", features = ["json", "cookies"] }
 jsonschema = { version = "0.58", default-features = false }

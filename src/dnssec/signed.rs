@@ -824,6 +824,61 @@ mod tests {
         assert_eq!(back.sig_cache.len(), back.signed_rrsets);
     }
 
+    /// O13a: a signed zone rebuilt after every change (the soak's pattern:
+    /// names created, changed and deleted, the serial bumped each time)
+    /// holds exactly one signature, one cache entry and one NSEC per current
+    /// RRset / name: nothing from earlier builds survives in the chain.
+    #[test]
+    fn rebuilt_signed_zones_hold_only_the_current_rrsets() {
+        let (_, key) = test_key();
+        let w = Window {
+            inception: 1000,
+            expiration: 2000,
+        };
+        let mut live: std::collections::BTreeMap<String, String> = Default::default();
+        let mut prev: Option<SignedZone> = None;
+        let mut z = zone(1, "example.net");
+        for n in 0..300u32 {
+            match n % 5 {
+                0 | 1 => {
+                    live.insert(format!("h{n}"), format!("10.0.{}.{}", n / 250, n % 250));
+                }
+                2 => {
+                    if let Some(k) = live.keys().next().cloned() {
+                        live.insert(k, format!("10.1.{}.{}", n / 250, n % 250));
+                    }
+                }
+                _ => {
+                    if live.len() > 20 {
+                        let k = live.keys().nth(n as usize % live.len()).cloned().unwrap();
+                        live.remove(&k);
+                    }
+                }
+            }
+            z.serial += 1;
+            let mut recs = vec![
+                rec(1, "@", Rt::NS, "ns1.example.net."),
+                rec(2, "ns1", Rt::A, "192.0.2.53"),
+            ];
+            for (i, (name, v)) in live.iter().enumerate() {
+                recs.push(rec(10 + i as i64, name, Rt::A, v));
+            }
+            let c = Catalog::build(vec![z.clone()], recs);
+            let zd = c.zones.get("example.net.").unwrap().clone();
+            let s = SignedZone::build(&zd, &key, w, String::new(), prev.as_ref()).unwrap();
+            // apex (SOA, NS, DNSKEY, NSEC), ns1 (A, NSEC), each name (A, NSEC).
+            let rrsets = 4 + 2 + 2 * live.len();
+            assert_eq!(s.signed_rrsets, rrsets, "build {n}");
+            assert_eq!(s.sig_cache.len(), rrsets, "signature cache after build {n}");
+            assert_eq!(s.sigs.len(), rrsets, "signatures after build {n}");
+            assert_eq!(s.chain.len(), 2 + live.len(), "NSEC chain after build {n}");
+            assert_eq!(s.index.len(), s.chain.len(), "chain index after build {n}");
+            prev = Some(s);
+        }
+        let last = prev.unwrap();
+        assert!(last.reused_signatures > 0, "unchanged RRsets are reused");
+    }
+
     #[test]
     fn signatures_verify_with_the_public_key() {
         let c = sample();

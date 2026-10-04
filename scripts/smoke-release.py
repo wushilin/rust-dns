@@ -150,9 +150,27 @@ file = "{log}"
     return cfg
 
 
-def exercise(web, dns, alive):
+def static_elf(path):
+    """Is `path` a statically linked ELF executable (no PT_INTERP: the musl
+    release builds)? Little-endian 64-bit only; anything else: False."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(64)
+            if head[:4] != b"\x7fELF" or head[4] != 2 or head[5] != 1:
+                return False
+            phoff, = struct.unpack_from("<Q", head, 0x20)
+            phentsize, phnum = struct.unpack_from("<HH", head, 0x36)
+            f.seek(phoff)
+            table = f.read(phentsize * phnum)
+        return all(struct.unpack_from("<I", table, i * phentsize)[0] != 3 for i in range(phnum))
+    except OSError:
+        return False
+
+
+def exercise(web, dns, alive, allocator=None):
     """Health, sign-in, a zone and a record through the API, then the
-    record over UDP and TCP. `alive()` raises when the server is gone."""
+    record over UDP and TCP. `alive()` raises when the server is gone.
+    `allocator`: the one `/metrics` must report (O13a), if known."""
     base = f"http://127.0.0.1:{web}/api"
     jar = http.cookiejar.CookieJar()
     opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
@@ -187,6 +205,15 @@ def exercise(web, dns, alive):
     status, _ = call("POST", f"/zones/{ZONE}/records", {"name": "www", "type": "A", "value": ADDR})
     assert status == 201, f"create record: {status}"
     print("api: zone and record created")
+
+    req = urllib.request.Request(f"http://127.0.0.1:{web}/metrics")
+    with opener.open(req, timeout=10) as r:
+        metrics = r.read().decode()
+    info = [l for l in metrics.splitlines() if l.startswith("rustdns_build_info{")]
+    assert info, "rustdns_build_info missing from /metrics"
+    print(f"metrics: {info[0]}")
+    if allocator:
+        assert f'allocator="{allocator}"' in info[0], f"expected allocator {allocator}: {info[0]}"
 
     name = f"www.{ZONE}"
     for proto, fn in (("udp", dns_udp), ("tcp", dns_tcp)):
@@ -310,7 +337,8 @@ def main():
             if proc.poll() is not None:
                 raise AssertionError(f"server exited with {proc.returncode}")
 
-        exercise(web, dns, alive)
+        # O13a: the static Linux (musl) release builds must use mimalloc.
+        exercise(web, dns, alive, "mimalloc" if static_elf(binary) else None)
         print("smoke test passed")
     finally:
         proc.terminate()

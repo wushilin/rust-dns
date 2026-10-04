@@ -426,8 +426,35 @@ pub async fn metrics(State(s): St, _caller: Caller) -> ApiResult<Response> {
         "# TYPE rustdns_uptime_seconds gauge\nrustdns_uptime_seconds {}\n",
         s.started.elapsed().as_secs()
     ));
+    // O13a: what the build is and how much memory the process holds, so a
+    // slow growth shows on a dashboard instead of in a soak test.
+    out.push_str(&format!(
+        "# HELP rustdns_build_info Version and memory allocator of this build\n# TYPE rustdns_build_info gauge\nrustdns_build_info{{version=\"{}\",allocator=\"{}\"}} 1\n",
+        env!("CARGO_PKG_VERSION"),
+        crate::ALLOCATOR
+    ));
+    if let Some(rss) = resident_bytes() {
+        out.push_str(&format!(
+            "# HELP rustdns_process_resident_memory_bytes Resident memory of this process (Linux)\n# TYPE rustdns_process_resident_memory_bytes gauge\nrustdns_process_resident_memory_bytes {rss}\n"
+        ));
+    }
     out.push_str(&s.repl.metrics_text());
     Ok(([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], out).into_response())
+}
+
+/// Resident set size from `/proc/self/statm` (Linux; `None` elsewhere).
+fn resident_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+        let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        (page > 0).then(|| pages * page as u64)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
 }
 
 /// This OpenAPI document, generated from the handlers' annotations and the
