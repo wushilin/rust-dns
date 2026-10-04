@@ -40,3 +40,20 @@ jobs:
       - run: scripts/conformance-local.sh target/debug/rust-dns
       - name: UDP load probe (Linux)
         run: scripts/load-test-local.sh target/debug/rust-dns 5 8
+
+  # O14: the console's live updates through a reverse proxy. tests/proxy.rs
+  # starts an unprivileged nginx (own prefix and ports) in front of the
+  # server; it is skipped where nginx is missing, required here.
+  nginx-proxy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y nginx
+      # The package starts a system nginx on port 80; the test runs its own.
+      - run: sudo systemctl stop nginx || true
+      - run: cargo test --test proxy -- --nocapture
+        env:
+          REQUIRE_NGINX_TEST: "1"
+          NGINX_BIN: /usr/sbin/nginx

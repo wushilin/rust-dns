@@ -132,18 +132,35 @@ impl DnsServer {
         let zone = catalog.zones.get(&key).filter(|z| !z.zone.is_override());
         let signed_by = q.signed_by;
         let key_name = signed_by.map(|b| b.entry.key.name.as_str());
+        // O16: a zone's own transfer ACL and TSIG requirement replace the
+        // server's ([transfer]) for that zone.
+        let own = zone.and_then(|z| z.zone.settings.as_deref());
+        let allowed = |z_allow: Option<&Vec<String>>| match z_allow {
+            Some(list) => list
+                .iter()
+                .filter_map(|c| crate::config::Cidr::parse(c))
+                .any(|c| c.contains(client.ip())),
+            None => rt.may_transfer(client.ip()),
+        };
+        let require_tsig = own.and_then(|s| s.require_tsig).unwrap_or(rt.require_tsig);
         let refusal = match zone {
             None => Some((false, "not a zone on this server")),
-            Some(_) if !rt.may_transfer(client.ip()) => {
-                Some((false, "client address is not in [transfer].allow"))
-            }
+            Some(_) if !allowed(own.and_then(|s| s.transfer_allow.as_ref())) => Some((
+                false,
+                if own.is_some_and(|s| s.transfer_allow.is_some()) {
+                    "client address is not in the zone's transfer_allow"
+                } else {
+                    "client address is not in [transfer].allow"
+                },
+            )),
             Some(z) => match signed_by {
                 Some(b) if !b.entry.allows_zone(&z.zone.name) => {
                     Some((true, "the TSIG key is not allowed to transfer this zone"))
                 }
-                None if rt.require_tsig => {
-                    Some((true, "unsigned request and [transfer].require_tsig is on"))
-                }
+                None if require_tsig => Some((
+                    true,
+                    "unsigned request and TSIG is required ([transfer].require_tsig or the zone's require_tsig)",
+                )),
                 _ => None,
             },
         };

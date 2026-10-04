@@ -1082,6 +1082,7 @@ function renderZone(keepFilter) {
         <div class="actions">
           <button class="btn" id="z-io" data-ro-ok>Import / Export</button>
           ${isOwner && z.override ? `<button class="btn" id="z-ov" data-perm="edit_settings" data-zone="${esc(z.name)}">Override settings</button>` : ''}
+          ${S.user.is_admin && !z.override ? `<button class="btn" id="z-xfer" data-perm="server_admin">Transfers &amp; PTR</button>` : ''}
           ${S.user.is_admin ? `<button class="btn" id="z-clone" data-perm="create_zones">Clone</button>` : ''}
           ${isOwner && S.user.is_admin ? `<button class="btn" id="z-rename" data-perm="delete_zone" data-zone="${esc(z.name)}">Rename</button>` : ''}
           ${isOwner ? `<button class="btn" id="z-edit" data-perm="edit_settings" data-zone="${esc(z.name)}">Settings</button><button class="btn danger" id="z-del" data-perm="delete_zone" data-zone="${esc(z.name)}">Delete zone</button>` : ''}
@@ -1120,6 +1121,7 @@ function renderZone(keepFilter) {
   if ($('#r-bulk')) $('#r-bulk').onclick = () => bulkModal(z);
   $('#z-io').onclick = () => ioModal(z.name);
   if ($('#z-edit')) $('#z-edit').onclick = zoneSettingsModal;
+  if ($('#z-xfer')) $('#z-xfer').onclick = () => zoneServerSettingsModal();
   if ($('#z-clone')) $('#z-clone').onclick = () => zoneNameModal(z, 'clone');
   if ($('#z-rename')) $('#z-rename').onclick = () => zoneNameModal(z, 'rename');
   if ($('#z-ov')) $('#z-ov').onclick = () => overrideModal(z);
@@ -1953,6 +1955,40 @@ function zoneSettingsModal() {
   });
 }
 
+// O16: a zone's own automatic PTR, transfer ACL and NOTIFY targets
+// (PUT /zones/{zone}/settings, server administrators). Empty or "server"
+// keeps the server's setting.
+function zoneServerSettingsModal() {
+  const z = S.zone, st = z.settings || {};
+  const tri = (id, v, on, off) => `<select id="${id}"><option value=""${v == null ? ' selected' : ''}>As the server</option><option value="on"${v === true ? ' selected' : ''}>${on}</option><option value="off"${v === false ? ' selected' : ''}>${off}</option></select>`;
+  const notifyText = (st.notify || []).map(t => t.address + (t.key ? ' ' + t.key : '')).join('\n');
+  openModal(`<h2>Transfers &amp; PTR · <span class="mono">${esc(z.name)}</span></h2>
+    <p class="hint">This zone's own settings; each one left at "as the server" uses the configuration file (<span class="mono">[server] auto_ptr</span>, <span class="mono">[transfer]</span>). Saved settings apply at once and are copied to standbys; the serial does not change.</p>
+    <div class="field"><label for="zs-ptr">Automatic PTR from this zone's A/AAAA records</label>${tri('zs-ptr', st.auto_ptr, 'On', 'Off')}</div>
+    <div class="field"><label><input type="checkbox" id="zs-acl-own"${st.transfer_allow ? ' checked' : ''}> Own transfer ACL (instead of <span class="mono">[transfer] allow</span>)</label>
+      <textarea id="zs-acl" rows="3" spellcheck="false" placeholder="192.0.2.53/32&#10;2001:db8::/64">${esc((st.transfer_allow || []).join('\n'))}</textarea>
+      <span class="hint">One address or CIDR per line. Checked, an empty list allows nobody.</span></div>
+    <div class="field"><label for="zs-tsig">Transfers need a TSIG signature</label>${tri('zs-tsig', st.require_tsig, 'Required', 'Not required')}</div>
+    <div class="field"><label><input type="checkbox" id="zs-nt-own"${st.notify ? ' checked' : ''}> Own NOTIFY targets (instead of <span class="mono">[transfer] notify</span>)</label>
+      <textarea id="zs-nt" rows="3" spellcheck="false" placeholder="192.0.2.53 hn-secondary.&#10;[2001:db8::53]:53">${esc(notifyText)}</textarea>
+      <span class="hint">One per line: address (port 53 when left out), optionally a TSIG key name that signs the NOTIFY. Checked, an empty list notifies nobody.</span></div>
+    <div class="error" id="m-err"></div>
+    <div class="foot"><button class="btn" data-close>Cancel</button>${z.settings ? '<button class="btn" id="zs-clear" data-perm="server_admin">Use the server\'s settings</button>' : ''}<button class="btn primary" id="m-ok" data-perm="server_admin">Save</button></div>`, m => {
+    const triVal = id => { const v = m.querySelector(id).value; return v === '' ? undefined : v === 'on'; };
+    const save = async body => { try { await PUT('/zones/' + encodeURIComponent(z.name) + '/settings', body); closeModal(); toast('Zone transfer and PTR settings saved', 'ok'); reloadZone(); } catch (e) { $('#m-err').textContent = e.message; } };
+    $('#m-ok').onclick = () => {
+      const b = {};
+      const ptr = triVal('#zs-ptr'), tsig = triVal('#zs-tsig');
+      if (ptr !== undefined) b.auto_ptr = ptr;
+      if (tsig !== undefined) b.require_tsig = tsig;
+      if (m.querySelector('#zs-acl-own').checked) b.transfer_allow = m.querySelector('#zs-acl').value.split('\n').map(x => x.trim()).filter(Boolean);
+      if (m.querySelector('#zs-nt-own').checked) b.notify = m.querySelector('#zs-nt').value.split('\n').map(x => x.trim()).filter(Boolean).map(l => { const [address, key] = l.split(/\s+/); return key ? { address, key } : { address }; });
+      save(b);
+    };
+    if (m.querySelector('#zs-clear')) m.querySelector('#zs-clear').onclick = () => save({});
+  });
+}
+
 // ---------------------------------------------------------------------------
 // live queries
 // ---------------------------------------------------------------------------
@@ -2145,8 +2181,10 @@ async function viewServer() {
         <span class="k">Hit rate</span><span>${(f.cache.hit_rate * 100).toFixed(1)}%</span></div>` : '<p class="hint">The cache is off (<code>[forwarding].cache_entries = 0</code>).</p>'}
       <div class="error" id="fc-err"></div>
     </div>
-    <div id="resolver-card"></div>`;
+    <div id="resolver-card"></div>
+    <div id="ratelimit-card"></div>`;
   renderResolver();
+  renderRateLimit();
   const body = () => ({
     upstreams: $('#fw-up').value.split('\n').map(x => x.trim()).filter(Boolean),
     allowed_clients: $('#fw-acl').value.split('\n').map(x => x.trim()).filter(Boolean),
@@ -2246,6 +2284,46 @@ async function renderResolver() {
     try { await DEL('/settings/resolver'); toast('Resolver defaults in effect', 'ok'); renderResolver(); }
     catch (e) { $('#rs-err').textContent = e.message; }
   };
+}
+
+// O15: DNS rate limiting (console setting `rate_limit`; empty field = the
+// config file's value).
+async function renderRateLimit() {
+  const host = $('#ratelimit-card'); if (!host) return;
+  let r;
+  try { r = await GET('/settings/rate-limit'); }
+  catch (e) { host.innerHTML = `<div class="card panel" style="max-width:820px;margin-top:16px"><h2>Rate limiting</h2><div class="error">${esc(e.message)}</div></div>`; return; }
+  const s = r.settings, f = r.file, live = r.in_effect;
+  const src = r.source === 'console' ? `<span class="badge">set in the console</span> <span class="hint">by ${esc(r.updated_by || '?')} ${r.updated_at ? ago(r.updated_at) : ''}</span>` : '<span class="badge muted">config file</span>';
+  const exempt = s.exempt_valid_cookies == null ? '' : s.exempt_valid_cookies ? 'on' : 'off';
+  host.innerHTML = `<div class="card panel" style="max-width:820px;margin-top:16px"><div class="row between"><h2>Rate limiting</h2><div>${src}</div></div>
+    <p class="hint">Per client (IPv4 address, IPv6 /64). Leave a field empty to use the configuration file's value. Applies at once on this server and is copied to standbys. In effect now: <b>${live.max_resolutions_per_second_per_address ? num(live.max_resolutions_per_second_per_address) + ' queries/s' : 'no limit'}</b>, slip ${live.slip}, server-cookie exemption <b>${live.exempt_valid_cookies ? 'on' : 'off'}</b>. Limited so far: ${num(r.rate_limited)}; answered thanks to a cookie: ${num(r.cookie_exempt)}.</p>
+    <div class="grid two" style="gap:0 16px">
+      <div class="field"><label>Queries per second per client (0 = no limit)</label><input type="text" inputmode="numeric" id="rl-max" value="${s.max_resolutions_per_second_per_address ?? ''}" placeholder="${f.max_resolutions_per_second_per_address} (file)"></div>
+      <div class="field"><label>Over the limit, over UDP (slip)</label><input type="text" inputmode="numeric" id="rl-slip" value="${s.slip ?? ''}" placeholder="${f.slip} (file)"><span class="hint">Every Nth limited query gets an empty truncated answer so a real client can retry over TCP; the others are dropped. 0 drops all. TCP clients get REFUSED.</span></div>
+      <div class="field"><label>Clients with a valid server cookie</label><select id="rl-ck">
+        <option value=""${exempt === '' ? ' selected' : ''}>As the configuration file (${f.exempt_valid_cookies ? 'exempt' : 'limited'})</option>
+        <option value="on"${exempt === 'on' ? ' selected' : ''}>Exempt: answered even over the limit</option>
+        <option value="off"${exempt === 'off' ? ' selected' : ''}>Limited like everyone</option></select>
+        <span class="hint">A valid DNS cookie (RFC 7873) proves the client's address, so a spoofed flood cannot use it.${r.in_effect.cookies ? '' : ' <b>DNS cookies are off in the configuration file ([server] cookies): no client has one, the exemption does nothing.</b>'}</span></div>
+      <div></div></div>
+    <div class="error" id="rl-err"></div>
+    <div class="row" style="margin-top:12px"><button class="btn primary" id="rl-save" data-perm="server_admin">Save and apply</button>${r.source === 'console' ? '<button class="btn" id="rl-reset" data-perm="server_admin">Use the configuration file</button>' : ''}</div>
+  </div>`;
+  const numOrNull = id => { const v = $(id).value.trim(); return v === '' ? null : Number(v); };
+  $('#rl-save').onclick = async () => {
+    $('#rl-err').textContent = '';
+    const ck = $('#rl-ck').value;
+    const b = { max_resolutions_per_second_per_address: numOrNull('#rl-max'), slip: numOrNull('#rl-slip'), exempt_valid_cookies: ck === '' ? null : ck === 'on' };
+    if ([b.max_resolutions_per_second_per_address, b.slip].some(v => v !== null && !(Number.isInteger(v) && v >= 0))) { $('#rl-err').textContent = 'Enter whole numbers (or leave empty).'; return; }
+    try { await PUT('/settings/rate-limit', b); toast('Rate limiting applied', 'ok'); renderRateLimit(); }
+    catch (e) { $('#rl-err').textContent = e.message; }
+  };
+  if ($('#rl-reset')) $('#rl-reset').onclick = async () => {
+    try { await DEL('/settings/rate-limit'); toast('Configuration file values in effect', 'ok'); renderRateLimit(); }
+    catch (e) { $('#rl-err').textContent = e.message; }
+  };
+  applyAccess();
 }
 
 // ---------------------------------------------------------------------------

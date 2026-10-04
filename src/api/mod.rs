@@ -7,6 +7,7 @@ pub mod error;
 pub mod guard;
 pub mod openapi;
 pub mod proxy;
+pub mod ratelimit;
 pub mod replication;
 pub mod resolver;
 pub mod rollover;
@@ -366,6 +367,7 @@ fn api_router() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(routes::update_record, routes::delete_record))
         .routes(routes!(routes::search))
         .routes(routes!(routes::rename_zone))
+        .routes(routes!(routes::set_zone_settings))
         .routes(routes!(routes::clone_zone))
         .routes(routes!(routes::bulk_records))
         .routes(routes!(routes::set_member, routes::remove_member))
@@ -419,6 +421,11 @@ fn api_router() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(
             resolver::get_blocklists,
             resolver::update_blocklists
+        ))
+        .routes(routes!(
+            ratelimit::get_rate_limit,
+            ratelimit::update_rate_limit,
+            ratelimit::reset_rate_limit
         ))
         .routes(routes!(resolver::refresh_blocklists))
         .routes(routes!(resolver::test_blocklists))

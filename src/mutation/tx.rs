@@ -761,6 +761,27 @@ impl<'a> Tx<'a> {
         Ok(())
     }
 
+    /// O16: replace a zone's own server settings (`None`: the server's).
+    /// Recorded as a `ZoneUpdated` whose rows differ only in `settings`:
+    /// `updated_at` is kept and the serial is not bumped, because nothing
+    /// the zone serves changes (and a signed zone keeps its window).
+    pub fn set_zone_settings(
+        &mut self,
+        zone: &Zone,
+        settings: Option<crate::model::ZoneSettings>,
+    ) -> MResult<Zone> {
+        let after = Zone {
+            settings: settings.filter(|s| !s.is_empty()).map(Box::new),
+            ..zone.clone()
+        };
+        let after = sql::update_zone(self.conn, &after)?;
+        self.changes.push(Change::Dns(DnsChange::ZoneUpdated {
+            before: zone.clone(),
+            after: after.clone(),
+        }));
+        Ok(after)
+    }
+
     /// The zone loses its owner (the owner account is being deleted).
     /// Recorded as a `ZoneUpdated` whose rows differ only in `owner_id`:
     /// `updated_at` is kept and the serial is not bumped, because nothing
@@ -1258,6 +1279,9 @@ mod tests {
             );
         }
         let mut rng = StdRng::seed_from_u64(20260927);
+        // O16 draws from its own generator, so the history above stays the
+        // one that covers every kind.
+        let mut rng16 = StdRng::seed_from_u64(16);
         let zones = ["r1.test", "r2.test", "r3.test"];
         let types = [
             (RecordType::A, "192.0.2."),
@@ -1295,7 +1319,27 @@ mod tests {
                         None,
                     )
                     .await
-                    .map(|_| ()),
+                    .map(|_| ())
+                    .and(match rng16.random_range(0..4) {
+                        // O16: a zone's own settings set or cleared.
+                        0 => Ok(()),
+                        n => m
+                            .set_zone_settings(
+                                actor(),
+                                z,
+                                (n != 1).then(|| crate::model::ZoneSettings {
+                                    auto_ptr: Some(n == 2),
+                                    transfer_allow: Some(vec!["192.0.2.0/24".into()]),
+                                    require_tsig: (n == 3).then_some(true),
+                                    notify: Some(vec![crate::model::ZoneNotifyTarget {
+                                        address: "192.0.2.53:53".into(),
+                                        key: None,
+                                    }]),
+                                }),
+                            )
+                            .await
+                            .map(|_| ()),
+                    }),
                 11..=50 => {
                     let (t, prefix) = types[rng.random_range(0..types.len())];
                     let n = rng.random_range(1..30);

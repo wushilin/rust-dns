@@ -336,6 +336,9 @@ pub struct RateLimitConfig {
     /// instead of being dropped, so a genuine client whose address is being
     /// spoofed can retry over TCP. 0 = always drop.
     pub slip: u32,
+    /// O15: UDP queries with a valid server cookie (the client's address is
+    /// proven) are answered even over the limit. Needs `[server].cookies`.
+    pub exempt_valid_cookies: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -635,6 +638,7 @@ impl Default for RateLimitConfig {
             max_resolutions_per_second_per_address: 500,
             max_tracked_addresses: 10_000,
             slip: 2,
+            exempt_valid_cookies: false,
         }
     }
 }
@@ -744,6 +748,7 @@ notify = []              # secondaries to NOTIFY on change, e.g. ["203.0.113.5:5
 max_resolutions_per_second_per_address = 500   # per IPv4 address / IPv6 /64
 max_tracked_addresses = 10000
 slip = 2                 # every 2nd limited UDP query gets an empty TC=1 answer; 0 = drop all
+exempt_valid_cookies = false  # answer UDP queries with a valid server cookie even over the limit
 
 [database]
 path = "rust-dns.db"

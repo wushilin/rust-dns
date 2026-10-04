@@ -159,6 +159,7 @@ pub(super) fn default_zone(name: &str, owner_id: Option<i64>) -> Zone {
         signed_at: None,
         overrides: None,
         record_policy: None,
+        settings: None,
     }
 }
 
@@ -237,6 +238,32 @@ impl Mutator {
         self.storage
             .get_zone(&zone_name)?
             .ok_or_else(|| MutationError::NotFound(format!("zone '{zone_name}' not found")))
+    }
+
+    /// O16: set (or clear, with `None` / an empty object) a zone's own
+    /// server settings. Override zones have none (they are never
+    /// transferred or announced, and serve no automatic PTR).
+    pub async fn set_zone_settings(
+        &self,
+        actor: Actor,
+        name: &str,
+        settings: Option<crate::model::ZoneSettings>,
+    ) -> MResult<Zone> {
+        let name = normalize_zone_name(name)?;
+        let settings = match settings.filter(|s| !s.is_empty()) {
+            Some(s) => Some(s.normalized()?),
+            None => None,
+        };
+        self.execute(actor, "set_zone_settings", move |t| {
+            let z = t.require_zone(&name)?;
+            if z.is_override() && settings.is_some() {
+                return Err(MutationError::Invalid(
+                    "an override zone has no transfer, NOTIFY or automatic PTR settings".into(),
+                ));
+            }
+            t.set_zone_settings(&z, settings)
+        })
+        .await
     }
 
     /// O11: rename `name` to `new_name` (one transaction). A key rollover

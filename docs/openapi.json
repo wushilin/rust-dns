@@ -1310,6 +1310,78 @@
         }
       }
     },
+    "/zones/{zone}/settings": {
+      "put": {
+        "tags": [
+          "Zones"
+        ],
+        "summary": "Set a zone's own transfer, NOTIFY and automatic PTR settings (admin)",
+        "description": "Replaces the zone's own server settings; every field left out uses the server's (`[server].auto_ptr`, `[transfer].allow`, `[transfer].require_tsig`, `[transfer].notify`), and an empty object clears them all. `auto_ptr`: whether this zone's A/AAAA records answer PTR queries automatically. `transfer_allow`: CIDRs allowed to transfer (AXFR/IXFR) the zone instead of `[transfer].allow` (empty: nobody). `require_tsig`: transfers need a signature by a TSIG key allowed for the zone. `notify`: secondaries sent NOTIFY on changes instead of `[transfer].notify` (empty: none), each optionally signed with a TSIG key that must exist and be allowed for the zone. Not for override zones. Applies at once and replicates; the serial is not bumped. Refused (409) while a standby of a version without per-zone settings follows this server (it could not keep them). Audited in the change log. Needs `server_admin` and view rights on the zone.",
+        "operationId": "set_zone_settings",
+        "parameters": [
+          {
+            "name": "zone",
+            "in": "path",
+            "description": "Zone name, e.g. `example.com`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "example.com"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ZoneSettings"
+              },
+              "example": {
+                "auto_ptr": false,
+                "notify": [
+                  {
+                    "address": "127.0.0.1:5399"
+                  }
+                ],
+                "require_tsig": false,
+                "transfer_allow": [
+                  "127.0.0.1/32",
+                  "2001:db8::/64"
+                ]
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Saved.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ZoneView"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/ConflictOrReadOnly"
+          }
+        }
+      }
+    },
     "/zones/{zone}/clone": {
       "post": {
         "tags": [
@@ -3910,6 +3982,110 @@
         }
       }
     },
+    "/settings/rate-limit": {
+      "get": {
+        "tags": [
+          "Server"
+        ],
+        "summary": "DNS rate limiting (admin)",
+        "description": "The per-client query limit, the slip ratio and the server-cookie exemption: saved values, the config file's and what is in effect on this server, with counters. Needs `server_admin`.",
+        "operationId": "get_rate_limit",
+        "responses": {
+          "200": {
+            "description": "Rate limiting.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitView"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "Server"
+        ],
+        "summary": "Change DNS rate limiting (admin)",
+        "description": "Saves the settings; they apply at once on this server and replicate to standbys, which apply them too. A field left out or `null` keeps the config file's value. `exempt_valid_cookies`: UDP queries that carry a valid server cookie (RFC 7873; the client proved its address earlier, so it is not spoofed) are answered even over the limit. Audited as `settings.rate_limit.update`. Needs `server_admin`.",
+        "operationId": "update_rate_limit",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RateLimitSettings"
+              },
+              "example": {
+                "exempt_valid_cookies": true,
+                "max_resolutions_per_second_per_address": 200,
+                "slip": 2
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Saved.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitView"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/ReadOnly"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Server"
+        ],
+        "summary": "Use the config file's rate limiting again (admin)",
+        "description": "Removes the saved settings; `[rate_limit]` of the config file applies again (here and on standbys). Audited as `settings.rate_limit.reset`; no-op when nothing is saved. Needs `server_admin`.",
+        "operationId": "reset_rate_limit",
+        "responses": {
+          "200": {
+            "description": "File values in effect.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitView"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/ReadOnly"
+          }
+        }
+      }
+    },
     "/blocklists/refresh": {
       "post": {
         "tags": [
@@ -5556,6 +5732,7 @@
           "nxdomain",
           "errors",
           "rate_limited",
+          "rate_limit_cookie_exempt",
           "truncated",
           "bad_cookie",
           "transfers",
@@ -5626,6 +5803,12 @@
             "type": "integer",
             "format": "int64",
             "description": "Queries dropped by rate limiting.",
+            "minimum": 0
+          },
+          "rate_limit_cookie_exempt": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Over-limit UDP queries answered anyway because they carried a valid\nserver cookie (`exempt_valid_cookies`, O15).",
             "minimum": 0
           },
           "truncated": {
@@ -7910,6 +8093,82 @@
           }
         }
       },
+      "RateLimitInEffect": {
+        "type": "object",
+        "description": "The limits in effect on this server.",
+        "required": [
+          "max_resolutions_per_second_per_address",
+          "slip",
+          "exempt_valid_cookies",
+          "cookies",
+          "max_tracked_addresses"
+        ],
+        "properties": {
+          "max_resolutions_per_second_per_address": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Queries per second per client (0: no limit).",
+            "minimum": 0
+          },
+          "slip": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Every Nth over-limit UDP query gets a TC=1 answer (0: all dropped).",
+            "minimum": 0
+          },
+          "exempt_valid_cookies": {
+            "type": "boolean",
+            "description": "Over-limit UDP queries with a valid server cookie are answered\n(in effect: only while `cookies` is on)."
+          },
+          "cookies": {
+            "type": "boolean",
+            "description": "`[server].cookies`: without it no client holds a server cookie and\nthe exemption has no effect."
+          },
+          "max_tracked_addresses": {
+            "type": "integer",
+            "description": "`[rate_limit].max_tracked_addresses` (file only).",
+            "minimum": 0
+          }
+        }
+      },
+      "RateLimitSettings": {
+        "type": "object",
+        "description": "DNS rate limiting set from the console (setting `rate_limit`). A field\nleft out (`null`) keeps the `[rate_limit]` value of the config file;\nunknown fields are ignored (an older server stores the row and keeps\nusing its file).",
+        "properties": {
+          "max_resolutions_per_second_per_address": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Queries per second per client (IPv4 address / IPv6 /64); 0 turns\nthe limit off. `null`: `[rate_limit].max_resolutions_per_second_per_address`.",
+            "default": null,
+            "example": 200,
+            "maximum": 1000000,
+            "minimum": 0
+          },
+          "slip": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "What an over-limit UDP query gets: every Nth one an empty truncated\n(TC=1) answer so a real client can retry over TCP, the others are\ndropped; 0 drops all. `null`: `[rate_limit].slip`.",
+            "default": null,
+            "example": 2,
+            "maximum": 10,
+            "minimum": 0
+          },
+          "exempt_valid_cookies": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "UDP queries carrying a valid server cookie (RFC 7873: the client\nproved its address in an earlier exchange, so it is not spoofed)\nare answered even over the limit. Needs `[server].cookies` (on by\ndefault). `null`: `[rate_limit].exempt_valid_cookies` (default off).",
+            "default": null
+          }
+        }
+      },
       "RateLimitStatus": {
         "type": "object",
         "required": [
@@ -7929,6 +8188,62 @@
           "max_resolutions_per_second_per_address": {
             "type": "integer",
             "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "RateLimitView": {
+        "type": "object",
+        "description": "Rate limiting: the saved settings, the file's and what is in effect.",
+        "required": [
+          "settings",
+          "in_effect",
+          "file",
+          "source",
+          "updated_by",
+          "updated_at",
+          "rate_limited",
+          "cookie_exempt"
+        ],
+        "properties": {
+          "settings": {
+            "$ref": "#/components/schemas/RateLimitSettings",
+            "description": "Saved settings (`null` fields: the file's value)."
+          },
+          "in_effect": {
+            "$ref": "#/components/schemas/RateLimitInEffect"
+          },
+          "file": {
+            "$ref": "#/components/schemas/RateLimitInEffect",
+            "description": "`[rate_limit]` in the config file."
+          },
+          "source": {
+            "$ref": "#/components/schemas/SettingSource",
+            "description": "`config`: nothing saved; `console`: saved settings."
+          },
+          "updated_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "updated_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "rate_limited": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Over-limit UDP queries dropped (or slipped) since start.",
+            "minimum": 0
+          },
+          "cookie_exempt": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Over-limit UDP queries answered because of a valid server cookie.",
             "minimum": 0
           }
         }
@@ -10855,6 +11170,10 @@
           "record_policy": {
             "$ref": "#/components/schemas/RecordPolicy",
             "description": "Expiry policy for records below the apex (M2, self-registration\nzones); absent: none."
+          },
+          "settings": {
+            "$ref": "#/components/schemas/ZoneSettings",
+            "description": "Per-zone server settings (O16): automatic PTR, transfer ACL, NOTIFY\ntargets; absent: the server's for everything."
           }
         }
       },
@@ -11140,6 +11459,29 @@
           "records": true
         }
       },
+      "ZoneNotifyTarget": {
+        "type": "object",
+        "description": "One NOTIFY target of a zone (O16).",
+        "required": [
+          "address"
+        ],
+        "properties": {
+          "address": {
+            "type": "string",
+            "description": "`ip` or `ip:port` (`[v6]:port`); port 53 when omitted. Stored as\n`ip:port`.",
+            "example": "192.0.2.53:53"
+          },
+          "key": {
+            "type": "string",
+            "description": "TSIG key that signs the NOTIFY (it must exist and be allowed to\ntransfer the zone); absent: unsigned.",
+            "example": "hn-secondary."
+          }
+        },
+        "example": {
+          "address": "192.0.2.53:53",
+          "key": "hn-secondary."
+        }
+      },
       "ZoneOverride": {
         "type": "object",
         "description": "The override settings of a zone (I1).",
@@ -11249,6 +11591,51 @@
           "owner"
         ],
         "example": "owner"
+      },
+      "ZoneSettings": {
+        "type": "object",
+        "description": "A zone's own server settings (O16). Every field left out (`null`) uses\nthe server's setting (`[server].auto_ptr`, `[transfer]`).",
+        "properties": {
+          "auto_ptr": {
+            "type": "boolean",
+            "description": "Answer PTR queries from this zone's A/AAAA records (automatic PTR)."
+          },
+          "transfer_allow": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Addresses (CIDR) allowed to transfer this zone, instead of\n`[transfer].allow`; an empty list allows nobody.",
+            "example": [
+              "192.0.2.53/32"
+            ]
+          },
+          "require_tsig": {
+            "type": "boolean",
+            "description": "Transfers of this zone need a TSIG signature (a key allowed to\ntransfer it), instead of `[transfer].require_tsig`."
+          },
+          "notify": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ZoneNotifyTarget"
+            },
+            "description": "Secondaries told about this zone's changes, instead of\n`[transfer].notify`; an empty list notifies nobody."
+          }
+        },
+        "example": {
+          "auto_ptr": false,
+          "notify": [
+            {
+              "address": "192.0.2.53:53",
+              "key": "hn-secondary."
+            }
+          ],
+          "require_tsig": true,
+          "transfer_allow": [
+            "192.0.2.53/32",
+            "2001:db8::/64"
+          ]
+        }
       },
       "ZoneUpstreams": {
         "type": "object",

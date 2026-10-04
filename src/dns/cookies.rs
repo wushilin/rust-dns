@@ -67,6 +67,12 @@ impl CookieJar {
         out
     }
 
+    /// O15: the COOKIE option data carries a valid, unexpired server
+    /// cookie for `ip`.
+    pub fn is_valid(&self, data: &[u8], ip: IpAddr) -> bool {
+        matches!(self.check(data, ip), CookieCheck::Valid(_))
+    }
+
     /// Evaluate the COOKIE option data from a request.
     pub fn check(&self, data: &[u8], ip: IpAddr) -> CookieCheck {
         self.check_at(data, ip, Self::now())
@@ -101,9 +107,91 @@ impl CookieJar {
     }
 }
 
+/// EDNS option code of COOKIE (RFC 7873).
+const OPTION_COOKIE: u16 = 10;
+/// Record type of OPT.
+const TYPE_OPT: u16 = 41;
+
+/// O15: the COOKIE option data of a request, read straight from the wire
+/// (no decode, no allocation): the OPT record in the additional section,
+/// then its options. `None` for a malformed message or one without it.
+pub fn find_option(msg: &[u8]) -> Option<&[u8]> {
+    use super::tsig::{skip_name, u16_at};
+    let qd = u16_at(msg, 4).ok()?;
+    let an = u16_at(msg, 6).ok()? as usize;
+    let ns = u16_at(msg, 8).ok()? as usize;
+    let ar = u16_at(msg, 10).ok()? as usize;
+    let mut i = 12;
+    for _ in 0..qd {
+        i = skip_name(msg, i).ok()? + 4;
+    }
+    for n in 0..an + ns + ar {
+        let after_name = skip_name(msg, i).ok()?;
+        let rtype = u16_at(msg, after_name).ok()?;
+        let rdlen = u16_at(msg, after_name + 8).ok()? as usize;
+        let rdata = after_name + 10;
+        let next = rdata.checked_add(rdlen)?;
+        if next > msg.len() {
+            return None;
+        }
+        if rtype == TYPE_OPT && n >= an + ns {
+            let mut o = rdata;
+            while o + 4 <= next {
+                let code = u16_at(msg, o).ok()?;
+                let len = u16_at(msg, o + 2).ok()? as usize;
+                let end = o + 4 + len;
+                if end > next {
+                    return None;
+                }
+                if code == OPTION_COOKIE {
+                    return Some(&msg[o + 4..end]);
+                }
+                o = end;
+            }
+            return None;
+        }
+        i = next;
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// O15: the COOKIE option is found in a request built by hickory, with
+    /// other options around it; absent, malformed or cut short: none.
+    #[test]
+    fn cookie_option_is_found_on_the_wire() {
+        use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query};
+        use hickory_proto::rr::rdata::opt::{EdnsCode, EdnsOption};
+        use hickory_proto::rr::{Name, RecordType};
+        let cookie: Vec<u8> = (1..=24).collect();
+        let mut m = Message::new(7, MessageType::Query, OpCode::Query);
+        m.add_query(Query::query(
+            Name::from_ascii("www.example.").unwrap(),
+            RecordType::A,
+        ));
+        let mut e = Edns::new();
+        e.options_mut()
+            .insert(EdnsOption::Unknown(u16::from(EdnsCode::NSID), vec![]));
+        e.options_mut()
+            .insert(EdnsOption::Unknown(10, cookie.clone()));
+        m.set_edns(e);
+        let wire = m.to_vec().unwrap();
+        assert_eq!(find_option(&wire), Some(&cookie[..]));
+        for cut in [wire.len() - 1, wire.len() - 20, 14] {
+            assert_eq!(find_option(&wire[..cut]), None, "cut at {cut}");
+        }
+        let mut plain = Message::new(7, MessageType::Query, OpCode::Query);
+        plain.add_query(Query::query(
+            Name::from_ascii("www.example.").unwrap(),
+            RecordType::A,
+        ));
+        assert_eq!(find_option(&plain.to_vec().unwrap()), None);
+        plain.set_edns(Edns::new());
+        assert_eq!(find_option(&plain.to_vec().unwrap()), None);
+    }
 
     #[test]
     fn roundtrip_and_expiry() {

@@ -355,6 +355,11 @@ pub async fn metrics(State(s): St, _caller: Caller) -> ApiResult<Response> {
         d.rate_limited.load(Relaxed),
     );
     m(
+        "rustdns_rate_limit_cookie_exempt_total",
+        "Over-limit UDP queries answered because of a valid server cookie",
+        d.rate_limit_cookie_exempt.load(Relaxed),
+    );
+    m(
         "rustdns_bad_cookie_total",
         "DNS requests with invalid or malformed cookies",
         d.bad_cookie.load(Relaxed),
@@ -573,22 +578,7 @@ pub struct ZoneNameBody {
 /// Standbys known to this primary that cannot follow a zone rename (an
 /// older version would ignore the new name and halt at its reconcile).
 fn rename_blocked_by(s: &AppState) -> Vec<String> {
-    s.repl
-        .replica_list()
-        .into_iter()
-        .filter(|r| !crate::replication::replicas::has_feature(&r.version, "zone-rename"))
-        .map(|r| {
-            format!(
-                "{} (version {})",
-                r.instance,
-                if r.version.is_empty() {
-                    "unknown"
-                } else {
-                    &r.version
-                }
-            )
-        })
-        .collect()
+    standbys_without(s, "zone-rename")
 }
 
 #[utoipa::path(
@@ -642,6 +632,88 @@ pub async fn rename_zone(
         .await?;
     let n = s.storage.list_records(renamed.id)?.len();
     Ok(Json(zone_view(&s, &renamed, role, n)))
+}
+
+/// Standbys known to this primary that lack `feature` ("instance
+/// (version v)" each).
+fn standbys_without(s: &AppState, feature: &str) -> Vec<String> {
+    s.repl
+        .replica_list()
+        .into_iter()
+        .filter(|r| !crate::replication::replicas::has_feature(&r.version, feature))
+        .map(|r| {
+            format!(
+                "{} (version {})",
+                r.instance,
+                if r.version.is_empty() {
+                    "unknown"
+                } else {
+                    &r.version
+                }
+            )
+        })
+        .collect()
+}
+
+#[utoipa::path(
+    put,
+    path = "/zones/{zone}/settings",
+    tag = "Zones",
+    operation_id = "set_zone_settings",
+    summary = "Set a zone's own transfer, NOTIFY and automatic PTR settings (admin)",
+    description = "Replaces the zone's own server settings; every field left out uses the server's (`[server].auto_ptr`, `[transfer].allow`, `[transfer].require_tsig`, `[transfer].notify`), and an empty object clears them all. `auto_ptr`: whether this zone's A/AAAA records answer PTR queries automatically. `transfer_allow`: CIDRs allowed to transfer (AXFR/IXFR) the zone instead of `[transfer].allow` (empty: nobody). `require_tsig`: transfers need a signature by a TSIG key allowed for the zone. `notify`: secondaries sent NOTIFY on changes instead of `[transfer].notify` (empty: none), each optionally signed with a TSIG key that must exist and be allowed for the zone. Not for override zones. Applies at once and replicates; the serial is not bumped. Refused (409) while a standby of a version without per-zone settings follows this server (it could not keep them). Audited in the change log. Needs `server_admin` and view rights on the zone.",
+    params(ZonePath),
+    request_body(content = crate::model::ZoneSettings, example = json!({ "auto_ptr": false, "transfer_allow": ["127.0.0.1/32", "2001:db8::/64"], "require_tsig": false, "notify": [{ "address": "127.0.0.1:5399" }] })),
+    responses(
+        (status = 200, description = "Saved.", body = ZoneView),
+        (status = 400, response = BadRequest),
+        (status = 401, response = Unauthorized),
+        (status = 403, response = Forbidden),
+        (status = 404, response = NotFound),
+        (status = 409, response = ConflictOrReadOnly),
+    ),
+)]
+pub async fn set_zone_settings(
+    State(s): St,
+    caller: Caller,
+    Path(ZonePath { zone }): Path<ZonePath>,
+    Json(b): Json<crate::model::ZoneSettings>,
+) -> ApiResult<Json<ZoneView>> {
+    let (z, role) = s.require_zone(&caller, &zone, ZonePerm::View)?;
+    s.require(&caller, GlobalPerm::ServerAdmin)?;
+    let b = b.normalized().map_err(|e| ApiError::bad_request(e.0))?;
+    let ring = s.dns.tsig_keys.load();
+    for k in b.notify.iter().flatten().filter_map(|t| t.key.as_deref()) {
+        match ring.get(k) {
+            None => {
+                return Err(ApiError::bad_request(format!(
+                    "notify: TSIG key '{k}' does not exist"
+                )))
+            }
+            Some(e) if !e.allows_zone(&z.name) => {
+                return Err(ApiError::bad_request(format!(
+                    "notify: TSIG key '{k}' is not allowed for zone {}",
+                    z.name
+                )))
+            }
+            Some(_) => {}
+        }
+    }
+    if !b.is_empty() {
+        let blocked = standbys_without(&s, "zone-settings");
+        if !blocked.is_empty() {
+            return Err(ApiError::conflict(format!(
+                "standbys of an older version follow this server and could not keep per-zone settings: {}. Upgrade them first (or forget a standby that no longer follows, on the Replication page)",
+                blocked.join(", ")
+            )));
+        }
+    }
+    let after = s
+        .mutator
+        .set_zone_settings(caller.actor(), &z.name, Some(b))
+        .await?;
+    let n = s.storage.list_records(after.id)?.len();
+    Ok(Json(zone_view(&s, &after, role, n)))
 }
 
 #[utoipa::path(

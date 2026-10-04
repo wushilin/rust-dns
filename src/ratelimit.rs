@@ -121,6 +121,10 @@ impl RateLimiter {
         self.slip.store(slip, Relaxed);
     }
 
+    pub fn slip(&self) -> u32 {
+        self.slip.load(Relaxed)
+    }
+
     pub fn limit(&self) -> u32 {
         self.limit.load(Relaxed)
     }

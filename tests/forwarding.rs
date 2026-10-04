@@ -193,6 +193,8 @@ impl Server {
                 continue;
             };
             let listening = common::dns_listening(srv.dns, Duration::from_secs(5));
+            // See `common::came_up`: an exit for want of the web port.
+            std::thread::sleep(Duration::from_millis(300));
             if matches!(srv.child.try_wait(), Ok(Some(_))) {
                 // Exited: the health check reached another process.
                 eprintln!("the server exited at start; starting again on other ports");

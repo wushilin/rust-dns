@@ -845,12 +845,12 @@ Group 3: operations
   with a standby; record numbers in plan.md. Do not touch its /opt/rust-dns
   service; use separate ports and a scratch directory; stop everything after.
   This is the ONLY container/remote machine this phase may use.
-- [ ] O14. Live updates through a reverse proxy: CI job on Linux with nginx
+- [x] O14. Live updates through a reverse proxy: CI job on Linux with nginx
   in front of the console (websocket upgrade works, live feed receives an
   event); locally skipped when nginx is missing.
-- [ ] O15. Rate limiting: exempt clients presenting a valid server cookie
+- [x] O15. Rate limiting: exempt clients presenting a valid server cookie
   from the UDP cap; rate-limit modes configurable from the console.
-- [ ] O16. Per-zone settings: auto-PTR toggle, transfer ACL, NOTIFY targets
+- [x] O16. Per-zone settings: auto-PTR toggle, transfer ACL, NOTIFY targets
   (replicated; console; AXFR/NOTIFY tests incl. TSIG).
 - [ ] O17. utoipa 6 / utoipa-axum 0.3 upgrade if it builds cleanly and the
   generated spec stays equivalent (diff the snapshot; contract tests).
@@ -1026,6 +1026,32 @@ Final
   lacks it (test `a_zone_rename_replicates_and_waits_for_old_standbys`,
   real d32d67f binary). Upgrade baba2 first, then gate; a standby that no
   longer follows must be forgotten (Replication page) before renames work.
+
+- After phase O, group 3 (this session; not deployed): protocol 2, no new
+  change kind, fixture untouched. O0b: every early answer (404, 405) now
+  waits for the request body: no client-visible change except that lost
+  answers under load are gone. O15: new console setting key `rate_limit`
+  (`setting_set` / `setting_cleared`, JSON, every field optional, unknown
+  fields ignored) and a new optional `[rate_limit] exempt_valid_cookies`
+  (default false; `[rate_limit]` ignores keys it does not know, so an older
+  binary starts with it). An older (d32d67f) standby stores the setting
+  and keeps its file's limits: harmless, reconcile ok (test `phase_i_
+  settings_keep_an_old_standby_following`, real previous binary); once
+  upgraded it applies it. Defaults unchanged: no exemption, the file's
+  limit and slip. O16: new nullable column `zones.zone_settings` (added NULL,
+  nothing rewritten; `compat_columns`, covered by the per-zone checksum)
+  and an optional `settings` field in the zone row of `zone_created` /
+  `zone_updated` and snapshots, present only when a zone has settings. An
+  older standby would drop them and halt at its reconcile, so standbys now
+  advertise `zone-settings` (`X-Rust-DNS-Version: 0.1.0+dnssec-rollover.
+  zone-rename.zone-settings`) and the primary refuses to set them (409,
+  naming the standby) while a known standby lacks it; clearing stays
+  allowed (test `zone_settings_replicate_and_wait_for_old_standbys`, real
+  previous binary). Upgrade baba2 first, then gate; set per-zone settings
+  only after both run this version; no downgrade once a zone has settings
+  (the old binary would serve the zone with the server's transfer ACL and
+  NOTIFY targets). Zone clones and the JSON export/import do not carry
+  them (they need `server_admin`). O14 is CI-only (no runtime change).
 
 ## Log
 
@@ -1838,3 +1864,63 @@ Final
   existing `early_answers_reach_the_client_and_large_bodies_are_refused`,
   and every suite now starting through `common::came_up`. The same stress
   run on the fixed commit: see the next Log line.
+- 2026-10-04 (phase O): O0 after the fix (db49d46, same `stress.sh` load,
+  15 minutes): `json_import_and_record_paging` 0 failures in 285 runs
+  (before: 5 in 231); the forwarding test 2 in ~855, both a third variant
+  of O0a: the web port was taken, the health check was answered by the
+  other process and the new server exited a few milliseconds later, after
+  the check (login then failed to connect). `common::came_up` now waits
+  300 ms after the DNS probe before its exit check (committed with
+  O14-O16; re-run below).
+- 2026-10-04 (phase O): O14 done. `tests/proxy.rs`: the real binary behind
+  an unprivileged nginx (own prefix, config, temp paths and loopback ports;
+  the settings of `examples/proxy/nginx.conf` without TLS): console page
+  and API through it, a session websocket (cookie, `Origin` of the proxy's
+  address) and a token websocket (subprotocol) both upgraded (101), a
+  record created through the proxy reaches both live feeds, a cross-site
+  `Origin` is refused through it too. Skipped when nginx is missing;
+  CI job `nginx-proxy` (`apt-get install nginx`, `REQUIRE_NGINX_TEST=1`)
+  requires it. Not run here (no nginx on this Mac): first proof is that CI
+  job. Test: `proxy::live_updates_through_nginx`.
+- 2026-10-04 (phase O): O15 done. Console setting `rate_limit`
+  (`GET/PUT/DELETE /settings/rate-limit`, `server_admin`): per-client
+  limit, slip, and `exempt_valid_cookies`; each field optional (the file's
+  `[rate_limit]` value otherwise). Exemption: an over-limit UDP query whose
+  COOKIE option (read from the wire at admission, no decode) carries a
+  valid server cookie minted for its address is answered (counter
+  `rate_limit_cookie_exempt`, metric `rustdns_rate_limit_cookie_exempt_total`);
+  needs `[server].cookies`. Off by default. Replicated; each server applies
+  it to its own limiter (standbys after each replicated change). Console:
+  "Rate limiting" card on the Server page. Tests:
+  `dns::cookies::tests::cookie_option_is_found_on_the_wire`,
+  `dns::handler::tests::valid_server_cookies_are_exempt_from_the_udp_limit_when_configured`,
+  `api::tests::rate_limit_settings_apply_at_once`, follow
+  `phase_i_settings_keep_an_old_standby_following` (old standby keeps
+  following with the setting; upgraded, it runs its limiter with it and
+  applies a change while following; writes refused on it), contract test
+  (example), browser flows "O15: rate limiting saved and in effect", "O15:
+  reset to the configuration file".
+- 2026-10-04 (phase O): O16 done. `PUT /zones/{zone}/settings`
+  (`server_admin`): `auto_ptr`, `transfer_allow`, `require_tsig`, `notify`
+  (address + optional TSIG key, which must exist and cover the zone); each
+  replaces the server's setting for that zone, `{}` clears. Stored in
+  `zones.zone_settings`, replicated as `zone_updated` without a serial bump;
+  feature `zone-settings` (see Rollout). Served: the transfer filter uses
+  the zone's ACL / TSIG requirement, NOTIFY goes to the zone's targets
+  (signed with its key), automatic PTR takes a zone's A/AAAA only where
+  its setting (else the server's) is on. Not for override zones; not
+  copied by clone. Console: "Transfers & PTR" on the zone page
+  (administrators). Tests: `model::zone_settings_tests::zone_settings_are_normalized_and_checked`,
+  `zones::tests::auto_ptr_follows_the_zone_setting`,
+  `mutation::tx::tests::replaying_the_changelog_rebuilds_identical_data`
+  (zone settings set and cleared in the random history),
+  `api::tests::zone_settings_through_the_api`,
+  `tsig::zone_settings_control_transfers_notify_and_auto_ptr` (AXFR refused
+  outside the zone ACL, refused unsigned, served signed with the zone's
+  key; NOTIFY to the zone's target signed with its key, none for it to the
+  server's target; auto PTR off for the zone only),
+  `follow::zone_settings_replicate_and_wait_for_old_standbys` (standby
+  applies ACL and PTR, no serial bump, reconcile ok; d32d67f standby blocks
+  setting, clearing allowed), contract test (example), browser flows
+  "O16: zone transfer, NOTIFY and PTR settings saved", "O16: back to the
+  server's settings".

@@ -64,6 +64,7 @@ fn zone() -> Zone {
         signed_at: None,
         overrides: None,
         record_policy: None,
+        settings: None,
     }
 }
 

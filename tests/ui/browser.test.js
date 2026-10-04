@@ -439,6 +439,36 @@ async function phaseO(b, p, rootApi, admin) {
   await admin.click('#m-ok');
   await admin.wait('renamed', `return location.hash === '#/zones/renamed.test'`);
   ok('O11: zone renamed', (await rootApi('GET', '/zones/renamed.test/records')).json.records.length === 4 && (await rootApi('GET', '/zones/copy.other.test')).status === 404);
+
+  // O15: rate limiting from the Server page (empty field = the file's value).
+  await admin.route('#/server', `return !!document.querySelector('#rl-max')`);
+  await admin.fill('#rl-max', '123');
+  await admin.fill('#rl-ck', 'on');
+  await admin.click('#rl-save');
+  await admin.wait('rate limit saved', `return document.querySelector('#ratelimit-card')?.textContent.includes('set in the console') && document.querySelector('#rl-max').value === '123'`);
+  const rl = (await rootApi('GET', '/settings/rate-limit')).json;
+  ok('O15: rate limiting saved and in effect', rl.in_effect.max_resolutions_per_second_per_address === 123 && rl.in_effect.exempt_valid_cookies === true && rl.settings.slip === null, JSON.stringify(rl));
+  await admin.click('#rl-reset');
+  await admin.wait('rate limit reset', `return document.querySelector('#ratelimit-card')?.textContent.includes('config file') && document.querySelector('#rl-max').value === ''`);
+  ok('O15: reset to the configuration file', (await rootApi('GET', '/settings/rate-limit')).json.source === 'config');
+
+  // O16: a zone's own transfer ACL, NOTIFY targets and automatic PTR.
+  await admin.route('#/zones/renamed.test', `return !!document.querySelector('#z-xfer')`);
+  await admin.click('#z-xfer');
+  await admin.wait('zone settings dialog', `return !!document.querySelector('#zs-acl')`);
+  await admin.fill('#zs-ptr', 'off');
+  await admin.eval(`document.querySelector('#zs-acl-own').checked = true; document.querySelector('#zs-nt-own').checked = true; return true`);
+  await admin.fill('#zs-acl', '192.0.2.53\n2001:db8::/64');
+  await admin.fill('#zs-nt', '192.0.2.53');
+  await admin.click('#m-ok');
+  await admin.wait('dialog closed', `return !document.querySelector('#zs-acl')`);
+  const zs = (await rootApi('GET', '/zones/renamed.test')).json.settings;
+  ok('O16: zone transfer, NOTIFY and PTR settings saved', JSON.stringify(zs) === JSON.stringify({ auto_ptr: false, transfer_allow: ['192.0.2.53/32', '2001:db8::/64'], notify: [{ address: '192.0.2.53:53' }] }), JSON.stringify(zs));
+  await admin.click('#z-xfer');
+  await admin.wait('zone settings dialog', `return !!document.querySelector('#zs-clear')`);
+  await admin.click('#zs-clear');
+  await admin.wait('dialog closed', `return !document.querySelector('#zs-acl')`);
+  ok('O16: back to the server\'s settings', !(await rootApi('GET', '/zones/renamed.test')).json.settings);
   return [olive];
 }
 

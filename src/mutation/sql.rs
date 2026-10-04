@@ -12,18 +12,18 @@ use rusqlite::{params, Connection};
 /// (idempotent: a standby may re-apply changes from an earlier offset).
 pub(super) fn insert_zone(c: &Connection, z: &Zone) -> Result<Zone> {
     c.execute(
-        "INSERT INTO zones (id, name, serial, soa_mname, soa_rname, refresh, retry, expire, minimum, default_ttl, created_at, updated_at, owner_id, dnssec, signed_at, override_spec, record_policy)
-         VALUES (NULLIF(?1, 0), ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+        "INSERT INTO zones (id, name, serial, soa_mname, soa_rname, refresh, retry, expire, minimum, default_ttl, created_at, updated_at, owner_id, dnssec, signed_at, override_spec, record_policy, zone_settings)
+         VALUES (NULLIF(?1, 0), ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
          ON CONFLICT(id) DO UPDATE SET name = excluded.name, serial = excluded.serial, soa_mname = excluded.soa_mname,
             soa_rname = excluded.soa_rname, refresh = excluded.refresh, retry = excluded.retry, expire = excluded.expire,
             minimum = excluded.minimum, default_ttl = excluded.default_ttl, created_at = excluded.created_at,
             updated_at = excluded.updated_at, owner_id = excluded.owner_id, dnssec = excluded.dnssec,
             signed_at = excluded.signed_at, override_spec = excluded.override_spec,
-            record_policy = excluded.record_policy",
+            record_policy = excluded.record_policy, zone_settings = excluded.zone_settings",
         params![
             z.id, z.name, z.serial as i64, z.soa_mname, z.soa_rname, z.refresh as i64, z.retry as i64,
             z.expire as i64, z.minimum as i64, z.default_ttl as i64, z.created_at, z.updated_at, z.owner_id,
-            z.dnssec as i64, z.signed_at, override_json(z)?, policy_json(z)?
+            z.dnssec as i64, z.signed_at, override_json(z)?, policy_json(z)?, settings_json(z)?
         ],
     )?;
     let id = if z.id != 0 {
@@ -38,13 +38,14 @@ pub(super) fn update_zone(c: &Connection, z: &Zone) -> Result<Zone> {
     c.execute(
         "UPDATE zones SET serial=?2, soa_mname=?3, soa_rname=?4, refresh=?5, retry=?6, expire=?7, minimum=?8,
          default_ttl=?9, updated_at=?10, owner_id=?11, dnssec=?12, signed_at=?13, override_spec=?14,
-         record_policy=?15, name=?16 WHERE id = ?1",
+         record_policy=?15, name=?16, zone_settings=?17 WHERE id = ?1",
         params![
             z.id, z.serial as i64, z.soa_mname, z.soa_rname, z.refresh as i64, z.retry as i64,
             z.expire as i64, z.minimum as i64, z.default_ttl as i64, z.updated_at, z.owner_id,
             z.dnssec as i64, z.signed_at, override_json(z)?, policy_json(z)?,
             // O11: the name too (a rename); unchanged for every other update.
-            z.name
+            z.name,
+            settings_json(z)?
         ],
     )?;
     Ok(db::get_zone_by_id(c, z.id)?.expect("zone exists"))
@@ -60,6 +61,13 @@ fn override_json(z: &Zone) -> Result<Option<String>> {
 fn policy_json(z: &Zone) -> Result<Option<String>> {
     Ok(match z.record_policy.as_ref().filter(|p| !p.is_empty()) {
         Some(p) => Some(serde_json::to_string(p)?),
+        None => None,
+    })
+}
+
+fn settings_json(z: &Zone) -> Result<Option<String>> {
+    Ok(match z.settings.as_ref().filter(|s| !s.is_empty()) {
+        Some(s) => Some(serde_json::to_string(s)?),
         None => None,
     })
 }

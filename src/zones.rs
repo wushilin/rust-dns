@@ -325,8 +325,8 @@ pub fn lookup_dnssec(
         Some(z) if z.zone.is_override() => return Lookup::Override(z.clone()),
         Some(z) => z.clone(),
         None => {
-            if auto_ptr && (qtype == RecordType::PTR || qtype == RecordType::ANY) {
-                if let Some(a) = auto_ptr_answer(catalog, qname, &key) {
+            if qtype == RecordType::PTR || qtype == RecordType::ANY {
+                if let Some(a) = auto_ptr_answer(catalog, qname, &key, auto_ptr) {
                     return Lookup::Answer(a);
                 }
             }
@@ -372,20 +372,39 @@ fn ds_parent_side(
     (p.signed.is_some() || has_ds).then(|| p.clone())
 }
 
-fn auto_ptr_answer(catalog: &Catalog, qname: &Name, key: &str) -> Option<Answer> {
+/// The automatic PTR answer for reverse name `key`: one PTR per A/AAAA
+/// owner with that address, from zones whose automatic PTR is on (their
+/// own setting, O16, else the server's `server_default`). `None`: none.
+fn auto_ptr_answer(
+    catalog: &Catalog,
+    qname: &Name,
+    key: &str,
+    server_default: bool,
+) -> Option<Answer> {
     let targets = catalog.reverse.get(key)?;
     let mut ans = Answer::new(ResponseCode::NoError);
     for t in targets {
+        let Some(z) = catalog.find_zone(t) else {
+            continue;
+        };
+        let on = z
+            .zone
+            .settings
+            .as_ref()
+            .and_then(|s| s.auto_ptr)
+            .unwrap_or(server_default);
+        if !on {
+            continue;
+        }
         if let Some(n) = name_of(t) {
-            let ttl = catalog
-                .find_zone(t)
-                .map(|z| z.zone.default_ttl)
-                .unwrap_or(300);
-            ans.answers
-                .push(Record::from_rdata(qname.clone(), ttl, RData::PTR(PTR(n))));
+            ans.answers.push(Record::from_rdata(
+                qname.clone(),
+                z.zone.default_ttl,
+                RData::PTR(PTR(n)),
+            ));
         }
     }
-    Some(ans)
+    (!ans.answers.is_empty()).then_some(ans)
 }
 
 /// Append the RRSIG of every RRset in `section[from..]` (records owned by
@@ -711,8 +730,8 @@ fn resolve_into(
     // Nothing found: try auto PTR before going negative. Not in a signed
     // zone: a synthesized PTR could not be signed (and would contradict
     // the zone's NSEC chain).
-    if auto_ptr && signed.is_none() && (qtype == RecordType::PTR || qtype == RecordType::ANY) {
-        if let Some(a) = auto_ptr_answer(catalog, qname, key) {
+    if signed.is_none() && (qtype == RecordType::PTR || qtype == RecordType::ANY) {
+        if let Some(a) = auto_ptr_answer(catalog, qname, key, auto_ptr) {
             ans.answers.extend(a.answers);
             return;
         }
@@ -797,6 +816,7 @@ mod tests {
             signed_at: None,
             overrides: None,
             record_policy: None,
+            settings: None,
         }
     }
     fn rec(id: i64, zone_id: i64, name: &str, t: Rt, v: &str) -> StoredRecord {
@@ -974,6 +994,58 @@ mod tests {
             ),
             Lookup::NotOurs
         ));
+    }
+
+    /// O16: a zone's own `auto_ptr` decides whether its A/AAAA records
+    /// answer PTR queries, over the server's setting, both outside any
+    /// reverse zone and inside one.
+    #[test]
+    fn auto_ptr_follows_the_zone_setting() {
+        let build = |own: Option<bool>| {
+            let mut z = zone(1, "example.com");
+            z.settings = own.map(|b| {
+                Box::new(crate::model::ZoneSettings {
+                    auto_ptr: Some(b),
+                    ..Default::default()
+                })
+            });
+            Catalog::build(
+                vec![z, zone(2, "0.0.10.in-addr.arpa"), zone(3, "other.test")],
+                vec![
+                    rec(1, 1, "www", Rt::A, "10.0.0.1"),
+                    rec(2, 1, "v6", Rt::AAAA, "2001:db8::1"),
+                    rec(3, 3, "www", Rt::A, "10.0.0.1"),
+                ],
+            )
+        };
+        let v6 = "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa.";
+        let ptrs = |c: &Catalog, name: &str, server: bool| -> Vec<String> {
+            match lookup(c, &Name::from_ascii(name).unwrap(), RecordType::PTR, server) {
+                Lookup::Answer(a) => {
+                    let mut v: Vec<String> = a.answers.iter().map(|r| r.data.to_string()).collect();
+                    v.sort();
+                    v
+                }
+                _ => Vec::new(),
+            }
+        };
+        let in_rev = "1.0.0.10.in-addr.arpa.";
+        // No setting: the server's.
+        let c = build(None);
+        assert_eq!(
+            ptrs(&c, in_rev, true),
+            vec!["www.example.com.", "www.other.test."]
+        );
+        assert!(ptrs(&c, in_rev, false).is_empty());
+        assert_eq!(ptrs(&c, v6, true), vec!["v6.example.com."]);
+        // Off for example.com: only other.test's record answers.
+        let c = build(Some(false));
+        assert_eq!(ptrs(&c, in_rev, true), vec!["www.other.test."]);
+        assert!(ptrs(&c, v6, true).is_empty(), "nothing left: not ours");
+        // On for example.com while the server has it off.
+        let c = build(Some(true));
+        assert_eq!(ptrs(&c, in_rev, false), vec!["www.example.com."]);
+        assert_eq!(ptrs(&c, v6, false), vec!["v6.example.com."]);
     }
 
     #[test]

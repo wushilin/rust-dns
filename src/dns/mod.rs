@@ -36,6 +36,8 @@ pub struct Stats {
     pub nxdomain: AtomicU64,
     pub errors: AtomicU64,
     pub rate_limited: AtomicU64,
+    /// O15: over-limit UDP queries answered because of a valid server cookie.
+    pub rate_limit_cookie_exempt: AtomicU64,
     pub truncated: AtomicU64,
     pub bad_cookie: AtomicU64,
     pub transfers: AtomicU64,
@@ -84,6 +86,7 @@ impl Stats {
             nxdomain: self.nxdomain.load(Relaxed),
             errors: self.errors.load(Relaxed),
             rate_limited: self.rate_limited.load(Relaxed),
+            rate_limit_cookie_exempt: self.rate_limit_cookie_exempt.load(Relaxed),
             truncated: self.truncated.load(Relaxed),
             bad_cookie: self.bad_cookie.load(Relaxed),
             transfers: self.transfers.load(Relaxed),
@@ -121,6 +124,9 @@ pub struct DnsCounters {
     pub errors: u64,
     /// Queries dropped by rate limiting.
     pub rate_limited: u64,
+    /// Over-limit UDP queries answered anyway because they carried a valid
+    /// server cookie (`exempt_valid_cookies`, O15).
+    pub rate_limit_cookie_exempt: u64,
     /// UDP responses truncated.
     pub truncated: u64,
     /// Requests with an invalid or malformed DNS cookie.
@@ -273,6 +279,11 @@ pub struct DnsServer {
     pub cache: Arc<Cache>,
     pub bus: Arc<Bus>,
     pub limiter: Arc<RateLimiter>,
+    /// O15: over-limit UDP queries with a valid server cookie are answered
+    /// (effective `exempt_valid_cookies`, with cookies on).
+    pub cookie_exempt: std::sync::atomic::AtomicBool,
+    /// O15: rate limiting set from the console (defaults: the file's).
+    rate_limit: std::sync::RwLock<crate::mutation::settings::RateLimitSettings>,
     /// Open resolver mode: per-client limit on forwarded queries.
     pub fwd_limiter: RateLimiter,
     /// Listener settings (fixed for the process lifetime).
@@ -324,6 +335,10 @@ impl DnsServer {
             cache,
             bus,
             limiter,
+            cookie_exempt: std::sync::atomic::AtomicBool::new(
+                cfg.rate_limit.exempt_valid_cookies && cfg.server.cookies,
+            ),
+            rate_limit: std::sync::RwLock::new(Default::default()),
             fwd_limiter: {
                 let l = RateLimiter::new(
                     cfg.forwarding.open_resolver_rate_per_second,
@@ -369,6 +384,25 @@ impl DnsServer {
         self.reload(cfg);
     }
 
+    /// O15: replace the console rate-limit settings (`None`: the file's)
+    /// and apply them now.
+    pub fn set_rate_limit(
+        &self,
+        r: Option<crate::mutation::settings::RateLimitSettings>,
+        cfg: &Config,
+    ) {
+        *self.rate_limit.write().unwrap_or_else(|p| p.into_inner()) = r.unwrap_or_default();
+        self.reload(cfg);
+    }
+
+    /// O15: the rate limiting in effect (console settings over the file).
+    pub fn rate_limit_in_effect(&self, cfg: &Config) -> crate::config::RateLimitConfig {
+        self.rate_limit
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .effective(&cfg.rate_limit)
+    }
+
     pub fn resolver(&self) -> ResolverSettings {
         self.resolver
             .read()
@@ -411,6 +445,13 @@ impl DnsServer {
                 }
             }
             Err(e) => tracing::error!(error = %e, "stored blocklist settings are unreadable"),
+        }
+        match st::load_rate_limit(storage) {
+            Ok(o) => {
+                *self.rate_limit.write().unwrap_or_else(|p| p.into_inner()) =
+                    o.map(|(r, _, _)| r).unwrap_or_default()
+            }
+            Err(e) => tracing::error!(error = %e, "stored rate-limit settings are unreadable"),
         }
         self.reload(cfg);
     }
@@ -481,13 +522,18 @@ impl DnsServer {
             cfg.forwarding.open_resolver_rate_per_second,
             fwd_limiter_size(&next, cfg),
         );
-        self.fwd_limiter.set_slip(cfg.rate_limit.slip);
+        let rl = self.rate_limit_in_effect(cfg);
+        self.fwd_limiter.set_slip(rl.slip);
+        self.cookie_exempt.store(
+            rl.exempt_valid_cookies && next.cookies,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         self.runtime.store(Arc::new(next));
         self.limiter.reconfigure(
-            cfg.rate_limit.max_resolutions_per_second_per_address,
-            cfg.rate_limit.max_tracked_addresses,
+            rl.max_resolutions_per_second_per_address,
+            rl.max_tracked_addresses,
         );
-        self.limiter.set_slip(cfg.rate_limit.slip);
+        self.limiter.set_slip(rl.slip);
     }
 
     /// Loud warnings while open resolver mode is in effect (startup, reload).

@@ -1598,6 +1598,36 @@ fn live_api_matches_spec() {
     );
     c.expect("security settings back to the defaults", &r, 200);
 
+    // ---- O15: rate limiting from the console --------------------------------
+    let r = c.call(
+        Auth::Session(&root),
+        "get",
+        "/settings/rate-limit",
+        &[],
+        "",
+        Body::None,
+    );
+    c.expect("rate limiting (file values)", &r, 200);
+    let ex = c.example("/settings/rate-limit", "put");
+    let r = c.send_example(
+        Auth::Session(&root),
+        "put",
+        "/settings/rate-limit",
+        &[],
+        "",
+        &ex,
+    );
+    c.expect("PUT /settings/rate-limit with the spec example", &r, 200);
+    let r = c.call(
+        Auth::Session(&root),
+        "delete",
+        "/settings/rate-limit",
+        &[],
+        "",
+        Body::None,
+    );
+    c.expect("rate limiting back to the file", &r, 200);
+
     // ---- voluntary MFA for root: start, confirm, recovery, login, disable -----
     let r = c.call(
         Auth::Session(&root),
@@ -2096,6 +2126,17 @@ fn live_api_matches_spec() {
         &ex,
     );
     c.expect("rename an unsigned zone", &r, 200);
+    // O16: the renamed zone's own transfer / NOTIFY / PTR settings.
+    let ex = c.example("/zones/{zone}/settings", "put");
+    let r = c.send_example(
+        Auth::Session(&root),
+        "put",
+        "/zones/{zone}/settings",
+        &[("zone", "renamed.example.com".to_string())],
+        "",
+        &ex,
+    );
+    c.expect("zone settings with the spec example", &r, 200);
 
     // ---- logout --------------------------------------------------------------
     let r = c.call(

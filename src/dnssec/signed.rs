@@ -570,6 +570,7 @@ mod tests {
             signed_at: None,
             overrides: None,
             record_policy: None,
+            settings: None,
         }
     }
 

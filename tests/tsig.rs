@@ -909,3 +909,165 @@ zone "bind.test" {{
     drop(srv);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// O16: a zone's own settings, end to end: its transfer ACL and TSIG
+/// requirement replace `[transfer]` for it (AXFR refused from an address
+/// outside, refused unsigned, served signed with a key for the zone), its
+/// NOTIFY targets replace `[transfer].notify` (the zone's target gets a
+/// NOTIFY signed with the zone's key, the global target none), and its
+/// automatic PTR can be switched off. Other zones keep the server's.
+#[test]
+fn zone_settings_control_transfers_notify_and_auto_ptr() {
+    let dir = std::env::temp_dir().join(format!(
+        "rust-dns-tsig-zs-{}-{}",
+        std::process::id(),
+        rand_id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (dns, web_port) = (free_port(), free_port());
+    let global = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let own = UdpSocket::bind("127.0.0.1:0").unwrap();
+    // `[transfer].notify` points at `global` (signed with hn-secondary.).
+    write_config(
+        &dir,
+        dns,
+        web_port,
+        global.local_addr().unwrap().port(),
+        false,
+    );
+    let srv = Server::start(dir.clone(), web_port, dns);
+    let dns = srv.dns;
+    let web = format!("http://127.0.0.1:{web_port}");
+    let root = login(&web, "root", "rootpass123");
+    // hn-secondary. exists, so the server-wide NOTIFY is sent.
+    let mut secret = String::new();
+    for (name, zones) in [("hn-secondary.", vec![]), ("zs-key.", vec!["zs.test"])] {
+        let (s, v) = call(
+            &root,
+            "POST",
+            &format!("{web}/api/tsig/keys"),
+            Some(serde_json::json!({ "name": name, "zones": zones })),
+        );
+        assert_eq!(s, 201, "{v}");
+        secret = v["secret"].as_str().unwrap().to_string();
+    }
+    let key = Key {
+        name: "zs-key.".into(),
+        algorithm: Algorithm::HmacSha256,
+        secret: b64(&secret),
+    };
+    for zone in ["zs.test", "plain.test"] {
+        let (s, v) = call(
+            &root,
+            "POST",
+            &format!("{web}/api/zones"),
+            Some(serde_json::json!({ "name": zone })),
+        );
+        assert_eq!(s, 201, "{v}");
+        let (s, v) = call(
+            &root,
+            "POST",
+            &format!("{web}/api/zones/{zone}/records"),
+            Some(
+                serde_json::json!({ "name": "host", "type": "A", "value": if zone == "zs.test" { "10.9.8.7" } else { "10.9.8.6" } }),
+            ),
+        );
+        assert_eq!(s, 201, "{v}");
+    }
+    let settings = |b: serde_json::Value| {
+        let (s, v) = call(
+            &root,
+            "PUT",
+            &format!("{web}/api/zones/zs.test/settings"),
+            Some(b),
+        );
+        assert_eq!(s, 200, "{v}");
+    };
+    let axfr = |zone: &str, sign: bool| -> (ResponseCode, usize) {
+        let q = query_bytes(rand_id(), zone, RecordType::AXFR);
+        let msgs = if sign {
+            let (req, mac) = signed(&q, &key, tsig::now());
+            let msgs = tcp_exchange(dns, &req);
+            let mut v = ResponseVerifier::new(key.clone(), &mac);
+            for m in &msgs {
+                v.verify(m, tsig::now()).unwrap();
+            }
+            msgs
+        } else {
+            tcp_exchange(dns, &q)
+        };
+        (rcode(&msgs[0]), answer_count(&msgs))
+    };
+    // The server's: 127.0.0.0/8, unsigned allowed.
+    assert_eq!(axfr("zs.test", false).0, ResponseCode::NoError);
+    // Own ACL without this address: refused (signed or not); the other
+    // zone is unaffected.
+    settings(serde_json::json!({ "transfer_allow": ["192.0.2.0/24"] }));
+    assert_eq!(axfr("zs.test", false).0, ResponseCode::Refused);
+    assert_eq!(axfr("zs.test", true).0, ResponseCode::Refused);
+    assert_eq!(axfr("plain.test", false).0, ResponseCode::NoError);
+    // Own ACL with it, TSIG required: unsigned refused, signed served.
+    settings(serde_json::json!({ "transfer_allow": ["127.0.0.1/32"], "require_tsig": true }));
+    assert_eq!(axfr("zs.test", false).0, ResponseCode::Refused);
+    let (rc, n) = axfr("zs.test", true);
+    assert_eq!(rc, ResponseCode::NoError);
+    assert!(n >= 3, "SOA, record(s), SOA: {n}");
+    assert_eq!(axfr("plain.test", false).0, ResponseCode::NoError);
+
+    // NOTIFY: the zone's own target, signed with the zone's key.
+    settings(serde_json::json!({
+        "transfer_allow": ["127.0.0.1/32"], "require_tsig": true,
+        "notify": [{ "address": format!("127.0.0.1:{}", own.local_addr().unwrap().port()), "key": "zs-key." }]
+    }));
+    // Drain whatever earlier changes announced to the global target.
+    global
+        .set_read_timeout(Some(Duration::from_millis(2500)))
+        .unwrap();
+    let mut buf = [0u8; 4096];
+    while global.recv_from(&mut buf).is_ok() {}
+    let (s, _) = call(
+        &root,
+        "POST",
+        &format!("{web}/api/zones/zs.test/records"),
+        Some(serde_json::json!({ "name": "changed", "type": "A", "value": "10.9.8.8" })),
+    );
+    assert_eq!(s, 201);
+    own.set_read_timeout(Some(Duration::from_secs(8))).unwrap();
+    let (n, _) = own
+        .recv_from(&mut buf)
+        .expect("NOTIFY to the zone's target");
+    let m = buf[..n].to_vec();
+    let sig = tsig::find(&m).unwrap().expect("signed with the zone's key");
+    assert_eq!(sig.tsig.key_name, "zs-key.");
+    tsig::verify(&m, &sig, Some(&key), Chain::Request, tsig::now()).unwrap();
+    let parsed = Message::from_bytes(&tsig::strip(&m, &sig)).unwrap();
+    assert_eq!(parsed.metadata.op_code, OpCode::Notify);
+    assert_eq!(parsed.queries[0].name().to_ascii(), "zs.test.");
+    // The global target hears nothing about zs.test (only plain.test
+    // changes would reach it).
+    while let Ok((n, _)) = global.recv_from(&mut buf) {
+        let m = Message::from_bytes(&buf[..n]).ok();
+        let name = m
+            .as_ref()
+            .and_then(|m| m.queries.first())
+            .map(|q| q.name().to_ascii())
+            .unwrap_or_default();
+        assert_ne!(name, "zs.test.", "zs.test announced to the server's target");
+    }
+
+    // Automatic PTR: on by default ([server].auto_ptr), off for zs.test.
+    let ptr = |addr: &str| -> Vec<String> {
+        let m = Message::from_bytes(&udp_exchange(
+            dns,
+            &query_bytes(rand_id(), addr, RecordType::PTR),
+        ))
+        .unwrap();
+        m.answers.iter().map(|r| r.data.to_string()).collect()
+    };
+    assert_eq!(ptr("7.8.9.10.in-addr.arpa"), vec!["host.zs.test."]);
+    settings(serde_json::json!({ "auto_ptr": false }));
+    assert!(ptr("7.8.9.10.in-addr.arpa").is_empty());
+    assert_eq!(ptr("6.8.9.10.in-addr.arpa"), vec!["host.plain.test."]);
+    drop(srv);
+    let _ = std::fs::remove_dir_all(&dir);
+}

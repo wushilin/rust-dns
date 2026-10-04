@@ -82,6 +82,10 @@ pub fn dns_listening(port: u16, wait: Duration) -> bool {
 /// ports.
 pub fn came_up(child: &mut std::process::Child, dns: u16) -> bool {
     let listening = dns_listening(dns, Duration::from_secs(5));
+    // The web listener is bound right after the DNS ones; a server that
+    // could not bind it exits within milliseconds, while the health check
+    // may have been answered by whatever holds that port.
+    std::thread::sleep(Duration::from_millis(300));
     if matches!(child.try_wait(), Ok(Some(_))) {
         eprintln!("the server exited at start (a port was taken); starting another");
         return false;

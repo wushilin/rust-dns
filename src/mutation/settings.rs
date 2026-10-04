@@ -419,6 +419,79 @@ pub fn load_blocklists(
     }
 }
 
+/// O15: DNS rate limiting, console setting `rate_limit`.
+pub const RATE_LIMIT_KEY: &str = "rate_limit";
+
+/// DNS rate limiting set from the console (setting `rate_limit`). A field
+/// left out (`null`) keeps the `[rate_limit]` value of the config file;
+/// unknown fields are ignored (an older server stores the row and keeps
+/// using its file).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct RateLimitSettings {
+    /// Queries per second per client (IPv4 address / IPv6 /64); 0 turns
+    /// the limit off. `null`: `[rate_limit].max_resolutions_per_second_per_address`.
+    #[schema(minimum = 0, maximum = 1000000, example = 200)]
+    pub max_resolutions_per_second_per_address: Option<u32>,
+    /// What an over-limit UDP query gets: every Nth one an empty truncated
+    /// (TC=1) answer so a real client can retry over TCP, the others are
+    /// dropped; 0 drops all. `null`: `[rate_limit].slip`.
+    #[schema(minimum = 0, maximum = 10, example = 2)]
+    pub slip: Option<u32>,
+    /// UDP queries carrying a valid server cookie (RFC 7873: the client
+    /// proved its address in an earlier exchange, so it is not spoofed)
+    /// are answered even over the limit. Needs `[server].cookies` (on by
+    /// default). `null`: `[rate_limit].exempt_valid_cookies` (default off).
+    pub exempt_valid_cookies: Option<bool>,
+}
+
+impl RateLimitSettings {
+    pub fn validate(self) -> Result<Self, Vec<String>> {
+        let mut errs = Vec::new();
+        if self
+            .max_resolutions_per_second_per_address
+            .is_some_and(|n| n > 1_000_000)
+        {
+            errs.push(
+                "max_resolutions_per_second_per_address must be between 0 and 1000000".into(),
+            );
+        }
+        if self.slip.is_some_and(|n| n > 10) {
+            errs.push("slip must be between 0 and 10".into());
+        }
+        if errs.is_empty() {
+            Ok(self)
+        } else {
+            Err(errs)
+        }
+    }
+
+    /// The limits in effect: these settings over the config file's.
+    pub fn effective(
+        &self,
+        file: &crate::config::RateLimitConfig,
+    ) -> crate::config::RateLimitConfig {
+        crate::config::RateLimitConfig {
+            max_resolutions_per_second_per_address: self
+                .max_resolutions_per_second_per_address
+                .unwrap_or(file.max_resolutions_per_second_per_address),
+            max_tracked_addresses: file.max_tracked_addresses,
+            slip: self.slip.unwrap_or(file.slip),
+            exempt_valid_cookies: self
+                .exempt_valid_cookies
+                .unwrap_or(file.exempt_valid_cookies),
+        }
+    }
+}
+
+/// The stored rate-limit settings, with who set them and when.
+pub fn load_rate_limit(storage: &Storage) -> Result<Option<(RateLimitSettings, String, String)>> {
+    match storage.get_setting(RATE_LIMIT_KEY)? {
+        None => Ok(None),
+        Some((value, by, at)) => Ok(Some((serde_json::from_str(&value)?, by, at))),
+    }
+}
+
 /// O5/O6: account security settings, console setting `security`.
 pub const SECURITY_KEY: &str = "security";
 

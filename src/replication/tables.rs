@@ -89,7 +89,15 @@ pub const TABLES: &[Table] = &[
         // an override zone), so a version without the column computes the
         // same table checksum while no override zone exists.
         // `record_policy` (M2) likewise: in the zone row JSON only when set.
-        compat_columns: &["dnssec", "signed_at", "override_spec", "record_policy"],
+        // `zone_settings` (O16) likewise; a standby must have the feature
+        // `zone-settings` before a zone gets settings (the primary refuses).
+        compat_columns: &[
+            "dnssec",
+            "signed_at",
+            "override_spec",
+            "record_policy",
+            "zone_settings",
+        ],
         ..replicated("zones", "id", ("zone", "zones"))
     },
     replicated("records", "id", ("record", "records")),

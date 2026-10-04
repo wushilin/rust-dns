@@ -153,14 +153,14 @@ pub struct FormErr(pub &'static str);
 // wire helpers
 // ---------------------------------------------------------------------------
 
-fn u16_at(b: &[u8], i: usize) -> Result<u16, FormErr> {
+pub(super) fn u16_at(b: &[u8], i: usize) -> Result<u16, FormErr> {
     b.get(i..i + 2)
         .map(|x| u16::from_be_bytes([x[0], x[1]]))
         .ok_or(FormErr("message truncated"))
 }
 
 /// Skip a (possibly compressed) name starting at `i`; returns the offset after it.
-fn skip_name(b: &[u8], mut i: usize) -> Result<usize, FormErr> {
+pub(super) fn skip_name(b: &[u8], mut i: usize) -> Result<usize, FormErr> {
     loop {
         let len = *b.get(i).ok_or(FormErr("name runs past the end"))? as usize;
         match len & 0xC0 {

@@ -171,6 +171,107 @@ pub struct Zone {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false, value_type = Option<RecordPolicy>)]
     pub record_policy: Option<Box<RecordPolicy>>,
+    /// Per-zone server settings (O16): automatic PTR, transfer ACL, NOTIFY
+    /// targets; absent: the server's for everything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false, value_type = Option<ZoneSettings>)]
+    pub settings: Option<Box<ZoneSettings>>,
+}
+
+/// One NOTIFY target of a zone (O16).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(example = json!({ "address": "192.0.2.53:53", "key": "hn-secondary." }))]
+pub struct ZoneNotifyTarget {
+    /// `ip` or `ip:port` (`[v6]:port`); port 53 when omitted. Stored as
+    /// `ip:port`.
+    #[schema(example = "192.0.2.53:53")]
+    pub address: String,
+    /// TSIG key that signs the NOTIFY (it must exist and be allowed to
+    /// transfer the zone); absent: unsigned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false, example = "hn-secondary.")]
+    pub key: Option<String>,
+}
+
+/// At most this many transfer ACL entries and NOTIFY targets per zone.
+pub const MAX_ZONE_TARGETS: usize = 32;
+
+/// A zone's own server settings (O16). Every field left out (`null`) uses
+/// the server's setting (`[server].auto_ptr`, `[transfer]`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(example = json!({ "auto_ptr": false, "transfer_allow": ["192.0.2.53/32", "2001:db8::/64"], "require_tsig": true, "notify": [{ "address": "192.0.2.53:53", "key": "hn-secondary." }] }))]
+pub struct ZoneSettings {
+    /// Answer PTR queries from this zone's A/AAAA records (automatic PTR).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub auto_ptr: Option<bool>,
+    /// Addresses (CIDR) allowed to transfer this zone, instead of
+    /// `[transfer].allow`; an empty list allows nobody.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false, example = json!(["192.0.2.53/32"]))]
+    pub transfer_allow: Option<Vec<String>>,
+    /// Transfers of this zone need a TSIG signature (a key allowed to
+    /// transfer it), instead of `[transfer].require_tsig`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub require_tsig: Option<bool>,
+    /// Secondaries told about this zone's changes, instead of
+    /// `[transfer].notify`; an empty list notifies nobody.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub notify: Option<Vec<ZoneNotifyTarget>>,
+}
+
+impl ZoneSettings {
+    pub fn is_empty(&self) -> bool {
+        self.auto_ptr.is_none()
+            && self.transfer_allow.is_none()
+            && self.require_tsig.is_none()
+            && self.notify.is_none()
+    }
+
+    /// Checked and normalized when saved: CIDRs in canonical form, NOTIFY
+    /// addresses as `ip:port`, key names normalized (their existence is
+    /// checked by the caller, which has the keyring).
+    pub fn normalized(mut self) -> Result<Self, Invalid> {
+        if let Some(list) = &mut self.transfer_allow {
+            if list.len() > MAX_ZONE_TARGETS {
+                return invalid(format!("at most {MAX_ZONE_TARGETS} transfer_allow entries"));
+            }
+            for c in list.iter_mut() {
+                let t = c.trim();
+                let Some(cidr) = crate::config::Cidr::parse(t) else {
+                    return invalid(format!("transfer_allow: '{t}' is not an address or CIDR"));
+                };
+                *c = format!("{}/{}", cidr.ip, cidr.prefix);
+            }
+            list.dedup();
+        }
+        if let Some(list) = &mut self.notify {
+            if list.len() > MAX_ZONE_TARGETS {
+                return invalid(format!("at most {MAX_ZONE_TARGETS} notify targets"));
+            }
+            for t in list.iter_mut() {
+                let a = crate::mutation::settings::parse_upstream(&t.address)
+                    .map_err(|e| Invalid(format!("notify: {e}")))?;
+                t.address = a.to_string();
+                t.key = match t.key.as_deref().map(str::trim) {
+                    None | Some("") => None,
+                    Some(k) => Some(crate::mutation::tsig::normalize_key_name(k)?),
+                };
+            }
+        }
+        Ok(self)
+    }
+
+    /// NOTIFY targets as `(address, key)`.
+    pub fn notify_targets(&self) -> Option<Vec<(std::net::SocketAddr, Option<String>)>> {
+        self.notify.as_ref().map(|l| {
+            l.iter()
+                .filter_map(|t| Some((t.address.parse().ok()?, t.key.clone())))
+                .collect()
+        })
+    }
 }
 
 /// Longest record lifetime a policy may name (100 years, as `expires_in`).
@@ -1490,5 +1591,76 @@ mod permission_tests {
         assert!(exp.expired_at("2026-10-04T10:00:00.000Z"));
         assert!(TokenScope::default().is_unrestricted());
         assert_eq!(serde_json::to_string(&TokenScope::default()).unwrap(), "{}");
+    }
+}
+
+#[cfg(test)]
+mod zone_settings_tests {
+    use super::*;
+
+    /// O16: saved settings are normalized (canonical CIDRs, `ip:port`
+    /// NOTIFY addresses, key names with the trailing dot) and bad entries
+    /// refused; an empty object is "the server's settings".
+    #[test]
+    fn zone_settings_are_normalized_and_checked() {
+        assert!(ZoneSettings::default().is_empty());
+        let s = ZoneSettings {
+            auto_ptr: Some(false),
+            transfer_allow: Some(vec![" 192.0.2.7 ".into(), "2001:db8::/64".into()]),
+            require_tsig: Some(true),
+            notify: Some(vec![
+                ZoneNotifyTarget {
+                    address: "192.0.2.53".into(),
+                    key: Some("HN-Secondary".into()),
+                },
+                ZoneNotifyTarget {
+                    address: "[2001:db8::53]:5300".into(),
+                    key: Some(" ".into()),
+                },
+            ]),
+        }
+        .normalized()
+        .unwrap();
+        assert_eq!(
+            s.transfer_allow.as_deref().unwrap(),
+            ["192.0.2.7/32", "2001:db8::/64"]
+        );
+        assert_eq!(
+            s.notify_targets().unwrap(),
+            vec![
+                (
+                    "192.0.2.53:53".parse().unwrap(),
+                    Some("hn-secondary.".to_string())
+                ),
+                ("[2001:db8::53]:5300".parse().unwrap(), None),
+            ]
+        );
+        for bad in [
+            ZoneSettings {
+                transfer_allow: Some(vec!["not-an-address".into()]),
+                ..Default::default()
+            },
+            ZoneSettings {
+                notify: Some(vec![ZoneNotifyTarget {
+                    address: "example.com".into(),
+                    key: None,
+                }]),
+                ..Default::default()
+            },
+            ZoneSettings {
+                transfer_allow: Some(vec!["10.0.0.0/8".into(); MAX_ZONE_TARGETS + 1]),
+                ..Default::default()
+            },
+        ] {
+            assert!(bad.normalized().is_err());
+        }
+        // Serialized without the fields left out (the zone row stays as
+        // before for zones without settings).
+        let j = serde_json::to_value(ZoneSettings {
+            auto_ptr: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(j, serde_json::json!({ "auto_ptr": true }));
     }
 }

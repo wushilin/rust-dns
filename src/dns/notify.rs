@@ -31,11 +31,12 @@ pub async fn run(server: Arc<DnsServer>) {
                 let due: Vec<String> = pending.iter().filter(|(_, t)| t.elapsed() >= Duration::from_secs(1)).map(|(z, _)| z.clone()).collect();
                 for zone in due {
                     pending.remove(&zone);
-                    let targets = server.runtime.load().notify.clone();
-                    if targets.is_empty() { continue; }
                     // Override zones are never announced (not authoritative).
-                    let still_exists = server.cache.load().zones.get(&crate::model::zone_fqdn(&zone)).is_some_and(|z| !z.zone.is_override());
-                    if !still_exists { continue; }
+                    let catalog = server.cache.load();
+                    let Some(z) = catalog.zones.get(&crate::model::zone_fqdn(&zone)).filter(|z| !z.zone.is_override()) else { continue; };
+                    // O16: the zone's own targets replace [transfer].notify.
+                    let targets = z.zone.settings.as_ref().and_then(|s| s.notify_targets()).unwrap_or_else(|| server.runtime.load().notify.clone());
+                    if targets.is_empty() { continue; }
                     for (to, key) in targets {
                         let s = server.clone();
                         let z = zone.clone();

@@ -106,6 +106,17 @@ impl DnsServer {
             Decision::Allow => return None,
             d => d,
         };
+        // O15: a valid server cookie proves the client's address (it was
+        // minted for that address in an earlier exchange), so a spoofed
+        // flood cannot use it: such a query is answered over the limit.
+        // Only over-limit UDP queries pay for the scan and the HMAC.
+        if proto == Proto::Udp
+            && self.cookie_exempt.load(Relaxed)
+            && super::cookies::find_option(req).is_some_and(|c| self.cookies.is_valid(c, ip))
+        {
+            self.stats.rate_limit_cookie_exempt.fetch_add(1, Relaxed);
+            return None;
+        }
         self.stats.rate_limited.fetch_add(1, Relaxed);
         if matches!(d, Decision::RejectFirst) {
             tracing::warn!(client = %ip, "rate limit exceeded; dropping queries for this window");
@@ -619,5 +630,113 @@ mod tests {
         assert!(server
             .admit(&junk, "192.0.2.10:5000".parse().unwrap(), Proto::Udp)
             .is_none());
+    }
+
+    /// O15: with `exempt_valid_cookies`, an over-limit UDP query carrying a
+    /// valid server cookie minted for its address is answered; a forged
+    /// cookie, one minted for another address, a client-only cookie, or
+    /// the setting off: dropped as before. Applied through the console
+    /// setting (`set_rate_limit`), which also changes the limit itself.
+    #[test]
+    fn valid_server_cookies_are_exempt_from_the_udp_limit_when_configured() {
+        use crate::mutation::settings::RateLimitSettings;
+        use crate::ratelimit::RateLimiter;
+        use hickory_proto::op::{Edns, MessageType, Query};
+        use hickory_proto::rr::rdata::opt::EdnsOption;
+        let cfg = crate::config::Config::default();
+        let server = DnsServer::new(
+            std::sync::Arc::new(crate::cache::Cache::new(crate::cache::Catalog::empty())),
+            std::sync::Arc::new(crate::events::Bus::new(8, 8)),
+            std::sync::Arc::new(RateLimiter::new(
+                500,
+                std::time::Duration::from_secs(60),
+                100,
+            )),
+            &cfg,
+        );
+        server.set_rate_limit(
+            Some(RateLimitSettings {
+                max_resolutions_per_second_per_address: Some(2),
+                slip: Some(0),
+                exempt_valid_cookies: None,
+            }),
+            &cfg,
+        );
+        assert_eq!(server.limiter.limit(), 2, "console limit applied");
+        let peer: SocketAddr = "192.0.2.9:5000".parse().unwrap();
+        let other: std::net::IpAddr = "192.0.2.99".parse().unwrap();
+        let client_cookie = [7u8; 8];
+        let super::super::cookies::CookieCheck::Invalid(good) =
+            server.cookies.check(&client_cookie, peer.ip())
+        else {
+            panic!("a client-only cookie mints a server cookie")
+        };
+        let super::super::cookies::CookieCheck::Invalid(elsewhere) =
+            server.cookies.check(&client_cookie, other)
+        else {
+            panic!()
+        };
+        let mut forged = good.clone();
+        forged[23] ^= 1;
+        let query = |cookie: &[u8]| {
+            let mut m = Message::new(1, MessageType::Query, OpCode::Query);
+            m.add_query(Query::query(
+                Name::from_ascii("www.example.").unwrap(),
+                RecordType::A,
+            ));
+            let mut e = Edns::new();
+            e.options_mut()
+                .insert(EdnsOption::Unknown(10, cookie.to_vec()));
+            m.set_edns(e);
+            m.to_vec().unwrap()
+        };
+        let (good_q, forged_q, elsewhere_q, client_only_q) = (
+            query(&good),
+            query(&forged),
+            query(&elsewhere),
+            query(&client_cookie),
+        );
+        for _ in 0..2 {
+            assert!(server.admit(&client_only_q, peer, Proto::Udp).is_none());
+        }
+        // Over the limit, exemption off: even a valid cookie is dropped.
+        assert!(matches!(
+            server.admit(&good_q, peer, Proto::Udp),
+            Some(Reply::None)
+        ));
+        server.set_rate_limit(
+            Some(RateLimitSettings {
+                max_resolutions_per_second_per_address: Some(2),
+                slip: Some(0),
+                exempt_valid_cookies: Some(true),
+            }),
+            &cfg,
+        );
+        for _ in 0..20 {
+            assert!(
+                server.admit(&good_q, peer, Proto::Udp).is_none(),
+                "valid server cookie: answered over the limit"
+            );
+        }
+        for q in [&forged_q, &elsewhere_q, &client_only_q] {
+            assert!(matches!(
+                server.admit(q, peer, Proto::Udp),
+                Some(Reply::None)
+            ));
+        }
+        assert_eq!(server.stats.rate_limit_cookie_exempt.load(Relaxed), 20);
+        // Cookies switched off in the file: nobody holds a server cookie
+        // of ours, so the exemption is not in effect.
+        let mut off = cfg.clone();
+        off.server.cookies = false;
+        server.reload(&off);
+        assert!(matches!(
+            server.admit(&good_q, peer, Proto::Udp),
+            Some(Reply::None)
+        ));
+        // Reset: the file's values again.
+        server.set_rate_limit(None, &cfg);
+        assert_eq!(server.limiter.limit(), 500);
+        assert!(!server.cookie_exempt.load(Relaxed));
     }
 }

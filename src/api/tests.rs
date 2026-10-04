@@ -2279,3 +2279,209 @@ async fn zones_can_be_cloned_and_renamed() {
     assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.json);
     assert_eq!(r.json["code"], "ds_published");
 }
+
+/// O15: rate limiting set from the console applies at once to this
+/// server's limiter (limit, slip, cookie exemption), is validated, needs
+/// `server_admin`, is audited, and a reset brings the file's values back.
+#[tokio::test]
+async fn rate_limit_settings_apply_at_once() {
+    use serde_json::json;
+    let h = Harness::new();
+    let root_c = root_session(&h).await;
+    let r = h
+        .call("GET", "/settings/rate-limit", Some(&root_c), None)
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.json);
+    assert_eq!(r.json["source"], "config");
+    let file_limit = r.json["file"]["max_resolutions_per_second_per_address"].clone();
+    assert_eq!(
+        r.json["in_effect"]["exempt_valid_cookies"], false,
+        "off by default"
+    );
+    let r = h
+        .call(
+            "PUT",
+            "/settings/rate-limit",
+            Some(&root_c),
+            Some(json!({ "slip": 11 })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.json);
+    let r = h
+        .call(
+            "PUT",
+            "/settings/rate-limit",
+            Some(&root_c),
+            Some(json!({ "max_resolutions_per_second_per_address": 7, "exempt_valid_cookies": true })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.json);
+    assert_eq!(r.json["source"], "console");
+    assert_eq!(
+        r.json["in_effect"]["max_resolutions_per_second_per_address"],
+        7
+    );
+    assert_eq!(
+        r.json["in_effect"]["slip"], r.json["file"]["slip"],
+        "null keeps the file's"
+    );
+    assert_eq!(h.state.dns.limiter.limit(), 7);
+    assert!(h
+        .state
+        .dns
+        .cookie_exempt
+        .load(std::sync::atomic::Ordering::Relaxed));
+    let audit = h.call("GET", "/audit", Some(&root_c), None).await;
+    assert!(
+        audit
+            .json
+            .to_string()
+            .contains("settings.rate_limit.update"),
+        "{}",
+        audit.json
+    );
+    // A non-administrator may not read or change it.
+    let r = h
+        .call(
+            "POST",
+            "/users",
+            Some(&root_c),
+            Some(json!({ "username": "olga", "password": "olga-password-1" })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.json);
+    let olga = h.login("olga", "olga-password-1").await.cookie.unwrap();
+    for (m, body) in [
+        ("GET", None),
+        ("PUT", Some(json!({ "slip": 0 }))),
+        ("DELETE", None),
+    ] {
+        let r = h.call(m, "/settings/rate-limit", Some(&olga), body).await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN, "{m}");
+    }
+    let r = h
+        .call("DELETE", "/settings/rate-limit", Some(&root_c), None)
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.json);
+    assert_eq!(r.json["source"], "config");
+    assert_eq!(
+        r.json["in_effect"]["max_resolutions_per_second_per_address"],
+        file_limit
+    );
+    assert_eq!(
+        Some(h.state.dns.limiter.limit() as u64),
+        file_limit.as_u64()
+    );
+}
+
+/// O16: a zone's own settings are set by a server administrator only,
+/// validated (CIDRs, NOTIFY addresses, TSIG keys that exist and cover the
+/// zone), applied to the served catalog at once without a serial bump,
+/// cleared by an empty object, and refused for override zones.
+#[tokio::test]
+async fn zone_settings_through_the_api() {
+    use serde_json::json;
+    let h = Harness::new();
+    let root_c = root_session(&h).await;
+    h.user("zoe", "zoe-password-1", None);
+    let r = h
+        .call(
+            "POST",
+            "/zones",
+            Some(&root_c),
+            Some(json!({ "name": "zs.test", "owner": "zoe" })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.json);
+    let serial = r.json["serial"].clone();
+    for (name, zone) in [("zs-key.", "zs.test"), ("other-key.", "other.test")] {
+        let r = h
+            .call(
+                "POST",
+                "/tsig/keys",
+                Some(&root_c),
+                Some(json!({ "name": name, "zones": [zone] })),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.json);
+    }
+    let put = |c: String, b: serde_json::Value| {
+        let h = &h;
+        async move {
+            h.call("PUT", "/zones/zs.test/settings", Some(&c), Some(b))
+                .await
+        }
+    };
+    // The zone's owner is not a server administrator.
+    let zoe = h.login("zoe", "zoe-password-1").await.cookie.unwrap();
+    let r = put(zoe, json!({ "auto_ptr": false })).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.json);
+    for (body, why) in [
+        (json!({ "transfer_allow": ["nope"] }), "not an address"),
+        (
+            json!({ "notify": [{ "address": "ns.example." }] }),
+            "notify",
+        ),
+        (
+            json!({ "notify": [{ "address": "127.0.0.1", "key": "missing." }] }),
+            "does not exist",
+        ),
+        (
+            json!({ "notify": [{ "address": "127.0.0.1", "key": "other-key." }] }),
+            "not allowed",
+        ),
+    ] {
+        let r = put(root_c.clone(), body).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.json);
+        assert!(
+            r.json["error"].as_str().unwrap().contains(why),
+            "{}",
+            r.json
+        );
+    }
+    let r = put(
+        root_c.clone(),
+        json!({ "auto_ptr": false, "transfer_allow": ["127.0.0.1"], "require_tsig": true, "notify": [{ "address": "127.0.0.1:5399", "key": "ZS-Key" }] }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.json);
+    assert_eq!(
+        r.json["settings"],
+        json!({ "auto_ptr": false, "transfer_allow": ["127.0.0.1/32"], "require_tsig": true, "notify": [{ "address": "127.0.0.1:5399", "key": "zs-key." }] })
+    );
+    assert_eq!(r.json["serial"], serial, "no serial bump");
+    let served = h.state.dns.cache.load();
+    let z = served.zones.get("zs.test.").expect("served");
+    assert_eq!(
+        z.zone.settings.as_ref().and_then(|s| s.notify_targets()),
+        Some(vec![(
+            "127.0.0.1:5399".parse().unwrap(),
+            Some("zs-key.".to_string())
+        )])
+    );
+    let r = h.call("GET", "/zones/zs.test", Some(&root_c), None).await;
+    assert_eq!(r.json["settings"]["require_tsig"], true, "{}", r.json);
+    // An empty object: the server's settings again.
+    let r = put(root_c.clone(), json!({})).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.json);
+    assert!(r.json.get("settings").is_none(), "{}", r.json);
+    // Override zones have none.
+    let r = h
+        .call(
+            "POST",
+            "/zones",
+            Some(&root_c),
+            Some(json!({ "name": "ov.test", "override": { "mode": "static" } })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.json);
+    let r = h
+        .call(
+            "PUT",
+            "/zones/ov.test/settings",
+            Some(&root_c),
+            Some(json!({ "auto_ptr": true })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.json);
+}

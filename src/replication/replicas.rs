@@ -32,8 +32,12 @@ pub const HEADER_VERSION: &str = "x-rust-dns-version";
 /// rollover). Older standbys send the bare version.
 /// O11: `zone-rename` (a renamed zone's row; older versions ignore the new
 /// name and would halt at the next reconcile).
-pub const VERSION_WITH_FEATURES: &str =
-    concat!(env!("CARGO_PKG_VERSION"), "+dnssec-rollover.zone-rename");
+/// O16: `zone-settings` (a zone's own auto-PTR / transfer / NOTIFY
+/// settings; older versions drop them and would halt at the reconcile).
+pub const VERSION_WITH_FEATURES: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "+dnssec-rollover.zone-rename.zone-settings"
+);
 
 /// Whether a standby's reported version names `feature`.
 pub fn has_feature(version: &str, feature: &str) -> bool {

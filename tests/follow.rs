@@ -465,7 +465,10 @@ fn primary_standby_failover_and_rejoin() {
     // The version with what the standby can follow (N1).
     assert_eq!(
         r["version"],
-        format!("{}+dnssec-rollover.zone-rename", env!("CARGO_PKG_VERSION"))
+        format!(
+            "{}+dnssec-rollover.zone-rename.zone-settings",
+            env!("CARGO_PKG_VERSION")
+        )
     );
     assert_eq!(r["address"], "127.0.0.1");
     assert_eq!(r["conflict"], false);
@@ -2476,6 +2479,11 @@ fn phase_i_settings_keep_an_old_standby_following() {
         "/blocklists",
         json!({ "lists": [{ "name": "none", "url": "http://127.0.0.1:9/never.txt" }], "allow": ["example.com"], "action": "null_address" }),
     );
+    // O15: rate limiting set from the console (key `rate_limit`).
+    put(
+        "/settings/rate-limit",
+        json!({ "max_resolutions_per_second_per_address": 300, "exempt_valid_cookies": true }),
+    );
     // The previous release follows from a snapshot that has these rows.
     s.configure(&format!("{fwd}{}", follow_cfg(&p, "dns2", &token)));
     s.start();
@@ -2489,6 +2497,10 @@ fn phase_i_settings_keep_an_old_standby_following() {
     put(
         "/blocklists",
         json!({ "lists": [{ "name": "none", "url": "http://127.0.0.1:9/other.txt", "enabled": false }] }),
+    );
+    put(
+        "/settings/rate-limit",
+        json!({ "max_resolutions_per_second_per_address": 250, "slip": 3, "exempt_valid_cookies": true }),
     );
     std::thread::sleep(Duration::from_millis(1100));
     add("mixed", "192.0.2.2");
@@ -2528,6 +2540,49 @@ fn phase_i_settings_keep_an_old_standby_following() {
     assert_eq!(
         v["settings"]["lists"][0]["url"],
         "http://127.0.0.1:9/other.txt"
+    );
+    // O15: the upgraded standby runs its limiter with the replicated rate
+    // limiting, and applies a change that arrives while it follows.
+    let rl = |what: &str| {
+        ok(
+            call(
+                &Auth::Session(&sr),
+                "GET",
+                &s.api("/settings/rate-limit"),
+                None,
+            ),
+            what,
+        )
+    };
+    let v = rl("standby rate limit");
+    assert_eq!(v["source"], "console", "{v}");
+    assert_eq!(
+        v["in_effect"]["max_resolutions_per_second_per_address"], 250,
+        "{v}"
+    );
+    assert_eq!(v["in_effect"]["slip"], 3, "{v}");
+    assert_eq!(v["in_effect"]["exempt_valid_cookies"], true, "{v}");
+    put(
+        "/settings/rate-limit",
+        json!({ "max_resolutions_per_second_per_address": 40, "exempt_valid_cookies": false }),
+    );
+    wait_for("the standby applies the new limit", 20, || {
+        rl("standby rate limit")["in_effect"]["max_resolutions_per_second_per_address"] == 40
+    });
+    assert_eq!(
+        rl("standby rate limit")["in_effect"]["exempt_valid_cookies"],
+        false
+    );
+    // A write on the standby is refused (its only writer is replication).
+    assert_eq!(
+        call(
+            &Auth::Session(&sr),
+            "PUT",
+            &s.api("/settings/rate-limit"),
+            Some(json!({ "slip": 0 })),
+        )
+        .0,
+        409
     );
     // An override zone now replicates with its type.
     ok(
@@ -3617,6 +3672,124 @@ fn a_zone_rename_replicates_and_waits_for_old_standbys() {
         let (st, v) = post("/zones/new.test/rename", json!({ "name": "newer.test" }));
         assert_eq!(st, 409, "{v}");
         assert!(v["error"].as_str().unwrap().contains("dns3"), "{v}");
+        drop(old);
+    }
+    drop(p);
+    let _ = std::fs::remove_dir_all(&root_dir);
+}
+
+/// First message's rcode of an AXFR of `zone` over TCP.
+fn axfr_rcode(port: u16, zone: &str) -> ResponseCode {
+    use std::io::{Read, Write};
+    let mut m = Message::new(0x4242, MessageType::Query, OpCode::Query);
+    m.add_query(Query::query(
+        Name::from_ascii(format!("{zone}.")).unwrap(),
+        RecordType::AXFR,
+    ));
+    let q = m.to_vec().unwrap();
+    let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    c.write_all(&(q.len() as u16).to_be_bytes()).unwrap();
+    c.write_all(&q).unwrap();
+    let mut len = [0u8; 2];
+    c.read_exact(&mut len).unwrap();
+    let mut buf = vec![0u8; u16::from_be_bytes(len) as usize];
+    c.read_exact(&mut buf).unwrap();
+    Message::from_bytes(&buf).unwrap().metadata.response_code
+}
+
+/// O16: a zone's own settings replicate (a `zone_updated` without a serial
+/// bump) and the standby applies them: it refuses the zone's transfer to
+/// an address outside the zone's ACL while serving other zones, and stops
+/// the zone's automatic PTR; clearing them replicates too; reconcile ok
+/// throughout. A standby of the previous release (no `zone-settings`
+/// feature) blocks setting them (409, naming it); clearing stays allowed.
+#[test]
+fn zone_settings_replicate_and_wait_for_old_standbys() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root_dir = std::env::temp_dir().join(format!(
+        "rust-dns-follow-zset-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root_dir).unwrap();
+    let mut p = Node::new(&root_dir, "primary", "rootpass-primary");
+    let mut s = Node::new(&root_dir, "standby", "rootpass-standby");
+    let xfer = "[transfer]\nallow = [\"127.0.0.0/8\"]\n";
+    p.configure(xfer);
+    p.start();
+    let pr = p.root();
+    let post =
+        |path: &str, body: Value| call(&Auth::Session(&pr), "POST", &p.api(path), Some(body));
+    let put = |body: Value| {
+        call(
+            &Auth::Session(&pr),
+            "PUT",
+            &p.api("/zones/zs.test/settings"),
+            Some(body),
+        )
+    };
+    for (z, ip) in [("zs.test", "10.7.7.1"), ("plain.test", "10.7.7.2")] {
+        ok(post("/zones", json!({ "name": z })), "zone");
+        ok(
+            post(
+                &format!("/zones/{z}/records"),
+                json!({ "name": "host", "type": "A", "value": ip }),
+            ),
+            "record",
+        );
+    }
+    let repl = ok(post("/tokens", json!({ "name": "repl" })), "token")["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    s.configure(&format!("{xfer}{}", follow_cfg(&p, "dns2", &repl)));
+    s.start();
+    let sr = s.root();
+    wait_reconciled(&p, &pr, &s, &sr, "before the settings");
+    let ptr = |port: u16, name: &str| -> usize { query(port, name, RecordType::PTR).answers.len() };
+    assert_eq!(axfr_rcode(s.dns, "zs.test"), ResponseCode::NoError);
+    assert_eq!(ptr(s.dns, "1.7.7.10.in-addr.arpa."), 1);
+    let serial = soa_serial(p.dns, "zs.test.");
+    ok(
+        put(json!({ "auto_ptr": false, "transfer_allow": ["192.0.2.0/24"] })),
+        "settings",
+    );
+    wait_for("the standby refuses the zone's transfer", 20, || {
+        axfr_rcode(s.dns, "zs.test") == ResponseCode::Refused
+    });
+    wait_reconciled(&p, &pr, &s, &sr, "settings set");
+    assert_eq!(axfr_rcode(s.dns, "plain.test"), ResponseCode::NoError);
+    assert_eq!(ptr(s.dns, "1.7.7.10.in-addr.arpa."), 0, "auto PTR off");
+    assert_eq!(ptr(s.dns, "2.7.7.10.in-addr.arpa."), 1, "other zone's");
+    assert_eq!(soa_serial(s.dns, "zs.test."), serial, "no serial bump");
+    let v = ok(
+        call(&Auth::Session(&sr), "GET", &s.api("/zones/zs.test"), None),
+        "standby zone",
+    );
+    assert_eq!(v["settings"]["transfer_allow"], json!(["192.0.2.0/24"]));
+    ok(put(json!({})), "cleared");
+    wait_for("the standby serves the transfer again", 20, || {
+        axfr_rcode(s.dns, "zs.test") == ResponseCode::NoError
+    });
+    wait_reconciled(&p, &pr, &s, &sr, "settings cleared");
+    assert_eq!(ptr(s.dns, "1.7.7.10.in-addr.arpa."), 1);
+    drop(s);
+
+    if let Some(prev) = prev_bin() {
+        let mut old = Node::new(&root_dir, "old", "rootpass-old");
+        old.bin = prev;
+        old.configure(&format!("{xfer}{}", follow_cfg(&p, "dns3", &repl)));
+        old.start();
+        let or = old.root();
+        wait_reconciled(&p, &pr, &old, &or, "old standby");
+        let (st, v) = put(json!({ "auto_ptr": false }));
+        assert_eq!(st, 409, "{v}");
+        assert!(v["error"].as_str().unwrap().contains("dns3"), "{v}");
+        ok(put(json!({})), "clearing is allowed");
+        wait_reconciled(&p, &pr, &old, &or, "old standby, after a no-op clear");
         drop(old);
     }
     drop(p);
