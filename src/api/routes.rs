@@ -1649,6 +1649,11 @@ pub struct UserBody {
     /// Update only.
     #[schema(example = false)]
     pub disabled: Option<bool>,
+    /// Update only, with `password` (O1): also revoke every API token of
+    /// the user. Default false (tokens keep working).
+    #[serde(default)]
+    #[schema(example = false)]
+    pub revoke_tokens: Option<bool>,
 }
 
 #[utoipa::path(
@@ -1788,11 +1793,20 @@ pub async fn update_user(
         ch.disabled = Some(d);
         revoke_sessions |= d;
     }
+    let revoke_tokens = b.revoke_tokens.unwrap_or(false);
+    if revoke_tokens && b.password.is_none() {
+        return Err(ApiError::bad_request(
+            "revoke_tokens goes with a new password (revoke single tokens with DELETE /tokens/{id})",
+        ));
+    }
     // Only the fields in the request are written (see AuditTx::change_user).
     let u = s.accounts.run(&caller.actor(), "update_user", |t| {
         let u = t.change_user(before.id, &ch)?;
         if revoke_sessions {
             t.delete_user_sessions(&u, "password changed or account disabled")?;
+        }
+        if revoke_tokens {
+            t.revoke_user_tokens(&u, "password reset by an administrator")?;
         }
         Ok(u)
     })?;
@@ -1885,6 +1899,11 @@ pub struct PasswordBody {
     pub current_password: String,
     #[schema(format = Password, min_length = 8, example = "a-new-long-password")]
     pub new_password: String,
+    /// O1: also revoke every API token of the account (default false:
+    /// tokens keep working).
+    #[serde(default)]
+    #[schema(example = false)]
+    pub revoke_tokens: bool,
 }
 
 #[utoipa::path(
@@ -1922,12 +1941,15 @@ pub async fn change_password(
     let hash = auth::hash_password_async(&b.new_password).await??;
     // Only the password column is written, and every other session of the
     // user is signed out in the same transaction (this one stays). API
-    // tokens are not affected.
+    // tokens are revoked in it too when asked (O1).
     let keep = caller.session_id;
     s.accounts.run(&caller.actor(), "change_password", |t| {
         let u = t.set_password(caller.user.id, &hash)?;
         if let Some(keep) = keep {
             t.delete_other_sessions(&u, keep)?;
+        }
+        if b.revoke_tokens {
+            t.revoke_user_tokens(&u, "password changed")?;
         }
         Ok(())
     })?;
@@ -2330,6 +2352,19 @@ pub async fn create_token(
     Json(b): Json<TokenBody>,
 ) -> ApiResult<(StatusCode, Json<TokenCreated>)> {
     s.require(&caller, GlobalPerm::ManageOwnTokens)?;
+    // O1: optionally only from a signed-in browser session (a stolen
+    // token cannot mint more tokens).
+    if s.reloader
+        .current
+        .load()
+        .web_console
+        .token_creation_requires_session
+        && caller.via != AuthVia::Session
+    {
+        return Err(ApiError::forbidden(
+            "API tokens can only be created from a signed-in browser session on this server ([web_console] token_creation_requires_session)",
+        ));
+    }
     let name: String = b.name.trim().chars().take(100).collect();
     if name.is_empty() {
         return Err(ApiError::bad_request("name is required"));

@@ -2537,6 +2537,7 @@ function userModal(u) {
       <label><input type="checkbox" name="mfa_required" ${u.mfa_required ? 'checked' : ''}> Require MFA</label>
       ${isNew || u.is_root ? '' : `<label><input type="checkbox" name="disabled" ${u.disabled_at ? 'checked' : ''}> Disabled</label>`}
     </div>
+    ${isNew || u.is_root ? '' : '<div class="row" style="margin-top:8px"><label><input type="checkbox" name="revoke_tokens"> With a new password: also revoke their API tokens</label></div>'}
     ${!isNew && u.mfa_enrolled ? '<p class="hint" style="margin-top:12px">MFA is enrolled. <button type="button" class="linkbtn" id="u-reset-mfa" data-perm="manage_users">Reset MFA</button> to force re-enrollment (all sessions are signed out).</p>' : ''}
     ${!isNew ? '<p class="hint" style="margin-top:6px"><button type="button" class="linkbtn" id="u-signout" data-perm="manage_users" data-ro-ok>Sign this user out everywhere</button></p>' : ''}
     <p class="hint" style="margin-top:10px">When MFA is required, the user must enroll an authenticator on their next sign-in.</p>
@@ -2697,6 +2698,7 @@ async function viewAccount() {
       ${u.is_root ? '<p class="hint" style="margin-top:12px">The root password lives in the configuration file.</p>' : `<h3 style="margin-top:18px">Change password</h3>
         <div class="field"><label>Current password</label><input type="password" id="pw-cur" autocomplete="current-password"></div>
         <div class="field"><label>New password</label><input type="password" id="pw-new" autocomplete="new-password"></div>
+        <label class="check"><input type="checkbox" id="pw-revoke"> Also revoke my API tokens</label>
         <div class="error" id="pw-err"></div><button class="btn" id="pw-btn" data-perm="change_own_password">Update password</button>`}
       </div>
       <div class="grid">
@@ -2719,7 +2721,7 @@ async function viewAccount() {
     <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="m-ok" data-perm="manage_own_mfa">Generate</button></div>`, m => {
     $('#m-ok').onclick = async () => { try { const r = await POST('/me/mfa/recovery', { code: m.querySelector('[name=code]').value }); recoveryModal(r.recovery_codes, viewAccount); } catch (e) { $('#m-err').textContent = e.message; } };
   });
-  if ($('#pw-btn')) $('#pw-btn').onclick = async () => { $('#pw-err').textContent = ''; try { await PUT('/me/password', { current_password: $('#pw-cur').value, new_password: $('#pw-new').value }); toast('Password updated', 'ok'); $('#pw-cur').value = $('#pw-new').value = ''; } catch (e) { $('#pw-err').textContent = e.message; } };
+  if ($('#pw-btn')) $('#pw-btn').onclick = async () => { $('#pw-err').textContent = ''; try { await PUT('/me/password', { current_password: $('#pw-cur').value, new_password: $('#pw-new').value, revoke_tokens: $('#pw-revoke').checked }); toast($('#pw-revoke').checked ? 'Password updated; API tokens revoked' : 'Password updated', 'ok'); $('#pw-cur').value = $('#pw-new').value = ''; } catch (e) { $('#pw-err').textContent = e.message; } };
   if ($('#mfa-on')) $('#mfa-on').onclick = async () => {
     const e = await POST('/me/mfa/start');
     openModal(`<h2>Enable two-factor authentication</h2><p class="hint">Scan with your authenticator app, then enter the code it shows.</p><div class="qr">${e.qr_svg}</div><div class="hint">Manual entry: <code>${esc(e.secret)}</code></div>

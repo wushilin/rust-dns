@@ -7121,6 +7121,11 @@
             "format": "password",
             "example": "a-new-long-password",
             "minLength": 8
+          },
+          "revoke_tokens": {
+            "type": "boolean",
+            "description": "O1: also revoke every API token of the account (default false:\ntokens keep working).",
+            "example": false
           }
         },
         "example": {
@@ -9706,6 +9711,14 @@
               "null"
             ],
             "description": "Update only.",
+            "example": false
+          },
+          "revoke_tokens": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Update only, with `password` (O1): also revoke every API token of\nthe user. Default false (tokens keep working).",
             "example": false
           }
         }

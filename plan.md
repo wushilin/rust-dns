@@ -766,7 +766,7 @@ deployed by this phase; the live zone (wushilin.net) is never switched to a
 new DNSSEC mode by it.
 
 Group 1: security and accounts
-- [ ] O1. Revoke a user's API tokens on password change (option, default
+- [x] O1. Revoke a user's API tokens on password change (option, default
   off, per user choice in the change-password dialog + admin reset); token
   creation only from a browser session (config switch, default off).
 - [ ] O2. Instant websocket cut-off: publish session/token revocation and
@@ -841,6 +841,17 @@ Group 6: DNS protocol depth (all OFF by default; live zone not switched)
 - [ ] O29. DNS over TLS and DNS over HTTPS, inbound (own certificate files,
   rustls) and upstream for forwarding; off by default.
 - [ ] O30. Signing auto-PTR answers (low priority; private reverse zones only).
+
+Final
+- [ ] O31. Final verification (owner, 2026-10-04): after Group 6, run the
+  full gate with both previous binaries (d32d67f and 3884ba8), the
+  equivalence script against d32d67f (only documented differences), the
+  browser suite, and a fresh end-to-end pass on a local primary+standby
+  covering every Phase O feature; record the results here. Every item
+  lands with its own tests in its commit (unit tests for the logic, an
+  API/e2e test for anything reachable over the API or DNS, a follow test
+  for anything that replicates, a browser flow for new console features),
+  and its Log line names them.
 
 ## Rollout (after everything above passes)
 
@@ -1561,3 +1572,14 @@ Group 6: DNS protocol depth (all OFF by default; live zone not switched)
   93fc047, suites run against both d32d67f and 3884ba8, browser test, conformance
   127). Not deployed. Phase O added: the whole backlog in one phase, 6 groups,
   ordered by value and risk, protocol features off by default.
+- 2026-10-04 (phase O): O1 done. `PUT /me/password` and the
+  administrator's `PUT /users/{id}` take `revoke_tokens` (default false;
+  with a reset only together with a new password): every active token of
+  the user is revoked in the same transaction (one `token_revoked` change
+  and one `token.revoke` audit row with the reason each; no new change
+  kind). `[web_console] token_creation_requires_session` (default false)
+  refuses `POST /tokens` with a token. Console: "Also revoke my API
+  tokens" on the account page, "also revoke their API tokens" in the user
+  dialog. Tests: `api::tests::password_change_can_revoke_api_tokens`,
+  `api::tests::token_creation_can_require_a_session`, browser flow "O1:
+  password change from the console revokes the tokens".

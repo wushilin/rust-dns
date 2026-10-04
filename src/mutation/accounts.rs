@@ -713,6 +713,33 @@ impl<'a> AuditTx<'a> {
         Ok(true)
     }
 
+    /// O1: revoke every active API token of `owner` (one `token_revoked`
+    /// change and one `token.revoke` audit row each, `reason` in the
+    /// detail). Returns how many were revoked.
+    pub fn revoke_user_tokens(&mut self, owner: &User, reason: &str) -> Result<usize> {
+        let ids: Vec<i64> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id FROM api_tokens WHERE user_id = ?1 AND revoked_at IS NULL ORDER BY id",
+            )?;
+            let rows = stmt.query_map(params![owner.id], |r| r.get(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        for id in &ids {
+            let t = db::get_token(self.conn, *id)?.context("token vanished")?;
+            self.record(SecretChange::TokenRevoked {
+                token_id: t.id,
+                revoked_at: now_rfc3339(),
+            })?;
+            self.push(
+                "token.revoke",
+                Some(owner.id),
+                &owner.username,
+                serde_json::json!({ "token_id": t.id, "name": t.name, "reason": reason }),
+            );
+        }
+        Ok(ids.len())
+    }
+
     /// Audit rows and (when `changelog`) the recorded changes, one txn id.
     fn finish(
         self,

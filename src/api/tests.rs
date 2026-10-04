@@ -31,9 +31,14 @@ impl Harness {
     }
 
     fn with_backoff(login_backoff_after: u32) -> Harness {
-        let cfg: Config = toml::from_str(
-            "[web_console]\nlogin_attempts_per_minute = 1000\n[root]\npassword = \"x\"\n[backup]\ndir = \"\"",
-        )
+        Self::with_config(login_backoff_after, "")
+    }
+
+    /// `web_extra`: more `[web_console]` lines.
+    fn with_config(login_backoff_after: u32, web_extra: &str) -> Harness {
+        let cfg: Config = toml::from_str(&format!(
+            "[web_console]\nlogin_attempts_per_minute = 1000\n{web_extra}\n[root]\npassword = \"x\"\n[backup]\ndir = \"\"",
+        ))
         .unwrap();
         let cfg = Arc::new(cfg);
         let storage = Arc::new(Storage::open_memory().unwrap());
@@ -1259,4 +1264,176 @@ async fn zone_record_policy_through_the_api() {
         .await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.json);
     assert!(r.json.get("record_policy").is_none(), "{}", r.json);
+}
+
+/// Root with a known password, signed in: its session cookie.
+async fn root_session(h: &Harness) -> String {
+    h.state
+        .accounts
+        .sync_root(
+            "root",
+            &crate::auth::hash_password("root-password-1").unwrap(),
+            false,
+        )
+        .unwrap();
+    h.login("root", "root-password-1")
+        .await
+        .cookie
+        .expect("root session")
+}
+
+/// A new API token of the session's user: (`Bearer ...`, id).
+async fn new_token(h: &Harness, cookie: &str, name: &str) -> (String, i64) {
+    let r = h
+        .call(
+            "POST",
+            "/tokens",
+            Some(cookie),
+            Some(serde_json::json!({ "name": name })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.json);
+    (
+        format!("Bearer {}", r.json["token"].as_str().unwrap()),
+        r.json["info"]["id"].as_i64().unwrap(),
+    )
+}
+
+/// O1: a password change (own, or an administrator's reset) revokes the
+/// user's API tokens only when asked; each revocation is a `token_revoked`
+/// change with a `token.revoke` audit row.
+#[tokio::test]
+async fn password_change_can_revoke_api_tokens() {
+    use serde_json::json;
+    let h = Harness::new();
+    let root_c = root_session(&h).await;
+    let nora = h.user("nora", "nora-password-1", None);
+    let c = h.login("nora", "nora-password-1").await.cookie.unwrap();
+    let (t1, _) = new_token(&h, &c, "one").await;
+    // Default: tokens keep working.
+    let r = h
+        .call(
+            "PUT",
+            "/me/password",
+            Some(&c),
+            Some(
+                json!({ "current_password": "nora-password-1", "new_password": "nora-password-2" }),
+            ),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.json);
+    assert_eq!(
+        h.call("GET", "/me", Some(&t1), None).await.status,
+        StatusCode::OK
+    );
+    let (t2, _) = new_token(&h, &c, "two").await;
+    // Asked: every token of the user is revoked, in the same transaction.
+    let r = h
+        .call(
+            "PUT",
+            "/me/password",
+            Some(&c),
+            Some(json!({ "current_password": "nora-password-2", "new_password": "nora-password-3", "revoke_tokens": true })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.json);
+    for t in [&t1, &t2] {
+        assert_eq!(
+            h.call("GET", "/me", Some(t), None).await.status,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert_eq!(
+        h.call("GET", "/me", Some(&c), None).await.status,
+        StatusCode::OK
+    );
+    let log = h.state.storage.audit_after(0, 1000).unwrap();
+    let revoked: Vec<_> = log
+        .iter()
+        .filter(|e| e.operation == "change_password" && e.action == "token.revoke")
+        .collect();
+    assert_eq!(revoked.len(), 2);
+    assert_eq!(revoked[0].detail["reason"], "password changed");
+    let kinds: Vec<String> = h
+        .state
+        .storage
+        .read_tx(|c| {
+            let mut st = c.prepare("SELECT payload FROM changelog ORDER BY offset")?;
+            let rows = st.query_map([], |r| r.get::<_, String>(0))?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .unwrap();
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|p| p.contains("\"token_revoked\""))
+            .count(),
+        2
+    );
+    // Administrator reset: same option; without a password it is refused.
+    let (t3, _) = new_token(&h, &c, "three").await;
+    let path = format!("/users/{}", nora.id);
+    let r = h
+        .call(
+            "PUT",
+            &path,
+            Some(&root_c),
+            Some(json!({ "revoke_tokens": true })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.json);
+    let r = h
+        .call(
+            "PUT",
+            &path,
+            Some(&root_c),
+            Some(json!({ "password": "nora-password-4" })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.json);
+    assert_eq!(
+        h.call("GET", "/me", Some(&t3), None).await.status,
+        StatusCode::OK,
+        "a reset without the option keeps tokens"
+    );
+    let r = h
+        .call(
+            "PUT",
+            &path,
+            Some(&root_c),
+            Some(json!({ "password": "nora-password-5", "revoke_tokens": true })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.json);
+    assert_eq!(
+        h.call("GET", "/me", Some(&t3), None).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+/// O1: `token_creation_requires_session` refuses token creation with a
+/// token (default: allowed); a browser session still can.
+#[tokio::test]
+async fn token_creation_can_require_a_session() {
+    let h = Harness::new();
+    let c = root_session(&h).await;
+    let (t, _) = new_token(&h, &c, "a").await;
+    new_token(&h, &t, "made-with-a-token").await;
+
+    let h = Harness::with_config(1000, "token_creation_requires_session = true");
+    let c = root_session(&h).await;
+    let (t, _) = new_token(&h, &c, "a").await;
+    let r = h
+        .call(
+            "POST",
+            "/tokens",
+            Some(&t),
+            Some(serde_json::json!({ "name": "b" })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.json);
+    assert!(r.json["error"]
+        .as_str()
+        .unwrap()
+        .contains("token_creation_requires_session"));
 }

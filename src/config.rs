@@ -523,6 +523,9 @@ pub struct WebConfig {
     /// 4 s ... up to 15 min). Across all networks the account gets four
     /// times as many, then waits of at most one minute.
     pub login_backoff_after: u32,
+    /// O1: API tokens may be created only from a signed-in browser session
+    /// (not with another API token). Default false.
+    pub token_creation_requires_session: bool,
     /// Seconds a client has to send a request's headers; also how long an
     /// idle keep-alive connection stays open.
     pub request_header_timeout_secs: u64,
@@ -647,6 +650,7 @@ impl Default for WebConfig {
             secure_cookies: false,
             login_attempts_per_minute: 10,
             login_backoff_after: 5,
+            token_creation_requires_session: false,
             request_header_timeout_secs: 60,
             max_connections: 512,
         }
@@ -761,6 +765,7 @@ request_header_timeout_secs = 60  # a client must send each request's headers wi
 max_connections = 512    # concurrent web connections (websockets included)
 login_attempts_per_minute = 10  # sign-in requests per client address (IPv6: per /64) per minute
 login_backoff_after = 5  # failed attempts per account and network before waits start (account-wide: 4x, waits <= 1 min)
+token_creation_requires_session = false  # true: API tokens can only be created from a signed-in browser session, not with another token
 
 [root]
 username = "root"

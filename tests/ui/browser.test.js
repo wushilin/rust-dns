@@ -293,12 +293,34 @@ async function main() {
   await admin.eval(`document.querySelector('#modal [data-close]').click(); return true`);
   await admin.wait('token listed with its scope', `return document.querySelector('#main')?.textContent.includes('≤ viewer')`);
 
-  // ---- N1: the key rollover wizard, every step, with shortened timers ----
+  // ---- Phase O: account security and console productivity ----
   const pages = [admin, viewer, st];
+  pages.push(...(await phaseO(b, p, rootApi, admin)));
+
+  // ---- N1: the key rollover wizard, every step, with shortened timers ----
   pages.push(...(await rolloverWalk(b, rootApi)));
 
   for (const pg of pages) ok(`no page errors (${pg.label})`, pg.errors.length === 0, JSON.stringify(pg.errors));
   b.ws.close();
+}
+
+// Phase O flows on the primary `p` (root's API client `rootApi`, root's page `admin`).
+async function phaseO(b, p, rootApi, admin) {
+  const bearer = async (tok, method, pth) => (await fetch(`${p.url}/api${pth}`, { method, headers: { authorization: `Bearer ${tok}` } })).status;
+  // O1: change own password and revoke own API tokens from the account page.
+  await rootApi('POST', '/users', { username: 'olive', password: 'olive-password-1' });
+  const oliveApi = await apiLogin(p, 'olive', 'olive-password-1');
+  const otok = (await oliveApi('POST', '/tokens', { name: 'olive-ci' })).json.token;
+  ok('O1: token works before', (await bearer(otok, 'GET', '/me')) === 200);
+  const olive = await b.page('olive@primary');
+  await olive.signIn(p, 'olive', 'olive-password-1');
+  await olive.route('#/account', `return !!document.querySelector('#pw-revoke')`);
+  await olive.fill('#pw-cur', 'olive-password-1'); await olive.fill('#pw-new', 'olive-password-2');
+  await olive.eval(`document.querySelector('#pw-revoke').checked = true; return true`);
+  await olive.click('#pw-btn');
+  await olive.wait('password changed', `return document.querySelector('#toasts').textContent.includes('API tokens revoked') || document.querySelector('#pw-err').textContent`);
+  const after = await bearer(otok, 'GET', '/me'); ok('O1: password change from the console revokes the tokens', after === 401, String(after));
+  return [olive];
 }
 
 // Screenshots of the drawer when SCREENSHOT_DIR is set (for a human look).

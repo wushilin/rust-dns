@@ -148,6 +148,7 @@ proxy_trust = ""              # proxies whose PROXY header / X-Forwarded-* are b
 secure_cookies = false        # force Secure cookies (automatic when a trusted proxy says HTTPS)
 login_attempts_per_minute = 10
 login_backoff_after = 5       # failed attempts per account and network before waits start
+token_creation_requires_session = false  # true: API tokens only from a signed-in browser session
 request_header_timeout_secs = 60
 max_connections = 512
 
@@ -224,7 +225,10 @@ Before exposing rust-dns to the internet, note:
   signed-in session. TOTP codes are single-use (the last accepted time step
   is stored). Replacing an enrolled authenticator needs the current code or
   password. Changing your password signs out your other sessions; API tokens
-  are not affected (revoke them separately). Argon2 runs on a small bounded
+  keep working unless you tick "Also revoke my API tokens" (`revoke_tokens`;
+  an administrator's password reset has the same option). With
+  `token_creation_requires_session = true` API tokens can only be created
+  from a signed-in browser session, so a leaked token cannot mint more. Argon2 runs on a small bounded
   worker pool; when it is saturated sign-ins get 503 with `Retry-After`
   instead of slowing DNS.
 - **Websocket.** Streams re-check the session/token and zone rights every 10
