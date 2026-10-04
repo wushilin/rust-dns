@@ -802,13 +802,13 @@ Group 1: security and accounts
 - [ ] O8a. Passkeys (ES256/EdDSA via ring, see the O8 note).
 
 Group 2: console productivity
-- [ ] O9. Search across all zones (name, value, type; respects rights) with
+- [x] O9. Search across all zones (name, value, type; respects rights) with
   jump-to-record.
-- [ ] O10. Bulk record editing: multi-select delete, paste-many (one
+- [x] O10. Bulk record editing: multi-select delete, paste-many (one
   transaction, preview, per-line errors).
-- [ ] O11. Zone cloning and rename (rename is a typed change; DNSSEC-signed
+- [x] O11. Zone cloning and rename (rename is a typed change; DNSSEC-signed
   zones: refuse rename while a DS may be published, explain why).
-- [ ] O12. Records table column sorting and keyboard shortcuts.
+- [x] O12. Records table column sorting and keyboard shortcuts.
 
 Group 3: operations
 - [ ] O13. Soak test on dns-test (owner approved by "do all"): build release,
@@ -982,7 +982,21 @@ Final
   d32d67f binary), because it would drop the history. So: upgrade the
   standby (baba2) first, then the primary (gate); set a password history
   only after both run this version; do not downgrade once a history is
-  stored. Everything else in group 1 works in either order.
+  stored. Everything else in group 1 works in either order. O7: cookie
+  scripts must send `X-CSRF-Token` (or set `csrf_token_required = false`);
+  local per server, no replication impact.
+- After phase O, group 2: protocol 2, no new change kind, fixture
+  untouched. Bulk edits and clones are ordinary record/zone changes. A
+  zone rename is a `zone_updated` whose rows differ in `name`
+  (`sql::update_zone` now writes `name`; every other update writes the
+  same name, so nothing else changes). An older (d32d67f) standby would
+  ignore the new name (its update leaves `name`) and halt at the next
+  reconcile, so standbys now advertise the feature `zone-rename`
+  (`X-Rust-DNS-Version: 0.1.0+dnssec-rollover.zone-rename`) and the
+  primary refuses a rename (409, naming the standby) while a known standby
+  lacks it (test `a_zone_rename_replicates_and_waits_for_old_standbys`,
+  real d32d67f binary). Upgrade baba2 first, then gate; a standby that no
+  longer follows must be forgotten (Replication page) before renames work.
 
 ## Log
 
@@ -1724,3 +1738,51 @@ Final
 - 2026-10-04 (phase O): O8 not done (blocked, see the O8 note: the pure-Rust
   crate pulls `rsa` with RUSTSEC-2023-0071; `webauthn-rs` needs OpenSSL).
   New item O8a proposes an ES256/EdDSA-only implementation on `ring`.
+- 2026-10-04 (phase O): O9 done. `GET /search?q=&type=&zone=&limit=`:
+  records whose name, type or value contains `q` (case-insensitive,
+  `LIKE` with escaping), optionally one type / zone, only in
+  `visible_zones(caller)` with `View` (so through a token's scope), with
+  the caller's role per hit; `total` beyond `limit`. Console: "Search
+  records in all zones" on the Zones page; a hit opens its zone, filters
+  to the name when needed and highlights the row. Tests:
+  `api::tests::search_across_zones_respects_rights` (viewer of one zone
+  sees only it; scoped token), contract test (operation `search_records`),
+  browser flows "O9: search finds the record and jumps to it", "O9: a
+  viewer of another zone does not find it".
+- 2026-10-04 (phase O): O10 done. `POST /zones/{zone}/records/bulk`
+  (`delete`: ids, `add`: pasted lines `name [ttl] [IN] type value`,
+  `preview`): `Mutator::bulk_records` runs every delete and add in one
+  transaction; a preview, or any failing line / id, rolls it back and
+  returns what would happen with per-line errors (`applied` false); a
+  clean edit commits once (one serial bump, one txn). Console: "Paste
+  records" dialog (Preview, then Apply, applied text = previewed text) and
+  row checkboxes with "Delete selected" (one bulk call). Tests:
+  `mutation::bulk::tests::pasted_lines_parse_with_per_line_errors`,
+  `api::tests::bulk_record_edit_is_one_transaction`, follow test below
+  (bulk replicates), contract test (`bulk_records` example), browser flows
+  "O10: preview names the bad line and changes nothing", "O10: pasted
+  records applied", "O10: multi-select delete".
+- 2026-10-04 (phase O): O11 done. `POST /zones/{zone}/clone` (`create_zones`
+  + view): settings (SOA contacts inside the zone follow the new name,
+  timers, default TTL, record policy, override settings) and unexpired
+  records, not signing / members; caller owns it. `POST
+  /zones/{zone}/rename` (owner + `create_zones`): `Tx::rename_zone`
+  (`zone_updated` with the new name, the signing key row follows by
+  `dnssec_key_set`), refused while a rollover runs, while a known standby
+  lacks the `zone-rename` feature, and for a signed zone unless the parent
+  check says no DS is published (`ds_published`, the existing parent DS
+  check; no force). Scoped tokens naming the old zone do not follow
+  (documented). Console: Clone / Rename buttons on the zone page. Tests:
+  `api::tests::zones_can_be_cloned_and_renamed`,
+  `follow::a_zone_rename_replicates_and_waits_for_old_standbys` (standby
+  serves the new name, reconcile ok; d32d67f standby blocks the rename),
+  `follow::primary_standby_failover_and_rejoin` (feature-tagged version),
+  contract test, browser flows "O11: zone cloned with its records", "O11:
+  zone renamed".
+- 2026-10-04 (phase O): O12 done. Records table: click (or Enter) on Name,
+  Type, Value, TTL sorts, again reverses. Shortcuts (not while typing or
+  in a dialog): `/` focus the filter, `n` add record, `p` paste records,
+  `g z` / `g d` go to zones / dashboard, `?` list them, Esc closes. Tests:
+  browser flows "O12: sorting by name, both directions", "O12: \"/\"
+  focuses the filter", "O12: \"?\" lists the shortcuts" (and `n` opens
+  the record dialog).

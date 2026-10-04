@@ -282,6 +282,22 @@ Before exposing rust-dns to the internet, note:
 - **BIND zone-file import and export were removed** (the parser followed
   `$INCLUDE` to files on the server). JSON import/export remains.
 
+## Console productivity
+
+- **Search** (Zones page, `GET /api/search?q=&type=&zone=`): records in
+  every zone you may view whose name, type or value contains the text; a
+  hit opens its zone and highlights the record.
+- **Bulk edit** (zone page): "Paste records" takes one record per line
+  (`name [ttl] type value`), previews the result (nothing is written) and
+  applies it as one change; row checkboxes and "Delete selected" delete
+  several records at once (`POST /api/zones/{zone}/records/bulk`).
+- **Clone and rename** (zone page, administrators): a copy with the same
+  settings and records, or a new name for the zone (a signed zone only
+  once the parent publishes no DS for it; only while every standby runs a
+  version that can follow a rename).
+- **Sorting and shortcuts**: click a column header to sort the records;
+  `/` search, `n` add record, `p` paste records, `g z` zones, `?` help.
+
 ## Resolver features
 
 Queries run through a pipeline of filters (`src/dns/pipeline.rs`, order and

@@ -38,11 +38,13 @@ pub(super) fn update_zone(c: &Connection, z: &Zone) -> Result<Zone> {
     c.execute(
         "UPDATE zones SET serial=?2, soa_mname=?3, soa_rname=?4, refresh=?5, retry=?6, expire=?7, minimum=?8,
          default_ttl=?9, updated_at=?10, owner_id=?11, dnssec=?12, signed_at=?13, override_spec=?14,
-         record_policy=?15 WHERE id = ?1",
+         record_policy=?15, name=?16 WHERE id = ?1",
         params![
             z.id, z.serial as i64, z.soa_mname, z.soa_rname, z.refresh as i64, z.retry as i64,
             z.expire as i64, z.minimum as i64, z.default_ttl as i64, z.updated_at, z.owner_id,
-            z.dnssec as i64, z.signed_at, override_json(z)?, policy_json(z)?
+            z.dnssec as i64, z.signed_at, override_json(z)?, policy_json(z)?,
+            // O11: the name too (a rename); unchanged for every other update.
+            z.name
         ],
     )?;
     Ok(db::get_zone_by_id(c, z.id)?.expect("zone exists"))

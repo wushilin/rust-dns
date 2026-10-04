@@ -373,6 +373,72 @@ async function phaseO(b, p, rootApi, admin) {
     return { status: a.status, code: (await a.json()).code };`);
   ok('O7: a cookie write without the CSRF token is refused', csrf.status === 403 && csrf.code === 'csrf', JSON.stringify(csrf));
 
+  // O9: search across zones, jump to the record.
+  await rootApi('POST', '/zones', { name: 'other.test' });
+  await rootApi('POST', '/zones/other.test/records', { name: 'findme', type: 'TXT', value: 'needle-42' });
+  await admin.route('#/zones', `return !!document.querySelector('#s-q')`);
+  await admin.fill('#s-q', 'needle-42');
+  await admin.click('#s-go');
+  await admin.wait('search hit', `return document.querySelectorAll('#s-table [data-hit]').length === 1`);
+  await admin.eval(`document.querySelector('#s-table [data-hit]').click(); return true`);
+  await admin.wait('jumped to the record', `return location.hash === '#/zones/other.test' && !!document.querySelector('#records tr.flash')`);
+  ok('O9: search finds the record and jumps to it', true);
+  const vSearch = await (await apiLogin(p, 'vera', 'vera-password-1'))('GET', '/search?q=needle-42');
+  ok('O9: a viewer of another zone does not find it', vSearch.status === 200 && vSearch.json.hits.length === 0, JSON.stringify(vSearch.json));
+
+  // O10: paste several records with a preview, then delete two with multi-select.
+  await admin.route('#/zones/other.test', `return !!document.querySelector('#r-bulk')`);
+  await admin.click('#r-bulk');
+  await admin.wait('bulk dialog', `return !!document.querySelector('#bk-text')`);
+  await admin.fill('#bk-text', 'p1 A 192.0.2.101\np2 A 192.0.2.102\nbad A nope');
+  await admin.click('#bk-preview');
+  await admin.wait('preview shows the bad line', `return /line 3/.test(document.querySelector('#bk-out')?.textContent || '')`);
+  ok('O10: preview names the bad line and changes nothing', (await rootApi('GET', '/zones/other.test/records')).json.records.length === 1);
+  await admin.fill('#bk-text', 'p1 A 192.0.2.101\np2 A 192.0.2.102');
+  await admin.click('#bk-preview');
+  await admin.wait('clean preview', `return /2 to add/.test(document.querySelector('#bk-out')?.textContent || '') && !document.querySelector('#bk-apply').disabled`);
+  await admin.click('#bk-apply');
+  await admin.wait('applied', `return document.querySelector('#records')?.textContent.includes('192.0.2.102')`);
+  ok('O10: pasted records applied', (await rootApi('GET', '/zones/other.test/records')).json.records.length === 3);
+  await admin.eval(`for (const v of ['192.0.2.101', '192.0.2.102']) [...document.querySelectorAll('#records tr')].find(t => t.textContent.includes(v)).querySelector('[data-sel]').click(); return true`);
+  await admin.click('#r-del-sel');
+  await admin.wait('confirm', `return !!document.querySelector('#cf-ok')`);
+  await admin.click('#cf-ok');
+  await admin.wait('deleted', `return !document.querySelector('#records')?.textContent.includes('192.0.2.101')`);
+  ok('O10: multi-select delete', (await rootApi('GET', '/zones/other.test/records')).json.records.length === 1);
+
+  // O12: sort by a column; keyboard shortcuts.
+  await rootApi('POST', '/zones/other.test/records/bulk', { add: 'zz A 192.0.2.1\naa A 192.0.2.3\nmm A 192.0.2.2' });
+  await admin.route('#/zones/other.test', `return document.querySelectorAll('#records tbody tr').length === 4`);
+  const order = () => admin.eval(`return [...document.querySelectorAll('#records tbody .c-name')].map(t => t.textContent)`);
+  await admin.click('#records [data-sort="name"]');
+  const asc = await order();
+  await admin.click('#records [data-sort="name"]');
+  const desc = await order();
+  ok('O12: sorting by name, both directions', JSON.stringify(asc) === JSON.stringify(['aa', 'findme', 'mm', 'zz']) && JSON.stringify(desc) === JSON.stringify(['zz', 'mm', 'findme', 'aa']), JSON.stringify([asc, desc]));
+  await admin.eval(`document.activeElement?.blur(); document.dispatchEvent(new KeyboardEvent('keydown', { key: 'n', bubbles: true })); return true`);
+  await admin.wait('n opens the record dialog', `return !!document.querySelector('#rf-value')`);
+  await admin.eval(`document.querySelector('#modal [data-close]')?.click(); document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' })); return true`);
+  await admin.wait('dialog closed', `return !document.querySelector('#modal-root').classList.contains('open')`);
+  await admin.eval(`document.dispatchEvent(new KeyboardEvent('keydown', { key: '/', bubbles: true })); return true`);
+  ok('O12: "/" focuses the filter', await admin.eval(`return document.activeElement?.id === 'r-filter'`));
+  await admin.eval(`document.activeElement.blur(); document.dispatchEvent(new KeyboardEvent('keydown', { key: '?', bubbles: true })); return true`);
+  ok('O12: "?" lists the shortcuts', await admin.wait('help', `return !!document.querySelector('#kb-help')`));
+  await admin.eval(`document.querySelector('#modal [data-close]').click(); return true`);
+
+  // O11: clone and rename from the console.
+  await admin.click('#z-clone');
+  await admin.wait('clone dialog', `return !!document.querySelector('#zn-name')`);
+  await admin.fill('#zn-name', 'copy.other.test');
+  await admin.click('#m-ok');
+  await admin.wait('clone opened', `return location.hash === '#/zones/copy.other.test' && document.querySelectorAll('#records tbody tr').length === 4`);
+  ok('O11: zone cloned with its records', (await rootApi('GET', '/zones/copy.other.test/records')).json.records.length === 4);
+  await admin.click('#z-rename');
+  await admin.wait('rename dialog', `return !!document.querySelector('#zn-name')`);
+  await admin.fill('#zn-name', 'renamed.test');
+  await admin.click('#m-ok');
+  await admin.wait('renamed', `return location.hash === '#/zones/renamed.test'`);
+  ok('O11: zone renamed', (await rootApi('GET', '/zones/renamed.test/records')).json.records.length === 4 && (await rootApi('GET', '/zones/copy.other.test')).status === 404);
   return [olive];
 }
 

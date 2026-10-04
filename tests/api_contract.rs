@@ -105,6 +105,8 @@ const DEDICATED: &[&str] = &[
     "websocket",
     // Needs a second server following this one (see the promotion flow).
     "promote_standby",
+    // O11: needs an unsigned zone and no standby without the feature.
+    "rename_zone",
     // O5/O6: change who can sign in; exercised in their own flow.
     "admin_enroll_mfa",
     "update_security_settings",
@@ -2074,6 +2076,28 @@ fn live_api_matches_spec() {
     for (path, method) in &deletes {
         run_generic(&mut c, path, method);
     }
+
+    // ---- O11: rename (after the deletes: the example standby is forgotten
+    // and the signed example zone is gone) ---------------------------------
+    let r = c.call(
+        Auth::Session(&root),
+        "post",
+        "/zones",
+        &[],
+        "",
+        Body::Json(&json!({ "name": "rn.example.com" })),
+    );
+    c.expect("zone to rename", &r, 201);
+    let ex = c.example("/zones/{zone}/rename", "post");
+    let r = c.send_example(
+        Auth::Session(&root),
+        "post",
+        "/zones/{zone}/rename",
+        &[("zone", "rn.example.com".to_string())],
+        "",
+        &ex,
+    );
+    c.expect("rename an unsigned zone", &r, 200);
 
     // ---- logout --------------------------------------------------------------
     let r = c.call(

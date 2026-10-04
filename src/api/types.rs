@@ -339,6 +339,27 @@ pub struct RecordPage {
     pub limit: usize,
 }
 
+/// O9: one record found by a search across zones.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SearchHit {
+    /// The zone the record belongs to.
+    #[schema(example = "example.com")]
+    pub zone: String,
+    /// The caller's role on that zone.
+    pub role: crate::model::ZoneRole,
+    pub record: Record,
+}
+
+/// O9: records matching a search, in the zones the caller may view.
+#[derive(Debug, Serialize, ToSchema)]
+#[schema(example = json!({ "hits": [{ "zone": "example.com", "role": "owner", "record": { "id": 42, "zone_id": 1, "name": "www", "type": "A", "value": "192.0.2.10", "ttl": 300, "created_at": "2026-01-15T09:30:00.000Z", "updated_at": "2026-01-15T09:30:00.000Z", "expires_at": null } }], "total": 1, "limit": 200 }))]
+pub struct SearchResult {
+    pub hits: Vec<SearchHit>,
+    /// Matches in total (more than `hits` when the limit cut the list).
+    pub total: i64,
+    pub limit: usize,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 #[schema(example = json!({ "members": [{ "user_id": 2, "username": "alice", "role": "editor", "created_at": "2026-01-15T09:30:00.000Z" }] }))]
 pub struct MemberList {

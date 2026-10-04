@@ -790,6 +790,42 @@ impl Storage {
         })
     }
 
+    /// O9: records of the zones `zone_ids` whose name, value or type
+    /// contains `q` (case-insensitive; empty: any), optionally only of type
+    /// `rtype`; at most `limit`, by zone and name. Also the total match count.
+    pub fn search_all_records(
+        &self,
+        zone_ids: &[i64],
+        q: &str,
+        rtype: Option<&str>,
+        limit: usize,
+    ) -> Result<(Vec<Record>, i64)> {
+        if zone_ids.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+        let ids = serde_json::to_string(zone_ids)?;
+        self.with_read(|c| {
+            let pat = format!(
+                "%{}%",
+                q.to_ascii_lowercase().replace('%', "\\%").replace('_', "\\_")
+            );
+            let filter = "zone_id IN (SELECT value FROM json_each(?1))
+                AND (?2 = '' OR lower(name) LIKE ?3 ESCAPE '\\' OR lower(value) LIKE ?3 ESCAPE '\\' OR lower(rtype) LIKE ?3 ESCAPE '\\')
+                AND (?4 IS NULL OR rtype = ?4)";
+            let total: i64 = c.query_row(
+                &format!("SELECT COUNT(*) FROM records WHERE {filter}"),
+                params![ids, q, pat, rtype],
+                |r| r.get(0),
+            )?;
+            let mut stmt = c.prepare(&format!(
+                "SELECT {RECORD_COLS} FROM records WHERE {filter}
+                 ORDER BY zone_id, name, rtype, value LIMIT ?5"
+            ))?;
+            let rows = stmt.query_map(params![ids, q, pat, rtype, limit as i64], row_to_record)?;
+            Ok((rows.collect::<Result<Vec<_>, _>>()?, total))
+        })
+    }
+
     /// The earliest expiry that has not been processed yet, if any.
     pub fn next_expiry(&self) -> Result<Option<String>> {
         self.with_read(|c| {

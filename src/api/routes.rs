@@ -7,8 +7,8 @@
 
 use super::error::{ApiError, ApiResult, ErrorCode};
 use super::openapi::{
-    BadRequest, Conflict, Forbidden, InvalidRequest, NotFound, ServiceUnavailable, TooManyRequests,
-    Unauthorized,
+    BadRequest, Conflict, ConflictOrReadOnly, Forbidden, InvalidRequest, NotFound, ReadOnly,
+    ServiceUnavailable, TooManyRequests, Unauthorized,
 };
 use super::session::{public_user, Caller};
 use super::types::*;
@@ -559,6 +559,133 @@ pub async fn create_zone(
     ))
 }
 
+/// O11: the new name of a zone (rename) or of the copy (clone).
+#[derive(Deserialize, ToSchema)]
+#[schema(example = json!({ "name": "example.net", "records": true }))]
+pub struct ZoneNameBody {
+    #[schema(example = "example.net")]
+    pub name: String,
+    /// Clone only: copy the records too (default true).
+    #[serde(default)]
+    pub records: Option<bool>,
+}
+
+/// Standbys known to this primary that cannot follow a zone rename (an
+/// older version would ignore the new name and halt at its reconcile).
+fn rename_blocked_by(s: &AppState) -> Vec<String> {
+    s.repl
+        .replica_list()
+        .into_iter()
+        .filter(|r| !crate::replication::replicas::has_feature(&r.version, "zone-rename"))
+        .map(|r| {
+            format!(
+                "{} (version {})",
+                r.instance,
+                if r.version.is_empty() {
+                    "unknown"
+                } else {
+                    &r.version
+                }
+            )
+        })
+        .collect()
+}
+
+#[utoipa::path(
+    post,
+    path = "/zones/{zone}/rename",
+    tag = "Zones",
+    operation_id = "rename_zone",
+    summary = "Rename a zone",
+    description = "Gives the zone a new name; its records (relative names), members, owner, settings and signing key stay with it, and the serial is bumped. The registrar's delegation must follow. Refused while a standby of an older version follows this server (it could not apply it), while a DNSSEC key rollover runs, and for a signed zone unless the parent is confirmed to publish no DS record for the current name (a DS for the old name would otherwise point at a zone that no longer exists, and the new name needs its own DS step): `code` `ds_published`. API tokens scoped to the old name do not follow the rename. Needs the owner role and `create_zones`.",
+    params(ZonePath),
+    request_body(content = ZoneNameBody, example = json!({ "name": "renamed.example.com" })),
+    responses(
+        (status = 200, description = "Renamed.", body = ZoneView),
+        (status = 400, response = BadRequest),
+        (status = 401, response = Unauthorized),
+        (status = 403, response = Forbidden),
+        (status = 404, response = NotFound),
+        (status = 409, response = ConflictOrReadOnly),
+    ),
+)]
+pub async fn rename_zone(
+    State(s): St,
+    caller: Caller,
+    Path(ZonePath { zone }): Path<ZonePath>,
+    Json(b): Json<ZoneNameBody>,
+) -> ApiResult<Json<ZoneView>> {
+    let (z, role) = s.require_zone(&caller, &zone, ZonePerm::DeleteZone)?;
+    s.require(&caller, GlobalPerm::CreateZones)?;
+    let new_name = normalize_zone_name(&b.name)?;
+    let blocked = rename_blocked_by(&s);
+    if !blocked.is_empty() {
+        return Err(ApiError::conflict(format!(
+            "standbys of an older version follow this server and could not apply a rename: {}. Upgrade them first (or forget a standby that no longer follows, on the Replication page)",
+            blocked.join(", ")
+        )));
+    }
+    if z.dnssec {
+        let p = super::dnssec::parent_check(&s, &z).await;
+        let apex = z.fqdn();
+        if !matches!(p.state, super::dnssec::ParentDsState::Absent) {
+            return Err(ApiError::conflict(format!(
+                "{apex} is signed and the parent may publish a DS record for it ({}). Renaming it would leave that DS pointing at a name that is no longer served (validating resolvers fail until it is removed). Remove the DS at your registrar, wait for its TTL to pass, then rename (and set up the DS for the new name)",
+                if p.parent_ds.is_empty() { p.detail.clone() } else { p.parent_ds.join("; ") }
+            ))
+            .with_code(ErrorCode::DsPublished));
+        }
+    }
+    let renamed = s
+        .mutator
+        .rename_zone(caller.actor(), &z.name, &new_name)
+        .await?;
+    let n = s.storage.list_records(renamed.id)?.len();
+    Ok(Json(zone_view(&s, &renamed, role, n)))
+}
+
+#[utoipa::path(
+    post,
+    path = "/zones/{zone}/clone",
+    tag = "Zones",
+    operation_id = "clone_zone",
+    summary = "Copy a zone under a new name",
+    description = "A new zone with the settings of this one (SOA timers and contacts, default TTL, record policy, override settings) and, unless `records` is false, a copy of its records (expired ones left out). Signing, members and the key are not copied; the caller owns the copy. One transaction. Needs view rights on the source and `create_zones`.",
+    params(ZonePath),
+    request_body(content = ZoneNameBody, example = json!({ "name": "copy.example.com", "records": true })),
+    responses(
+        (status = 201, description = "Created.", body = ZoneView),
+        (status = 400, response = BadRequest),
+        (status = 401, response = Unauthorized),
+        (status = 403, response = Forbidden),
+        (status = 404, response = NotFound),
+        (status = 409, response = ConflictOrReadOnly),
+    ),
+)]
+pub async fn clone_zone(
+    State(s): St,
+    caller: Caller,
+    Path(ZonePath { zone }): Path<ZonePath>,
+    Json(b): Json<ZoneNameBody>,
+) -> ApiResult<(StatusCode, Json<ZoneView>)> {
+    let (z, _) = s.require_zone(&caller, &zone, ZonePerm::View)?;
+    s.require(&caller, GlobalPerm::CreateZones)?;
+    let (copy, n) = s
+        .mutator
+        .clone_zone(
+            caller.actor(),
+            &z.name,
+            &b.name,
+            Some(caller.user.id),
+            b.records.unwrap_or(true),
+        )
+        .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(zone_view(&s, &copy, ZoneRole::Owner, n)),
+    ))
+}
+
 #[utoipa::path(
     get,
     path = "/zones/{zone}",
@@ -690,6 +817,156 @@ pub struct RecordsQuery {
 }
 
 pub const RECORD_PAGE: usize = 500;
+
+/// O10: several record changes at once.
+#[derive(Deserialize, ToSchema)]
+#[schema(example = json!({ "delete": [], "add": "bulk1 300 A 192.0.2.31\nbulk2 A 192.0.2.32\nbulk1 TXT \"hello\"", "preview": false }))]
+pub struct BulkBody {
+    /// Ids of records of this zone to delete.
+    #[serde(default)]
+    pub delete: Vec<i64>,
+    /// Records to add, one per line: `name [ttl] [IN] type value`
+    /// (`@` = apex; blank lines and lines starting with `;` or `#` are
+    /// skipped).
+    #[serde(default)]
+    pub add: String,
+    /// Only check: run the edit and roll it back.
+    #[serde(default)]
+    pub preview: bool,
+}
+
+/// O10: the outcome of a bulk edit.
+#[derive(serde::Serialize, ToSchema)]
+pub struct BulkResult {
+    /// True when the changes were committed (not a preview, no errors).
+    pub applied: bool,
+    #[serde(flatten)]
+    pub outcome: crate::mutation::bulk::BulkOutcome,
+}
+
+#[utoipa::path(
+    post,
+    path = "/zones/{zone}/records/bulk",
+    tag = "Records",
+    operation_id = "bulk_records",
+    summary = "Delete and add many records in one transaction",
+    description = "Deletes the records `delete` and adds the lines of `add`, as one transaction: everything is committed, or nothing. With `preview` the same transaction runs and is rolled back, so the result shows exactly what would happen. When any line or delete fails nothing is applied and `errors` names each failing line (1-based) or record id; `applied` says whether the changes were committed. At most 5000 changes. Needs the editor role.",
+    params(ZonePath),
+    request_body(content = BulkBody, example = json!({ "delete": [], "add": "bulk1 300 A 192.0.2.31\nbulk2 A 192.0.2.32\nbulk1 TXT \"hello\"", "preview": false })),
+    responses(
+        (status = 200, description = "Applied, previewed, or refused with per-line errors (see `applied`).", body = BulkResult),
+        (status = 400, response = BadRequest),
+        (status = 401, response = Unauthorized),
+        (status = 403, response = Forbidden),
+        (status = 404, response = NotFound),
+        (status = 409, response = ReadOnly),
+    ),
+)]
+pub async fn bulk_records(
+    State(s): St,
+    caller: Caller,
+    Path(ZonePath { zone }): Path<ZonePath>,
+    Json(b): Json<BulkBody>,
+) -> ApiResult<Json<BulkResult>> {
+    let (z, _) = s.require_zone(&caller, &zone, ZonePerm::EditRecords)?;
+    let (lines, parse_errors) = crate::mutation::bulk::parse_bulk(&b.add);
+    if b.delete.is_empty() && lines.is_empty() && parse_errors.is_empty() {
+        return Err(ApiError::bad_request(
+            "nothing to do: give records to delete or lines to add",
+        ));
+    }
+    let preview = b.preview;
+    let outcome = s
+        .mutator
+        .bulk_records(
+            caller.actor(),
+            &z.name,
+            b.delete,
+            lines,
+            parse_errors,
+            preview,
+        )
+        .await?;
+    Ok(Json(BulkResult {
+        applied: !preview && outcome.errors.is_empty(),
+        outcome,
+    }))
+}
+
+/// O9: a search across zones.
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct SearchQuery {
+    /// Text matched (case-insensitive, substring) against record name,
+    /// type and value; also against zone names (all records of a matching
+    /// zone are not returned, only records whose own fields match).
+    #[param(example = "192.0.2")]
+    pub q: Option<String>,
+    /// Only records of this type (e.g. `A`, `MX`).
+    #[serde(rename = "type")]
+    #[param(rename = "type", example = "A")]
+    pub rtype: Option<String>,
+    /// Only this zone.
+    #[param(example = "example.com")]
+    pub zone: Option<String>,
+    /// Max hits (1-1000).
+    #[param(minimum = 1, maximum = 1000, default = 200)]
+    pub limit: Option<usize>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/search",
+    tag = "Records",
+    operation_id = "search_records",
+    summary = "Search records across zones",
+    description = "Records whose name, type or value contains `q` (case-insensitive), optionally of one `type` and/or in one `zone`, in every zone the caller may view (through its token's scope), with the caller's role on each. Ordered by zone, then name. Without `q` and `type` every record matches (up to `limit`).",
+    params(SearchQuery),
+    responses(
+        (status = 200, description = "Hits.", body = SearchResult),
+        (status = 400, response = BadRequest),
+        (status = 401, response = Unauthorized),
+    ),
+)]
+pub async fn search(
+    State(s): St,
+    caller: Caller,
+    Query(q): Query<SearchQuery>,
+) -> ApiResult<Json<SearchResult>> {
+    let text = q.q.as_deref().unwrap_or("").trim().to_string();
+    let rtype = q
+        .rtype
+        .as_deref()
+        .map(|t| t.trim().to_ascii_uppercase())
+        .filter(|t| !t.is_empty());
+    if text.chars().count() > 255 {
+        return Err(ApiError::bad_request("search text: at most 255 characters"));
+    }
+    let only = q.zone.as_deref().map(normalize_zone_name).transpose()?;
+    let limit = q.limit.unwrap_or(200).clamp(1, 1000);
+    // Rights: only zones the caller may view, through its scope.
+    let zones: Vec<(Zone, ZoneRole)> = s
+        .visible_zones(&caller)?
+        .into_iter()
+        .filter(|(z, r)| ZonePerm::View.allowed(*r) && only.as_ref().is_none_or(|o| *o == z.name))
+        .collect();
+    let ids: Vec<i64> = zones.iter().map(|(z, _)| z.id).collect();
+    let (records, total) = s
+        .storage
+        .search_all_records(&ids, &text, rtype.as_deref(), limit)?;
+    let hits = records
+        .into_iter()
+        .filter_map(|r| {
+            let (z, role) = zones.iter().find(|(z, _)| z.id == r.zone_id)?;
+            Some(SearchHit {
+                zone: z.name.clone(),
+                role: *role,
+                record: r,
+            })
+        })
+        .collect();
+    Ok(Json(SearchResult { hits, total, limit }))
+}
 
 #[utoipa::path(
     get,

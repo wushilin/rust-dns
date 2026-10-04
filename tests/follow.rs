@@ -196,7 +196,7 @@ fn call(auth: &Auth, method: &str, url: &str, body: Option<Value>) -> (u16, Valu
     let mut req = a
         .request(method, url)
         .set("X-Requested-With", "rust-dns")
-        .set("X-CSRF-Token", &csrf_of(&a));
+        .set("X-CSRF-Token", &csrf_of(a));
     if let Auth::Token(t) = auth {
         req = req.set("Authorization", &format!("Bearer {t}"));
     }
@@ -460,7 +460,7 @@ fn primary_standby_failover_and_rejoin() {
     // The version with what the standby can follow (N1).
     assert_eq!(
         r["version"],
-        format!("{}+dnssec-rollover", env!("CARGO_PKG_VERSION"))
+        format!("{}+dnssec-rollover.zone-rename", env!("CARGO_PKG_VERSION"))
     );
     assert_eq!(r["address"], "127.0.0.1");
     assert_eq!(r["conflict"], false);
@@ -3532,6 +3532,88 @@ fn a_password_history_replicates_and_an_old_standby_halts_on_it() {
     }
     drop(old.take());
     drop(s);
+    drop(p);
+    let _ = std::fs::remove_dir_all(&root_dir);
+}
+
+/// O11: a renamed zone reaches the standby (the `zone_updated` row carries
+/// the name; reconcile stays ok; DNS answers move to the new name), and
+/// bulk edits and clones replicate as ordinary changes. With the previous
+/// release following, the primary refuses a rename and names it (that
+/// standby would ignore the new name and halt).
+#[test]
+fn a_zone_rename_replicates_and_waits_for_old_standbys() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root_dir = std::env::temp_dir().join(format!(
+        "rust-dns-follow-rename-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root_dir).unwrap();
+    let mut p = Node::new(&root_dir, "primary", "rootpass-primary");
+    let mut s = Node::new(&root_dir, "standby", "rootpass-standby");
+    p.configure("");
+    p.start();
+    let pr = p.root();
+    let post =
+        |path: &str, body: Value| call(&Auth::Session(&pr), "POST", &p.api(path), Some(body));
+    ok(post("/zones", json!({ "name": "old.test" })), "zone");
+    ok(
+        post(
+            "/zones/old.test/records/bulk",
+            json!({ "add": "www A 192.0.2.7\nmail A 192.0.2.8" }),
+        ),
+        "bulk",
+    );
+    let repl = ok(post("/tokens", json!({ "name": "repl" })), "token")["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    s.configure(&follow_cfg(&p, "dns2", &repl));
+    s.start();
+    let sr = s.root();
+    wait_reconciled(&p, &pr, &s, &sr, "before the rename");
+    ok(
+        post("/zones/old.test/rename", json!({ "name": "new.test" })),
+        "rename",
+    );
+    ok(
+        post("/zones/new.test/clone", json!({ "name": "copy.test" })),
+        "clone",
+    );
+    wait_reconciled(&p, &pr, &s, &sr, "renamed and cloned");
+    let (rc, a) = answers(s.dns, "www.new.test.", RecordType::A);
+    assert_eq!(
+        (rc, a),
+        (
+            ResponseCode::NoError,
+            vec!["www.new.test. 300 192.0.2.7".to_string()]
+        )
+    );
+    let (rc, _) = answers(s.dns, "www.old.test.", RecordType::A);
+    assert_ne!(
+        rc,
+        ResponseCode::NoError,
+        "the old name is gone on the standby"
+    );
+    let (_, a) = answers(s.dns, "mail.copy.test.", RecordType::A);
+    assert_eq!(a, vec!["mail.copy.test. 300 192.0.2.8".to_string()]);
+    drop(s);
+
+    if let Some(prev) = prev_bin() {
+        let mut old = Node::new(&root_dir, "old", "rootpass-old");
+        old.bin = prev;
+        old.configure(&follow_cfg(&p, "dns3", &repl));
+        old.start();
+        let or = old.root();
+        wait_reconciled(&p, &pr, &old, &or, "old standby");
+        let (st, v) = post("/zones/new.test/rename", json!({ "name": "newer.test" }));
+        assert_eq!(st, 409, "{v}");
+        assert!(v["error"].as_str().unwrap().contains("dns3"), "{v}");
+        drop(old);
+    }
     drop(p);
     let _ = std::fs::remove_dir_all(&root_dir);
 }

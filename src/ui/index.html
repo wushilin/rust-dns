@@ -294,6 +294,10 @@ ol.steps li { padding-left: 2px; }
 .quick button { font-size: 11.5px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); background: none; cursor: pointer; color: var(--muted); }
 .quick button:hover { border-color: var(--accent); color: var(--accent); }
 textarea { resize: vertical; }
+.sortable { cursor: pointer; user-select: none; }
+.sortable.on { color: var(--text); }
+kbd { font-family: var(--mono, monospace); border: 1px solid var(--line); border-radius: 4px; padding: 1px 6px; }
+tr.flash td { background: color-mix(in srgb, var(--accent) 18%, transparent); transition: background 1.5s; }
 .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin: 0 0 14px; }
 .tabs button { background: none; border: 0; border-bottom: 2px solid transparent; padding: 8px 12px; cursor: pointer; color: var(--muted); font-weight: 500; white-space: nowrap; display: inline-flex; align-items: center; gap: 6px; }
 .tabs button.on { color: var(--text); border-bottom-color: var(--accent); }
@@ -554,6 +558,20 @@ function openModal(html, onOpen, opts = {}) {
 function closeModal() { $('#modal-root').classList.remove('open'); const m = $('#modal'); m.innerHTML = ''; m.className = 'card modal'; m.style.maxWidth = ''; }
 const modalOpen = () => $('#modal-root').classList.contains('open');
 $('#modal-root').addEventListener('click', e => { if (e.target === $('#modal-root')) closeModal(); });
+// O12: keyboard shortcuts (not while typing or with a dialog open).
+const SHORTCUTS = [['/', 'Focus the search / filter box'], ['n', 'Add a record (zone page)'], ['p', 'Paste records (zone page)'], ['g z', 'Go to zones'], ['g d', 'Go to the dashboard'], ['?', 'Show these shortcuts'], ['Esc', 'Close a dialog or panel']];
+let gPending = 0;
+document.addEventListener('keydown', e => {
+  if (e.ctrlKey || e.metaKey || e.altKey || modalOpen() || !S.user) return;
+  const t = e.target; if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
+  const click = sel => { const b = $(sel); if (b && !b.disabled) { e.preventDefault(); b.click(); } };
+  if (gPending && Date.now() - gPending < 1500) { gPending = 0; if (e.key === 'z') location.hash = '#/zones'; else if (e.key === 'd') location.hash = '#/dashboard'; return; }
+  if (e.key === 'g') { gPending = Date.now(); return; }
+  if (e.key === '/') { const f = $('#r-filter') || $('#z-filter') || $('#s-q') || $('#au-filter'); if (f) { e.preventDefault(); f.focus(); } }
+  else if (e.key === 'n') click('#r-add');
+  else if (e.key === 'p') click('#r-bulk');
+  else if (e.key === '?') { e.preventDefault(); openModal(`<h2>Keyboard shortcuts</h2><table id="kb-help"><tbody>${SHORTCUTS.map(([k, d]) => `<tr><td><kbd>${esc(k)}</kbd></td><td>${esc(d)}</td></tr>`).join('')}</tbody></table><div class="foot"><button class="btn primary" data-close data-ro-ok>Close</button></div>`); }
+});
 document.addEventListener('keydown', e => {
   if (e.key !== 'Escape') return;
   if (modalOpen()) closeModal();
@@ -597,7 +615,7 @@ $('#nav').addEventListener('click', e => { if (e.target.closest('a')) $('#app').
 // ---------------------------------------------------------------------------
 // state
 // ---------------------------------------------------------------------------
-const S = { user: null, zones: [], zone: null, panel: null, status: null, queries: [], changes: [], lastOffset: null, ws: null, wsTimer: null, paused: false, filter: '', repl: null, readOnly: false };
+const S = { sel: new Set(), rsort: { key: null, dir: 1 }, user: null, zones: [], zone: null, panel: null, status: null, queries: [], changes: [], lastOffset: null, ws: null, wsTimer: null, paused: false, filter: '', repl: null, readOnly: false };
 const RTYPES = ['A', 'AAAA', 'CNAME', 'DNAME', 'PTR', 'NS', 'MX', 'TXT', 'SRV', 'CAA', 'HTTPS', 'SVCB', 'TLSA', 'SSHFP', 'NAPTR', 'HINFO', 'DS'];
 const VALUE_HINT = { A: '10.0.0.1', AAAA: '2001:db8::1', CNAME: 'target.example.com', DNAME: 'other.example.com', PTR: 'host.example.com', NS: 'ns1.example.com', MX: '10 mail.example.com', TXT: 'v=spf1 -all', SRV: '10 20 5060 sip.example.com', CAA: '0 issue "letsencrypt.org"', HTTPS: '1 . alpn=h2,h3', SVCB: '1 svc.example.com. port=8443', TLSA: '3 1 1 <sha256 hex>', SSHFP: '4 2 <sha256 hex>', NAPTR: '100 10 "S" "SIP+D2U" "" _sip._udp.example.com.', HINFO: '"x86_64" "Linux"', DS: '12345 13 2 <sha256 digest, 64 hex digits>' };
 
@@ -969,8 +987,13 @@ async function viewZones() {
       ${S.user.is_admin ? '<button class="btn primary" id="z-new" data-perm="create_zones">New zone</button>' : ''}
     </div></div>
     <div class="row toolbar"><input type="text" id="z-filter" placeholder="Filter zones…"></div>
-    <div class="card" id="z-table"></div>`;
+    <div class="card" id="z-table"></div>
+    <div class="card panel" style="margin-top:16px"><h2>Search records in all zones</h2>
+      <div class="row toolbar"><input type="search" id="s-q" placeholder="Name, value or type (e.g. 192.0.2, mail)" aria-label="Search records"><select id="s-type"><option value="">Any type</option>${RTYPES.map(t => `<option>${t}</option>`).join('')}</select><button class="btn" id="s-go" data-ro-ok>Search</button></div>
+      <div id="s-results"></div></div>`;
   $('#z-filter').oninput = renderZonesTable;
+  $('#s-go').onclick = () => searchAll().catch(e => toast(e.message, 'err'));
+  $('#s-q').onkeydown = ev => { if (ev.key === 'Enter') $('#s-go').click(); };
   if ($('#z-new')) $('#z-new').onclick = newZoneModal;
   $('#z-io').onclick = () => ioModal(null);
   renderZonesTable();
@@ -1031,6 +1054,15 @@ function newZoneModal() {
 // ---------------------------------------------------------------------------
 // zone detail
 // ---------------------------------------------------------------------------
+// O9: search across every zone the caller may view; a hit opens its zone and highlights the record.
+async function searchAll() {
+  const q = $('#s-q').value.trim(), t = $('#s-type').value;
+  if (!q && !t) { $('#s-results').innerHTML = '<div class="hint">Type something to search for, or pick a type.</div>'; return; }
+  const p = new URLSearchParams(); if (q) p.set('q', q); if (t) p.set('type', t);
+  const r = await GET('/search?' + p);
+  $('#s-results').innerHTML = r.hits.length ? `<table id="s-table"><thead><tr><th>Zone</th><th>Name</th><th>Type</th><th>Value</th><th>Your role</th></tr></thead><tbody>${r.hits.map((h, i) => `<tr class="clickable" data-hit="${i}"><td class="mono">${esc(h.zone)}</td><td class="mono">${esc(h.record.name)}</td><td><span class="badge">${esc(h.record.type)}</span></td><td class="mono" style="word-break:break-all">${esc(h.record.value)}</td><td><span class="badge muted">${esc(h.role)}</span></td></tr>`).join('')}</tbody></table>${r.total > r.hits.length ? `<div class="hint" style="padding:8px">Showing ${num(r.hits.length)} of ${num(r.total)} matches: narrow the search.</div>` : ''}` : '<div class="empty">No records match</div>';
+  $$('#s-table [data-hit]').forEach(tr => tr.onclick = () => { const h = r.hits[Number(tr.dataset.hit)]; S.jump = { zone: h.zone, id: h.record.id, name: h.record.name }; location.hash = '#/zones/' + encodeURIComponent(h.zone); });
+}
 async function viewZone(name) {
   S.zone = await GET('/zones/' + encodeURIComponent(name));
   renderZone();
@@ -1050,6 +1082,8 @@ function renderZone(keepFilter) {
         <div class="actions">
           <button class="btn" id="z-io" data-ro-ok>Import / Export</button>
           ${isOwner && z.override ? `<button class="btn" id="z-ov" data-perm="edit_settings" data-zone="${esc(z.name)}">Override settings</button>` : ''}
+          ${S.user.is_admin ? `<button class="btn" id="z-clone" data-perm="create_zones">Clone</button>` : ''}
+          ${isOwner && S.user.is_admin ? `<button class="btn" id="z-rename" data-perm="delete_zone" data-zone="${esc(z.name)}">Rename</button>` : ''}
           ${isOwner ? `<button class="btn" id="z-edit" data-perm="edit_settings" data-zone="${esc(z.name)}">Settings</button><button class="btn danger" id="z-del" data-perm="delete_zone" data-zone="${esc(z.name)}">Delete zone</button>` : ''}
         </div>
       </div>
@@ -1066,7 +1100,7 @@ function renderZone(keepFilter) {
       <div class="rtool">
         <h2>Records <span class="badge muted" id="r-count">${z.record_total ?? z.records.length}</span></h2>
         <div class="search">${ico('search', 's')}<input type="search" id="r-filter" placeholder="Filter by name, type or value…" value="${esc(filter)}" aria-label="Filter records"></div>
-        ${canEdit ? `<button class="btn primary" id="r-add" data-perm="edit_records" data-zone="${esc(z.name)}">${ico('plus', 's')} Add record</button>` : ''}
+        ${canEdit ? `<button class="btn" id="r-del-sel" data-perm="edit_records" data-zone="${esc(z.name)}" disabled title="Select records first">Delete selected</button><button class="btn" id="r-bulk" data-perm="edit_records" data-zone="${esc(z.name)}" title="Add many records at once">Paste records</button><button class="btn primary" id="r-add" data-perm="edit_records" data-zone="${esc(z.name)}" title="Add a record (n)">${ico('plus', 's')} Add record</button>` : ''}
       </div>
       <div id="r-table"></div>
     </div>`;
@@ -1074,12 +1108,29 @@ function renderZone(keepFilter) {
   let searchTimer = null;
   $('#r-filter').oninput = () => { if (!large) return renderRecords(); clearTimeout(searchTimer); searchTimer = setTimeout(serverSearch, 250); };
   if ($('#r-add')) $('#r-add').onclick = () => recordModal(null);
+  if (!keepFilter) S.sel = new Set();
+  // O10: delete the selected records in one transaction.
+  if ($('#r-del-sel')) $('#r-del-sel').onclick = async () => {
+    const ids = [...S.sel]; if (!ids.length) return;
+    if (!await confirmModal('Delete records', `Delete ${ids.length} selected record(s)? One change: all or nothing.`, 'Delete', $('#r-del-sel'))) return;
+    try { const r = await POST(`/zones/${encodeURIComponent(z.name)}/records/bulk`, { delete: ids });
+      if (r.applied) { toast(`Deleted ${r.deleted.length} record(s)`, 'ok'); S.sel = new Set(); reloadZone(); } else toast(r.errors.map(e => e.error).join('; '), 'err');
+    } catch (e) { toast(e.message, 'err'); }
+  };
+  if ($('#r-bulk')) $('#r-bulk').onclick = () => bulkModal(z);
   $('#z-io').onclick = () => ioModal(z.name);
   if ($('#z-edit')) $('#z-edit').onclick = zoneSettingsModal;
+  if ($('#z-clone')) $('#z-clone').onclick = () => zoneNameModal(z, 'clone');
+  if ($('#z-rename')) $('#z-rename').onclick = () => zoneNameModal(z, 'rename');
   if ($('#z-ov')) $('#z-ov').onclick = () => overrideModal(z);
   if ($('#z-del')) $('#z-del').onclick = async () => { if (await confirmModal('Delete zone', `Delete ${z.name} and all ${z.records.length} records? This cannot be undone.`, 'Delete', $('#z-del'))) { try { await DEL('/zones/' + encodeURIComponent(z.name)); toast('Zone deleted', 'ok'); closeDrawer(); await refreshZones(); location.hash = '#/zones'; } catch (e) { toast(e.message, 'err'); } } };
   $$('[data-panel]').forEach(b => b.onclick = () => openZonePanel(b.dataset.panel));
   renderRecords();
+  if (S.jump && S.jump.zone === z.name) {
+    const j = S.jump; S.jump = null;
+    const show = () => { const tr = $(`#records tr[data-id="${j.id}"]`); if (tr) { tr.classList.add('flash'); tr.scrollIntoView({ block: 'center' }); } return !!tr; };
+    if (!show()) { $('#r-filter').value = j.name; (large ? serverSearch() : Promise.resolve(renderRecords())).then(show).catch(() => {}); }
+  }
   if (S.panel && S.panel.zone === z.name) {
     if (S.panel.tab === 'access' && $('#members')) { renderMembers(); markPanelChip(); }
     else openZonePanel(S.panel.tab);
@@ -1109,17 +1160,82 @@ function renderRecords() {
   const recs = z.records.filter(r => !f || r.name.includes(f) || r.type.toLowerCase().includes(f) || r.value.toLowerCase().includes(f))
     .sort((a, b) => order(a.name).localeCompare(order(b.name)) || RTYPES.indexOf(a.type) - RTYPES.indexOf(b.type) || a.value.localeCompare(b.value));
   $('#r-count').textContent = f ? `${num(recs.length)} of ${num(total)}` : num(large ? total : z.records.length);
-  $('#r-table').innerHTML = `<table class="records" id="records"><thead><tr><th style="width:20%">Name</th><th style="width:8%">Type</th><th>Value</th><th style="width:9%" title="How long resolvers may cache this record">TTL (s)</th><th style="width:15%" title="When the record stops answering: a duration from now (1m, 1h, 1d, 6d12h14s) or a date-time">Expires</th>${canEdit ? '<th style="width:1%"></th>' : ''}</tr></thead><tbody>
-    ${recs.length ? recs.map(r => recordRow(r, canEdit)).join('') : `<tr><td colspan="6" class="empty">${z.records.length ? 'No records match' : 'No records yet'}</td></tr>`}
+  const sorted = recordSort(recs);
+  const sh = (k, label) => `<span class="sortable${S.rsort.key === k ? ' on' : ''}" data-sort="${k}" role="button" tabindex="0" title="Sort by ${label.toLowerCase()}">${label}${S.rsort.key === k ? (S.rsort.dir > 0 ? ' ▲' : ' ▼') : ''}</span>`;
+  $('#r-table').innerHTML = `<table class="records" id="records"><thead><tr>${canEdit ? '<th style="width:1%"><input type="checkbox" id="r-sel-all" aria-label="Select all shown"></th>' : ''}<th style="width:20%">${sh('name', 'Name')}</th><th style="width:8%">${sh('type', 'Type')}</th><th>${sh('value', 'Value')}</th><th style="width:9%" title="How long resolvers may cache this record">${sh('ttl', 'TTL (s)')}</th><th style="width:15%" title="When the record stops answering: a duration from now (1m, 1h, 1d, 6d12h14s) or a date-time">Expires</th>${canEdit ? '<th style="width:1%"></th>' : ''}</tr></thead><tbody>
+    ${sorted.length ? sorted.map(r => recordRow(r, canEdit)).join('') : `<tr><td colspan="7" class="empty">${z.records.length ? 'No records match' : 'No records yet'}</td></tr>`}
   </tbody></table>${large && total > z.records.length ? `<div style="padding:10px;text-align:center"><button class="btn sm" id="r-more" data-ro-ok>Load more (${num(z.records.length)} of ${num(total)})</button></div>` : ''}`;
   if ($('#r-more')) $('#r-more').onclick = loadMore;
+  // O12: column sorting (click or Enter on a header).
+  $$('#records [data-sort]').forEach(h => { const go = () => { S.rsort = S.rsort.key === h.dataset.sort ? { key: h.dataset.sort, dir: -S.rsort.dir } : { key: h.dataset.sort, dir: 1 }; renderRecords(); }; h.onclick = go; h.onkeydown = e => { if (e.key === 'Enter') go(); }; });
+  // O10: selection for "Delete selected".
+  const selUpd = () => { const b = $('#r-del-sel'); if (!b) return; const n = S.sel.size; b.textContent = n ? `Delete selected (${n})` : 'Delete selected'; if ('denied' in b.dataset) b.dataset.denied = n ? '' : 'was'; else { b.disabled = !n; b.title = n ? '' : 'Select records first'; } };
+  $$('#records [data-sel]').forEach(c => { c.checked = S.sel.has(Number(c.dataset.sel)); c.onchange = () => { c.checked ? S.sel.add(Number(c.dataset.sel)) : S.sel.delete(Number(c.dataset.sel)); selUpd(); }; });
+  if ($('#r-sel-all')) $('#r-sel-all').onchange = e => { $$('#records [data-sel]').forEach(c => { c.checked = e.target.checked; e.target.checked ? S.sel.add(Number(c.dataset.sel)) : S.sel.delete(Number(c.dataset.sel)); }); selUpd(); };
+  selUpd();
 
   if (canEdit) $('#records').querySelectorAll('[data-edit]').forEach(b => b.onclick = () => recordModal(Number(b.dataset.edit)));
   if (canEdit) $('#records').querySelectorAll('[data-del]').forEach(b => b.onclick = async () => { const r = z.records.find(x => x.id === Number(b.dataset.del)); if (await confirmModal('Delete record', `Delete ${r.name} ${r.type} ${r.value}?`, 'Delete', b)) { try { await DEL(`/zones/${encodeURIComponent(z.name)}/records/${r.id}`); toast('Record deleted', 'ok'); reloadZone(); } catch (e) { toast(e.message, 'err'); } } });
 }
+// O12: the records in the chosen column order (default: the zone order).
+// O11: rename a zone, or copy it under a new name.
+function zoneNameModal(z, kind) {
+  const rename = kind === 'rename';
+  openModal(`<h2>${rename ? 'Rename' : 'Clone'} ${esc(z.name)}</h2>
+    <p class="hint">${rename ? 'Records, members, settings and the signing key move to the new name. Your registrar\'s delegation must follow. A signed zone can only be renamed once the parent publishes no DS record for it. API tokens limited to the old name do not follow.' : 'A new zone with these settings (not signing or members); you own it.'}</p>
+    <div class="field"><label>New name</label><input type="text" id="zn-name" class="mono" value="${rename ? '' : esc('copy.' + z.name)}"></div>
+    ${rename ? '' : '<label class="check"><input type="checkbox" id="zn-records" checked> Copy the records</label>'}
+    <div class="error" id="m-err"></div>
+    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="m-ok" ${rename ? `data-perm="delete_zone" data-zone="${esc(z.name)}"` : 'data-perm="create_zones"'}>${rename ? 'Rename' : 'Clone'}</button></div>`, m => {
+    $('#m-ok').onclick = async () => {
+      $('#m-err').textContent = '';
+      try {
+        const body = { name: $('#zn-name').value.trim() }; if (!rename) body.records = $('#zn-records').checked;
+        const r = rename ? await POST(`/zones/${encodeURIComponent(z.name)}/rename`, body) : await POST(`/zones/${encodeURIComponent(z.name)}/clone`, body);
+        closeModal(); await refreshZones(); toast(rename ? `Renamed to ${r.name}` : `Cloned to ${r.name}`, 'ok'); location.hash = '#/zones/' + encodeURIComponent(r.name);
+      } catch (e) { $('#m-err').textContent = e.message; }
+    };
+    setTimeout(() => $('#zn-name')?.focus(), 30);
+  });
+}
+// O10: paste many records: preview (rolled back) then apply, one transaction.
+function bulkModal(z) {
+  openModal(`<h2>Paste records into ${esc(z.name)}</h2>
+    <p class="hint">One record per line: <code>name [ttl] type value</code>, e.g. <code>www 300 A 192.0.2.10</code> or <code>@ MX 10 mail.${esc(z.name)}.</code>. Lines starting with ; or # are skipped. Everything is applied as one change, or nothing.</p>
+    <div class="field"><textarea id="bk-text" rows="10" spellcheck="false" class="mono"></textarea></div>
+    <div id="bk-out"></div><div class="error" id="m-err"></div>
+    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn" id="bk-preview" data-perm="edit_records" data-zone="${esc(z.name)}">Preview</button><button class="btn primary" id="bk-apply" data-perm="edit_records" data-zone="${esc(z.name)}" disabled>Apply</button></div>`, m => {
+    let checked = null;
+    $('#bk-text').oninput = () => { checked = null; if (!('denied' in $('#bk-apply').dataset)) $('#bk-apply').disabled = true; };
+    $('#bk-preview').onclick = async () => {
+      $('#m-err').textContent = '';
+      try {
+        const r = await POST(`/zones/${encodeURIComponent(z.name)}/records/bulk`, { add: $('#bk-text').value, preview: true });
+        $('#bk-out').innerHTML = r.errors.length
+          ? `<div class="note warn">${ico('warn', 's')}<span>${r.errors.map(e => `${e.line ? 'line ' + e.line : 'record ' + e.record_id}: ${esc(e.error)}`).join('<br>')}</span></div>`
+          : `<div class="note info">${ico('info', 's')}<span>${r.added.length} to add${r.deleted.length ? `, ${r.deleted.length} to delete` : ''}: ${r.added.slice(0, 8).map(x => `<code>${esc(x.name)} ${esc(x.type)} ${esc(x.value)}</code>`).join(' ')}${r.added.length > 8 ? ' …' : ''}</span></div>`;
+        checked = r.errors.length ? null : $('#bk-text').value; if (!('denied' in $('#bk-apply').dataset)) $('#bk-apply').disabled = checked === null;
+      } catch (e) { $('#m-err').textContent = e.message; }
+    };
+    $('#bk-apply').onclick = async () => {
+      if (checked === null) return;
+      try {
+        const r = await POST(`/zones/${encodeURIComponent(z.name)}/records/bulk`, { add: checked });
+        if (r.applied) { closeModal(); toast(`Added ${r.added.length} record(s)`, 'ok'); reloadZone(); }
+        else $('#bk-out').innerHTML = `<div class="note warn">${ico('warn', 's')}<span>${r.errors.map(e => `${e.line ? 'line ' + e.line : 'record ' + e.record_id}: ${esc(e.error)}`).join('<br>')}</span></div>`;
+      } catch (e) { $('#m-err').textContent = e.message; }
+    };
+    setTimeout(() => $('#bk-text')?.focus(), 30);
+  });
+}
+function recordSort(recs) {
+  const { key, dir } = S.rsort; if (!key) return recs;
+  const v = r => key === 'ttl' ? (r.ttl ?? -1) : key === 'type' ? r.type : key === 'value' ? r.value.toLowerCase() : r.name;
+  return recs.slice().sort((a, b) => { const x = v(a), y = v(b); return (typeof x === 'number' ? x - y : String(x).localeCompare(String(y), undefined, { numeric: true })) * dir; });
+}
 function recordRow(r, canEdit) {
   const expired = r.expires_at && new Date(r.expires_at) <= new Date();
-  return `<tr data-id="${r.id}"${expired ? ' style="opacity:.5" title="Expired: no longer served; deleted after the retention period"' : ''}><td class="mono c-name">${esc(r.name)}</td><td class="c-type"><span class="badge">${esc(r.type)}</span></td><td class="c-val"><div class="mono clamp" style="word-break:break-all" data-toggle-open title="${r.value.length > 80 ? 'Click to expand' : ''}">${esc(r.value)}</div></td><td class="hint c-ttl">${r.ttl ?? '<i>default</i>'}</td><td class="c-exp">${expiryCell(r)}</td>${canEdit ? `<td class="actions c-act"><button class="btn sm ghost" data-edit="${r.id}" data-perm="edit_records" data-zone="${esc(S.zone.name)}">Edit</button><button class="btn sm ghost danger" data-del="${r.id}" data-perm="edit_records" data-zone="${esc(S.zone.name)}">Delete</button></td>` : ''}</tr>`;
+  return `<tr data-id="${r.id}"${expired ? ' style="opacity:.5" title="Expired: no longer served; deleted after the retention period"' : ''}>${canEdit ? `<td><input type="checkbox" data-sel="${r.id}" aria-label="Select ${esc(r.name)} ${esc(r.type)}"></td>` : ''}<td class="mono c-name">${esc(r.name)}</td><td class="c-type"><span class="badge">${esc(r.type)}</span></td><td class="c-val"><div class="mono clamp" style="word-break:break-all" data-toggle-open title="${r.value.length > 80 ? 'Click to expand' : ''}">${esc(r.value)}</div></td><td class="hint c-ttl">${r.ttl ?? '<i>default</i>'}</td><td class="c-exp">${expiryCell(r)}</td>${canEdit ? `<td class="actions c-act"><button class="btn sm ghost" data-edit="${r.id}" data-perm="edit_records" data-zone="${esc(S.zone.name)}">Edit</button><button class="btn sm ghost danger" data-del="${r.id}" data-perm="edit_records" data-zone="${esc(S.zone.name)}">Delete</button></td>` : ''}</tr>`;
 }
 // Expiry: shown relative, edited as "30m", "24h", "7d", a date-time, or blank for never.
 // ---- durations: "1m", "1h", "1d", "6d12h14s" ---------------------------------

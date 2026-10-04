@@ -1176,6 +1176,267 @@
         }
       }
     },
+    "/search": {
+      "get": {
+        "tags": [
+          "Records"
+        ],
+        "summary": "Search records across zones",
+        "description": "Records whose name, type or value contains `q` (case-insensitive), optionally of one `type` and/or in one `zone`, in every zone the caller may view (through its token's scope), with the caller's role on each. Ordered by zone, then name. Without `q` and `type` every record matches (up to `limit`).",
+        "operationId": "search_records",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "description": "Text matched (case-insensitive, substring) against record name,\ntype and value; also against zone names (all records of a matching\nzone are not returned, only records whose own fields match).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "192.0.2"
+          },
+          {
+            "name": "type",
+            "in": "query",
+            "description": "Only records of this type (e.g. `A`, `MX`).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "A"
+          },
+          {
+            "name": "zone",
+            "in": "query",
+            "description": "Only this zone.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "example.com"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Max hits (1-1000).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 200,
+              "maximum": 1000,
+              "minimum": 1
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Hits.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SearchResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/zones/{zone}/rename": {
+      "post": {
+        "tags": [
+          "Zones"
+        ],
+        "summary": "Rename a zone",
+        "description": "Gives the zone a new name; its records (relative names), members, owner, settings and signing key stay with it, and the serial is bumped. The registrar's delegation must follow. Refused while a standby of an older version follows this server (it could not apply it), while a DNSSEC key rollover runs, and for a signed zone unless the parent is confirmed to publish no DS record for the current name (a DS for the old name would otherwise point at a zone that no longer exists, and the new name needs its own DS step): `code` `ds_published`. API tokens scoped to the old name do not follow the rename. Needs the owner role and `create_zones`.",
+        "operationId": "rename_zone",
+        "parameters": [
+          {
+            "name": "zone",
+            "in": "path",
+            "description": "Zone name, e.g. `example.com`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "example.com"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ZoneNameBody"
+              },
+              "example": {
+                "name": "renamed.example.com"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Renamed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ZoneView"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/ConflictOrReadOnly"
+          }
+        }
+      }
+    },
+    "/zones/{zone}/clone": {
+      "post": {
+        "tags": [
+          "Zones"
+        ],
+        "summary": "Copy a zone under a new name",
+        "description": "A new zone with the settings of this one (SOA timers and contacts, default TTL, record policy, override settings) and, unless `records` is false, a copy of its records (expired ones left out). Signing, members and the key are not copied; the caller owns the copy. One transaction. Needs view rights on the source and `create_zones`.",
+        "operationId": "clone_zone",
+        "parameters": [
+          {
+            "name": "zone",
+            "in": "path",
+            "description": "Zone name, e.g. `example.com`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "example.com"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ZoneNameBody"
+              },
+              "example": {
+                "name": "copy.example.com",
+                "records": true
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ZoneView"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/ConflictOrReadOnly"
+          }
+        }
+      }
+    },
+    "/zones/{zone}/records/bulk": {
+      "post": {
+        "tags": [
+          "Records"
+        ],
+        "summary": "Delete and add many records in one transaction",
+        "description": "Deletes the records `delete` and adds the lines of `add`, as one transaction: everything is committed, or nothing. With `preview` the same transaction runs and is rolled back, so the result shows exactly what would happen. When any line or delete fails nothing is applied and `errors` names each failing line (1-based) or record id; `applied` says whether the changes were committed. At most 5000 changes. Needs the editor role.",
+        "operationId": "bulk_records",
+        "parameters": [
+          {
+            "name": "zone",
+            "in": "path",
+            "description": "Zone name, e.g. `example.com`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "example.com"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BulkBody"
+              },
+              "example": {
+                "add": "bulk1 300 A 192.0.2.31\nbulk2 A 192.0.2.32\nbulk1 TXT \"hello\"",
+                "delete": [],
+                "preview": false
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Applied, previewed, or refused with per-line errors (see `applied`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BulkResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/ConflictOrReadOnly"
+          }
+        }
+      }
+    },
     "/zones/{zone}/members/{username}": {
       "put": {
         "tags": [
@@ -4895,6 +5156,109 @@
             "minimum": 0
           }
         }
+      },
+      "BulkBody": {
+        "type": "object",
+        "description": "O10: several record changes at once.",
+        "properties": {
+          "delete": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "description": "Ids of records of this zone to delete."
+          },
+          "add": {
+            "type": "string",
+            "description": "Records to add, one per line: `name [ttl] [IN] type value`\n(`@` = apex; blank lines and lines starting with `;` or `#` are\nskipped)."
+          },
+          "preview": {
+            "type": "boolean",
+            "description": "Only check: run the edit and roll it back."
+          }
+        },
+        "example": {
+          "add": "bulk1 300 A 192.0.2.31\nbulk2 A 192.0.2.32\nbulk1 TXT \"hello\"",
+          "delete": [],
+          "preview": false
+        }
+      },
+      "BulkError": {
+        "type": "object",
+        "description": "A line that cannot be applied, and why.",
+        "required": [
+          "line",
+          "error"
+        ],
+        "properties": {
+          "line": {
+            "type": "integer",
+            "description": "1-based line of the pasted text; 0 for a record to delete.",
+            "minimum": 0
+          },
+          "record_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The id of the record to delete it is about (deletes only)."
+          },
+          "error": {
+            "type": "string"
+          }
+        }
+      },
+      "BulkOutcome": {
+        "type": "object",
+        "description": "What a bulk edit did (or, previewed, would do).",
+        "required": [
+          "deleted",
+          "added",
+          "errors"
+        ],
+        "properties": {
+          "deleted": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Record"
+            }
+          },
+          "added": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Record"
+            }
+          },
+          "errors": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BulkError"
+            },
+            "description": "Empty when the edit was (or can be) applied."
+          }
+        }
+      },
+      "BulkResult": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/BulkOutcome"
+          },
+          {
+            "type": "object",
+            "required": [
+              "applied"
+            ],
+            "properties": {
+              "applied": {
+                "type": "boolean",
+                "description": "True when the changes were committed (not a preview, no errors)."
+              }
+            }
+          }
+        ],
+        "description": "O10: the outcome of a bulk edit."
       },
       "CacheFlushResult": {
         "type": "object",
@@ -8717,6 +9081,76 @@
           }
         }
       },
+      "SearchHit": {
+        "type": "object",
+        "description": "O9: one record found by a search across zones.",
+        "required": [
+          "zone",
+          "role",
+          "record"
+        ],
+        "properties": {
+          "zone": {
+            "type": "string",
+            "description": "The zone the record belongs to.",
+            "example": "example.com"
+          },
+          "role": {
+            "$ref": "#/components/schemas/ZoneRole",
+            "description": "The caller's role on that zone."
+          },
+          "record": {
+            "$ref": "#/components/schemas/Record"
+          }
+        }
+      },
+      "SearchResult": {
+        "type": "object",
+        "description": "O9: records matching a search, in the zones the caller may view.",
+        "required": [
+          "hits",
+          "total",
+          "limit"
+        ],
+        "properties": {
+          "hits": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SearchHit"
+            }
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Matches in total (more than `hits` when the limit cut the list)."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "example": {
+          "hits": [
+            {
+              "record": {
+                "created_at": "2026-01-15T09:30:00.000Z",
+                "expires_at": null,
+                "id": 42,
+                "name": "www",
+                "ttl": 300,
+                "type": "A",
+                "updated_at": "2026-01-15T09:30:00.000Z",
+                "value": "192.0.2.10",
+                "zone_id": 1
+              },
+              "role": "owner",
+              "zone": "example.com"
+            }
+          ],
+          "limit": 200,
+          "total": 1
+        }
+      },
       "SecuritySettings": {
         "type": "object",
         "description": "Account security settings (console setting `security`). Every field\nhas a default that keeps the behaviour before it existed; unknown\nfields are ignored (an older server stores the row and ignores it).",
@@ -10680,6 +11114,30 @@
               "updated_at": "2026-01-15T09:30:00.000Z"
             }
           ]
+        }
+      },
+      "ZoneNameBody": {
+        "type": "object",
+        "description": "O11: the new name of a zone (rename) or of the copy (clone).",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "example": "example.net"
+          },
+          "records": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Clone only: copy the records too (default true)."
+          }
+        },
+        "example": {
+          "name": "example.net",
+          "records": true
         }
       },
       "ZoneOverride": {

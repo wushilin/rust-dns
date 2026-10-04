@@ -1875,3 +1875,407 @@ async fn cookie_writes_need_the_csrf_token() {
     assert_eq!(st, StatusCode::CREATED, "switched off: {v}");
 }
 
+/// O9: search across zones finds records by name, value and type, only in
+/// zones the caller may view (a viewer of one zone sees only that zone;
+/// a token scoped to one zone only that one), with the role on each.
+#[tokio::test]
+async fn search_across_zones_respects_rights() {
+    use serde_json::json;
+    let h = Harness::new();
+    let root_c = root_session(&h).await;
+    h.user("vic", "vic-password-1", None);
+    for z in ["s1.test", "s2.test"] {
+        let r = h
+            .call("POST", "/zones", Some(&root_c), Some(json!({ "name": z })))
+            .await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.json);
+        for (n, t, v) in [
+            ("www", "A", "192.0.2.10"),
+            ("mail", "MX", "10 mx.example.net."),
+        ] {
+            let r = h
+                .call(
+                    "POST",
+                    &format!("/zones/{z}/records"),
+                    Some(&root_c),
+                    Some(json!({ "name": n, "type": t, "value": v })),
+                )
+                .await;
+            assert_eq!(r.status, StatusCode::CREATED, "{}", r.json);
+        }
+    }
+    let r = h
+        .call(
+            "PUT",
+            "/zones/s2.test/members/vic",
+            Some(&root_c),
+            Some(json!({ "role": "viewer" })),
+        )
+        .await;
+    assert!(r.status.is_success(), "{}", r.json);
+    let find = |who: String, q: &str| {
+        let h = &h;
+        let q = q.to_string();
+        async move {
+            let r = h
+                .call("GET", &format!("/search?{q}"), Some(&who), None)
+                .await;
+            assert_eq!(r.status, StatusCode::OK, "{}", r.json);
+            r.json["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| {
+                    format!(
+                        "{} {} {} {}",
+                        x["zone"].as_str().unwrap(),
+                        x["record"]["name"].as_str().unwrap(),
+                        x["record"]["type"].as_str().unwrap(),
+                        x["role"].as_str().unwrap()
+                    )
+                })
+                .collect::<Vec<_>>()
+        }
+    };
+    assert_eq!(
+        find(root_c.clone(), "q=192.0.2").await,
+        vec!["s1.test www A owner", "s2.test www A owner"]
+    );
+    assert_eq!(
+        find(root_c.clone(), "type=mx").await,
+        vec!["s1.test mail MX owner", "s2.test mail MX owner"]
+    );
+    assert_eq!(
+        find(root_c.clone(), "q=WWW&zone=s2.test").await,
+        vec!["s2.test www A owner"]
+    );
+    let vic = h.login("vic", "vic-password-1").await.cookie.unwrap();
+    assert_eq!(
+        find(vic.clone(), "q=192.0.2").await,
+        vec!["s2.test www A viewer"],
+        "a viewer of s2 sees only s2"
+    );
+    assert!(find(vic.clone(), "q=www&zone=s1.test").await.is_empty());
+    let r = h
+        .call(
+            "POST",
+            "/tokens",
+            Some(&root_c),
+            Some(json!({ "name": "one", "scope": { "zones": ["s1.test"], "max_role": "viewer" } })),
+        )
+        .await;
+    let tok = format!("Bearer {}", r.json["token"].as_str().unwrap());
+    assert_eq!(
+        find(tok, "q=www").await,
+        vec!["s1.test www A viewer"],
+        "a scoped token: its zones and role only"
+    );
+    let r = h.call("GET", "/search", Some(&root_c), None).await;
+    assert_eq!(r.json["total"], 4, "no filter: every visible record");
+    let r = h
+        .call("GET", "/search?q=www&limit=1", Some(&root_c), None)
+        .await;
+    assert_eq!(
+        (
+            r.json["hits"].as_array().unwrap().len(),
+            r.json["total"].as_i64()
+        ),
+        (1, Some(2))
+    );
+}
+
+/// O10: a bulk edit is one transaction: a preview shows the outcome and
+/// changes nothing; any bad line or delete applies nothing and names the
+/// line; a clean edit commits every change (one serial bump, one txn).
+#[tokio::test]
+async fn bulk_record_edit_is_one_transaction() {
+    use serde_json::json;
+    let h = Harness::new();
+    let root_c = root_session(&h).await;
+    let r = h
+        .call(
+            "POST",
+            "/zones",
+            Some(&root_c),
+            Some(json!({ "name": "b.test" })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED);
+    let old = h
+        .call(
+            "POST",
+            "/zones/b.test/records",
+            Some(&root_c),
+            Some(json!({ "name": "old", "type": "A", "value": "192.0.2.9" })),
+        )
+        .await
+        .json["id"]
+        .as_i64()
+        .unwrap();
+    let records = || async {
+        let mut v: Vec<String> = h
+            .call("GET", "/zones/b.test/records", Some(&root_c), None)
+            .await
+            .json["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                format!(
+                    "{} {} {}",
+                    r["name"].as_str().unwrap(),
+                    r["type"].as_str().unwrap(),
+                    r["value"].as_str().unwrap()
+                )
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let serial = || async {
+        h.call("GET", "/zones/b.test", Some(&root_c), None)
+            .await
+            .json["serial"]
+            .as_i64()
+            .unwrap()
+    };
+    let s0 = serial().await;
+    let body =
+        |preview: bool, add: &str| json!({ "delete": [old], "add": add, "preview": preview });
+    let good = "a 300 A 192.0.2.1\n; note\nb IN AAAA 2001:db8::1\n";
+    let r = h
+        .call(
+            "POST",
+            "/zones/b.test/records/bulk",
+            Some(&root_c),
+            Some(body(true, good)),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.json);
+    assert_eq!(r.json["applied"], false);
+    assert_eq!(r.json["added"].as_array().unwrap().len(), 2);
+    assert_eq!(r.json["deleted"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        records().await,
+        vec!["old A 192.0.2.9"],
+        "preview changed nothing"
+    );
+    // Errors: a bad value, an unknown type, an unknown record id.
+    let r = h
+        .call(
+            "POST",
+            "/zones/b.test/records/bulk",
+            Some(&root_c),
+            Some(json!({ "delete": [old, 999999], "add": "a A 192.0.2.1\nc A not-an-ip\nd FOO 1\n" })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.json);
+    assert_eq!(r.json["applied"], false);
+    let lines: Vec<i64> = r.json["errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["line"].as_i64().unwrap())
+        .collect();
+    assert_eq!(lines, vec![0, 2, 3], "{}", r.json);
+    assert_eq!(records().await, vec!["old A 192.0.2.9"], "nothing applied");
+    assert_eq!(serial().await, s0);
+    // Applied.
+    let r = h
+        .call(
+            "POST",
+            "/zones/b.test/records/bulk",
+            Some(&root_c),
+            Some(body(false, good)),
+        )
+        .await;
+    assert_eq!(r.json["applied"], true, "{}", r.json);
+    assert_eq!(records().await, vec!["a A 192.0.2.1", "b AAAA 2001:db8::1"]);
+    assert_eq!(serial().await, s0 + 1, "one serial bump for the whole edit");
+    let txns: Vec<String> = h
+        .state
+        .storage
+        .read_tx(|c| {
+            let mut st =
+                c.prepare("SELECT DISTINCT txn FROM changelog WHERE command = 'bulk_records'")?;
+            let rows = st.query_map([], |r| r.get::<_, String>(0))?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .unwrap();
+    assert_eq!(txns.len(), 1, "one transaction");
+    // A viewer cannot.
+    h.user("val", "val-password-1", None);
+    h.call(
+        "PUT",
+        "/zones/b.test/members/val",
+        Some(&root_c),
+        Some(json!({ "role": "viewer" })),
+    )
+    .await;
+    let vc = h.login("val", "val-password-1").await.cookie.unwrap();
+    let r = h
+        .call(
+            "POST",
+            "/zones/b.test/records/bulk",
+            Some(&vc),
+            Some(body(true, good)),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+}
+
+/// O11: clone copies settings and records (not expired ones, not signing);
+/// rename keeps records and members and is a typed change; a signed zone
+/// cannot be renamed while the parent may publish a DS (here: unknown, no
+/// upstream), and the clone/rename need `create_zones`.
+#[tokio::test]
+async fn zones_can_be_cloned_and_renamed() {
+    use serde_json::json;
+    let h = Harness::new();
+    let root_c = root_session(&h).await;
+    let ana = h.user("ana", "ana-password-1", None);
+    let mk = |b: serde_json::Value| {
+        let (h, c) = (&h, root_c.clone());
+        async move { h.call("POST", "/zones", Some(&c), Some(b)).await }
+    };
+    assert_eq!(
+        mk(json!({ "name": "src.test", "default_ttl": 120 }))
+            .await
+            .status,
+        StatusCode::CREATED
+    );
+    for (n, t, v) in [("www", "A", "192.0.2.1"), ("@", "MX", "10 mail.src.test.")] {
+        h.call(
+            "POST",
+            "/zones/src.test/records",
+            Some(&root_c),
+            Some(json!({ "name": n, "type": t, "value": v })),
+        )
+        .await;
+    }
+    h.call(
+        "PUT",
+        "/zones/src.test/members/ana",
+        Some(&root_c),
+        Some(json!({ "role": "editor" })),
+    )
+    .await;
+    let r = h
+        .call(
+            "POST",
+            "/zones/src.test/clone",
+            Some(&root_c),
+            Some(json!({ "name": "dst.test" })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.json);
+    let d = h
+        .call("GET", "/zones/dst.test", Some(&root_c), None)
+        .await
+        .json;
+    assert_eq!(d["default_ttl"], 120);
+    assert_eq!(
+        d["soa_rname"], "hostmaster.dst.test.",
+        "contacts inside the zone follow"
+    );
+    assert_eq!(d["records"].as_array().unwrap().len(), 2);
+    assert!(
+        d["members"].as_array().unwrap().is_empty(),
+        "members are not copied"
+    );
+    let r = h
+        .call(
+            "POST",
+            "/zones/src.test/clone",
+            Some(&root_c),
+            Some(json!({ "name": "dst.test" })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CONFLICT);
+    // A non-admin owner cannot rename or clone (create_zones).
+    let ac = h.login("ana", "ana-password-1").await.cookie.unwrap();
+    let r = h
+        .call(
+            "POST",
+            "/zones/src.test/rename",
+            Some(&ac),
+            Some(json!({ "name": "x.test" })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    // Rename.
+    let id = h
+        .call("GET", "/zones/src.test", Some(&root_c), None)
+        .await
+        .json["id"]
+        .clone();
+    let r = h
+        .call(
+            "POST",
+            "/zones/src.test/rename",
+            Some(&root_c),
+            Some(json!({ "name": "moved.test" })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.json);
+    assert_eq!(
+        h.call("GET", "/zones/src.test", Some(&root_c), None)
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+    let m = h
+        .call("GET", "/zones/moved.test", Some(&root_c), None)
+        .await
+        .json;
+    assert_eq!(m["id"], id);
+    assert_eq!(m["records"].as_array().unwrap().len(), 2);
+    assert_eq!(m["members"][0]["username"], "ana");
+    assert_eq!(
+        h.call("GET", "/zones/moved.test", Some(&ac), None)
+            .await
+            .status,
+        StatusCode::OK,
+        "the member keeps access"
+    );
+    let _ = ana;
+    // The change is a zone_updated with the new name (replays on a standby).
+    let last: String = h
+        .state
+        .storage
+        .read_tx(|c| {
+            Ok(c.query_row(
+                "SELECT payload FROM changelog WHERE command = 'rename_zone' AND entity = 'zone'",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap();
+    assert!(
+        last.contains("\"kind\":\"zone_updated\"") && last.contains("moved.test"),
+        "{last}"
+    );
+    // The DNS catalog serves the new name only.
+    let cat = h.state.cache.load();
+    assert!(cat.zones.contains_key("moved.test.") && !cat.zones.contains_key("src.test."));
+    // A signed zone: refused while a DS cannot be ruled out.
+    let r = h
+        .call(
+            "PUT",
+            "/zones/moved.test/dnssec",
+            Some(&root_c),
+            Some(json!({ "enabled": true })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.json);
+    let r = h
+        .call(
+            "POST",
+            "/zones/moved.test/rename",
+            Some(&root_c),
+            Some(json!({ "name": "again.test" })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.json);
+    assert_eq!(r.json["code"], "ds_published");
+}

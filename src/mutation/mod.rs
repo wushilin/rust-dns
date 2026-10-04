@@ -18,6 +18,7 @@
 
 pub mod accounts;
 mod acct_sql;
+pub mod bulk;
 mod dnssec_ops;
 mod expiry;
 mod gate;

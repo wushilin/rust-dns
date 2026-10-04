@@ -486,6 +486,32 @@ impl<'a> Tx<'a> {
         Ok(zone)
     }
 
+    /// O11: rename a zone (its records, members, owner and key stay with
+    /// it, by id). Recorded as a `ZoneUpdated` whose rows differ in `name`
+    /// (and `updated_at`); a signing key's row follows (`DnssecKeySet`).
+    /// The serial is bumped at commit.
+    pub fn rename_zone(&mut self, before: Zone, new_name: &str) -> MResult<Zone> {
+        if db::get_zone(self.conn, new_name)?.is_some() {
+            return Err(MutationError::Conflict(format!(
+                "zone '{new_name}' already exists"
+            )));
+        }
+        let mut after = before.clone();
+        after.name = new_name.to_string();
+        after.updated_at = now_rfc3339();
+        let zone = sql::update_zone(self.conn, &after)?;
+        self.touched.insert(zone.id, zone.name.clone());
+        self.changes.push(Change::Dns(DnsChange::ZoneUpdated {
+            before,
+            after: zone.clone(),
+        }));
+        if let Some(mut k) = self.dnssec_key(zone.id)? {
+            k.zone = zone.name.clone();
+            self.set_dnssec_key(k)?;
+        }
+        Ok(zone)
+    }
+
     pub fn delete_zone(&mut self, zone: &Zone) -> MResult<()> {
         for r in self.records(zone.id)? {
             self.delete_record(zone, &r)?;

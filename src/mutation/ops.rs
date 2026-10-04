@@ -239,6 +239,80 @@ impl Mutator {
             .ok_or_else(|| MutationError::NotFound(format!("zone '{zone_name}' not found")))
     }
 
+    /// O11: rename `name` to `new_name` (one transaction). A key rollover
+    /// in progress refuses it; whether a DS may be published is checked by
+    /// the caller (it needs the network).
+    pub async fn rename_zone(&self, actor: Actor, name: &str, new_name: &str) -> MResult<Zone> {
+        let (name, new_name) = (normalize_zone_name(name)?, normalize_zone_name(new_name)?);
+        if name == new_name {
+            return Err(MutationError::Invalid(
+                "the new name is the current one".into(),
+            ));
+        }
+        self.execute(actor, "rename_zone", move |t| {
+            let z = t.require_zone(&name)?;
+            if t.dnssec_key(z.id)?.is_some_and(|k| k.rollover.is_some()) {
+                return Err(MutationError::Conflict(
+                    "a DNSSEC key rollover is in progress: finish or cancel it first".into(),
+                ));
+            }
+            t.rename_zone(z, &new_name)
+        })
+        .await
+    }
+
+    /// O11: a new zone `new_name` with the settings of `name` (SOA timers
+    /// and contacts, default TTL, record policy, override settings; not
+    /// signing, not members) and, with `records`, a copy of its records
+    /// (not expired ones; expiry times kept). One transaction.
+    pub async fn clone_zone(
+        &self,
+        actor: Actor,
+        name: &str,
+        new_name: &str,
+        owner_id: Option<i64>,
+        records: bool,
+    ) -> MResult<(Zone, usize)> {
+        let (name, new_name) = (normalize_zone_name(name)?, normalize_zone_name(new_name)?);
+        self.execute(actor, "clone_zone", move |t| {
+            let src = t.require_zone(&name)?;
+            let mut z = default_zone(&new_name, owner_id);
+            for (from, to) in [
+                (&src.soa_mname, &mut z.soa_mname),
+                (&src.soa_rname, &mut z.soa_rname),
+            ] {
+                // Contacts inside the source zone move to the clone.
+                *to = match from.strip_suffix(&format!("{}.", src.name)) {
+                    Some(head) if head.ends_with('.') => format!("{head}{new_name}."),
+                    _ => from.clone(),
+                };
+            }
+            (z.refresh, z.retry, z.expire, z.minimum, z.default_ttl) = (
+                src.refresh,
+                src.retry,
+                src.expire,
+                src.minimum,
+                src.default_ttl,
+            );
+            z.record_policy = src.record_policy.clone();
+            z.overrides = src.overrides.clone();
+            let z = t.create_zone(z)?;
+            let mut n = 0;
+            if records {
+                let now = now_rfc3339();
+                for r in t.records(src.id)? {
+                    if r.is_expired_at(&now) {
+                        continue;
+                    }
+                    t.create_record(&z, &r.name, r.rtype, &r.value, r.ttl, r.expires_at.clone())?;
+                    n += 1;
+                }
+            }
+            Ok((z, n))
+        })
+        .await
+    }
+
     pub async fn delete_zone(&self, actor: Actor, name: &str) -> MResult<Zone> {
         let name = name.to_string();
         self.execute(actor, "delete_zone", move |t| {
