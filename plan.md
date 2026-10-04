@@ -615,11 +615,32 @@ contract tests, typed changes that replicate, tests, AGENT.md rules):
   transfers successful, no TSIG error in its log, and the server refused
   only the deliberate replay. Conformance 127/127; equivalence d32d67f vs
   this build 0 differences (248 TSIG MACs verified).
-- [ ] M4. Automated console flows: a headless browser test (Playwright or
+- [x] M4. Automated console flows: a headless browser test (Playwright or
   similar via node, or Chrome headless with a small driver) for the main
   flows: sign in, create zone, add/edit/delete record, standby read-only
   page, viewer cannot edit. Runs in CI on Linux; skips locally when the
   browser is missing unless REQUIRE_BROWSER_TEST=1.
+  Done: `tests/ui/browser.test.js`, a ~250-line Chrome DevTools Protocol
+  driver on node's built-in WebSocket/fetch (node 22+; no npm packages,
+  no Playwright download). It starts a primary and a following standby
+  (`target/debug/rust-dns` or `$RUST_DNS_BIN`, free loopback ports,
+  throwaway configs), launches headless Chrome (`$CHROME_BIN` or the
+  usual paths; one browser context per user) and checks: sign in; create
+  a zone from the dialog; add, edit, delete a record through the record
+  dialog (each confirmed through the API); a viewer sees the zone with no
+  enabled write control and the server refuses the write; the standby's
+  zone page shows the banner, every write control disabled with "Read-only
+  standby", and a forced click on a re-enabled button opens nothing; the
+  tokens page creates a scoped token (M1) and lists "≤ viewer"; no
+  uncaught page error in any page. Skips (exit 0) without Chrome or the
+  binary unless `REQUIRE_BROWSER_TEST=1`. CI: `browser-actions/setup-
+  chrome@v1` then the test with `REQUIRE_BROWSER_TEST=1` (after `cargo
+  build`; `--no-sandbox` on Linux for the runners' user-namespace
+  restrictions). Found and fixed on the first run: the record dialog
+  focused `#rf-value` 40 ms after opening and threw a TypeError when the
+  dialog had already been saved and closed (fast typing/Enter); the
+  focus now only touches an element still in the page. Locally 4/4 runs
+  pass (~10 s); the CI step itself is untested until pushed.
 - [ ] M5. Soak/load script for dns-test (LXD home:dns-test): a release build
   run for N hours under a mixed query load with periodic record changes and
   a standby, reporting memory, latency percentiles, errors. A script plus
@@ -1298,3 +1319,4 @@ what the registrar's DS must match on the live zone; plan it separately.
   clamp; see M2 and Rollout).
 - 2026-10-04 (phase M): M3 done (TSIG replay protection; BIND secondary
   interop test).
+- 2026-10-04 (phase M): M4 done (headless Chrome console flows; CI step).

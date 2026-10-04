@@ -947,6 +947,8 @@ cargo test --test api_contract    # every operation and example of the served Op
 cargo test --test openapi_spec     # completeness of the generated document (ids, tags, 400/401, request bodies, no bypassed routes)
 cargo test --bin rust-dns openapi  # docs/openapi.json equals the document generated from the code (UPDATE_OPENAPI=1 refreshes it)
 node tests/ui/duration.test.js     # console duration parser (1m, 1h, 6d12h14s)
+node tests/ui/access.test.js       # console access decisions (rights, standby allowlist)
+node tests/ui/browser.test.js      # console flows in headless Chrome (sign in, zone, records, viewer, standby, scoped token); needs `cargo build` and Chrome (CHROME_BIN), skips without them unless REQUIRE_BROWSER_TEST=1
 cargo test                          # unit tests + end-to-end (spawns the binary, drives API and DNS)
 scripts/conformance.py <zone> <ip> <port>   # 123 RFC conformance checks (incl. TSIG and DNSSEC validation) (needs dnspython + cryptography and a seeded zone)
 scripts/dnssec-vectors.py                   # regenerates the DNSSEC known-answer vectors (dnspython + BIND dnssec-dsfromkey)

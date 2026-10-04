@@ -1261,7 +1261,8 @@ function recordModal(id) {
       if (e.key !== 'Enter' || e.isComposing) return;
       if (e.target.matches('input[type=text]') || (e.target.tagName === 'TEXTAREA' && (e.metaKey || e.ctrlKey))) { e.preventDefault(); saveEdit(m, id); }
     });
-    setTimeout(() => (isNew ? nameIn : $('#rf-value')).focus(), 40);
+    // The dialog may already be gone (saved quickly): focus only what is still there.
+    setTimeout(() => { const el = isNew ? nameIn : $('#rf-value'); if (el && el.isConnected) el.focus(); }, 40);
   }, { size: 'md' });
 }
 async function saveEdit(f, id) {

@@ -30,6 +30,13 @@ jobs:
       - run: node tests/ui/duration.test.js
       - run: node tests/ui/access.test.js
       - run: cargo build
+      # tests/ui/browser.test.js (M4): headless Chrome over CDP, no npm packages.
+      - uses: browser-actions/setup-chrome@v1
+        id: chrome
+      - run: node tests/ui/browser.test.js
+        env:
+          REQUIRE_BROWSER_TEST: "1"
+          CHROME_BIN: ${{ steps.chrome.outputs.chrome-path }}
       - run: scripts/conformance-local.sh target/debug/rust-dns
       - name: UDP load probe (Linux)
         run: scripts/load-test-local.sh target/debug/rust-dns 5 8
