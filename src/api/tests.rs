@@ -52,6 +52,7 @@ impl Harness {
             "",
         ));
         let accounts = Arc::new(crate::mutation::accounts::Accounts::new(storage.clone()));
+        accounts.set_bus(bus.clone());
         let limiter = Arc::new(RateLimiter::new(0, Duration::from_secs(1), 10));
         let dns = Arc::new(DnsServer::new(
             cache.clone(),

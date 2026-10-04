@@ -10,11 +10,38 @@ use std::sync::Arc;
 
 pub const CHANGES: &str = "changes";
 pub const QUERIES: &str = "queries";
+pub const ACCESS: &str = "access";
+
+/// O2: a local signal that someone's access may just have shrunk: a session
+/// or API token revoked or changed, an account changed (disabled, demoted)
+/// or deleted. Ids only, never a secret, never replicated: each server
+/// publishes it for its own commits (a standby for the account changes it
+/// applied). Websocket streams re-check at once instead of at their next
+/// periodic check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessEvent {
+    /// Something about this user's sessions, tokens or account changed.
+    User(i64),
+    /// Anything may have changed (a standby applied account changes or a
+    /// snapshot): every stream re-checks.
+    All,
+}
+
+impl AccessEvent {
+    /// Does this event concern a stream of `user_id`?
+    pub fn concerns(self, user_id: i64) -> bool {
+        match self {
+            AccessEvent::User(u) => u == user_id,
+            AccessEvent::All => true,
+        }
+    }
+}
 
 pub struct Bus {
     registry: QueueRegistry,
     changes: Sender<ChangeEvent>,
     queries: Sender<QueryEvent>,
+    access: Sender<AccessEvent>,
     /// Live subscribers of the query feed (websocket sessions, the query
     /// log). With none, the DNS path does not build query events at all.
     query_subscribers: Arc<AtomicUsize>,
@@ -48,16 +75,23 @@ impl Bus {
         registry
             .create_broadcasting::<QueryEvent>(QUERIES, query_capacity)
             .expect("fresh registry");
+        registry
+            .create_broadcasting::<AccessEvent>(ACCESS, 256)
+            .expect("fresh registry");
         let changes = registry
             .acquire_sender::<ChangeEvent>(CHANGES)
             .expect("queue exists");
         let queries = registry
             .acquire_sender::<QueryEvent>(QUERIES)
             .expect("queue exists");
+        let access = registry
+            .acquire_sender::<AccessEvent>(ACCESS)
+            .expect("queue exists");
         Bus {
             registry,
             changes,
             queries,
+            access,
             query_subscribers: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -71,6 +105,15 @@ impl Bus {
 
     pub fn publish_query(&self, ev: QueryEvent) {
         let _ = self.queries.send(ev);
+    }
+
+    /// O2: publish an access signal (see [`AccessEvent`]).
+    pub fn publish_access(&self, ev: AccessEvent) {
+        let _ = self.access.send(ev);
+    }
+
+    pub fn subscribe_access(&self) -> Option<Receiver<AccessEvent>> {
+        self.registry.acquire_receiver::<AccessEvent>(ACCESS).ok()
     }
 
     pub fn subscribe_changes(&self) -> Option<Receiver<ChangeEvent>> {
@@ -94,6 +137,7 @@ impl Bus {
     pub fn shutdown(&self) {
         let _ = self.registry.shutdown(CHANGES);
         let _ = self.registry.shutdown(QUERIES);
+        let _ = self.registry.shutdown(ACCESS);
     }
 }
 

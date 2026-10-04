@@ -769,7 +769,7 @@ Group 1: security and accounts
 - [x] O1. Revoke a user's API tokens on password change (option, default
   off, per user choice in the change-password dialog + admin reset); token
   creation only from a browser session (config switch, default off).
-- [ ] O2. Instant websocket cut-off: publish session/token revocation and
+- [x] O2. Instant websocket cut-off: publish session/token revocation and
   user disable/scope change on the bus; sockets close at once (keep the 10 s
   re-check as a backstop).
 - [ ] O3. Login back-off counters survive restarts (local table, classified
@@ -1583,3 +1583,16 @@ Final
   dialog. Tests: `api::tests::password_change_can_revoke_api_tokens`,
   `api::tests::token_creation_can_require_a_session`, browser flow "O1:
   password change from the console revokes the tokens".
+- 2026-10-04 (phase O): O2 done. New local bus queue `access`
+  (`events::AccessEvent`: a user id, or "everyone"; ids only, never
+  replicated). `Accounts::run` publishes one per user after a commit whose
+  audit rows revoke/change a session or token or change/delete the
+  account (`accounts::ACCESS_ACTIONS`); a standby publishes "everyone"
+  after applying `token_revoked` / `token_tags_set` / `user_updated` /
+  `user_deleted` and after a snapshot. Websocket streams re-check at once
+  on a signal for their user; the 10 s re-check stays. Tests:
+  `mutation::accounts::tests::access_signals_follow_committed_revocations`,
+  `hardening::websocket_cut_off_is_immediate` (and the token-revoke and
+  disabled-account tests now require < 3 s),
+  `follow::a_revocation_on_the_primary_closes_standby_streams_at_once`.
+  No console change.

@@ -231,8 +231,11 @@ Before exposing rust-dns to the internet, note:
   from a signed-in browser session, so a leaked token cannot mint more. Argon2 runs on a small bounded
   worker pool; when it is saturated sign-ins get 503 with `Retry-After`
   instead of slowing DNS.
-- **Websocket.** Streams re-check the session/token and zone rights every 10
-  seconds and on membership changes, and close (1008) when revoked. Cookie
+- **Websocket.** Streams close (1008) at once when their session or token
+  is revoked or the account is disabled or deleted (a local signal on the
+  event bus, also on a standby when it applies such a change), and
+  re-check the session/token and zone rights every 10 seconds and on
+  membership changes as a backstop. Cookie
   upgrades must come from the same origin. Scripts pass the token as the
   subprotocol `rust-dns.bearer.<token>`; `?token=` still works but is
   deprecated (URLs end up in proxy logs).

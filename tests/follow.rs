@@ -3230,3 +3230,120 @@ fn a_zone_record_policy_replicates() {
     drop(p);
     let _ = std::fs::remove_dir_all(&root_dir);
 }
+
+/// Open a websocket with raw HTTP; returns the stream after the response
+/// head, and the head.
+fn ws_open(web: &str, path: &str, extra_headers: &str) -> (std::net::TcpStream, String) {
+    use std::io::{Read, Write};
+    let host = web.trim_start_matches("http://");
+    let mut s = std::net::TcpStream::connect(host).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n{extra_headers}\r\n"
+    );
+    s.write_all(req.as_bytes()).unwrap();
+    let mut head = Vec::new();
+    let mut b = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        if s.read(&mut b).unwrap_or(0) == 0 {
+            break;
+        }
+        head.push(b[0]);
+    }
+    (s, String::from_utf8_lossy(&head).to_string())
+}
+
+/// Read server frames until a close frame: its code (None: ended or timed
+/// out without one).
+fn ws_wait_close(s: &mut std::net::TcpStream) -> Option<u16> {
+    use std::io::Read;
+    loop {
+        let mut h = [0u8; 2];
+        s.read_exact(&mut h).ok()?;
+        let op = h[0] & 0x0f;
+        let mut len = (h[1] & 0x7f) as usize;
+        if len == 126 {
+            let mut l = [0u8; 2];
+            s.read_exact(&mut l).ok()?;
+            len = u16::from_be_bytes(l) as usize;
+        } else if len == 127 {
+            let mut l = [0u8; 8];
+            s.read_exact(&mut l).ok()?;
+            len = u64::from_be_bytes(l) as usize;
+        }
+        let mut body = vec![0u8; len];
+        s.read_exact(&mut body).ok()?;
+        if op == 8 {
+            return body.get(..2).map(|c| u16::from_be_bytes([c[0], c[1]]));
+        }
+    }
+}
+
+/// O2: a token revoked on the primary closes a stream that uses it on the
+/// standby as soon as the standby applies the revocation (it publishes an
+/// access signal for the account changes it applied), well before the
+/// periodic 10 s re-check.
+#[test]
+fn a_revocation_on_the_primary_closes_standby_streams_at_once() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root_dir = std::env::temp_dir().join(format!(
+        "rust-dns-follow-wscut-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root_dir).unwrap();
+    let mut p = Node::new(&root_dir, "primary", "rootpass-primary");
+    let mut s = Node::new(&root_dir, "standby", "rootpass-standby");
+    p.configure("");
+    p.start();
+    let pr = p.root();
+    let token = |name: &str| {
+        let v = ok(
+            call(
+                &Auth::Session(&pr),
+                "POST",
+                &p.api("/tokens"),
+                Some(json!({ "name": name })),
+            ),
+            "token",
+        );
+        (
+            v["token"].as_str().unwrap().to_string(),
+            v["info"]["id"].as_i64().unwrap(),
+        )
+    };
+    let (repl, _) = token("repl");
+    let (tok, tid) = token("stream");
+    s.configure(&follow_cfg(&p, "dns2", &repl));
+    s.start();
+    let sr = s.root();
+    wait_reconciled(&p, &pr, &s, &sr, "token in the snapshot");
+    let (mut ws, head) = ws_open(
+        &s.url(),
+        "/api/ws",
+        &format!("Sec-WebSocket-Protocol: rust-dns, rust-dns.bearer.{tok}\r\n"),
+    );
+    assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+    std::thread::sleep(Duration::from_millis(300));
+    let started = Instant::now();
+    ok(
+        call(
+            &Auth::Session(&pr),
+            "DELETE",
+            &p.api(&format!("/tokens/{tid}")),
+            None,
+        ),
+        "revoke",
+    );
+    assert_eq!(ws_wait_close(&mut ws), Some(1008));
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "closed after {:?}",
+        started.elapsed()
+    );
+    drop(s);
+    drop(p);
+    let _ = std::fs::remove_dir_all(&root_dir);
+}

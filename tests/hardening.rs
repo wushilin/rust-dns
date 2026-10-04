@@ -614,7 +614,54 @@ fn websocket_closes_when_its_token_is_revoked() {
         Some(1008),
         "closed with policy violation"
     );
-    assert!(started.elapsed() < Duration::from_secs(15));
+    // O2: at once (the revocation is published on the bus), not at the
+    // next periodic re-check (10 s).
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+/// O2: a cookie stream closes at once when its session is signed out
+/// elsewhere (an administrator's "sign out everywhere"), without waiting
+/// for the 10 s re-check.
+#[test]
+fn websocket_cut_off_is_immediate() {
+    let srv = Server::start("ws-instant", "", "", "");
+    let web = srv.web.clone();
+    let host = web.trim_start_matches("http://");
+    let root = login(&web, "root", "rootpass123");
+    let (s, u) = call(
+        &root,
+        "POST",
+        &format!("{web}/api/users"),
+        Some(serde_json::json!({ "username": "xena", "password": "xenapass1" })),
+    );
+    assert_eq!(s, 201, "{u}");
+    let cookie = login_cookie(&web, "xena", "xenapass1");
+    let (mut ws, head) = ws_open(
+        &web,
+        "/api/ws",
+        &format!("Cookie: {cookie}\r\nOrigin: http://{host}\r\n"),
+    );
+    assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+    // Let the stream reach its loop (past the first, immediate re-check).
+    std::thread::sleep(Duration::from_millis(300));
+    let started = Instant::now();
+    let (s, _) = call(
+        &root,
+        "POST",
+        &format!("{web}/api/users/{}/sessions/revoke", u["id"]),
+        None,
+    );
+    assert_eq!(s, 200);
+    assert_eq!(ws_wait_close(&mut ws), Some(1008));
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
 }
 
 /// M4 regression: a cookie websocket kept streaming after the account was
@@ -655,7 +702,13 @@ fn websocket_origin_and_disabled_account() {
         Some(serde_json::json!({ "disabled": true })),
     );
     assert_eq!(s, 200);
+    let started = Instant::now();
     assert_eq!(ws_wait_close(&mut ws), Some(1008));
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
 }
 
 /// L2: the session cookie is `__Host-` prefixed and Secure when a trusted

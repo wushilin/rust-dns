@@ -794,6 +794,37 @@ pub struct Accounts {
     /// steps and recovery codes used at sign-in) stay local and are not
     /// added to the changelog, which mirrors the primary's offsets.
     gate: std::sync::OnceLock<Arc<super::WriteGate>>,
+    /// O2: where access signals go after a commit.
+    bus: std::sync::OnceLock<Arc<crate::events::Bus>>,
+}
+
+/// O2: audit actions after which a user's open streams must re-check their
+/// access at once (a session or token ended or changed, the account
+/// changed or is gone).
+pub const ACCESS_ACTIONS: &[&str] = &[
+    "session.delete",
+    "session.revoke_all",
+    "session.revoke_others",
+    "token.revoke",
+    "token.update",
+    "user.update",
+    "user.delete",
+];
+
+/// The access signals for a committed transaction's audit rows, one per
+/// user concerned.
+pub fn access_events(records: &[AuditRecord]) -> Vec<crate::events::AccessEvent> {
+    let mut users: Vec<i64> = records
+        .iter()
+        .filter(|r| ACCESS_ACTIONS.contains(&r.action.as_str()))
+        .filter_map(|r| r.target_user_id)
+        .collect();
+    users.sort_unstable();
+    users.dedup();
+    users
+        .into_iter()
+        .map(crate::events::AccessEvent::User)
+        .collect()
 }
 
 impl Accounts {
@@ -802,7 +833,13 @@ impl Accounts {
             storage,
             on_commit: std::sync::OnceLock::new(),
             gate: std::sync::OnceLock::new(),
+            bus: std::sync::OnceLock::new(),
         }
+    }
+
+    /// O2: publish access signals on `bus` after each commit (once).
+    pub fn set_bus(&self, bus: Arc<crate::events::Bus>) {
+        let _ = self.bus.set(bus);
     }
 
     /// Install the commit hook (once).
@@ -841,6 +878,11 @@ impl Accounts {
                 }
                 if let Some(hook) = self.on_commit.get() {
                     hook(&records, logged);
+                }
+                if let Some(bus) = self.bus.get() {
+                    for ev in access_events(&records) {
+                        bus.publish_access(ev);
+                    }
                 }
                 Ok(out)
             }
@@ -978,6 +1020,52 @@ mod tests {
             is_admin: false,
             mfa_required: false,
         }
+    }
+
+    /// O2: revoking a token, signing a user out or changing the account
+    /// publishes an access signal for that user after the commit; a
+    /// sign-in does not; nothing for a rolled-back transaction.
+    #[test]
+    fn access_signals_follow_committed_revocations() {
+        use crate::events::{AccessEvent, Bus};
+        let s = Arc::new(Storage::open_memory().unwrap());
+        let a = Accounts::new(s.clone());
+        let bus = Arc::new(Bus::new(8, 8));
+        a.set_bus(bus.clone());
+        let rx = bus.subscribe_access().unwrap();
+        let u = a.create_user(&actor(), &new_user("alice")).unwrap();
+        let t = a
+            .create_token(&actor(), &u, "t", &crate::auth::sha256_hex("x"), &[])
+            .unwrap();
+        assert!(rx.try_recv().is_err(), "creating is not a cut-off");
+        a.run(&actor(), "revoke_token", |tx| tx.revoke_token(&u, &t))
+            .unwrap();
+        assert_eq!(rx.try_recv().unwrap(), AccessEvent::User(u.id));
+        let _ = a.run(&actor(), "update_user", |tx| -> Result<()> {
+            tx.change_user(
+                u.id,
+                &UserChanges {
+                    disabled: Some(true),
+                    ..UserChanges::default()
+                },
+            )?;
+            anyhow::bail!("rolled back")
+        });
+        assert!(rx.try_recv().is_err(), "nothing for a rollback");
+        a.run(&actor(), "update_user", |tx| {
+            tx.change_user(
+                u.id,
+                &UserChanges {
+                    disabled: Some(true),
+                    ..UserChanges::default()
+                },
+            )?;
+            tx.delete_user_sessions(&u, "test")
+        })
+        .unwrap();
+        assert_eq!(rx.try_recv().unwrap(), AccessEvent::User(u.id));
+        assert!(rx.try_recv().is_err(), "one signal per user and commit");
+        assert!(AccessEvent::All.concerns(42) && !AccessEvent::User(1).concerns(2));
     }
 
     #[test]

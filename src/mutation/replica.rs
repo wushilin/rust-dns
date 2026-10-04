@@ -414,28 +414,41 @@ impl Mutator {
         if events.is_empty() {
             return Ok((self.storage.changelog_head()?, false));
         }
-        self.replica_write("replication_apply", system("apply"), move |c, _t| {
-            let out = apply_changes(c, &primary_history, &events, &root.username)?;
-            // The zones to rebuild and the events to publish both derive
-            // from the changes just applied.
-            let changes: Vec<(ChangeEvent, Change)> = events
-                .into_iter()
-                .filter_map(|e| {
-                    let c = serde_json::from_value::<Change>(e.payload.clone()).ok()?;
-                    Some((e, c))
-                })
-                .collect();
-            let zones = super::catalog_zones(changes.iter().map(|(_, c)| c));
-            let dns = changes
-                .into_iter()
-                .filter_map(|(e, c)| match c {
-                    Change::Dns(d) => Some(DnsEvent::new(e, &d)),
-                    Change::Secret(_) => None,
-                })
-                .collect();
-            Ok((out, dns, Rebuild::Zones(zones)))
-        })
-        .await
+        // O2: account changes that can take access away; streams on this
+        // standby re-check at once after they are applied.
+        let access = events.iter().any(|e| {
+            matches!(
+                e.payload.get("kind").and_then(|k| k.as_str()),
+                Some("token_revoked" | "token_tags_set" | "user_updated" | "user_deleted")
+            )
+        });
+        let out = self
+            .replica_write("replication_apply", system("apply"), move |c, _t| {
+                let out = apply_changes(c, &primary_history, &events, &root.username)?;
+                // The zones to rebuild and the events to publish both derive
+                // from the changes just applied.
+                let changes: Vec<(ChangeEvent, Change)> = events
+                    .into_iter()
+                    .filter_map(|e| {
+                        let c = serde_json::from_value::<Change>(e.payload.clone()).ok()?;
+                        Some((e, c))
+                    })
+                    .collect();
+                let zones = super::catalog_zones(changes.iter().map(|(_, c)| c));
+                let dns = changes
+                    .into_iter()
+                    .filter_map(|(e, c)| match c {
+                        Change::Dns(d) => Some(DnsEvent::new(e, &d)),
+                        Change::Secret(_) => None,
+                    })
+                    .collect();
+                Ok((out, dns, Rebuild::Zones(zones)))
+            })
+            .await?;
+        if access {
+            self.bus.publish_access(crate::events::AccessEvent::All);
+        }
+        Ok(out)
     }
 
     /// Standby: replace every replicated table with a snapshot, adopt the
@@ -463,6 +476,7 @@ impl Mutator {
             Ok((sum, Vec::new(), Rebuild::Full))
         })
         .await
+        .inspect(|_| self.bus.publish_access(crate::events::AccessEvent::All))
     }
 
     /// Standby: keep a copy of the primary's DNS changelog rows from before

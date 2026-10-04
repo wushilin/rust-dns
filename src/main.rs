@@ -177,6 +177,7 @@ async fn main() -> anyhow::Result<()> {
     // Account changes on a standby stay local (its changelog mirrors the
     // primary's offsets): close the write gate before the root sync.
     accounts.set_gate(mutator.gate());
+    accounts.set_bus(bus.clone());
     if let Some(f) = &cfg.follow {
         mutator.gate().close(format!(
             "this server is a read-only standby of {}; make changes on the primary",
