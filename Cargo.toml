@@ -10,8 +10,8 @@ tokio = { version = "1", features = ["full"] }
 hickory-proto = "0.26.1"
 rusqlite = { version = "0.37", features = ["bundled", "backup"] }
 axum = { version = "0.8", features = ["ws", "macros"] }
-hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "service"] }
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "service", "http1", "http2"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["trace"] }
 serde = { version = "1", features = ["derive"] }
@@ -44,10 +44,16 @@ utoipa = { version = "5.5", features = ["preserve_order", "preserve_path_order"]
 utoipa-axum = "0.2"
 # Standby (follow) mode: HTTPS client to the primary. rustls with the ring
 # provider (no aws-lc-sys / OpenSSL), OS trust store via the platform verifier.
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "http2"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 # DNSSEC signing (ECDSA P-256, key generation): the same ring rustls uses.
 ring = "0.17"
+# O29: DNS over TLS / HTTPS (server and upstream client), on the same
+# rustls + ring; the system trust store through the platform verifier.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-platform-verifier = "0.7"
+http-body-util = "0.1"
+bytes = "1"
 
 # O13a: the static musl release builds use mimalloc (musl's allocator kept
 # RSS growing under sustained load; see plan.md O13a). `no_thp`: no
@@ -58,8 +64,6 @@ mimalloc = { version = "0.1", default-features = false, features = ["no_thp"] }
 [dev-dependencies]
 ureq = { version = "2", features = ["json", "cookies"] }
 jsonschema = { version = "0.58", default-features = false }
-# O23: a TLS endpoint with a private CA in front of a test server.
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 
 # O20: run as a Windows service (pure Rust, over windows-sys).
 [target.'cfg(windows)'.dependencies]

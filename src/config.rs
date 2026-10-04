@@ -33,6 +33,46 @@ pub struct Config {
     pub peer: Option<PeerConfig>,
     /// Primary side: how standbys (replicas) are judged and remembered.
     pub replication: ReplicationConfig,
+    /// O29: DNS over TLS / HTTPS listeners and upstreams (off by default;
+    /// per server). An older binary ignores the table.
+    pub encrypted_dns: EncryptedDnsConfig,
+}
+
+/// O29: `[encrypted_dns]`: DNS over TLS (RFC 7858) and over HTTPS (RFC
+/// 8484), inbound and as forwarding upstreams. Read at startup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EncryptedDnsConfig {
+    /// Certificate chain and private key (PEM) of the DoT / DoH listeners.
+    pub cert_file: String,
+    pub key_file: String,
+    /// DoT listeners (`ip:port`, usually port 853); empty: none.
+    pub dot_listen: Vec<SocketAddr>,
+    /// DoH listeners (`ip:port`, usually 443); empty: none.
+    pub doh_listen: Vec<SocketAddr>,
+    /// The DoH URL path (default `/dns-query`).
+    pub doh_path: String,
+    /// Encrypted forwarding upstreams, tried in order, replacing
+    /// `[forwarding].upstreams` (and the console's) for global forwarding:
+    /// `tls://ip[:port][#tls-name]`, `https://host[:port]/path`.
+    pub upstreams: Vec<String>,
+    /// Trust only the CA certificates in this PEM file for the upstreams;
+    /// empty: the system trust store.
+    pub upstream_ca_file: String,
+}
+
+impl Default for EncryptedDnsConfig {
+    fn default() -> Self {
+        EncryptedDnsConfig {
+            cert_file: String::new(),
+            key_file: String::new(),
+            dot_listen: Vec::new(),
+            doh_listen: Vec::new(),
+            doh_path: "/dns-query".into(),
+            upstreams: Vec::new(),
+            upstream_ca_file: String::new(),
+        }
+    }
 }
 
 /// `[replication]`: thresholds for the replica states shown on a primary
@@ -843,6 +883,16 @@ dir = "backups"             # online SQLite backups; empty disables backups
 interval_hours = 24
 keep = 7
 
+# DNS over TLS (RFC 7858) / HTTPS (RFC 8484), off unless listeners or upstreams are set.
+[encrypted_dns]
+cert_file = ""           # PEM certificate chain of the listeners, e.g. "/etc/rust-dns/tls.crt"
+key_file = ""            # PEM private key
+dot_listen = []          # e.g. ["0.0.0.0:853"]
+doh_listen = []          # e.g. ["0.0.0.0:443"]
+doh_path = "/dns-query"
+upstreams = []           # replaces [forwarding].upstreams: ["tls://9.9.9.9#dns.quad9.net", "https://1.1.1.1/dns-query"]
+upstream_ca_file = ""    # trust only this CA for the upstreams; empty = system trust store
+
 # PROXY protocol for DNS over TCP (UDP has no PROXY protocol; the socket peer is used).
 [tcp_dns]
 proxy_on = false
@@ -1182,6 +1232,34 @@ pub fn validate(cfg: &Config) -> Result<()> {
                 "[server].default_hostmaster '{}' is invalid: {e}",
                 s.default_hostmaster
             ));
+        }
+    }
+
+    // [encrypted_dns] (O29)
+    let enc = &cfg.encrypted_dns;
+    if !enc.dot_listen.is_empty() || !enc.doh_listen.is_empty() {
+        if enc.cert_file.trim().is_empty() || enc.key_file.trim().is_empty() {
+            errs.push(
+                "[encrypted_dns]: dot_listen / doh_listen need cert_file and key_file".into(),
+            );
+        } else if let Err(e) = crate::dns::encrypted::server_tls(enc, &[]) {
+            errs.push(format!("{e:#}"));
+        }
+    }
+    if !enc.doh_path.starts_with('/') {
+        errs.push("[encrypted_dns].doh_path must start with '/' (default /dns-query)".into());
+    }
+    for u in &enc.upstreams {
+        if let Err(e) = crate::dns::encrypted::parse_upstream(u) {
+            errs.push(format!("[encrypted_dns].upstreams: {e}"));
+        }
+    }
+    if !enc.upstream_ca_file.trim().is_empty() {
+        if let Err(e) = load_ca_file(
+            "[encrypted_dns].upstream_ca_file",
+            enc.upstream_ca_file.trim(),
+        ) {
+            errs.push(format!("{e:#}"));
         }
     }
 

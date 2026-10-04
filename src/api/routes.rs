@@ -360,6 +360,16 @@ pub async fn metrics(State(s): St, _caller: Caller) -> ApiResult<Response> {
         d.rate_limit_cookie_exempt.load(Relaxed),
     );
     m(
+        "rustdns_dot_connections_total",
+        "DNS over TLS connections accepted (after the handshake)",
+        s.dns.stats.dot.load(Relaxed),
+    );
+    m(
+        "rustdns_doh_requests_total",
+        "DNS over HTTPS requests carrying a DNS message",
+        s.dns.stats.doh.load(Relaxed),
+    );
+    m(
         "rustdns_rrl_dropped_total",
         "UDP answers dropped by response rate limiting (RRL)",
         s.dns.rrl.dropped.load(Relaxed),

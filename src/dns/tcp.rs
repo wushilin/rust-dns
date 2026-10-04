@@ -95,7 +95,11 @@ pub async fn run(server: Arc<DnsServer>, listener: TcpListener) {
     }
 }
 
-async fn write_timed(stream: &mut TcpStream, buf: &[u8], limit: Duration) -> std::io::Result<()> {
+async fn write_timed<S: tokio::io::AsyncWrite + Unpin>(
+    stream: &mut S,
+    buf: &[u8],
+    limit: Duration,
+) -> std::io::Result<()> {
     match tokio::time::timeout(limit, stream.write_all(buf)).await {
         Ok(r) => r,
         Err(_) => Err(std::io::Error::new(
@@ -111,11 +115,6 @@ async fn handle_conn(
     mut peer: std::net::SocketAddr,
 ) -> std::io::Result<()> {
     let listen = &server.listen;
-    let idle = Duration::from_secs(listen.tcp_idle_timeout_secs.max(1));
-    let write_limit = Duration::from_secs(listen.tcp_write_timeout_secs.max(1));
-    let lifetime = Duration::from_secs(listen.tcp_max_connection_secs.max(1));
-    let max_queries = listen.tcp_max_queries_per_connection.max(1);
-    let opened = Instant::now();
     let _ = stream.set_nodelay(true);
     if server.tcp_proxy.proxy_on && server.tcp_proxy_trust.iter().any(|c| c.contains(peer.ip())) {
         use crate::api::proxy::{read_proxy_header, ProxyHeader};
@@ -135,6 +134,22 @@ async fn handle_conn(
         tracing::debug!(%peer, "per-client TCP connection limit reached; closing");
         return Ok(());
     };
+    serve_stream(server, stream, peer).await
+}
+
+/// Answer length-prefixed DNS messages on `stream` (TCP, or DoT after the
+/// TLS handshake, O29) with the TCP timeouts and per-connection limits.
+pub(super) async fn serve_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    server: Arc<DnsServer>,
+    mut stream: S,
+    peer: std::net::SocketAddr,
+) -> std::io::Result<()> {
+    let listen = &server.listen;
+    let idle = Duration::from_secs(listen.tcp_idle_timeout_secs.max(1));
+    let write_limit = Duration::from_secs(listen.tcp_write_timeout_secs.max(1));
+    let lifetime = Duration::from_secs(listen.tcp_max_connection_secs.max(1));
+    let max_queries = listen.tcp_max_queries_per_connection.max(1);
+    let opened = Instant::now();
     let mut served = 0u32;
     loop {
         if served >= max_queries || opened.elapsed() >= lifetime {

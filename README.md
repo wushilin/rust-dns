@@ -697,6 +697,39 @@ zone "example.com" {
 Test from an allowed address with
 `dig -y hmac-sha256:hn-secondary.:<secret> @192.0.2.1 example.com AXFR`.
 
+## DNS over TLS and DNS over HTTPS
+
+Off by default; per server, in its config file (nothing replicates):
+
+```toml
+[encrypted_dns]
+cert_file = "/etc/rust-dns/tls.crt"   # PEM chain (e.g. from your ACME client)
+key_file = "/etc/rust-dns/tls.key"
+dot_listen = ["0.0.0.0:853"]          # DNS over TLS (RFC 7858)
+doh_listen = ["0.0.0.0:443"]          # DNS over HTTPS (RFC 8484), HTTP/2 and HTTP/1.1
+doh_path = "/dns-query"
+# Forwarding over TLS / HTTPS instead of [forwarding].upstreams:
+upstreams = ["tls://9.9.9.9#dns.quad9.net", "https://1.1.1.1/dns-query"]
+upstream_ca_file = ""                 # trust only this CA; empty = system trust store
+```
+
+- DoT and DoH queries take the same path as DNS over TCP: the per-client
+  rate limit (admission, also REFUSED over the limit), every filter, the
+  live feed. DoT connections count against the TCP connection caps and
+  timeouts; response rate limiting (RRL) applies to UDP only, as for TCP.
+- DoH: `GET ?dns=<base64url>` and `POST` of `application/dns-message`;
+  `Cache-Control: max-age` is the smallest TTL of the answer; zone transfers
+  are not offered over DoH.
+- Upstreams: `tls://ip[:port][#name]` (port 853; the certificate must be
+  valid for `name`, default the address) and `https://host[:port]/path`
+  (a host name is resolved by the operating system: prefer an address, so
+  forwarding never depends on this server). Tried in order, one query per
+  connection (no pooling). They replace the plain upstreams for global
+  forwarding; override zones keep their own plain upstreams. The health
+  tracking and strategies of plain upstreams do not apply.
+- `/metrics`: `rustdns_dot_connections_total`, `rustdns_doh_requests_total`.
+- The certificate is read at startup (restart after renewing it).
+
 ## Secondary zones
 
 A zone hosted on another server (BIND, NSD, Knot, another rust-dns) can be
@@ -1287,9 +1320,7 @@ ceiling is the OS loopback path, not the server. Resident memory stays around
   above needs the DS change done by hand), algorithms other than 13 and 15,
   automated algorithm rollovers (13 <-> 15, see DNSSEC).
 - Automatic failover.
-- DNS over TLS/HTTPS.
-- Console sorting and bulk record tools, WebAuthn, static musl multi-arch
-  publishing, Debian packaging, and a Homebrew formula.
+- WebAuthn / passkeys.
 
 ## License
 

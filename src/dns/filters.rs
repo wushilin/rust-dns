@@ -435,16 +435,35 @@ impl DnsServer {
             };
         };
         let sent = r.upstream_req.as_deref().unwrap_or(q.req);
-        match super::forward::forward_via(
-            r.upstreams,
-            rt.forwarding.timeout_ms,
-            rt.resolver.strategy,
-            Some(&self.upstream_health),
-            sent,
-            q.meta.proto,
-        )
-        .await
-        {
+        // O29: global forwarding goes to the encrypted upstreams when set.
+        let encrypted = r.scope == 0 || r.alt_scope == Some(ECS_SHARED);
+        let answer = if encrypted && !rt.encrypted_upstreams.is_empty() {
+            match &self.enc_clients {
+                Some(c) => {
+                    super::encrypted::forward(
+                        c,
+                        &rt.encrypted_upstreams,
+                        sent,
+                        rt.forwarding.timeout_ms,
+                    )
+                    .await
+                }
+                None => Err(anyhow::anyhow!(
+                    "encrypted upstreams unusable (see the startup log)"
+                )),
+            }
+        } else {
+            super::forward::forward_via(
+                r.upstreams,
+                rt.forwarding.timeout_ms,
+                rt.resolver.strategy,
+                Some(&self.upstream_health),
+                sent,
+                q.meta.proto,
+            )
+            .await
+        };
+        match answer {
             Ok(mut bytes) => {
                 self.stats.forwarded.fetch_add(1, Relaxed);
                 if r.clear_ad && bytes.len() > 3 {

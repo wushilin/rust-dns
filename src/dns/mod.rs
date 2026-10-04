@@ -2,6 +2,7 @@
 
 pub mod axfr;
 pub mod cookies;
+pub mod encrypted;
 pub mod filters;
 pub mod forward;
 pub mod fwdcache;
@@ -43,6 +44,9 @@ pub struct Stats {
     pub bad_cookie: AtomicU64,
     pub transfers: AtomicU64,
     pub notifies: AtomicU64,
+    /// O29: DoT connections and DoH requests.
+    pub dot: AtomicU64,
+    pub doh: AtomicU64,
     pub tsig_errors: AtomicU64,
     /// Open resolver: forwarded UDP answers truncated by the payload cap.
     pub open_resolver_truncated: AtomicU64,
@@ -182,6 +186,9 @@ pub struct Runtime {
     /// The query pipeline's filter chain for this snapshot (see
     /// [`pipeline::chain_for`]); replaced together with everything above.
     pub chain: Vec<pipeline::Filter>,
+    /// O29: encrypted forwarding upstreams (replace the plain ones for
+    /// global forwarding when set).
+    pub encrypted_upstreams: Arc<Vec<encrypted::Upstream>>,
 }
 
 impl Runtime {
@@ -245,18 +252,31 @@ impl Runtime {
             resolver: resolver.clone(),
             blocklists,
             chain: Vec::new(),
+            encrypted_upstreams: Arc::new(
+                cfg.encrypted_dns
+                    .upstreams
+                    .iter()
+                    .filter_map(|u| encrypted::parse_upstream(u).ok())
+                    .collect(),
+            ),
         };
         rt.chain = pipeline::chain_for(&rt);
         rt
     }
 
     pub fn may_forward(&self, client: std::net::IpAddr) -> bool {
-        !self.forwarding.upstreams.is_empty() && self.forward_acl.iter().any(|c| c.contains(client))
+        self.forwards() && self.forward_acl.iter().any(|c| c.contains(client))
     }
 
     /// Open resolver mode is in effect (with forwarding on at all).
     pub fn open_resolver(&self) -> bool {
-        self.forwarding.open_resolver && !self.forwarding.upstreams.is_empty()
+        self.forwarding.open_resolver && self.forwards()
+    }
+
+    /// Global forwarding has somewhere to go: plain or (O29) encrypted
+    /// upstreams.
+    pub fn forwards(&self) -> bool {
+        !self.forwarding.upstreams.is_empty() || !self.encrypted_upstreams.is_empty()
     }
 
     pub fn cache_caps(&self) -> fwdcache::Caps {
@@ -318,6 +338,11 @@ pub struct DnsServer {
     pub rebind_log: filters::RebindLog,
     /// Followed interfaces and their bound addresses (I11).
     pub interfaces: ifaces::Follower,
+    /// O29: `[encrypted_dns]` of the config file (listeners: startup).
+    pub encrypted: crate::config::EncryptedDnsConfig,
+    /// O29: TLS clients of the encrypted upstreams (`None`: none set, or
+    /// they could not be built; logged).
+    pub enc_clients: Option<encrypted::Clients>,
     /// O27: secondary zones (set at startup): an accepted NOTIFY wakes
     /// the zone's refresh.
     pub secondaries: std::sync::OnceLock<Arc<crate::secondary::Store>>,
@@ -374,6 +399,18 @@ impl DnsServer {
             rebind_log: filters::RebindLog::default(),
             interfaces: ifaces::Follower::default(),
             secondaries: std::sync::OnceLock::new(),
+            encrypted: cfg.encrypted_dns.clone(),
+            enc_clients: if cfg.encrypted_dns.upstreams.is_empty() {
+                None
+            } else {
+                match encrypted::Clients::new(&cfg.encrypted_dns.upstream_ca_file) {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        tracing::error!(error = %e, "encrypted upstreams unusable; forwarding to them fails");
+                        None
+                    }
+                }
+            },
         }
     }
 
@@ -599,6 +636,8 @@ pub fn bind_tcp(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
 /// With `[server].interfaces`, the listeners follow those interfaces'
 /// addresses instead ([`ifaces::follow`]).
 pub async fn serve(server: Arc<DnsServer>) -> anyhow::Result<()> {
+    // O29: DoT / DoH listeners (explicit addresses, also with interfaces).
+    tokio::spawn(encrypted::serve(server.clone()));
     if !server.listen.interfaces.is_empty() {
         tracing::info!(interfaces = ?server.listen.interfaces, "DNS listeners follow these interfaces' addresses");
         ifaces::follow(server).await;

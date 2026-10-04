@@ -94,7 +94,11 @@ fn prepare(req: &[u8], span: &std::ops::Range<usize>, mix_case: bool) -> Vec<u8>
 }
 
 /// Put the client's ID and question bytes back into an accepted reply.
-fn restore(client_req: &[u8], span: &std::ops::Range<usize>, mut reply: Vec<u8>) -> Vec<u8> {
+pub(super) fn restore(
+    client_req: &[u8],
+    span: &std::ops::Range<usize>,
+    mut reply: Vec<u8>,
+) -> Vec<u8> {
     reply[..2].copy_from_slice(&client_req[..2]);
     reply[span.clone()].copy_from_slice(&client_req[span.clone()]);
     reply

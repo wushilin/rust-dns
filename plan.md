@@ -943,9 +943,32 @@ Group 6: DNS protocol depth (all OFF by default; live zone not switched)
   NOTIFY in, TSIG, refresh/retry/expire timers, served read-only).
 - [x] O28. Record types hickory's text parser lacks (LOC and others that
   matter), via presentation-format parsing.
-- [ ] O29. DNS over TLS and DNS over HTTPS, inbound (own certificate files,
+- [x] O29. DNS over TLS and DNS over HTTPS, inbound (own certificate files,
   rustls) and upstream for forwarding; off by default.
 - [ ] O30. Signing auto-PTR answers (low priority; private reverse zones only).
+
+  O30 status (2026-10-04): NOT done, skipped as the item allows ("skip
+  with reason if it complicates the signed-zone model"). Automatic PTR
+  answers are synthesized at query time from the A / AAAA records of
+  OTHER zones; in a signed reverse zone they are switched off today
+  (`resolve_into`: `signed.is_none()`), so a signed reverse zone answers
+  only its own records. Signing them would make a reverse zone's signed
+  content (its NSEC / NSEC3 chain and RRSIGs) depend on other zones:
+  every A / AAAA change anywhere would have to rebuild and re-sign the
+  reverse zone in the catalog (today an incremental build touches only
+  the changed zones), with no serial change of the reverse zone, so a
+  secondary transferring it (AXFR / IXFR, O16 / O27) would see different
+  content under the same serial, and the standby must reproduce the same
+  cross-zone input at the same moment to sign identically. For private
+  ranges (RFC 6303) there is no chain of trust to the zone anyway
+  (validators treat it as insecure without a local trust anchor), so the
+  gain is small. Proposed smaller scope (O30a): an explicit action "Create
+  PTR records from A / AAAA" on a reverse zone (API + console button,
+  preview, one transaction) that writes ordinary PTR records into it:
+  typed record changes, serial bumps, signed like any record, replicated
+  and transferred normally; optionally a per-zone setting that repeats it
+  on the primary after each forward change (as typed changes, never on a
+  standby).
 
 Final
 - [ ] O31. Final verification (owner, 2026-10-04): after Group 6, run the
@@ -1138,6 +1161,18 @@ Final
   start with `ca_file` set: add it only after the upgrade, and remove it
   before a downgrade. gate and baba2 use the system trust store today:
   nothing to change.
+
+- After phase O, O29 (DoT / DoH; this session; not deployed): no
+  replication, data or console-setting change. New optional config table
+  `[encrypted_dns]` (listeners, certificate, encrypted upstreams), off by
+  default; the top-level config ignores unknown tables, so an older binary
+  starts with it and simply has no DoT / DoH (remove nothing before a
+  downgrade). Either upgrade order. Dependencies: tokio-rustls (was a
+  dev-dependency), rustls-platform-verifier (already in the lock via
+  reqwest), http-body-util, bytes; hyper / hyper-util gain `http2`, reqwest
+  `http2` (h2 was already in the lock). gate and baba2: nothing to change;
+  to offer DoT later open port 853 and point cert_file / key_file at a
+  certificate for dns1 / dns2.
 
 - After phase O, O28 (record types; this session; not deployed): protocol
   2, no new change kind, no new column, fixture untouched. Records may now
@@ -2561,3 +2596,31 @@ Final
   dnspython checks (each type's answer equals dnspython's parse of the
   value, signed and valid in a signed zone; the AXFR parses with every
   type): 158/158; OpenAPI snapshot.
+- 2026-10-04 (phase O): O29 done. DNS over TLS (RFC 7858) and DNS over
+  HTTPS (RFC 8484), inbound and upstream, off by default, `[encrypted_dns]`
+  per server (`src/dns/encrypted.rs`). Inbound: rustls (ring) with the
+  configured PEM certificate chain and key; DoT (ALPN `dot`) reuses the TCP
+  message loop (`tcp::serve_stream`, now generic over the stream: same
+  idle / write / lifetime / per-connection limits) and the TCP connection
+  caps (total and per client); DoH serves GET `?dns=` and POST
+  `application/dns-message` on `doh_path` over HTTP/2 and HTTP/1.1
+  (hyper-util auto), 64 KiB body limit, `Cache-Control: max-age` = the
+  smallest TTL, zone transfers refused (400). Both go through
+  `DnsServer::handle` as TCP: admission (C2 per-client limit, REFUSED over
+  it) and every filter apply. Upstream: `tls://ip[:port][#name]` (rustls,
+  certificate checked for `name`) and `https://host/path` (reqwest, POST,
+  ID 0), tried in order, replacing the plain upstreams for global
+  forwarding (also with ECS); trust: the system store (platform
+  verifier) or only `upstream_ca_file`. `--check` validates the
+  certificate / key pair, the upstream syntax and the CA file. Metrics
+  `rustdns_dot_connections_total`, `rustdns_doh_requests_total`. Not done:
+  connection reuse to upstreams, a console view (the listeners are in the
+  config file only). Tests: unit `dns::encrypted::tests::{upstreams_parse,
+  config_is_validated, doh_cache_lifetime_is_the_smallest_ttl}`; new suite
+  `tests/encrypted.rs` `dns_over_tls_and_https_inbound_and_upstream` (BIND
+  9.20 `dig +tls`, `+https` (POST) and `+https-get` with the test CA get
+  the authoritative answer and NXDOMAIN over TLS / HTTPS; `dig` with an
+  unrelated CA gets nothing; plain DNS unaffected; metrics count both;
+  with a 3 queries/s limit, 10 quick DoT / DoH queries get >= 3 REFUSED;
+  `named` with `tls` and `http` listeners as the upstream: forwarding over
+  DoT and over DoH answers, and with an untrusted CA SERVFAIL).
