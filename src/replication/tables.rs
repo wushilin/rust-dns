@@ -91,12 +91,15 @@ pub const TABLES: &[Table] = &[
         // `record_policy` (M2) likewise: in the zone row JSON only when set.
         // `zone_settings` (O16) likewise; a standby must have the feature
         // `zone-settings` before a zone gets settings (the primary refuses).
+        // `nsec3` (O24) likewise (`nsec3` in the zone row JSON only when
+        // on); a standby must have the feature `nsec3` first.
         compat_columns: &[
             "dnssec",
             "signed_at",
             "override_spec",
             "record_policy",
             "zone_settings",
+            "nsec3",
         ],
         ..replicated("zones", "id", ("zone", "zones"))
     },

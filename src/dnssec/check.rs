@@ -7,7 +7,7 @@
 //! BIND (`dnssec-verify`, `delv`, a validating `named`) and dnspython in the
 //! test suite.
 
-use super::wire::{self, T_NSEC, T_RRSIG};
+use super::wire::{self, T_NSEC, T_NSEC3, T_RRSIG};
 use super::KeyInfo;
 use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, Record, RecordType};
@@ -162,6 +162,53 @@ pub fn nsec_covers(nsec: &Record, name: &Name) -> bool {
     }
 }
 
+/// O24: the hash an NSEC3 record stands for (its first label) and the
+/// hash of `name` with that record's parameters.
+fn nsec3_hashes(nsec3: &Record, name: &Name) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    let (_, _, iterations, salt, next, _) = wire::parse_nsec3(wire::raw_rdata(nsec3)?)?;
+    let label = nsec3.name.iter().next()?.to_ascii_uppercase();
+    let owner = data_encoding::BASE32HEX_NOPAD.decode(&label).ok()?;
+    let h = wire::nsec3_hash(name, &salt, iterations).to_vec();
+    Some((owner, next, h))
+}
+
+/// The NSEC3 record stands for `name` (RFC 5155 §8.3).
+pub fn nsec3_matches(nsec3: &Record, name: &Name) -> bool {
+    nsec3_hashes(nsec3, name).is_some_and(|(o, _, h)| o == h)
+}
+
+/// The NSEC3 record covers the hash of `name` (RFC 5155 §8.3), wrapping
+/// around the end of the chain.
+pub fn nsec3_covers(nsec3: &Record, name: &Name) -> bool {
+    let Some((o, x, h)) = nsec3_hashes(nsec3, name) else {
+        return false;
+    };
+    if o < x {
+        o < h && h < x
+    } else {
+        o < h || h < x
+    }
+}
+
+/// RFC 5155 §8.3-8.4: a closest encloser of `qname` (an ancestor matched
+/// by an NSEC3) whose next closer name is covered, and the wildcard at it
+/// covered.
+fn nsec3_nxdomain_proven(nsec3s: &[&Record], qname: &Name) -> bool {
+    let mut child = qname.clone();
+    while child.num_labels() > 0 {
+        let ce = child.base_name();
+        if nsec3s.iter().any(|r| nsec3_matches(r, &ce)) {
+            let wildcard = Name::from_ascii("*")
+                .ok()
+                .and_then(|w| w.append_domain(&ce).ok());
+            return nsec3s.iter().any(|r| nsec3_covers(r, &child))
+                && wildcard.is_some_and(|w| nsec3s.iter().any(|r| nsec3_covers(r, &w)));
+        }
+        child = ce;
+    }
+    false
+}
+
 /// What a probe expects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Expect {
@@ -233,7 +280,28 @@ pub fn validate_response(
         .iter()
         .filter(|r| u16::from(r.record_type()) == T_NSEC)
         .collect();
+    let nsec3s: Vec<&Record> = m
+        .authorities
+        .iter()
+        .filter(|r| u16::from(r.record_type()) == T_NSEC3)
+        .collect();
     match expect {
+        Expect::NxDomain if !nsec3s.is_empty() => {
+            if !nsec3_nxdomain_proven(&nsec3s, qname) {
+                return Err("no NSEC3 closest encloser proof shows the name does not exist".into());
+            }
+        }
+        Expect::NoData if !nsec3s.is_empty() => {
+            let ok = nsec3s.iter().any(|r| {
+                nsec3_matches(r, qname)
+                    && wire::raw_rdata(r)
+                        .and_then(wire::parse_nsec3)
+                        .is_some_and(|(.., types)| !types.contains(&u16::from(qtype)))
+            });
+            if !ok {
+                return Err(format!("no NSEC3 proves the absence of {qtype}"));
+            }
+        }
         Expect::NxDomain => {
             if !nsecs.iter().any(|r| nsec_covers(r, qname)) {
                 return Err("no NSEC proves the name does not exist".into());

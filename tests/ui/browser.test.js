@@ -553,6 +553,23 @@ async function rolloverWalk(b) {
   await pg.wait('done: back to "Start key rollover"', `return !!document.querySelector('#roll-start')`, 30000);
   const fin = (await rpApi('GET', '/zones/roll.test/dnssec')).json;
   ok('rollover: done, the new key signs', fin.key.key_tag === nd.key_tag, JSON.stringify(fin.key));
+
+  // O24: switch the signed zone to NSEC3 from the console; the standby
+  // follows and shows the control disabled with the reason.
+  await pg.wait('the denial switch', `return !!document.querySelector('#sec-denial') && !document.querySelector('#sec-denial').disabled`);
+  ok('nsec3: the panel offers the switch to NSEC3', /Switch to NSEC3/.test(await pg.eval(`return document.querySelector('#sec-denial').textContent`)));
+  await pg.click('#sec-denial');
+  await pg.wait('confirm', `return !!document.querySelector('#cf-ok')`);
+  await pg.click('#cf-ok');
+  await waitUntil('primary signs with NSEC3', async () => (await rpApi('GET', '/zones/roll.test/dnssec')).json.denial === 'nsec3');
+  await pg.wait('the panel shows NSEC3', `return /Switch to NSEC…/.test(document.querySelector('#sec-denial')?.textContent || '') && (document.querySelector('.facts')?.textContent || '').includes('NSEC3')`);
+  ok('nsec3: switched from the console, same key', (await rpApi('GET', '/zones/roll.test/dnssec')).json.key.key_tag === nd.key_tag);
+  const rsApi = await apiLogin(rs, 'root', 'rootpass-rs');
+  await waitUntil('standby signs with NSEC3', async () => (await rsApi('GET', '/zones/roll.test/dnssec')).json.denial === 'nsec3', 20000);
+  await openTab(sp);
+  await sp.wait('standby panel shows NSEC3', `return (document.querySelector('.facts')?.textContent || '').includes('NSEC3')`, 15000);
+  const sd = await sp.eval(`const b = document.querySelector('#sec-denial'); return b ? { disabled: b.disabled, title: b.title } : null`);
+  ok('nsec3: the standby\'s switch is disabled with the reason', sd && sd.disabled && /standby/i.test(sd.title), JSON.stringify(sd));
   return [pg, sp];
 }
 

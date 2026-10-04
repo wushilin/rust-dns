@@ -159,6 +159,7 @@ pub(super) fn default_zone(name: &str, owner_id: Option<i64>) -> Zone {
         signed_at: None,
         overrides: None,
         record_policy: None,
+        nsec3: false,
         settings: None,
     }
 }

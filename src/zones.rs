@@ -7,7 +7,6 @@ use hickory_proto::rr::rdata::{A, AAAA, CNAME, MX, NS, NULL, PTR, SOA, SRV, TXT}
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
 
-use crate::dnssec::signed::NsecEntry;
 use crate::dnssec::wire;
 use crate::dnssec::SignedZone;
 
@@ -448,17 +447,12 @@ fn closest_encloser(z: &ZoneData, key: &str) -> String {
     z.apex.clone()
 }
 
-fn push_proofs(sec: &SignedZone, entries: Vec<&NsecEntry>, out: &mut Vec<Record>) {
-    let mut seen: Vec<&str> = Vec::new();
-    for e in entries {
-        if seen.contains(&e.owner.as_str()) {
-            continue;
-        }
-        seen.push(&e.owner);
-        for r in sec.proof(e) {
-            if !out.contains(&r) {
-                out.push(r);
-            }
+/// Append denial proof records (NSEC or NSEC3, with their RRSIGs) not
+/// already in the section.
+fn push_proofs(proofs: Vec<Record>, out: &mut Vec<Record>) {
+    for r in proofs {
+        if !out.contains(&r) {
+            out.push(r);
         }
     }
 }
@@ -515,8 +509,7 @@ fn resolve_into(
                     }
                     negative_soa(z, sec, ans);
                     if let Some(sec) = sec {
-                        let proof: Vec<&NsecEntry> = sec.nsec_at(deleg).into_iter().collect();
-                        push_proofs(sec, proof, &mut ans.authority);
+                        push_proofs(sec.deny_ds(deleg), &mut ans.authority);
                     }
                 } else {
                     let from = ans.answers.len();
@@ -542,8 +535,7 @@ fn resolve_into(
             // RFC 4035 §3.1.4: the DS RRset (signed) or an NSEC proving there is none.
             if let Some(sec) = sec {
                 if ds.is_empty() {
-                    let proof: Vec<&NsecEntry> = sec.nsec_at(deleg).into_iter().collect();
-                    push_proofs(sec, proof, &mut ans.authority);
+                    push_proofs(sec.deny_ds(deleg), &mut ans.authority);
                 } else {
                     let from = ans.authority.len();
                     ans.authority.extend(ds);
@@ -634,6 +626,13 @@ fn resolve_into(
                 ans.answers.push(r);
             }
         }
+        // O24: an NSEC3 zone's NSEC3PARAM.
+        if is_apex && (qtype == RecordType::NSEC3PARAM || qtype == RecordType::ANY) {
+            if let Some(mut r) = s.nsec3param.clone() {
+                r.name = qname.clone();
+                ans.answers.push(r);
+            }
+        }
         if wildcard.is_none() && qtype == RecordType::NSEC {
             if let Some(e) = s.nsec_at(key) {
                 let mut r = e.record.clone();
@@ -688,9 +687,8 @@ fn resolve_into(
             }
             // RFC 4035 §3.1.3.3: a wildcard answer proves that no closer
             // name (the next closer name) exists.
-            if wildcard.is_some() {
-                let proof: Vec<&NsecEntry> = sec.nsec_covering(key).into_iter().collect();
-                push_proofs(sec, proof, &mut ans.proofs);
+            if let Some(wc) = &wildcard {
+                push_proofs(sec.prove_wildcard_answer(key, wc), &mut ans.proofs);
             }
         }
     }
@@ -747,35 +745,19 @@ fn resolve_into(
     }
     negative_soa(z, sec, ans);
     if let Some(sec) = sec {
-        // RFC 4035 §3.1.3.
-        let proofs: Vec<&NsecEntry> = if exists {
-            // NODATA: the NSEC at the name shows the type is absent; an empty
-            // non-terminal is proven by the NSEC whose next name is below it.
-            match sec.nsec_at(key) {
-                Some(e) => vec![e],
-                None => sec.nsec_covering(key).into_iter().collect(),
-            }
+        // RFC 4035 §3.1.3 (NSEC), RFC 5155 §7.2 (NSEC3).
+        let proofs = if exists {
+            // NODATA: the NSEC (NSEC3) at the name shows the type is absent.
+            sec.deny_nodata(key)
         } else if let Some(wc) = &wildcard {
             // Wildcard NODATA: no closer match, and the wildcard lacks the type.
-            sec.nsec_covering(key)
-                .into_iter()
-                .chain(sec.nsec_at(wc))
-                .collect()
+            sec.deny_wildcard_nodata(key, wc)
         } else {
             // NXDOMAIN: the name does not exist, nor the wildcard at its
             // closest encloser.
-            let ce = closest_encloser(z, key);
-            let wc = if ce == "." {
-                "*.".to_string()
-            } else {
-                format!("*.{ce}")
-            };
-            sec.nsec_covering(key)
-                .into_iter()
-                .chain(sec.nsec_covering(&wc))
-                .collect()
+            sec.deny_nxdomain(key, &closest_encloser(z, key))
         };
-        push_proofs(sec, proofs, &mut ans.authority);
+        push_proofs(proofs, &mut ans.authority);
     }
 }
 
@@ -816,6 +798,7 @@ mod tests {
             signed_at: None,
             overrides: None,
             record_policy: None,
+            nsec3: false,
             settings: None,
         }
     }

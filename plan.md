@@ -933,7 +933,7 @@ Group 5: replication extras
 - [x] O23. Custom CA file for the primary's certificate ([follow] ca_file).
 
 Group 6: DNS protocol depth (all OFF by default; live zone not switched)
-- [ ] O24. NSEC3 (RFC 5155 with RFC 9276 defaults: 0 iterations, no salt),
+- [x] O24. NSEC3 (RFC 5155 with RFC 9276 defaults: 0 iterations, no salt),
   per-zone choice; independent validation with BIND/dnspython.
 - [ ] O25. Ed25519 (algorithm 15) as a per-zone choice for new keys and for
   the rollover wizard (algorithm rollover documented, not automated).
@@ -1163,6 +1163,29 @@ Final
   Unix-only (it did not compile for Windows since I11: the release
   workflow's Windows build was broken until this fix). gate and baba2 are
   unaffected (Linux, same code paths).
+
+- After phase O, O24 (NSEC3; this session; not deployed): protocol 2, no
+  new change kind, fixture untouched. New nullable column `zones.nsec3`
+  (added NULL by the migration, nothing rewritten; `compat_columns`,
+  covered by the per-zone checksum) and an optional `nsec3` field in the
+  zone row of `zone_created` / `zone_updated` and snapshots, present only
+  for a zone signed with NSEC3. Defaults unchanged: every zone stays NSEC
+  until `denial: "nsec3"` is set (wushilin.net is not switched). An older
+  (d32d67f, 3884ba8, or any build before this one) standby would drop the
+  field, sign the zone with NSEC (valid answers, but a different zone)
+  and halt at its reconcile, so standbys now advertise `nsec3`
+  (`X-Rust-DNS-Version: 0.1.0+dnssec-rollover.zone-rename.zone-settings.
+  nsec3`) and the primary refuses NSEC3 (409, naming the standby) while a
+  known standby lacks it; switching back to NSEC stays allowed (test
+  `nsec3_replicates_and_waits_for_old_standbys`, real previous binary).
+  A standby bootstrapped by an older binary from a primary that already
+  has an NSEC3 zone halts at its first reconcile (`diverged`): rebuild it
+  after its upgrade. Upgrade baba2 first, then gate; switch a zone to NSEC3
+  only after both run this version; do not downgrade once a zone uses
+  NSEC3 (the old binary would include the unknown column in its zones
+  table checksum and sign with NSEC). Switching wushilin.net later is one
+  atomic re-sign with the same key (no DS change); check with
+  `/dnssec/check` and delv afterwards.
 
 ## Log
 
@@ -2234,3 +2257,55 @@ Final
   it), `nonminimal_bool` in `accounts.rs` (`!is_some_and(..)` ->
   `is_none_or(..)`) and in a replica.rs test assertion. Behaviour
   unchanged. The gate now runs both clippies (header of this file).
+- 2026-10-04 (phase O): O24 done. NSEC3 per zone (RFC 5155, RFC 9276:
+  SHA-1, 0 extra iterations, no salt, flags 0 / no opt-out), off by
+  default. The choice is the zone row's `nsec3` (new nullable column,
+  `compat_columns`, per-zone checksum; set with `PUT /zones/{zone}/dnssec`
+  `{"enabled": true, "denial": "nsec3" | "nsec"}`, a `zone_updated` with a
+  serial bump; the status reports `denial`). Rather than a field of the
+  O16 zone settings: those need `server_admin` and are replaced as a whole
+  by `PUT /settings`, while the denial is part of signing (owner,
+  `edit_settings`). The signed view (`dnssec/signed.rs`) builds an NSEC3
+  chain over the same owners as the NSEC chain plus every empty
+  non-terminal (bitmap of the original name; RRSIG only where something is
+  signed; none for ENTs), an apex NSEC3PARAM (signed, in the bitmap, in
+  AXFR, answered for NSEC3PARAM/ANY), and the query path asks it for each
+  proof (`deny_nodata`, `deny_nxdomain` = closest encloser proof + wildcard,
+  `prove_wildcard_answer`, `deny_wildcard_nodata`, `deny_ds`); NSEC zones
+  produce exactly the records they did. The API self-check
+  (`dnssec/check.rs`) verifies NSEC3 proofs too. Switching NSEC <-> NSEC3 is
+  one atomic catalog swap with the same key (algorithm 13 is valid with
+  both; RFC 5155 section 2's alias algorithms 6/7 concern RSA/SHA-1 only).
+  New feature `nsec3` in the standby version header; the primary refuses
+  NSEC3 while a standby lacks it (Rollout). Console: DNSSEC tab fact
+  "Denial of existence", **Switch to NSEC3/NSEC** (confirm; disabled with
+  the reason on a standby), choice in the turn-on dialog. Tests: unit
+  `dnssec::wire::tests::nsec3_hashes_match_rfc5155_and_bind` (RFC 5155
+  appendix A vectors = BIND `nsec3hash`; RFC 9276 hash of example.net.;
+  RDATA/presentation), `dnssec::signed::tests::nsec3_chain_and_proofs`
+  (owners incl. ENTs, no occluded names, hash order and links, bitmaps,
+  NSEC3PARAM, every signature verified, each proof checked by hash
+  relations), the randomized replay tests now switch NSEC3 on/off
+  (`set_dnssec_with`), storage migration test (column added last);
+  dnssec `nsec3_validates_and_switching_denial_keeps_every_answer_valid`
+  (delv in a loop over NXDOMAIN, NODATA, ENT, wildcard, wildcard NODATA and
+  DS-at-cut while the zone is switched 5 times NSEC -> NSEC3 -> NSEC ->
+  NSEC3 -> NSEC -> NSEC3: 35 delv answers, all validated; dnssec-verify of
+  the NSEC and of the NSEC3 AXFR "Zone fully signed"; all 40 delv cases of
+  the main test and the validating named (BIND 9.20) on the NSEC3 zone;
+  BIND `nsec3hash` of the apex is an owner in the AXFR; no-DO answers
+  unchanged but the serial; self-check ok); follow `nsec3_replicates_and_
+  waits_for_old_standbys` (identical NSEC3 proofs on primary and standby
+  for 6 probes, standby AXFR dnssec-verify, delv on the standby, its
+  self-check ok, reconcile ok through NSEC3 and back; a standby cannot
+  switch (409); the previous release's standby (d32d67f and 3884ba8)
+  blocks NSEC3 with 409 naming it and keeps following a valid NSEC zone);
+  conformance: 15 new dnspython checks on `nsec3.test` (a copy of
+  signed.test switched to NSEC3 by conformance-local.sh; hashes by
+  `dns.dnssec.nsec3_hash`, every RRset validated with `dns.dnssec.validate`:
+  NSEC3PARAM, NXDOMAIN closest encloser proof incl. deep, NODATA, ENT,
+  wildcard answer / NODATA, referral and DS at an unsigned cut, NSEC query,
+  NSEC3 owner name NXDOMAIN (7.2.8), AXFR validates, chain = one per name
+  and ENT in hash order): 142/142; browser: the rollover walk switches
+  roll.test to NSEC3 from the console and checks the standby's disabled
+  control. OpenAPI snapshot refreshed (`denial`), validator ok.

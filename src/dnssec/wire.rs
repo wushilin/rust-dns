@@ -16,6 +16,8 @@ pub const T_DS: u16 = 43;
 pub const T_RRSIG: u16 = 46;
 pub const T_NSEC: u16 = 47;
 pub const T_DNSKEY: u16 = 48;
+pub const T_NSEC3: u16 = 50;
+pub const T_NSEC3PARAM: u16 = 51;
 pub const CLASS_IN: u16 = 1;
 
 /// Lower-case, uncompressed wire form of a name (RFC 4034 §6.2).
@@ -251,6 +253,80 @@ pub fn parse_nsec(b: &[u8]) -> Option<(Name, Vec<u16>)> {
     Some((next, parse_bitmap(&b[end..])?))
 }
 
+/// NSEC3 hash algorithm 1 (SHA-1), the only one defined (RFC 5155 §11).
+pub const NSEC3_SHA1: u8 = 1;
+
+/// The NSEC3 hash of an owner name (RFC 5155 §5): SHA-1 over the
+/// canonical (lower-case) wire name and the salt, then `iterations` more
+/// times over the previous digest and the salt.
+pub fn nsec3_hash(owner: &Name, salt: &[u8], iterations: u16) -> [u8; 20] {
+    let mut h = sha1::Sha1::new();
+    h.update(name_wire(owner));
+    h.update(salt);
+    let mut d: [u8; 20] = h.finalize().into();
+    for _ in 0..iterations {
+        let mut h = sha1::Sha1::new();
+        h.update(d);
+        h.update(salt);
+        d = h.finalize().into();
+    }
+    d
+}
+
+/// The owner label of an NSEC3 record: the hash in lower-case Base32hex
+/// without padding (RFC 5155 §3.3, RFC 4648 §7).
+pub fn nsec3_label(hash: &[u8]) -> String {
+    data_encoding::BASE32HEX_NOPAD
+        .encode(hash)
+        .to_ascii_lowercase()
+}
+
+/// NSEC3 RDATA (RFC 5155 §3.2): hash algorithm, flags, iterations, salt,
+/// next hashed owner name (raw hash), type bit maps.
+pub fn nsec3_rdata(flags: u8, iterations: u16, salt: &[u8], next: &[u8], types: &[u16]) -> Vec<u8> {
+    let mut d = vec![NSEC3_SHA1, flags];
+    d.extend(iterations.to_be_bytes());
+    d.push(salt.len() as u8);
+    d.extend_from_slice(salt);
+    d.push(next.len() as u8);
+    d.extend_from_slice(next);
+    d.extend(type_bitmap(types));
+    d
+}
+
+/// The fields of an NSEC3 RDATA: (hash algorithm, flags, iterations,
+/// salt, next hashed owner, types).
+pub type Nsec3Fields = (u8, u8, u16, Vec<u8>, Vec<u8>, Vec<u16>);
+
+pub fn parse_nsec3(b: &[u8]) -> Option<Nsec3Fields> {
+    let (alg, flags) = (*b.first()?, *b.get(1)?);
+    let iterations = u16::from_be_bytes([*b.get(2)?, *b.get(3)?]);
+    let slen = *b.get(4)? as usize;
+    let salt = b.get(5..5 + slen)?.to_vec();
+    let hlen = *b.get(5 + slen)? as usize;
+    let next = b.get(6 + slen..6 + slen + hlen)?.to_vec();
+    let types = parse_bitmap(&b[6 + slen + hlen..])?;
+    Some((alg, flags, iterations, salt, next, types))
+}
+
+/// NSEC3PARAM RDATA (RFC 5155 §4.2): hash algorithm, flags (0), iterations,
+/// salt.
+pub fn nsec3param_rdata(iterations: u16, salt: &[u8]) -> Vec<u8> {
+    let mut d = vec![NSEC3_SHA1, 0];
+    d.extend(iterations.to_be_bytes());
+    d.push(salt.len() as u8);
+    d.extend_from_slice(salt);
+    d
+}
+
+fn salt_text(salt: &[u8]) -> String {
+    if salt.is_empty() {
+        "-".into()
+    } else {
+        hex::encode_upper(salt)
+    }
+}
+
 pub fn dnskey_rdata(flags: u16, algorithm: u8, public_key: &[u8]) -> Vec<u8> {
     let mut d = Vec::with_capacity(4 + public_key.len());
     d.extend(flags.to_be_bytes());
@@ -396,6 +472,30 @@ pub fn display_rdata(code: u16, b: &[u8]) -> Option<String> {
             let names: Vec<String> = types.iter().map(|t| type_name(*t)).collect();
             Some(format!("{next} {}", names.join(" ")))
         }
+        T_NSEC3 => {
+            let (alg, flags, it, salt, next, types) = parse_nsec3(b)?;
+            let names: Vec<String> = types.iter().map(|t| type_name(*t)).collect();
+            Some(
+                format!(
+                    "{alg} {flags} {it} {} {} {}",
+                    salt_text(&salt),
+                    data_encoding::BASE32HEX_NOPAD.encode(&next),
+                    names.join(" ")
+                )
+                .trim_end()
+                .to_string(),
+            )
+        }
+        T_NSEC3PARAM if b.len() >= 5 => {
+            let salt = b.get(5..5 + b[4] as usize)?;
+            Some(format!(
+                "{} {} {} {}",
+                b[0],
+                b[1],
+                u16::from_be_bytes([b[2], b[3]]),
+                salt_text(salt)
+            ))
+        }
         T_DNSKEY if b.len() > 4 => Some(format!(
             "{} {} {} {}",
             u16::from_be_bytes([b[0], b[1]]),
@@ -413,6 +513,50 @@ pub fn display_rdata(code: u16, b: &[u8]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// O24: RFC 5155 Appendix A (salt aabbccdd, 12 extra iterations), the
+    /// same values BIND's `nsec3hash` prints, and the RFC 9276 parameters
+    /// (no salt, no extra iteration) for example.net. (`nsec3hash - 1 0
+    /// example.net.`).
+    #[test]
+    fn nsec3_hashes_match_rfc5155_and_bind() {
+        let salt = [0xaa, 0xbb, 0xcc, 0xdd];
+        for (name, want) in [
+            ("example.", "0p9mhaveqvm6t7vbl5lop2u3t2rp3tom"),
+            ("a.example.", "35mthgpgcu1qg68fab165klnsnk3dpvl"),
+            ("ai.example.", "gjeqe526plbf1g8mklp59enfd789njgi"),
+            ("NS1.example.", "2t7b4g4vsa5smi47k61mv5bv1a22bojr"),
+            ("*.w.example.", "r53bq7cc2uvmubfu5ocmm6pers9tk9en"),
+            ("x.y.w.example.", "2vptu5timamqttgl4luu9kg21e0aor3s"),
+            ("xx.example.", "t644ebqk9bibcna874givr6joj62mlhv"),
+        ] {
+            let h = nsec3_hash(&Name::from_ascii(name).unwrap(), &salt, 12);
+            assert_eq!(nsec3_label(&h), want, "{name}");
+        }
+        let h = nsec3_hash(&Name::from_ascii("example.net.").unwrap(), &[], 0);
+        assert_eq!(nsec3_label(&h), "93j57bnunnk7b6rcofljbhj4mkp5bpjh");
+        // RDATA round trip and presentation form.
+        let rd = nsec3_rdata(0, 0, &[], &h, &[1, 16, 46]);
+        let (alg, flags, it, s, next, types) = parse_nsec3(&rd).unwrap();
+        assert_eq!((alg, flags, it, s.len()), (1, 0, 0, 0));
+        assert_eq!((next.as_slice(), types), (&h[..], vec![1, 16, 46]));
+        assert_eq!(
+            display_rdata(T_NSEC3, &rd).unwrap(),
+            "1 0 0 - 93J57BNUNNK7B6RCOFLJBHJ4MKP5BPJH A TXT RRSIG"
+        );
+        // An empty non-terminal's NSEC3 has no types.
+        let ent = nsec3_rdata(0, 0, &[], &h, &[]);
+        assert_eq!(ent.len(), 6 + 20);
+        assert_eq!(
+            display_rdata(T_NSEC3, &ent).unwrap(),
+            "1 0 0 - 93J57BNUNNK7B6RCOFLJBHJ4MKP5BPJH"
+        );
+        assert_eq!(nsec3param_rdata(0, &[]), vec![1, 0, 0, 0, 0]);
+        assert_eq!(
+            display_rdata(T_NSEC3PARAM, &nsec3param_rdata(0, &[])).unwrap(),
+            "1 0 0 -"
+        );
+    }
     use super::*;
 
     fn n(s: &str) -> Name {

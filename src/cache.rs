@@ -568,6 +568,7 @@ mod tests {
             signed_at: None,
             overrides: None,
             record_policy: None,
+            nsec3: false,
             settings: None,
         }
     }

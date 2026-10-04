@@ -630,8 +630,154 @@ while cur in chain and cur not in walk:
 owners = {name for (name, rdtype, _) in zone_rrsets if not any(name.is_subdomain(c) and name != c for c in (dns.name.from_text("sub.signed.test."), dns.name.from_text("secure.signed.test.")))}
 check("4034 §4.1.1: NSEC chain in canonical order covers every authoritative name and wraps to the apex", cur == SZ and set(walk) == owners and walk == sorted(walk), f"{len(walk)} links, {len(owners)} names")
 
-# --- override zones (I1); only where the harness seeded one -----------------
+# --- NSEC3 (RFC 5155, RFC 9276), O24; only where the harness seeded one ----
+# The harness signs a copy of signed.test as nsec3.test with `denial:
+# nsec3`. Hashes are computed by dnspython (dns.dnssec.nsec3_hash) and
+# every RRset is validated with dns.dnssec.validate.
 import os
+N3 = os.environ.get("CONFORMANCE_NSEC3")
+if N3:
+    NZ = dns.name.from_text(N3 + ".")
+    NSEC3 = dns.rdatatype.NSEC3
+
+    def nq(name, rtype, do=True):
+        if isinstance(name, str) and not name.endswith("."):
+            name = f"{name}.{N3}."
+        m = dns.message.make_query(name, rtype, want_dnssec=do)
+        m.use_edns(0, payload=4096, ednsflags=dns.flags.DO if do else 0)
+        return dns.query.tcp(m, IP, port=PORT, timeout=3)
+
+    r = nq(NZ, "DNSKEY")
+    nkey = r.get_rrset(r.answer, NZ, IN, dns.rdatatype.DNSKEY)
+    NKEYS = {NZ: nkey} if nkey is not None else {}
+
+    def nvalidate(r):
+        problems = []
+        for sec in ("answer", "authority"):
+            rs = getattr(r, sec)
+            for rrset in rs:
+                if rrset.rdtype == RRSIG or not rrset.name.is_subdomain(NZ):
+                    continue
+                if rrset.rdtype == dns.rdatatype.NS and not (r.flags & dns.flags.AA):
+                    continue
+                sig = r.get_rrset(rs, rrset.name, IN, RRSIG, rrset.rdtype)
+                if sig is None:
+                    problems.append(f"{rrset.name} {dns.rdatatype.to_text(rrset.rdtype)}: no RRSIG")
+                    continue
+                try:
+                    dns.dnssec.validate(rrset, sig, NKEYS)
+                except Exception as e:
+                    problems.append(f"{rrset.name} {dns.rdatatype.to_text(rrset.rdtype)}: {e!r}")
+        return problems
+
+    def h(name):
+        if isinstance(name, str):
+            name = dns.name.from_text(name if name.endswith(".") else f"{name}.{N3}.")
+        return dns.dnssec.nsec3_hash(name, None, 0, 1).lower()
+
+    def n3s(r):
+        return [rr for rr in r.authority if rr.rdtype == NSEC3]
+
+    def n3_owner(rrset):
+        return rrset.name.labels[0].decode().lower()
+
+    def _b32hex(b):
+        import base64
+        return base64.b32hexencode(b).decode().rstrip("=").lower()
+
+    def matches(r, name):
+        return [n for n in n3s(r) if n3_owner(n) == h(name)]
+
+    def n3_covers(n, name):
+        o, x, t = n3_owner(n), _b32hex(n[0].next), h(name)
+        if o < x:
+            return o < t < x
+        return t > o or t < x
+
+    def n3_types(n):
+        return [t for w in n[0].windows for t in _window_types(w)]
+
+    def params_ok(r):
+        return all(n[0].algorithm == 1 and n[0].flags == 0 and n[0].iterations == 0 and n[0].salt == b"" for n in n3s(r))
+
+    r = nq(NZ, "NSEC3PARAM")
+    p = nvalidate(r)
+    np_ = rrsets(r.answer, "NSEC3PARAM")
+    check("5155 §4 / 9276 §3.1: NSEC3PARAM at the apex: SHA-1, flags 0, 0 iterations, no salt; signed", np_ and np_[0][0].algorithm == 1 and np_[0][0].flags == 0 and np_[0][0].iterations == 0 and np_[0][0].salt == b"" and not p and NKEYS, str(p))
+    r = nq("nope", "A")
+    p = nvalidate(r)
+    check("5155 §7.2.2: NXDOMAIN: NSEC3 records signed and valid, no NSEC", r.rcode() == dns.rcode.NXDOMAIN and n3s(r) and not nsecs(r) and not p and params_ok(r), str(p))
+    check("5155 §7.2.1: NXDOMAIN: closest encloser (apex) matched, next closer covered", matches(r, N3 + ".") and any(n3_covers(n, "nope") for n in n3s(r)))
+    check("5155 §7.2.2: NXDOMAIN: wildcard at the closest encloser covered", any(n3_covers(n, "*") for n in n3s(r)))
+    r = nq("x.y.a.b.deep", "A")
+    check("5155 §7.2.1: deep NXDOMAIN: closest encloser a.b.deep matched, next closer y.a.b.deep covered", r.rcode() == dns.rcode.NXDOMAIN and matches(r, "a.b.deep") and any(n3_covers(n, "y.a.b.deep") for n in n3s(r)) and any(n3_covers(n, "*.a.b.deep") for n in n3s(r)) and not nvalidate(r))
+    r = nq("www", "MX")
+    m = matches(r, "www")
+    check("5155 §7.2.3: NODATA: the matching NSEC3 lists A, not MX; signed", r.rcode() == dns.rcode.NOERROR and not r.answer and m and dns.rdatatype.A in n3_types(m[0]) and dns.rdatatype.MX not in n3_types(m[0]) and not nvalidate(r))
+    r = nq("deep", "A")
+    m = matches(r, "deep")
+    check("5155 §7.1 / §7.2.3: empty non-terminal has an NSEC3 with no types (NODATA)", r.rcode() == dns.rcode.NOERROR and m and n3_types(m[0]) == [] and not nvalidate(r))
+    r = nq("host.gate", "A")
+    p = nvalidate(r)
+    check("5155 §7.2.6: wildcard answer validates, next closer name covered", r.answer and not p and any(n3_covers(n, "host.gate") for n in n3s(r)), str(p))
+    r = nq("host.gate", "AAAA")
+    w = matches(r, "*.gate")
+    check("5155 §7.2.5: wildcard NODATA: closest encloser, next closer, wildcard without the type", r.rcode() == dns.rcode.NOERROR and matches(r, "gate") and any(n3_covers(n, "host.gate") for n in n3s(r)) and w and dns.rdatatype.AAAA not in n3_types(w[0]) and not nvalidate(r))
+    r = nq("host.sub", "A")
+    m = matches(r, "sub")
+    check("5155 §7.2.7: referral to an unsigned child: NSEC3 at the cut with NS, no DS (no opt-out)", not (r.flags & dns.flags.AA) and m and dns.rdatatype.NS in n3_types(m[0]) and dns.rdatatype.DS not in n3_types(m[0]) and not nvalidate(r))
+    r = nq("sub", "DS")
+    check("5155 §7.2.4: DS query at an unsigned cut: authoritative NODATA with the matching NSEC3", r.flags & dns.flags.AA and not r.answer and matches(r, "sub") and not nvalidate(r))
+    r = nq("www", "NSEC")
+    check("5155: an NSEC3 zone has no NSEC: NSEC query is NODATA proven by NSEC3", r.rcode() == dns.rcode.NOERROR and not r.answer and matches(r, "www") and not nvalidate(r))
+    r = nq(f"{h('www')}.{N3}.", "NSEC3")
+    check("5155 §7.2.8: a query for an NSEC3 owner name is NXDOMAIN", r.rcode() == dns.rcode.NXDOMAIN and not r.answer and not nvalidate(r))
+    axfr = []
+    for msg in dns.query.xfr(IP, N3, port=PORT, timeout=5, relativize=False):
+        axfr.extend(msg.answer)
+    zr = {}
+    for rr in axfr:
+        k = (rr.name, rr.rdtype, rr.covers if rr.rdtype == RRSIG else 0)
+        if k in zr:
+            zr[k].union_update(rr)
+        else:
+            zr[k] = rr
+    cuts = [dns.name.from_text(f"sub.{N3}."), dns.name.from_text(f"secure.{N3}.")]
+    problems, ok = [], 0
+    for (name, rdtype, _), rrset in zr.items():
+        if rdtype == RRSIG:
+            continue
+        below = any(name.is_subdomain(c) and name != c for c in cuts)
+        if below or (rdtype == dns.rdatatype.NS and name != NZ):
+            continue
+        sig = zr.get((name, RRSIG, rdtype))
+        if sig is None:
+            problems.append(f"{name} {dns.rdatatype.to_text(rdtype)} unsigned")
+            continue
+        try:
+            dns.dnssec.validate(rrset, sig, NKEYS)
+            ok += 1
+        except Exception as e:
+            problems.append(f"{name} {dns.rdatatype.to_text(rdtype)}: {e!r}")
+    check("5155 + 5936: AXFR of an NSEC3 zone: every authoritative RRset (NSEC3 included) validates", ok > 20 and not problems and not any(k[1] == NSEC for k in zr), str(problems[:3]))
+    chain = {n3_owner(rs): _b32hex(rs[0].next) for (name, rdtype, _), rs in zr.items() if rdtype == NSEC3}
+    names = set()
+    for (name, rdtype, _) in zr:
+        if rdtype in (NSEC3, RRSIG) or any(name.is_subdomain(c) and name != c for c in cuts):
+            continue
+        n = name
+        while n != NZ and n.is_subdomain(NZ):
+            names.add(n)
+            n = n.parent()
+        names.add(NZ)
+    want = {h(n) for n in names}
+    walk, cur = [], min(chain) if chain else None
+    while cur in chain and cur not in walk:
+        walk.append(cur)
+        cur = chain[cur]
+    check("5155 §7.1: NSEC3 chain: one per authoritative name and empty non-terminal, ordered ring by hash", set(chain) == want and len(walk) == len(chain) and walk == sorted(walk), f"{len(chain)} NSEC3, {len(want)} names")
+
+# --- override zones (I1); only where the harness seeded one -----------------
 OV = os.environ.get("CONFORMANCE_OVERRIDE")
 if OV:
     r = q(f"gw.{OV}.", "A", edns=0, want_dnssec=True)

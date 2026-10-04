@@ -34,9 +34,11 @@ pub const HEADER_VERSION: &str = "x-rust-dns-version";
 /// name and would halt at the next reconcile).
 /// O16: `zone-settings` (a zone's own auto-PTR / transfer / NOTIFY
 /// settings; older versions drop them and would halt at the reconcile).
+/// O24: `nsec3` (a zone signed with NSEC3; older versions would sign it
+/// with NSEC and halt at the reconcile).
 pub const VERSION_WITH_FEATURES: &str = concat!(
     env!("CARGO_PKG_VERSION"),
-    "+dnssec-rollover.zone-rename.zone-settings"
+    "+dnssec-rollover.zone-rename.zone-settings.nsec3"
 );
 
 /// Whether a standby's reported version names `feature`.

@@ -106,7 +106,8 @@ pub enum DnssecState {
              "record": "example.com. IN DS 12345 13 2 3490A6806D47F17A34C29E2CE80E8A999FFBE4BE3A1C5B8BCCDE3CFB5A0BA3B5", "recommended": true }],
     "signatures": { "serial": 2026011502, "inception": "2026-01-15T08:30:00Z", "expiration": "2026-01-29T08:30:00Z",
                     "next_resign": "2026-01-22T08:30:00Z", "signed_rrsets": 42, "nsec_names": 17 },
-    "error": null, "signature_validity_days": 14, "resign_before_days": 7, "standby": false
+    "error": null, "signature_validity_days": 14, "resign_before_days": 7, "standby": false,
+    "denial": "nsec"
 }))]
 pub struct DnssecStatus {
     pub zone: String,
@@ -131,6 +132,22 @@ pub struct DnssecStatus {
     /// This server is a read-only standby: it signs in memory with the
     /// replicated key and never re-signs by itself.
     pub standby: bool,
+    /// How the zone proves that a name or type does not exist (O24),
+    /// kept while signing is off.
+    pub denial: Denial,
+}
+
+/// Denial of existence of a signed zone (O24).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Denial {
+    /// NSEC (RFC 4034): the names of the zone can be listed by walking
+    /// the chain. The default.
+    Nsec,
+    /// NSEC3 (RFC 5155) with the RFC 9276 parameters: SHA-1, no extra
+    /// iterations, no salt, no opt-out. Hashed names: walking the chain
+    /// does not list the zone's names directly.
+    Nsec3,
 }
 
 /// Turn signing on or off.
@@ -151,6 +168,13 @@ pub struct DnssecInput {
     #[serde(default)]
     #[schema(nullable = false)]
     pub new_key: Option<bool>,
+    /// With `enabled: true`: sign with NSEC or NSEC3 from now on (absent:
+    /// unchanged; new zones use NSEC). Switching a signed zone is one
+    /// atomic re-sign with the same key: no DS change, answers validate
+    /// before, during and after it.
+    #[serde(default)]
+    #[schema(nullable = false)]
+    pub denial: Option<Denial>,
 }
 
 /// The DS records of the zone's key.
@@ -305,6 +329,7 @@ fn status(s: &AppState, z: &Zone) -> ApiResult<DnssecStatus> {
         signature_validity_days: cfg.signature_validity_days,
         resign_before_days: cfg.resign_before_days,
         standby,
+        denial: if z.nsec3 { Denial::Nsec3 } else { Denial::Nsec },
     })
 }
 
@@ -338,7 +363,7 @@ pub async fn get_dnssec(
     tag = "DNSSEC",
     operation_id = "set_dnssec",
     summary = "Turn DNSSEC signing on or off",
-    description = "Needs the owner role. **On**: the zone is signed from now on (a key is generated the first time). Nothing changes for resolvers until the DS record is published at the registrar. **Off**: refused with 409 `ds_published` while the parent publishes a DS for the zone (or when that cannot be checked): remove the DS at the registrar first and wait for its TTL. `force: true` skips that check.",
+    description = "Needs the owner role. **On**: the zone is signed from now on (a key is generated the first time). Nothing changes for resolvers until the DS record is published at the registrar. **Off**: refused with 409 `ds_published` while the parent publishes a DS for the zone (or when that cannot be checked): remove the DS at the registrar first and wait for its TTL. `force: true` skips that check. **Denial** (`denial`, with `enabled: true`): `nsec` (default) or `nsec3` (RFC 5155 with RFC 9276 parameters); switching re-signs the zone at once with the same key (no DS change). Choosing `nsec3` is refused (409) while a standby of a version without NSEC3 follows this server (it would sign the zone with NSEC).",
     params(ZonePath),
     request_body(content = DnssecInput, example = json!({ "enabled": true })),
     responses(
@@ -358,6 +383,16 @@ pub async fn set_dnssec(
 ) -> ApiResult<Json<DnssecStatus>> {
     let (z, _) = s.require_zone(&caller, &zone, ZonePerm::EditSettings)?;
     let force = input.force.unwrap_or(false);
+    let nsec3 = input.denial.map(|d| d == Denial::Nsec3);
+    if nsec3 == Some(true) && !z.nsec3 {
+        let blocked = super::routes::standbys_without(&s, "nsec3");
+        if !blocked.is_empty() {
+            return Err(ApiError::conflict(format!(
+                "standbys of an older version follow this server and could not sign the zone with NSEC3: {}. Upgrade them first (or forget a standby that no longer follows, on the Replication page)",
+                blocked.join(", ")
+            )));
+        }
+    }
     if !input.enabled && z.dnssec {
         if force {
             tracing::warn!(zone = %z.name, actor = %caller.user.username, "DNSSEC: turning signing off with force (parent DS check skipped)");
@@ -382,15 +417,16 @@ pub async fn set_dnssec(
     }
     let out = s
         .mutator
-        .set_dnssec(
+        .set_dnssec_with(
             caller.actor(),
             &z.name,
             input.enabled,
             input.new_key.unwrap_or(false),
+            nsec3,
         )
         .await?;
-    if out.changed || out.key_generated {
-        tracing::info!(zone = %z.name, enabled = input.enabled, key_generated = out.key_generated, actor = %caller.user.username, "DNSSEC setting changed");
+    if out.changed || out.key_generated || out.denial_changed {
+        tracing::info!(zone = %z.name, enabled = input.enabled, key_generated = out.key_generated, nsec3 = out.zone.nsec3, actor = %caller.user.username, "DNSSEC setting changed");
     }
     Ok(Json(status(&s, &out.zone)?))
 }

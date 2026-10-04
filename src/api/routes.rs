@@ -663,7 +663,7 @@ pub async fn rename_zone(
 
 /// Standbys known to this primary that lack `feature` ("instance
 /// (version v)" each).
-fn standbys_without(s: &AppState, feature: &str) -> Vec<String> {
+pub(crate) fn standbys_without(s: &AppState, feature: &str) -> Vec<String> {
     s.repl
         .replica_list()
         .into_iter()

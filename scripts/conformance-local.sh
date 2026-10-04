@@ -75,8 +75,23 @@ def req(path, body):
 req("/api/auth/login", {"username": "root", "password": "ci-root-password"})
 req("/api/zones", {"name": "vpn.signed.test", "override": {"mode": "static"}})
 req("/api/zones/vpn.signed.test/records", {"name": "gw", "type": "A", "value": "10.8.0.1"})
+# O24: a copy of signed.test signed with NSEC3 (CONFORMANCE_NSEC3).
+r = o.open(urllib.request.Request(base + "/api/zones/signed.test/export"), timeout=5).read()
+doc = json.loads(r)
+z = doc["zones"][0]
+z["name"] = "nsec3.test"
+for k in ("soa_mname", "soa_rname"):
+    z[k] = z[k].replace("signed.test", "nsec3.test")
+for rec in z["records"]:
+    rec["value"] = rec["value"].replace("signed.test", "nsec3.test")
+    rec.pop("id", None)
+req("/api/import?mode=merge", doc)
+r = urllib.request.Request(base + "/api/zones/nsec3.test/dnssec", data=json.dumps({"enabled": True, "denial": "nsec3"}).encode(), method="PUT",
+    headers={"Content-Type": "application/json", "X-Requested-With": "rust-dns", "X-CSRF-Token": next((c.value for c in jar if c.name in ("rdns_csrf", "__Host-rdns_csrf")), "")})
+st = json.loads(o.open(r, timeout=5).read())
+assert st["state"] == "signing" and st["denial"] == "nsec3", st
 PY
-CONFORMANCE_OVERRIDE=vpn.signed.test python3 "$ROOT/scripts/conformance.py" "$ZONE" 127.0.0.1 "$DNS_PORT"
+CONFORMANCE_NSEC3=nsec3.test CONFORMANCE_OVERRIDE=vpn.signed.test python3 "$ROOT/scripts/conformance.py" "$ZONE" 127.0.0.1 "$DNS_PORT"
 if [ "${RUN_COMPLIANCE:-0}" = "1" ]; then
   "$ROOT/scripts/compliance.sh" "$ZONE" 127.0.0.1 "$DNS_PORT"
 fi

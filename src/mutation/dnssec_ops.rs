@@ -10,6 +10,8 @@ pub struct DnssecChange {
     pub key_generated: bool,
     /// Signing was switched on or off by this call.
     pub changed: bool,
+    /// O24: the denial of existence (NSEC / NSEC3) was switched.
+    pub denial_changed: bool,
 }
 
 impl Mutator {
@@ -21,6 +23,7 @@ impl Mutator {
     /// transaction (a serial bump; the key is an account-class change).
     /// Off: the flag is cleared; the key is kept, so turning signing back
     /// on reuses it (the DS at the registrar stays valid).
+    #[cfg(test)]
     pub async fn set_dnssec(
         &self,
         actor: Actor,
@@ -28,8 +31,28 @@ impl Mutator {
         enable: bool,
         new_key: bool,
     ) -> MResult<DnssecChange> {
+        self.set_dnssec_with(actor, zone_name, enable, new_key, None)
+            .await
+    }
+
+    /// [`Self::set_dnssec`], and (O24) `nsec3`: when given, the zone is
+    /// signed with NSEC3 (true) or NSEC (false) from this transaction on.
+    /// Switching an already signed zone is one atomic re-sign with the same
+    /// key (a `zone_updated` with a serial bump): every answer before it
+    /// carries the old chain, every answer after it the new one, and both
+    /// validate under the published DNSKEY / DS (algorithm 13 is defined
+    /// for both; RFC 5155 §2's NSEC3-only algorithm numbers concern the
+    /// RSA/SHA-1 aliases 6 and 7 only).
+    pub async fn set_dnssec_with(
+        &self,
+        actor: Actor,
+        zone_name: &str,
+        enable: bool,
+        new_key: bool,
+        nsec3: Option<bool>,
+    ) -> MResult<DnssecChange> {
         let zone_name = zone_name.to_string();
-        let (name, key_generated, changed) = self
+        let (name, key_generated, changed, denial_changed) = self
             .execute(actor, if enable { "enable_dnssec" } else { "disable_dnssec" }, move |t| {
                 let z = t.require_zone(&normalize_zone_name(&zone_name)?)?;
                 if !enable {
@@ -38,8 +61,13 @@ impl Mutator {
                             "new_key applies only when turning signing on".into(),
                         ));
                     }
+                    if nsec3.is_some() {
+                        return Err(MutationError::Invalid(
+                            "denial (NSEC / NSEC3) applies only when signing is on".into(),
+                        ));
+                    }
                     if !z.dnssec {
-                        return Ok((z.name, false, false));
+                        return Ok((z.name, false, false, false));
                     }
                     if t.dnssec_key(z.id)?.is_some_and(|k| k.rollover.is_some()) {
                         return Err(MutationError::Conflict(
@@ -49,7 +77,7 @@ impl Mutator {
                     let mut after = z.clone();
                     after.dnssec = false;
                     t.update_zone(z.clone(), after)?;
-                    return Ok((z.name, false, true));
+                    return Ok((z.name, false, true, false));
                 }
                 if z.is_override() {
                     return Err(MutationError::Invalid(
@@ -84,13 +112,16 @@ impl Mutator {
                     })?;
                     generated = true;
                 }
-                if z.dnssec {
-                    return Ok((z.name, generated, false));
+                let want_nsec3 = nsec3.unwrap_or(z.nsec3);
+                let denial_changed = want_nsec3 != z.nsec3;
+                if z.dnssec && !denial_changed {
+                    return Ok((z.name, generated, false, false));
                 }
                 let mut after = z.clone();
                 after.dnssec = true;
+                after.nsec3 = want_nsec3;
                 t.update_zone(z.clone(), after)?;
-                Ok((z.name, generated, true))
+                Ok((z.name, generated, !z.dnssec, denial_changed))
             })
             .await?;
         let zone = self
@@ -101,6 +132,7 @@ impl Mutator {
             zone,
             key_generated,
             changed,
+            denial_changed,
         })
     }
 

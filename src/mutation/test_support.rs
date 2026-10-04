@@ -171,8 +171,15 @@ pub(crate) async fn random_dns_op(
             }
             _ => Ok(()),
         },
+        // O24: NSEC3 on, off or unchanged with it.
         80..=85 => m
-            .set_dnssec(actor(), z, true, step.is_multiple_of(5))
+            .set_dnssec_with(
+                actor(),
+                z,
+                true,
+                step.is_multiple_of(5),
+                [None, Some(true), Some(false)][step % 3],
+            )
             .await
             .map(|_| ()),
         86..=88 => m.set_dnssec(actor(), z, false, false).await.map(|_| ()),

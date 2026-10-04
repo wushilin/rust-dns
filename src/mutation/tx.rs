@@ -1466,8 +1466,15 @@ mod tests {
                         .map(|_| ())
                 }
                 // ---- DNSSEC: key (account class), flag, re-sign ----
+                // O24: NSEC3 on, off or unchanged with it.
                 130..=134 => m
-                    .set_dnssec(actor(), z, true, step % 7 == 0)
+                    .set_dnssec_with(
+                        actor(),
+                        z,
+                        true,
+                        step % 7 == 0,
+                        [None, Some(true), Some(false)][step % 3],
+                    )
                     .await
                     .map(|_| ()),
                 135..=137 => m.set_dnssec(actor(), z, false, false).await.map(|_| ()),

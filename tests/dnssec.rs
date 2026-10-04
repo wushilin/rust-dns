@@ -1100,3 +1100,233 @@ fn turning_signing_off_is_refused_while_the_parent_publishes_a_ds() {
     assert_eq!(again["ds"][0]["record"].as_str().unwrap(), ds);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The AXFR of the zone as text (dig), checked with dnssec-verify. Returns
+/// the transfer.
+fn axfr_verified(dig: &Path, verify: &Path, dir: &Path, port: u16, file: &str) -> String {
+    let p = port.to_string();
+    let (ok, axfr) = run(
+        dig,
+        &[
+            "@127.0.0.1",
+            "-p",
+            &p,
+            ZONE,
+            "AXFR",
+            "+nocmd",
+            "+nocomments",
+            "+nostats",
+        ],
+    );
+    assert!(ok && axfr.contains("RRSIG"), "{axfr}");
+    let zf = dir.join(file);
+    std::fs::write(&zf, &axfr).unwrap();
+    let (ok, out) = run(verify, &["-z", "-o", ZONE, zf.to_str().unwrap()]);
+    assert!(
+        ok && out.contains("Zone fully signed"),
+        "dnssec-verify ({file}):\n{out}"
+    );
+    axfr
+}
+
+/// Records of one type in a dig transfer (tab-separated presentation form).
+fn axfr_count(axfr: &str, t: &str) -> usize {
+    axfr.lines()
+        .filter(|l| l.split_whitespace().nth(3) == Some(t))
+        .count()
+}
+
+/// O24: a zone signed with NSEC3 (RFC 5155, RFC 9276 parameters) validates
+/// with BIND (delv on positive, NXDOMAIN, NODATA, wildcard, empty
+/// non-terminal, delegation and DS answers; dnssec-verify on the AXFR;
+/// a validating named when installed), and switching a signed zone
+/// between NSEC and NSEC3 keeps every answer validating at every moment:
+/// delv runs in a loop while the zone is switched back and forth, and no
+/// answer fails. Answers without DO do not change (serial aside).
+#[test]
+fn nsec3_validates_and_switching_denial_keeps_every_answer_valid() {
+    let dir = tmpdir("nsec3");
+    let s = Server::new(dir.clone(), "");
+    s.import(ZONE, &records());
+    let set = |body: Value| -> Value {
+        let (st, r) = s.api("PUT", &format!("/api/zones/{ZONE}/dnssec"), Some(body));
+        assert_eq!(st, 200, "{r}");
+        r
+    };
+    // Denial applies only while signing is on.
+    let (st, r) = s.api(
+        "PUT",
+        &format!("/api/zones/{ZONE}/dnssec"),
+        Some(json!({ "enabled": false, "denial": "nsec3" })),
+    );
+    assert_eq!(st, 400, "{r}");
+    let before = no_do_answers(s.dns);
+    let on = set(json!({ "enabled": true }));
+    assert_eq!(on["denial"], "nsec", "NSEC by default");
+    let dnskey_text = on["key"]["dnskey"].as_str().unwrap().to_string();
+    let nsec_names = on["signatures"]["nsec_names"].as_u64().unwrap();
+    let (Some(dig), Some(verify), Some(delv)) = (
+        bind_tool("dig"),
+        bind_tool("dnssec-verify"),
+        bind_tool("delv"),
+    ) else {
+        return;
+    };
+    let anchor = anchor_file(&dir, &dnskey_text, "anchor.conf");
+    let axfr = axfr_verified(&dig, &verify, &dir, s.dns, "nsec.zone");
+    assert!(axfr_count(&axfr, "NSEC") > 10 && axfr_count(&axfr, "NSEC3") == 0);
+    let f = run_delv(&delv, s.dns, &anchor);
+    assert!(f.is_empty(), "NSEC zone: {}", f.join("\n"));
+
+    // delv in a loop over the denial cases while the zone is switched.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let loop_handle = {
+        let (stop, delv, anchor, port) = (stop.clone(), delv.clone(), anchor.clone(), s.dns);
+        std::thread::spawn(move || {
+            let cases: &[(&str, &str, &str)] = &[
+                (
+                    "negative response, fully validated",
+                    "nope.wushilin.test",
+                    "A",
+                ),
+                (
+                    "negative response, fully validated",
+                    "www.wushilin.test",
+                    "MX",
+                ),
+                (
+                    "negative response, fully validated",
+                    "deep.wushilin.test",
+                    "A",
+                ),
+                (
+                    "negative response, fully validated",
+                    "foo.gate.wushilin.test",
+                    "AAAA",
+                ),
+                (
+                    "negative response, fully validated",
+                    "sub.wushilin.test",
+                    "DS",
+                ),
+                ("fully validated", "foo.gate.wushilin.test", "A"),
+                ("fully validated", "www.wushilin.test", "A"),
+            ];
+            let p = port.to_string();
+            let (mut runs, mut failures) = (0usize, Vec::new());
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                for (expect, name, t) in cases {
+                    let (_, out) = run(
+                        &delv,
+                        &[
+                            "@127.0.0.1",
+                            "-p",
+                            &p,
+                            "-a",
+                            anchor.to_str().unwrap(),
+                            "+root=wushilin.test",
+                            name,
+                            t,
+                        ],
+                    );
+                    runs += 1;
+                    let line = delv_line(&out);
+                    if !line.starts_with(&format!("; {expect}")) {
+                        failures.push(format!("{name} {t}: {line:?}\n{out}"));
+                    }
+                }
+            }
+            (runs, failures)
+        })
+    };
+    let mut denials = Vec::new();
+    for want in ["nsec3", "nsec", "nsec3", "nsec", "nsec3"] {
+        std::thread::sleep(Duration::from_millis(700));
+        let r = set(json!({ "enabled": true, "denial": want }));
+        assert_eq!(r["denial"], want, "{r}");
+        assert_eq!(r["state"], "signing");
+        assert_eq!(
+            r["key"]["dnskey"].as_str().unwrap(),
+            dnskey_text,
+            "same key: no DS change"
+        );
+        denials.push(r["signatures"]["nsec_names"].as_u64().unwrap());
+        // What the server serves right after the switch.
+        let m = parse(&tcp(
+            s.dns,
+            &query_bytes("nope.wushilin.test.", RecordType::A, Some(1232), true),
+        ));
+        let has = |code: u16| {
+            m.authorities
+                .iter()
+                .any(|r| u16::from(r.record_type()) == code)
+        };
+        assert_eq!(
+            (has(50), has(47)),
+            (want == "nsec3", want == "nsec"),
+            "{want}: NSEC3 / NSEC in the NXDOMAIN proof"
+        );
+    }
+    std::thread::sleep(Duration::from_millis(700));
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (runs, failures) = loop_handle.join().unwrap();
+    assert!(
+        failures.is_empty(),
+        "{} of {runs} delv answers failed during the switches:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+    assert!(runs >= 21, "the loop ran across the switches ({runs})");
+    eprintln!("nsec3: {runs} delv answers during 5 switches, all validated");
+    // NSEC3 counts the empty non-terminals too (deep, b.deep, _tcp,
+    // _domainkey).
+    assert!(denials[0] > nsec_names, "{denials:?} vs {nsec_names}");
+
+    // Now NSEC3: the whole zone validates.
+    let axfr = axfr_verified(&dig, &verify, &dir, s.dns, "nsec3.zone");
+    assert_eq!(axfr_count(&axfr, "NSEC"), 0, "{axfr}");
+    assert_eq!(axfr_count(&axfr, "NSEC3PARAM"), 1);
+    assert_eq!(axfr_count(&axfr, "NSEC3") as u64, denials[0]);
+    let mut failures = run_delv(&delv, s.dns, &anchor);
+    if let Some(named) = tool("named") {
+        failures.extend(run_named(&named, &dig, &dir, s.dns, &anchor));
+    }
+    assert!(
+        failures.is_empty(),
+        "NSEC3 zone, {} failures:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+    // NSEC3PARAM is served (signed with DO, plain without).
+    let m = parse(&tcp(
+        s.dns,
+        &query_bytes("wushilin.test.", RecordType::NSEC3PARAM, Some(1232), true),
+    ));
+    assert_eq!(m.answers.len(), 2, "NSEC3PARAM + RRSIG");
+    let m = parse(&udp(
+        s.dns,
+        &query_bytes("wushilin.test.", RecordType::NSEC3PARAM, None, false),
+    ));
+    assert_eq!(m.answers.len(), 1);
+    // BIND's own hash of the apex is the NSEC3 owner it validated.
+    if let Some(nsec3hash) = bind_tool("nsec3hash") {
+        let (ok, out) = run(&nsec3hash, &["-", "1", "0", "wushilin.test."]);
+        let h = out.split_whitespace().next().unwrap_or("").to_lowercase();
+        assert!(
+            ok && axfr.to_lowercase().contains(&format!("{h}.wushilin.test.")),
+            "{out}"
+        );
+    }
+    // Without DO nothing changed but the serial.
+    let after = no_do_answers(s.dns);
+    for ((what, a), (_, b)) in before.iter().zip(&after) {
+        assert!(
+            a == b || without_serial(a) == without_serial(b),
+            "{what}: answer without DO changed"
+        );
+    }
+    // The self-check of the API understands NSEC3 zones too.
+    let (_, chk) = s.api("GET", &format!("/api/zones/{ZONE}/dnssec/check"), None);
+    assert_eq!(chk["ok"], true, "{chk:#}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -1626,13 +1626,14 @@ function dnssecHtml(z) {
   const badge = st.state === 'signing' ? '<span class="badge ok">signing</span>' : st.state === 'error' ? '<span class="badge bad">error: served unsigned</span>' : '<span class="badge muted">off</span>';
   const k = st.key, sig = st.signatures;
   const rec = (st.ds || []).find(x => x.recommended);
-  return `<p class="hint">DNSSEC lets resolvers verify that answers for <span class="mono">${esc(zn)}</span> come from you unchanged. This server signs the zone itself (ECDSA P-256, NSEC). It protects anyone only once the parent zone publishes a <b>DS record</b> for it, which you add at your registrar.</p>
+  return `<p class="hint">DNSSEC lets resolvers verify that answers for <span class="mono">${esc(zn)}</span> come from you unchanged. This server signs the zone itself (ECDSA P-256, ${st.denial === 'nsec3' ? 'NSEC3' : 'NSEC'}). It protects anyone only once the parent zone publishes a <b>DS record</b> for it, which you add at your registrar.</p>
     <div class="facts">
       ${fact('Status', '', badge + (st.error ? `<div class="hint" style="margin-top:4px">${esc(st.error)}</div>` : ''), st.enabled ? 'Answers carry signatures for resolvers that ask for them (DO bit); zone transfers include DNSKEY, RRSIG and NSEC records.' : 'Answers are unsigned.')}
       ${k ? fact('Key', '', `tag <b class="mono">${k.key_tag}</b> · algorithm ${k.algorithm} (${esc(k.algorithm_name)}) · flags ${k.flags}`, `One combined signing key, created ${esc(fmtTime(k.created_at))}. The private key stays on this server (and its standbys).`) : ''}
       ${k ? fact('DNSKEY', '', copyVal(k.dnskey), 'The public key, published in the zone.') : ''}
       ${sig ? fact('Signatures', '', `valid ${secWhen(sig.inception)} to ${secWhen(sig.expiration)}`, `${num(sig.signed_rrsets)} RRsets and ${num(sig.nsec_names)} names signed at serial ${sig.serial}. Valid ${st.signature_validity_days} days; ${st.standby ? 'the primary re-signs them' : 're-signed automatically ' + st.resign_before_days + ' days before they expire (a new serial, so secondaries transfer them)'}.`) : ''}
       ${sig && sig.next_resign ? fact('Next re-sign', '', secWhen(sig.next_resign), '') : ''}
+      ${st.enabled ? fact('Denial of existence', '', st.denial === 'nsec3' ? 'NSEC3 <span class="hint">(SHA-1, 0 extra iterations, no salt, no opt-out)</span>' : 'NSEC', st.denial === 'nsec3' ? 'Negative answers prove non-existence with hashed names (RFC 5155, RFC 9276 parameters).' : 'Negative answers prove non-existence with the next existing name: the chain lists the zone\'s names.') : ''}
     </div>
     ${st.standby ? `<div class="note info">${ico('servers', 's')}<span>This server is a read-only standby: it signs with the key replicated from the primary (its own signatures, equally valid). Turn signing on or off on the primary.</span></div>` : ''}
     ${rec ? `<h3>DS record for the registrar</h3>
@@ -1643,12 +1644,15 @@ function dnssecHtml(z) {
       <ol class="steps">
         <li><b>Check this server's answers</b>: queries this server with the DO bit and validates every signature and denial-of-existence proof with the key.
           <div class="row" style="margin-top:6px"><button class="btn" id="sec-check" data-ro-ok>Check before adding DS</button></div><div id="sec-check-out">${checkHtml(d.check)}</div></li>
-        <li><b>Every nameserver of the zone must serve it signed.</b> Standbys sign by themselves; secondaries get DNSKEY, RRSIG and NSEC with the zone transfer. A nameserver that still serves the zone unsigned makes it fail for validating resolvers.</li>
+        <li><b>Every nameserver of the zone must serve it signed.</b> Standbys sign by themselves; secondaries get DNSKEY, RRSIG and ${st.denial === 'nsec3' ? 'NSEC3 (with NSEC3PARAM)' : 'NSEC'} with the zone transfer. A nameserver that still serves the zone unsigned makes it fail for validating resolvers.</li>
         <li><b>Publish the DS</b> (above) at your registrar.</li>
         <li><b>Is the DS published at the parent?</b>
           <div class="row" style="margin-top:6px"><button class="btn" id="sec-parent" data-ro-ok>Look up the DS at the parent</button></div><div id="sec-parent-out">${parentHtml(d.parent, st)}</div></li>
       </ol>` : `<h3>Is a DS published at the parent?</h3><p class="hint">With signing off the parent must not publish a DS for this zone.</p>
       <div class="row"><button class="btn" id="sec-parent" data-ro-ok>Look up the DS at the parent</button></div><div id="sec-parent-out">${parentHtml(d.parent, st)}</div>`}
+    ${st.enabled ? `<h3>Denial of existence</h3>
+      <p class="hint">How the zone proves that a name or a type does not exist. <b>NSEC</b> names the next existing name, so anyone can walk the chain and list the zone's names. <b>NSEC3</b> (RFC 5155, with the RFC 9276 parameters: no extra iterations, no salt) uses hashed names instead. Switching re-signs the zone at once with the same key: the DS at the registrar stays, and answers validate before, during and after the switch.</p>
+      <div class="row"><button class="btn" id="sec-denial" data-perm="edit_settings" data-zone="${esc(z.name)}"${blockAttr(st.standby && 'Read-only standby: switch on the primary')}>Switch to ${st.denial === 'nsec3' ? 'NSEC' : 'NSEC3'}…</button></div>` : ''}
     ${st.enabled && d.roll ? `<h3>Key rollover</h3><div id="sec-roll">${rolloverHtml(z, d.roll, st)}</div>` : ''}
     ${owner && !st.standby ? `<h3>${st.enabled ? 'Turn signing off' : 'Turn signing on'}</h3>
       <div class="row">${st.enabled ? `<button class="btn danger" id="sec-off" data-perm="edit_settings" data-zone="${esc(z.name)}"${blockAttr(d.roll && d.roll.active && 'A key rollover is in progress: finish or cancel it first')}>Turn off signing…</button>` : `<button class="btn primary" id="sec-on" data-perm="edit_settings" data-zone="${esc(z.name)}">Turn on signing…</button>`}</div>` : ''}
@@ -1713,6 +1717,13 @@ function wireDnssec(z, d) {
   if ($('#sec-on', d)) $('#sec-on', d).onclick = () => dnssecOnModal(z, st);
   if ($('#sec-roll', d)) wireRollover(z);
   if ($('#sec-off', d)) $('#sec-off', d).onclick = () => dnssecOffModal(z);
+  const dn = $('#sec-denial', d);
+  if (dn) dn.onclick = async () => {
+    const to = st.denial === 'nsec3' ? 'nsec' : 'nsec3', label = to.toUpperCase();
+    if (!await confirmModal(`Switch to ${label}`, `${noDot(z.fqdn)} is re-signed now with ${label} instead of ${st.denial.toUpperCase()}, with the same key (the DS at the registrar stays valid). The serial changes once; secondaries get the new chain with the next transfer.`, `Switch to ${label}`, dn)) return;
+    try { const r = await PUT(`/zones/${encodeURIComponent(z.name)}/dnssec`, { enabled: true, denial: to }); toast(`${noDot(z.fqdn)} now uses ${label}`, 'ok'); afterDnssecChange(z, r); }
+    catch (e) { toast(e.message, 'err'); }
+  };
 }
 async function afterDnssecChange(z, st) {
   S.dnssec = { zone: z.name, st, check: null, parent: null };
@@ -1735,6 +1746,7 @@ function dnssecOnModal(z, st) {
     <div id="so-step2" class="hidden">
       <p><b>Confirm:</b> sign <span class="mono">${esc(zn)}</span> now. The change is recorded in the zone's change log.</p>
       ${st.key ? `<label style="display:flex;gap:8px;align-items:center;margin-top:10px"><input type="checkbox" id="so-new"> Use a new key instead of key ${st.key.key_tag} (its DS changes; only when no DS of the old key is published)</label>` : ''}
+      <label style="display:flex;gap:8px;align-items:center;margin-top:10px">Denial of existence <select id="so-denial"><option value="nsec"${st.denial === 'nsec3' ? '' : ' selected'}>NSEC</option><option value="nsec3"${st.denial === 'nsec3' ? ' selected' : ''}>NSEC3 (hashed names)</option></select></label>
     </div>
     <div class="error" id="so-err"></div>
     <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn" id="so-next" disabled data-perm="edit_settings" data-zone="${esc(z.name)}">Continue</button><button class="btn primary hidden" id="so-ok" data-perm="edit_settings" data-zone="${esc(z.name)}">Turn on signing</button></div>`, m => {
@@ -1744,7 +1756,8 @@ function dnssecOnModal(z, st) {
     ok.onclick = async () => {
       ok.disabled = true; m.querySelector('#so-err').textContent = '';
       const nk = m.querySelector('#so-new');
-      try { const r = await PUT(`/zones/${encodeURIComponent(z.name)}/dnssec`, { enabled: true, new_key: !!(nk && nk.checked) }); closeModal(); toast(`${zn} is signed (key ${r.key.key_tag})`, 'ok'); afterDnssecChange(z, r); }
+      const den = m.querySelector('#so-denial');
+      try { const r = await PUT(`/zones/${encodeURIComponent(z.name)}/dnssec`, { enabled: true, new_key: !!(nk && nk.checked), denial: den ? den.value : 'nsec' }); closeModal(); toast(`${zn} is signed (key ${r.key.key_tag})`, 'ok'); afterDnssecChange(z, r); }
       catch (e) { m.querySelector('#so-err').textContent = e.message; ok.disabled = false; }
     };
   });

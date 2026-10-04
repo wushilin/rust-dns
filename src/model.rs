@@ -176,6 +176,11 @@ pub struct Zone {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false, value_type = Option<ZoneSettings>)]
     pub settings: Option<Box<ZoneSettings>>,
+    /// O24: a signed zone proves non-existence with NSEC3 (RFC 5155 with
+    /// the RFC 9276 parameters: SHA-1, no extra iterations, no salt, no
+    /// opt-out) instead of NSEC; absent: NSEC.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub nsec3: bool,
 }
 
 /// One NOTIFY target of a zone (O16).

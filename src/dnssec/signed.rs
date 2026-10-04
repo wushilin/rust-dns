@@ -14,6 +14,14 @@
 //! descendant of the empty non-terminal, proves it exists without data.
 //! Names below a cut or a DNAME are not in the chain.
 //!
+//! O24: a zone with `nsec3` gets an NSEC3 chain instead (RFC 5155, with the
+//! RFC 9276 parameters: SHA-1, no extra iterations, no salt, flags 0 (no
+//! opt-out)) and an NSEC3PARAM RRset at the apex. Every name of the NSEC
+//! chain has an NSEC3, and so does every empty non-terminal (RFC 5155
+//! §7.1); the bitmap lists the types at the original name (RRSIG when
+//! something there is signed; no NSEC3 type). The NSEC3 records live at
+//! `<base32hex hash>.<apex>` and are ordered by hash.
+//!
 //! Every record is the wire record the catalog prepared (`cache::Rec`), the
 //! same one the query path serves, so what is signed is exactly what is
 //! served.
@@ -29,7 +37,9 @@
 //! TTL, the key, the window) misses the lookup and is signed afresh; an
 //! entry can never be used for other octets or another key.
 
-use super::wire::{self, CanonKey, RrsigFields, T_DNSKEY, T_DS, T_NSEC, T_RRSIG};
+use super::wire::{
+    self, CanonKey, RrsigFields, T_DNSKEY, T_DS, T_NSEC, T_NSEC3, T_NSEC3PARAM, T_RRSIG,
+};
 use super::{Window, ZoneKey, ALGORITHM};
 use crate::cache::ZoneData;
 use crate::model::RecordType as Rt;
@@ -38,7 +48,7 @@ use crate::zones::{apex_ns, soa_record};
 use anyhow::{anyhow, Result};
 use hickory_proto::rr::{Name, Record, RecordType};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Bumped when the signing code changes what it produces (cache key).
 const SIGNER_VERSION: u32 = 1;
@@ -49,6 +59,24 @@ pub struct NsecEntry {
     pub owner: String,
     key: CanonKey,
     pub record: Record,
+    pub types: Vec<u16>,
+}
+
+/// O24: the NSEC3 iterations and salt this server signs with (RFC 9276
+/// §3.1: no extra iteration, no salt).
+pub const NSEC3_ITERATIONS: u16 = 0;
+pub const NSEC3_SALT: &[u8] = &[];
+
+/// One link of the NSEC3 chain (O24).
+pub struct Nsec3Entry {
+    /// The original owner name (lower case, as in `ZoneData::names`), or
+    /// an empty non-terminal.
+    pub owner: String,
+    hash: [u8; 20],
+    /// The NSEC3 owner name, `<hash>.<apex>` (lower case).
+    pub hashed: String,
+    pub record: Record,
+    /// Types at the original owner name (the NSEC3 bitmap).
     pub types: Vec<u16>,
 }
 
@@ -76,6 +104,12 @@ pub struct SignedZone {
     sigs: HashMap<(String, u16), Record>,
     chain: Vec<NsecEntry>,
     index: HashMap<String, usize>,
+    /// O24: the NSEC3 chain, by hash (empty for an NSEC zone) ...
+    nsec3: Vec<Nsec3Entry>,
+    /// ... and the position of each original owner name in it.
+    nsec3_index: HashMap<String, usize>,
+    /// The apex NSEC3PARAM record (NSEC3 zones only).
+    pub nsec3param: Option<Record>,
 }
 
 /// Where a name stands in the zone.
@@ -225,6 +259,18 @@ impl SignedZone {
             .entry(T_DNSKEY)
             .or_default()
             .extend(dnskey_set.iter().cloned());
+        let use_nsec3 = zone.nsec3;
+        let nsec3param = use_nsec3.then(|| {
+            wire::raw_record(
+                apex.clone(),
+                nsec_ttl,
+                T_NSEC3PARAM,
+                wire::nsec3param_rdata(NSEC3_ITERATIONS, NSEC3_SALT),
+            )
+        });
+        if let Some(p) = &nsec3param {
+            apex_sets.insert(T_NSEC3PARAM, vec![p.clone()]);
+        }
         owners.insert(
             wire::canon_key(&apex),
             OwnerSets {
@@ -328,6 +374,9 @@ impl SignedZone {
                 }
                 sigs.insert((o.owner.clone(), *t), sign(&o.owner, &o.name, *t, set)?);
             }
+            if use_nsec3 {
+                continue;
+            }
             let next = &list[(i + 1) % list.len()].name;
             let mut types: Vec<u16> = o.rrsets.keys().copied().collect();
             types.push(T_NSEC);
@@ -356,6 +405,73 @@ impl SignedZone {
             .enumerate()
             .map(|(i, e)| (e.owner.clone(), i))
             .collect();
+
+        // O24: the NSEC3 chain over the same names plus the empty
+        // non-terminals between them and the apex.
+        let mut nsec3 = Vec::new();
+        if use_nsec3 {
+            let mut items: Vec<(String, Name, Vec<u16>)> = Vec::new();
+            let mut seen: HashSet<String> = HashSet::new();
+            for o in &list {
+                let mut types: Vec<u16> = o.rrsets.keys().copied().collect();
+                let signed_here = o.position != Position::Cut || o.rrsets.contains_key(&T_DS);
+                if signed_here && !types.is_empty() {
+                    types.push(T_RRSIG);
+                }
+                types.sort_unstable();
+                types.dedup();
+                seen.insert(o.owner.clone());
+                items.push((o.owner.clone(), o.name.clone(), types));
+            }
+            for o in &list {
+                let mut cur = o.name.clone();
+                while cur.num_labels() > apex.num_labels() {
+                    cur = cur.base_name();
+                    let owner = cur.to_lowercase().to_ascii();
+                    if seen.insert(owner.clone()) {
+                        items.push((owner, cur.clone(), vec![]));
+                    }
+                }
+            }
+            let mut hashed: Vec<([u8; 20], String, Vec<u16>)> = items
+                .into_iter()
+                .map(|(owner, name, types)| {
+                    (
+                        wire::nsec3_hash(&name, NSEC3_SALT, NSEC3_ITERATIONS),
+                        owner,
+                        types,
+                    )
+                })
+                .collect();
+            hashed.sort_by_key(|a| a.0);
+            for (i, (hash, owner, types)) in hashed.iter().enumerate() {
+                let next = &hashed[(i + 1) % hashed.len()].0;
+                let hname = format!("{}.{}", wire::nsec3_label(hash), z.apex);
+                let hn = Name::from_ascii(&hname).map_err(|e| anyhow!("NSEC3 owner: {e}"))?;
+                let rec = wire::raw_record(
+                    hn.clone(),
+                    nsec_ttl,
+                    T_NSEC3,
+                    wire::nsec3_rdata(0, NSEC3_ITERATIONS, NSEC3_SALT, next, types),
+                );
+                sigs.insert(
+                    (hname.clone(), T_NSEC3),
+                    sign(&hname, &hn, T_NSEC3, std::slice::from_ref(&rec))?,
+                );
+                nsec3.push(Nsec3Entry {
+                    owner: owner.clone(),
+                    hash: *hash,
+                    hashed: hname,
+                    record: rec,
+                    types: types.clone(),
+                });
+            }
+        }
+        let nsec3_index = nsec3
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.owner.clone(), i))
+            .collect();
         Ok(SignedZone {
             fingerprint,
             key_tag: key.key_tag,
@@ -370,11 +486,25 @@ impl SignedZone {
             sigs,
             chain,
             index,
+            nsec3,
+            nsec3_index,
+            nsec3param,
         })
     }
 
+    /// Names in the denial chain (NSEC, or NSEC3 with the empty
+    /// non-terminals).
     pub fn chain_len(&self) -> usize {
-        self.chain.len()
+        if self.uses_nsec3() {
+            self.nsec3.len()
+        } else {
+            self.chain.len()
+        }
+    }
+
+    /// O24: denial of existence with NSEC3 instead of NSEC.
+    pub fn uses_nsec3(&self) -> bool {
+        self.nsec3param.is_some()
     }
 
     /// The RRSIG over the RRset of type `t` at `owner` (stored owner name:
@@ -418,19 +548,32 @@ impl SignedZone {
 
     /// Every RRSIG at `owner` (qtype RRSIG).
     pub fn sigs_at(&self, owner: &str) -> Vec<Record> {
-        match self.nsec_at(owner) {
-            Some(e) => e
-                .types
-                .iter()
-                .filter_map(|t| self.sig(owner, *t).cloned())
-                .collect(),
-            None => vec![],
-        }
+        let types = match (self.nsec_at(owner), self.nsec3_at(owner)) {
+            (Some(e), _) => &e.types,
+            (None, Some(e)) => &e.types,
+            (None, None) => return vec![],
+        };
+        types
+            .iter()
+            .filter_map(|t| self.sig(owner, *t).cloned())
+            .collect()
     }
 
     /// DNSSEC records a zone transfer adds: DNSKEY, every RRSIG and NSEC.
     pub fn transfer_records(&self) -> Vec<Record> {
         let mut out = self.dnskey_set.clone();
+        out.extend(self.nsec3param.iter().cloned());
+        for e in &self.nsec3 {
+            for t in &e.types {
+                if let Some(s) = self.sig(&e.owner, *t) {
+                    out.push(s.clone());
+                }
+            }
+            out.push(e.record.clone());
+            if let Some(s) = self.sig(&e.hashed, T_NSEC3) {
+                out.push(s.clone());
+            }
+        }
         for e in &self.chain {
             out.push(e.record.clone());
             for t in &e.types {
@@ -440,6 +583,202 @@ impl SignedZone {
             }
         }
         out
+    }
+}
+
+/// Denial of existence (RFC 4035 §3.1.3, RFC 5155 §7.2): the proof
+/// records (each NSEC or NSEC3 with its RRSIG, no duplicates) for each kind
+/// of answer, from the NSEC or the NSEC3 chain as the zone is signed.
+impl SignedZone {
+    fn nsec_records(&self, entries: Vec<&NsecEntry>) -> Vec<Record> {
+        let mut out: Vec<Record> = Vec::new();
+        let mut seen: Vec<&str> = Vec::new();
+        for e in entries {
+            if seen.contains(&e.owner.as_str()) {
+                continue;
+            }
+            seen.push(&e.owner);
+            for r in self.proof(e) {
+                if !out.contains(&r) {
+                    out.push(r);
+                }
+            }
+        }
+        out
+    }
+
+    fn nsec3_records(&self, entries: Vec<&Nsec3Entry>) -> Vec<Record> {
+        let mut out: Vec<Record> = Vec::new();
+        let mut seen: Vec<&str> = Vec::new();
+        for e in entries {
+            if seen.contains(&e.hashed.as_str()) {
+                continue;
+            }
+            seen.push(&e.hashed);
+            out.push(e.record.clone());
+            if let Some(s) = self.sig(&e.hashed, T_NSEC3) {
+                out.push(s.clone());
+            }
+        }
+        out
+    }
+
+    /// The NSEC3 of an original owner name (an existing name or an empty
+    /// non-terminal).
+    pub fn nsec3_at(&self, owner: &str) -> Option<&Nsec3Entry> {
+        self.nsec3_index.get(owner).map(|i| &self.nsec3[*i])
+    }
+
+    /// The NSEC3 whose hash precedes the hash of `name` and whose next hash
+    /// follows it (wrapping around the end of the chain): proof that no
+    /// name with that hash exists. None when `name` has an NSEC3 itself.
+    pub fn nsec3_covering(&self, name: &str) -> Option<&Nsec3Entry> {
+        if self.nsec3.is_empty() {
+            return None;
+        }
+        let n = Name::from_ascii(name).ok()?;
+        let h = wire::nsec3_hash(&n, NSEC3_SALT, NSEC3_ITERATIONS);
+        let pp = self.nsec3.partition_point(|e| e.hash < h);
+        if pp < self.nsec3.len() && self.nsec3[pp].hash == h {
+            return None;
+        }
+        Some(&self.nsec3[pp.checked_sub(1).unwrap_or(self.nsec3.len() - 1)])
+    }
+
+    /// The closest encloser of a name without an NSEC3 (its longest
+    /// ancestor that has one) and the next closer name (the ancestor-or-
+    /// self of `name` one label longer), RFC 5155 §7.2.1.
+    fn nsec3_encloser(&self, name: &str) -> Option<(String, String)> {
+        let mut child = name;
+        loop {
+            let (_, parent) = child.split_once('.')?;
+            let parent = if parent.is_empty() { "." } else { parent };
+            if self.nsec3_index.contains_key(parent) {
+                return Some((parent.to_string(), child.to_string()));
+            }
+            if parent == "." {
+                return None;
+            }
+            child = parent;
+        }
+    }
+
+    fn wildcard_of(ce: &str) -> String {
+        if ce == "." {
+            "*.".to_string()
+        } else {
+            format!("*.{ce}")
+        }
+    }
+
+    /// NODATA at a name that exists (or an empty non-terminal): the NSEC at
+    /// it (the one whose next name is below it for an empty non-terminal
+    /// with NSEC), or the matching NSEC3 (RFC 5155 §7.2.3).
+    pub fn deny_nodata(&self, key: &str) -> Vec<Record> {
+        if self.uses_nsec3() {
+            return match self.nsec3_at(key) {
+                Some(e) => self.nsec3_records(vec![e]),
+                None => self.deny_nxdomain(key, ""),
+            };
+        }
+        self.nsec_records(match self.nsec_at(key) {
+            Some(e) => vec![e],
+            None => self.nsec_covering(key).into_iter().collect(),
+        })
+    }
+
+    /// NXDOMAIN. NSEC: the name and the wildcard at its closest encloser
+    /// `ce` (as the zone data knows it) are covered. NSEC3 (RFC 5155
+    /// §7.2.2): the closest encloser proof (the NSEC3 matching the closest
+    /// encloser and the one covering the next closer name) and the NSEC3
+    /// covering the wildcard at the closest encloser.
+    pub fn deny_nxdomain(&self, key: &str, ce: &str) -> Vec<Record> {
+        if self.uses_nsec3() {
+            let Some((ce, next_closer)) = self.nsec3_encloser(key) else {
+                return vec![];
+            };
+            let wc = Self::wildcard_of(&ce);
+            return self.nsec3_records(
+                self.nsec3_at(&ce)
+                    .into_iter()
+                    .chain(self.nsec3_covering(&next_closer))
+                    .chain(self.nsec3_covering(&wc))
+                    .collect(),
+            );
+        }
+        let wc = Self::wildcard_of(ce);
+        self.nsec_records(
+            self.nsec_covering(key)
+                .into_iter()
+                .chain(self.nsec_covering(&wc))
+                .collect(),
+        )
+    }
+
+    /// An answer synthesized from the wildcard `wc`: no closer name exists.
+    /// NSEC: the NSEC covering the query name. NSEC3 (RFC 5155 §7.2.6): the
+    /// NSEC3 covering the next closer name (the closest encloser is the
+    /// wildcard's parent).
+    pub fn prove_wildcard_answer(&self, key: &str, wc: &str) -> Vec<Record> {
+        if self.uses_nsec3() {
+            return self.nsec3_records(
+                Self::next_closer_below(key, wc)
+                    .and_then(|nc| self.nsec3_covering(&nc))
+                    .into_iter()
+                    .collect(),
+            );
+        }
+        self.nsec_records(self.nsec_covering(key).into_iter().collect())
+    }
+
+    /// Wildcard NODATA: no closer name, and the wildcard lacks the type.
+    /// NSEC: the NSEC covering the name and the wildcard's NSEC. NSEC3
+    /// (RFC 5155 §7.2.5): the closest encloser proof and the NSEC3 matching
+    /// the wildcard.
+    pub fn deny_wildcard_nodata(&self, key: &str, wc: &str) -> Vec<Record> {
+        if self.uses_nsec3() {
+            let ce = wc.strip_prefix("*.").unwrap_or(".");
+            let ce = if ce.is_empty() { "." } else { ce };
+            return self.nsec3_records(
+                self.nsec3_at(ce)
+                    .into_iter()
+                    .chain(Self::next_closer_below(key, wc).and_then(|nc| self.nsec3_covering(&nc)))
+                    .chain(self.nsec3_at(wc))
+                    .collect(),
+            );
+        }
+        self.nsec_records(
+            self.nsec_covering(key)
+                .into_iter()
+                .chain(self.nsec_at(wc))
+                .collect(),
+        )
+    }
+
+    /// No DS at a delegation point (a referral, or a DS query at the cut):
+    /// the NSEC, or the matching NSEC3 (no opt-out: every delegation has
+    /// one; RFC 5155 §7.2.4 / §7.2.7), showing NS without DS.
+    pub fn deny_ds(&self, deleg: &str) -> Vec<Record> {
+        if self.uses_nsec3() {
+            return self.nsec3_records(self.nsec3_at(deleg).into_iter().collect());
+        }
+        self.nsec_records(self.nsec_at(deleg).into_iter().collect())
+    }
+
+    /// The next closer name of `key` under the wildcard `wc`'s parent.
+    fn next_closer_below(key: &str, wc: &str) -> Option<String> {
+        let ce = wc.strip_prefix("*.")?;
+        let prefix = if ce == "." || ce.is_empty() {
+            key.strip_suffix('.')?
+        } else {
+            key.strip_suffix(ce)?.strip_suffix('.')?
+        };
+        let label = prefix.rsplit('.').next()?;
+        Some(if ce == "." || ce.is_empty() {
+            format!("{label}.")
+        } else {
+            format!("{label}.{ce}")
+        })
     }
 }
 
@@ -463,7 +802,17 @@ impl SignedZone {
         for ((owner, t), sig) in &self.sigs {
             let name = Name::from_ascii(owner).unwrap();
             let (f, sigbytes) = wire::parse_rrsig(wire::raw_rdata(sig).unwrap()).unwrap();
-            let set: Vec<Record> = if *t == T_NSEC {
+            let set: Vec<Record> = if *t == T_NSEC3 {
+                vec![self
+                    .nsec3
+                    .iter()
+                    .find(|e| &e.hashed == owner)
+                    .expect("NSEC3 for the RRSIG")
+                    .record
+                    .clone()]
+            } else if *t == T_NSEC3PARAM {
+                vec![self.nsec3param.clone().expect("NSEC3PARAM")]
+            } else if *t == T_NSEC {
                 vec![self
                     .nsec_at(owner)
                     .expect("NSEC for the RRSIG")
@@ -516,6 +865,20 @@ impl SignedZone {
                 );
             }
         }
+        for e in &self.nsec3 {
+            assert!(self.sigs.contains_key(&(e.hashed.clone(), T_NSEC3)));
+            let cut = position(z, &e.owner) == Position::Cut;
+            for t in &e.types {
+                if *t == T_RRSIG || (cut && *t != T_DS) {
+                    continue;
+                }
+                assert!(
+                    self.sigs.contains_key(&(e.owner.clone(), *t)),
+                    "{} type {t} is not signed",
+                    e.owner
+                );
+            }
+        }
         assert_eq!(verified, self.signed_rrsets);
         verified
     }
@@ -539,6 +902,9 @@ impl SignedZone {
             "dnskey": hex::encode(wire::raw_rdata(&self.dnskey).unwrap()),
             "chain": self.chain.iter().map(|e| serde_json::json!([
                 e.owner, e.types, e.record.ttl, hex::encode(wire::raw_rdata(&e.record).unwrap())
+            ])).collect::<Vec<_>>(),
+            "nsec3": self.nsec3.iter().map(|e| serde_json::json!([
+                e.owner, e.hashed, e.types, e.record.ttl, hex::encode(wire::raw_rdata(&e.record).unwrap())
             ])).collect::<Vec<_>>(),
             "sigs": sigs,
         })
@@ -570,6 +936,7 @@ mod tests {
             signed_at: None,
             overrides: None,
             record_policy: None,
+            nsec3: false,
             settings: None,
         }
     }
@@ -607,8 +974,15 @@ mod tests {
     }
 
     fn sample() -> Catalog {
+        sample_with(false)
+    }
+
+    fn sample_with(nsec3: bool) -> Catalog {
         Catalog::build(
-            vec![zone(1, "example.net")],
+            vec![Zone {
+                nsec3,
+                ..zone(1, "example.net")
+            }],
             vec![
                 rec(1, "@", Rt::NS, "ns1.example.net."),
                 rec(2, "ns1", Rt::A, "192.0.2.53"),
@@ -694,6 +1068,154 @@ mod tests {
         let cov = s.nsec_covering("x.gate.example.net.").unwrap();
         assert_eq!(cov.owner, "*.gate.example.net.");
         assert!(s.nsec_covering("gate.example.net.").is_none());
+    }
+
+    /// O24: the NSEC3 chain of the sample zone: every authoritative name,
+    /// the empty non-terminals, no occluded name; hashes ordered and
+    /// linked; bitmaps of the original names; and the records each kind of
+    /// negative or wildcard answer carries (RFC 5155 §7.2), checked by
+    /// hash relations, not by the code that picks them.
+    #[test]
+    fn nsec3_chain_and_proofs() {
+        let c = sample_with(true);
+        let zd = c.zones.get("example.net.").unwrap().clone();
+        let (_, key) = test_key();
+        let w = Window {
+            inception: 1000,
+            expiration: 2000,
+        };
+        let s = SignedZone::build(&zd, &key, w, String::new(), None).unwrap();
+        assert!(s.uses_nsec3());
+        assert!(s.chain.is_empty() && s.nsec_at("example.net.").is_none());
+        let mut owners: Vec<&str> = s.nsec3.iter().map(|e| e.owner.as_str()).collect();
+        owners.sort();
+        assert_eq!(
+            owners,
+            vec![
+                "*.gate.example.net.",
+                "a.b.c.example.net.",
+                "b.c.example.net.",
+                "c.example.net.",
+                "example.net.",
+                "gate.example.net.",
+                "ns1.example.net.",
+                "old.example.net.",
+                "sub.example.net.",
+            ],
+            "ENTs b.c and c have an NSEC3; ns.sub and x.old (occluded) do not"
+        );
+        assert_eq!(s.chain_len(), 9);
+        let h = |n: &str| wire::nsec3_hash(&Name::from_ascii(n).unwrap(), &[], 0);
+        for (i, e) in s.nsec3.iter().enumerate() {
+            assert_eq!(e.hash, h(&e.owner));
+            assert_eq!(
+                e.hashed,
+                format!("{}.example.net.", wire::nsec3_label(&e.hash))
+            );
+            let (alg, flags, it, salt, next, types) =
+                wire::parse_nsec3(wire::raw_rdata(&e.record).unwrap()).unwrap();
+            assert_eq!(
+                (alg, flags, it, salt.len()),
+                (1, 0, 0, 0),
+                "RFC 9276 parameters"
+            );
+            assert_eq!(next, s.nsec3[(i + 1) % s.nsec3.len()].hash.to_vec());
+            assert_eq!(types, e.types);
+            assert_eq!(e.record.ttl, 300, "min(SOA minimum, zone TTL) as NSEC");
+            if i > 0 {
+                assert!(s.nsec3[i - 1].hash < e.hash, "ordered by hash");
+            }
+        }
+        assert_eq!(
+            s.nsec3_at("example.net.").unwrap().types,
+            vec![2, 6, 46, 48, 51]
+        );
+        assert_eq!(
+            s.nsec3_at("sub.example.net.").unwrap().types,
+            vec![2, 43, 46]
+        );
+        assert!(s.nsec3_at("c.example.net.").unwrap().types.is_empty());
+        assert_eq!(s.nsec3_at("gate.example.net.").unwrap().types, vec![1, 46]);
+        let p = s.nsec3param.as_ref().unwrap();
+        assert_eq!(wire::raw_rdata(p).unwrap(), &[1, 0, 0, 0, 0]);
+        assert!(s.sig("example.net.", T_NSEC3PARAM).is_some());
+        assert_eq!(s.verify_all(&zd), s.signed_rrsets);
+
+        // Which NSEC3 matches (same hash) or covers (hash strictly between
+        // owner and next, wrapping) a name.
+        let rel = |recs: &[Record], name: &str| -> (bool, bool) {
+            let hn = h(name);
+            let mut m = false;
+            let mut cv = false;
+            for r in recs
+                .iter()
+                .filter(|r| u16::from(r.record_type()) == T_NSEC3)
+            {
+                let own = r.name.iter().next().unwrap().to_vec();
+                let own = data_encoding::BASE32HEX_NOPAD
+                    .decode(&own.to_ascii_uppercase())
+                    .unwrap();
+                let (_, _, _, _, next, _) = wire::parse_nsec3(wire::raw_rdata(r).unwrap()).unwrap();
+                let hn = hn.to_vec();
+                if own == hn {
+                    m = true;
+                } else if (own < next && own < hn && hn < next)
+                    || (own >= next && (hn > own || hn < next))
+                {
+                    cv = true;
+                }
+            }
+            (m, cv)
+        };
+        let n3 = |recs: &[Record]| {
+            let k = recs
+                .iter()
+                .filter(|r| u16::from(r.record_type()) == T_NSEC3)
+                .count();
+            assert_eq!(recs.len(), 2 * k, "each NSEC3 with its RRSIG");
+            k
+        };
+        // NXDOMAIN: closest encloser matched, next closer and wildcard covered.
+        let p = s.deny_nxdomain("zzz.example.net.", "example.net.");
+        assert!(rel(&p, "example.net.").0);
+        assert!(rel(&p, "zzz.example.net.").1);
+        assert!(rel(&p, "*.example.net.").1);
+        assert!(n3(&p) <= 3);
+        let p = s.deny_nxdomain("x.y.a.b.c.example.net.", "a.b.c.example.net.");
+        assert!(rel(&p, "a.b.c.example.net.").0);
+        assert!(rel(&p, "y.a.b.c.example.net.").1, "next closer");
+        assert!(rel(&p, "*.a.b.c.example.net.").1);
+        // NODATA at a name and at an empty non-terminal: the matching NSEC3.
+        let p = s.deny_nodata("b.c.example.net.");
+        assert_eq!((n3(&p), rel(&p, "b.c.example.net.").0), (1, true));
+        let p = s.deny_nodata("gate.example.net.");
+        assert_eq!((n3(&p), rel(&p, "gate.example.net.").0), (1, true));
+        // Wildcard answer: the next closer name is covered.
+        let p = s.prove_wildcard_answer("q.r.gate.example.net.", "*.gate.example.net.");
+        assert_eq!((n3(&p), rel(&p, "r.gate.example.net.").1), (1, true));
+        // Wildcard NODATA: closest encloser, next closer, the wildcard.
+        let p = s.deny_wildcard_nodata("q.gate.example.net.", "*.gate.example.net.");
+        assert!(rel(&p, "gate.example.net.").0);
+        assert!(rel(&p, "q.gate.example.net.").1);
+        assert!(rel(&p, "*.gate.example.net.").0);
+        // No DS at a delegation: its matching NSEC3.
+        let p = s.deny_ds("sub.example.net.");
+        assert_eq!((n3(&p), rel(&p, "sub.example.net.").0), (1, true));
+        // AXFR: NSEC3PARAM, every NSEC3 with its RRSIG, no NSEC.
+        let t = s.transfer_records();
+        assert!(t.iter().all(|r| u16::from(r.record_type()) != T_NSEC));
+        assert_eq!(
+            t.iter()
+                .filter(|r| u16::from(r.record_type()) == T_NSEC3)
+                .count(),
+            9
+        );
+        assert_eq!(
+            t.iter()
+                .filter(|r| u16::from(r.record_type()) == T_NSEC3PARAM)
+                .count(),
+            1
+        );
     }
 
     /// D2: signatures are reused per RRset; the lookup key is the public

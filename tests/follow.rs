@@ -469,7 +469,7 @@ fn primary_standby_failover_and_rejoin() {
     assert_eq!(
         r["version"],
         format!(
-            "{}+dnssec-rollover.zone-rename.zone-settings",
+            "{}+dnssec-rollover.zone-rename.zone-settings.nsec3",
             env!("CARGO_PKG_VERSION")
         )
     );
@@ -4554,5 +4554,167 @@ fn a_private_ca_from_ca_file_is_trusted_for_the_primary_and_the_peer() {
         assert_eq!(status(&p, &pr)["writable"], true);
     }
     drop((p, s));
+    let _ = std::fs::remove_dir_all(&root_dir);
+}
+
+/// O24: a zone switched to NSEC3 on the primary is signed with NSEC3 by
+/// the standby too: the same NSEC3 chain (the records are deterministic;
+/// only the ECDSA signatures differ) in the NXDOMAIN, NODATA and wildcard
+/// proofs of both servers, the standby's zone passes dnssec-verify and
+/// delv, its self-check is ok, and the reconcile stays ok through the
+/// switch to NSEC3 and back. A standby of the previous release (no `nsec3`
+/// feature) blocks the switch (409, naming it) and keeps following;
+/// switching back to NSEC stays allowed.
+#[test]
+fn nsec3_replicates_and_waits_for_old_standbys() {
+    let root_dir = temp_root("follow-nsec3");
+    let mut p = Node::new(&root_dir, "primary", "rootpass-primary");
+    let mut s = Node::new(&root_dir, "standby", "rootpass-standby");
+    let xfer = "[transfer]\nallow = [\"127.0.0.0/8\"]\n";
+    p.configure(xfer);
+    p.start();
+    let pr = p.root();
+    let post =
+        |path: &str, body: Value| call(&Auth::Session(&pr), "POST", &p.api(path), Some(body));
+    let put = |body: Value| {
+        call(
+            &Auth::Session(&pr),
+            "PUT",
+            &p.api("/zones/n3.test/dnssec"),
+            Some(body),
+        )
+    };
+    ok(post("/zones", json!({ "name": "n3.test" })), "zone");
+    for (name, t, v) in [
+        ("@", "NS", "ns1.n3.test."),
+        ("ns1", "A", "192.0.2.53"),
+        ("www", "A", "192.0.2.80"),
+        ("*.wild", "A", "192.0.2.81"),
+        ("a.b.deep", "TXT", "below empty non-terminals"),
+    ] {
+        ok(
+            post(
+                "/zones/n3.test/records",
+                json!({ "name": name, "type": t, "value": v }),
+            ),
+            "record",
+        );
+    }
+    let on = ok(put(json!({ "enabled": true })), "signing on");
+    assert_eq!(on["denial"], "nsec");
+    let dnskey = on["key"]["dnskey"].as_str().unwrap().to_string();
+    let repl = ok(post("/tokens", json!({ "name": "repl" })), "token")["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    s.configure(&format!("{xfer}{}", follow_cfg(&p, "dns2", &repl)));
+    s.start();
+    let sr = s.root();
+    wait_reconciled(&p, &pr, &s, &sr, "NSEC");
+
+    // The proofs of both servers, without the (randomised) signatures.
+    let probes = [
+        ("nope.n3.test.", RecordType::A),
+        ("www.n3.test.", RecordType::MX),
+        ("deep.n3.test.", RecordType::A),
+        ("x.y.a.b.deep.n3.test.", RecordType::A),
+        ("q.wild.n3.test.", RecordType::A),
+        ("q.wild.n3.test.", RecordType::AAAA),
+    ];
+    let proofs = |port: u16| -> Vec<(ResponseCode, Vec<String>)> {
+        probes
+            .iter()
+            .map(|(n, t)| {
+                let m = dnssec_query(port, n, *t);
+                let mut v: Vec<String> = m
+                    .authorities
+                    .iter()
+                    .filter(|r| matches!(u16::from(r.record_type()), 47 | 50))
+                    .map(|r| format!("{} {:?}", r.name, r.data))
+                    .collect();
+                v.sort();
+                (m.metadata.response_code, v)
+            })
+            .collect()
+    };
+    let nsec = proofs(p.dns);
+    assert_eq!(nsec, proofs(s.dns), "same NSEC proofs");
+    let r = ok(put(json!({ "enabled": true, "denial": "nsec3" })), "NSEC3");
+    assert_eq!(r["denial"], "nsec3");
+    wait_for("the standby serves NSEC3", 20, || {
+        dnssec_query(s.dns, "nope.n3.test.", RecordType::A)
+            .authorities
+            .iter()
+            .any(|r| u16::from(r.record_type()) == 50)
+    });
+    wait_reconciled(&p, &pr, &s, &sr, "NSEC3");
+    let n3 = proofs(p.dns);
+    assert_eq!(n3, proofs(s.dns), "same NSEC3 proofs on both servers");
+    assert!(n3.iter().all(|(_, v)| !v.is_empty()), "{n3:?}");
+    assert_ne!(n3, nsec);
+    let st = dnssec_status(&s, &sr, "n3.test");
+    assert_eq!(st["denial"], "nsec3", "{st}");
+    let chk = ok(
+        call(
+            &Auth::Session(&sr),
+            "GET",
+            &s.api("/zones/n3.test/dnssec/check"),
+            None,
+        ),
+        "standby check",
+    );
+    assert_eq!(chk["ok"], true, "{chk:#}");
+    verify_zone(&root_dir, s.dns, "n3.test", "standby nsec3");
+    let cases = [
+        ("www.n3.test", "A", "; fully validated"),
+        ("q.wild.n3.test", "A", "; fully validated"),
+        ("nope.n3.test", "A", "; negative response, fully validated"),
+        ("deep.n3.test", "A", "; negative response, fully validated"),
+        (
+            "q.wild.n3.test",
+            "AAAA",
+            "; negative response, fully validated",
+        ),
+    ];
+    delv_all(&root_dir, &dnskey, "n3.test", s.dns, &cases);
+    // A standby cannot switch it.
+    let (st, _) = call(
+        &Auth::Session(&sr),
+        "PUT",
+        &s.api("/zones/n3.test/dnssec"),
+        Some(json!({ "enabled": true, "denial": "nsec" })),
+    );
+    assert_eq!(st, 409, "read-only standby");
+    ok(
+        put(json!({ "enabled": true, "denial": "nsec" })),
+        "back to NSEC",
+    );
+    wait_reconciled(&p, &pr, &s, &sr, "NSEC again");
+    assert_eq!(proofs(s.dns), proofs(p.dns));
+    assert_eq!(dnssec_status(&s, &sr, "n3.test")["denial"], "nsec");
+    drop(s);
+
+    if let Some(prev) = prev_bin() {
+        let mut old = Node::new(&root_dir, "old", "rootpass-old");
+        old.bin = prev;
+        old.configure(&format!("{xfer}{}", follow_cfg(&p, "dns3", &repl)));
+        old.start();
+        let or = old.root();
+        wait_reconciled(&p, &pr, &old, &or, "old standby");
+        let (st, v) = put(json!({ "enabled": true, "denial": "nsec3" }));
+        assert_eq!(st, 409, "{v}");
+        assert!(v["error"].as_str().unwrap().contains("dns3"), "{v}");
+        assert_eq!(dnssec_status(&p, &pr, "n3.test")["denial"], "nsec");
+        ok(
+            put(json!({ "enabled": true, "denial": "nsec" })),
+            "NSEC stays allowed",
+        );
+        // The old standby still serves valid NSEC answers and follows.
+        add_record(&p, &pr, "n3.test", "late", "192.0.2.90");
+        wait_reconciled(&p, &pr, &old, &or, "old standby after a change");
+        verify_zone(&root_dir, old.dns, "n3.test", "old standby nsec");
+        drop(old);
+    }
+    drop(p);
     let _ = std::fs::remove_dir_all(&root_dir);
 }

@@ -1756,7 +1756,7 @@
           "DNSSEC"
         ],
         "summary": "Turn DNSSEC signing on or off",
-        "description": "Needs the owner role. **On**: the zone is signed from now on (a key is generated the first time). Nothing changes for resolvers until the DS record is published at the registrar. **Off**: refused with 409 `ds_published` while the parent publishes a DS for the zone (or when that cannot be checked): remove the DS at the registrar first and wait for its TTL. `force: true` skips that check.",
+        "description": "Needs the owner role. **On**: the zone is signed from now on (a key is generated the first time). Nothing changes for resolvers until the DS record is published at the registrar. **Off**: refused with 409 `ds_published` while the parent publishes a DS for the zone (or when that cannot be checked): remove the DS at the registrar first and wait for its TTL. `force: true` skips that check. **Denial** (`denial`, with `enabled: true`): `nsec` (default) or `nsec3` (RFC 5155 with RFC 9276 parameters); switching re-signs the zone at once with the same key (no DS change). Choosing `nsec3` is refused (409) while a standby of a version without NSEC3 follows this server (it would sign the zone with NSEC).",
         "operationId": "set_dnssec",
         "parameters": [
           {
@@ -5715,6 +5715,14 @@
           "deleted"
         ]
       },
+      "Denial": {
+        "type": "string",
+        "description": "Denial of existence of a signed zone (O24).",
+        "enum": [
+          "nsec",
+          "nsec3"
+        ]
+      },
       "DnsCounters": {
         "type": "object",
         "description": "DNS counters since start.",
@@ -5962,6 +5970,10 @@
           "new_key": {
             "type": "boolean",
             "description": "Turning on while off: replace the kept key with a new one (a new DS\nmust then be published at the registrar)."
+          },
+          "denial": {
+            "$ref": "#/components/schemas/Denial",
+            "description": "With `enabled: true`: sign with NSEC or NSEC3 from now on (absent:\nunchanged; new zones use NSEC). Switching a signed zone is one\natomic re-sign with the same key: no DS change, answers validate\nbefore, during and after it."
           }
         }
       },
@@ -6035,7 +6047,8 @@
           "error",
           "signature_validity_days",
           "resign_before_days",
-          "standby"
+          "standby",
+          "denial"
         ],
         "properties": {
           "zone": {
@@ -6099,9 +6112,14 @@
           "standby": {
             "type": "boolean",
             "description": "This server is a read-only standby: it signs in memory with the\nreplicated key and never re-signs by itself."
+          },
+          "denial": {
+            "$ref": "#/components/schemas/Denial",
+            "description": "How the zone proves that a name or type does not exist (O24),\nkept while signing is off."
           }
         },
         "example": {
+          "denial": "nsec",
           "ds": [
             {
               "algorithm": 13,
@@ -11179,6 +11197,10 @@
           "settings": {
             "$ref": "#/components/schemas/ZoneSettings",
             "description": "Per-zone server settings (O16): automatic PTR, transfer ACL, NOTIFY\ntargets; absent: the server's for everything."
+          },
+          "nsec3": {
+            "type": "boolean",
+            "description": "O24: a signed zone proves non-existence with NSEC3 (RFC 5155 with\nthe RFC 9276 parameters: SHA-1, no extra iterations, no salt, no\nopt-out) instead of NSEC; absent: NSEC."
           }
         }
       },

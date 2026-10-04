@@ -15,7 +15,7 @@ Single static binary, one SQLite file, one TOML config. Zero JavaScript build.
   HINFO, DNAME and DS. SOA and apex NS are synthesized from zone settings when
   not set explicitly.
 - DNSSEC online signing per zone (off by default): ECDSA P-256 combined
-  signing key, NSEC denial, signatures renewed automatically, DS records for
+  signing key, NSEC or NSEC3 denial, signatures renewed automatically, DS records for
   the registrar and a pre-publication check in the console (see
   [DNSSEC](#dnssec)).
 - CNAME chasing, RFC 4592 wildcards, delegations with glue, RFC 2308 negative
@@ -436,7 +436,8 @@ the DO bit of a query is now copied into the response (RFC 3225).
 
 **What is signed.** One combined signing key per zone (flags 257, SEP,
 algorithm 13 = ECDSA P-256 / SHA-256), generated on this server the first time
-signing is turned on. Denial of existence is NSEC (not NSEC3). Every
+signing is turned on. Denial of existence is NSEC by default, or NSEC3 per
+zone (see **NSEC3** below). Every
 authoritative RRset is signed: SOA, apex NS, DNSKEY, every record set and
 every NSEC; a DS RRset at a delegation point is signed (DS records can be
 added in the record editor); the NS RRset at a delegation and glue below it
@@ -463,6 +464,34 @@ complete. Zone transfers of a signed zone carry the DNSKEY, every RRSIG and
 NSEC (TSIG-signed as usual). **Automatic PTR answers are not synthesized in a
 signed zone** (they could not be signed); auto-PTR for names outside any zone
 is unchanged.
+
+**NSEC3.** Per zone, `denial: "nsec3"` (console: DNSSEC tab -> **Switch to
+NSEC3**, or when turning signing on; API: `PUT /api/zones/{zone}/dnssec` with
+`{"enabled": true, "denial": "nsec3"}`; `"nsec"` switches back) signs the zone
+with NSEC3 (RFC 5155) using the RFC 9276 parameters: hash SHA-1, no extra
+iterations, no salt, no opt-out (flags 0), and an `NSEC3PARAM 1 0 0 -` at the
+apex. Every authoritative name, every delegation point and every empty
+non-terminal has an NSEC3 (owner `<base32hex hash>.<zone>`, TTL as the NSEC
+records: min(SOA minimum, zone TTL)); names below a cut or a DNAME have none.
+Answers carry the RFC 5155 section 7.2 proofs: NXDOMAIN with the closest
+encloser proof (the NSEC3 matching the closest encloser, the one covering the
+next closer name) and the NSEC3 covering the wildcard at the closest
+encloser; NODATA (and empty non-terminals, and DS queries at a cut without
+DS) with the matching NSEC3; wildcard answers with the NSEC3 covering the next
+closer name; wildcard NODATA with all three. A query for an NSEC3 owner name
+is NXDOMAIN (section 7.2.8); an NSEC query is NODATA. Zone transfers carry the
+NSEC3PARAM, every NSEC3 and their RRSIGs instead of the NSEC records.
+Switching between NSEC and NSEC3 is one atomic re-sign with the **same key**
+(a serial bump): no DS change at the registrar, and every answer validates
+before, during and after it (both chains are signed by the DNSKEY the DS
+points to; algorithm 13 is defined for both, the NSEC3-only algorithm numbers
+of RFC 5155 section 2 concern RSA/SHA-1 aliases 6 and 7). A resolver that
+cached an NSEC proof keeps a valid proof until it expires. Standbys sign with
+NSEC3 too (their own signatures; the NSEC3 records are identical). Choosing
+NSEC3 is refused (409) while a standby of an older version follows (it would
+sign the zone with NSEC); upgrade standbys first. NSEC3 hides names from
+casual zone walking but not from an offline dictionary attack on the hashes
+(RFC 9276); it is not a secrecy feature.
 
 **Signatures and re-signing.** The zone is signed in memory whenever the
 catalog is built after a change, and the signed view is cached until the zone
@@ -1148,7 +1177,8 @@ ceiling is the OS loopback path, not the server. Resident memory stays around
 
 ## Not yet
 
-- DNSSEC: NSEC3, automated key rollover through CDS/CDNSKEY (the wizard
+- DNSSEC: NSEC3 opt-out and salts / extra iterations (RFC 9276 advises
+  against them), automated key rollover through CDS/CDNSKEY (the wizard
   above needs the DS change done by hand), algorithms other than 13.
 - Inbound NOTIFY / acting as a secondary for zones hosted elsewhere; automatic failover.
 - DNS over TLS/HTTPS, response tuple rate limiting (RRL by answer), and per-zone forwarding,
