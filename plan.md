@@ -971,7 +971,7 @@ Group 6: DNS protocol depth (all OFF by default; live zone not switched)
   standby).
 
 Final
-- [ ] O31. Final verification (owner, 2026-10-04): after Group 6, run the
+- [x] O31. Final verification (owner, 2026-10-04): after Group 6, run the
   full gate with both previous binaries (d32d67f and 3884ba8), the
   equivalence script against d32d67f (only documented differences), the
   browser suite, and a fresh end-to-end pass on a local primary+standby
@@ -2632,3 +2632,40 @@ Final
   is handled (accepted from a primary or with the zone key, else
   REFUSED). `tests/secondary.rs` asserts NOTIMP. Equivalence after the
   fix: 20,743 cases, 0 differences.
+- 2026-10-05 (phase O): Group 6 checkpoint gates, in the clean worktree,
+  both previous binaries, the rustup clippy included (gate header).
+  f63d3df (O24 + O25): all 16 steps PASS; 343 tests with d32d67f and 343
+  with 3884ba8 (`--no-fail-fast`), no orphaned test server before,
+  between or after; UI duration / access / browser; OpenAPI snapshot and
+  validator; conformance 150/150; smoke; cargo-audit only `paste`.
+  df51773 (O26 + O27 + O28): all 16 steps PASS; 356 tests with each
+  previous binary; browser suite 60 checks; conformance 158/158; smoke;
+  cargo-audit only `paste`. O29 (fc76ef1) and the NOTIFY follow-up
+  (ad5e159) are covered by the O31 gate below (the O27-O30 checkpoint
+  and the final gate are the same run).
+- 2026-10-05 (phase O): O31 final verification on ad5e159 (clean
+  worktree; `<scratch>/phaseo/gate-o31`). Full gate: fmt, clippy
+  `-D warnings` with Homebrew 1.98 AND rustup 1.94, all tests with
+  `REQUIRE_BIND_TOOLS=1 REQUIRE_PREV_BIN=1 --no-fail-fast` against
+  d32d67f (360 passed, 0 failed) and against 3884ba8 (360 / 0), orphan
+  check before, after the tests and at the end (0), UI duration / access,
+  browser suite (60 checks, 0 failures), OpenAPI snapshot and validator,
+  conformance 158/158, smoke, cargo-audit (only `paste`): all PASS.
+  Equivalence d32d67f vs ad5e159 (defaults): 20,743 cases, 0 differences
+  (before the NOTIFY follow-up: 18, all NOTIFY, see above). End-to-end:
+  new reusable `scripts/e2e-phase-o.py BIN` (U = an independent server as
+  the external primary of a secondary zone, P = primary with RRL, DoT and
+  DoH, S = its standby, C = a standby of S): 34/34 on the ad5e159 build:
+  O7 CSRF refusal, O6 policy and history, O1 token revocation on
+  password change, O4 sign-in audit, O5 admin MFA enrollment, O9 search,
+  O10 bulk, O11 clone + rename, O15 cookie exemption, O16 per-zone
+  settings, O22 gzip snapshot, O21 C serves P's data and the replica
+  lists, O24 NSEC3 denial validated by delv on P and S, O25 Ed25519
+  validated on P and S, O28 LOC on P and S, O27 the secondary zone served
+  by P and S from their own transfers, read-only, refreshed by NOTIFY,
+  O29 DoT / DoH POST / DoH GET, O26 RRL (5-10 answers of 40, slips, the
+  rest dropped; another name unaffected), and S and C reconciled, not
+  halted. Not covered by the script (covered elsewhere): console flows
+  (browser suite), O14 / O18-O20 (CI), O13 soak, O23 (follow tests).
+  Group 6 outcome: O24-O29 done, O30 skipped with the reason and O30a
+  proposed; O8a (passkeys) stays parked for the owner.
