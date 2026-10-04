@@ -1345,3 +1345,16 @@ what the registrar's DS must match on the live zone; plan it separately.
   change), iterator loop. Gate re-run on the fix.
 - 2026-10-04 (phase M): M5 done (scripts/soak.py + README; local 4-min run
   clean; not run on dns-test).
+- 2026-10-04 (phase M): gates. After M1-M3 (+M4) on 79b87ea and at the
+  end on 941dda5, both in the clean worktree: fmt, clippy `-D warnings`,
+  all tests with `REQUIRE_BIND_TOOLS=1 REQUIRE_PREV_BIN=1` against d32d67f
+  AND 3884ba8 (224 unit tests; suites api_contract 5, dnssec 3,
+  dnssec_changes 1, e2e 6, follow 11, forwarding 8, hardening 10, netlink
+  0 (Linux only), openapi_spec 8, resolver 8, tsig 9), `duration` and
+  `access` UI tests, the browser test with `REQUIRE_BROWSER_TEST=1`,
+  OpenAPI snapshot + validator, conformance 127/127, smoke, cargo-audit
+  (only `paste`): all pass. Phase M complete; nothing pushed, tagged or
+  deployed. Rollout for M: protocol 2, no new change kind, fixture
+  untouched; upgrade baba2 (standby) first, then gate; create scoped
+  tokens and zone record policies only after both run this version (an
+  older standby halts on them by design; see Rollout).
