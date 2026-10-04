@@ -856,11 +856,21 @@ Group 2: console productivity
 - [x] O12. Records table column sorting and keyboard shortcuts.
 
 Group 3: operations
-- [ ] O13. Soak test on dns-test (owner approved by "do all"): build release,
+- [x] O13. Soak test on dns-test (owner approved by "do all"): build release,
   run scripts/soak.py on the LXD container home:dns-test for a few hours,
   with a standby; record numbers in plan.md. Do not touch its /opt/rust-dns
   service; use separate ports and a scratch directory; stop everything after.
   This is the ONLY container/remote machine this phase may use.
+
+  O13 result (2026-10-04, run done; soak verdict FAIL on memory): see the
+  Log. Follow-up needed: O13a below.
+- [ ] O13a. (found by O13) RSS of primary and standby grows steadily under
+  the soak (about 0.27 MiB per minute, 15 MiB -> 49 MiB in 2 h, no
+  plateau) while the data stays small (0.7 MB database + 4 MB WAL, a
+  bounded record pool). Find what grows (per change or per query: event
+  bus history, changelog caches, rate-limiter / cookie / forward caches,
+  signature cache of the signed zone, SQLite page cache per connection)
+  with a heap profile on a long local run; fix or bound it; soak again.
 - [x] O14. Live updates through a reverse proxy: CI job on Linux with nginx
   in front of the console (websocket upgrade works, live feed receives an
   event); locally skipped when nginx is missing.
@@ -2024,3 +2034,21 @@ Final
   own "cannot bind UDP ... Address already in use" at start. Tests: the
   SIGKILL check above (manual, scripts/check-orphans.sh), all suites pass
   with the hook; re-run of the stress below.
+- 2026-10-04 (phase O): O13 done (soak run; verdict FAIL on memory, see
+  O13a). Release build of db49d46 (cargo zigbuild, x86_64 musl) in a
+  scratch directory on home:dns-test (started for this, stopped again
+  after; /opt/rust-dns untouched; scratch removed). `scripts/soak.py
+  --duration 2h --qps 500 --change-rate 6 --interval 60`: primary +
+  standby on loopback, DNSSEC-signed zone, 718 record changes (0 errors).
+  Primary: 3,590,968 queries, 308 timeouts, 0 wrong (0.0086%); p50
+  0.16 ms, p99 median of samples 0.255 ms, worst sample p99 305.7 ms, max
+  2227 ms. Standby: 3,591,897 queries, 416 timeouts, 23 NXDOMAIN for
+  records just added (replication window), 0.0122%; p50 0.13 ms, p99
+  median 0.224 ms, worst 677.7 ms. All timeouts fell in four samples
+  between 4564 s and 4927 s, on both servers at once (a host-wide stall
+  of the container is the likely cause; not proven). Replication lag 0 in
+  every sample, state following, never halted, caught up at the end;
+  file descriptors flat (23 / 22). Memory: RSS 15.6 -> 49.3 MiB (primary)
+  and 15.5 -> 44.0 MiB (standby), roughly linear, growth after warm-up
+  168% / 153% against the 50% limit: the soak's FAIL. Note: the script's
+  `cpu_s` stayed at 1.0 throughout (its CPU reading looks broken).
