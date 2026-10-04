@@ -221,7 +221,8 @@ Before exposing rust-dns to the internet, note:
   limits; per account and network, exponential waits after
   `login_backoff_after` failures (up to 15 minutes); per account from all
   networks, waits capped at one minute (a distributed attack is slowed, the
-  owner is never locked out for long); 5 wrong codes end an MFA-pending or
+  owner is never locked out for long); these counters are stored (local
+  table `login_failures`), so a restart does not reset them; 5 wrong codes end an MFA-pending or
   signed-in session. TOTP codes are single-use (the last accepted time step
   is stored). Replacing an enrolled authenticator needs the current code or
   password. Changing your password signs out your other sessions; API tokens

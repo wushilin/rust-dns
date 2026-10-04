@@ -772,7 +772,7 @@ Group 1: security and accounts
 - [x] O2. Instant websocket cut-off: publish session/token revocation and
   user disable/scope change on the bus; sockets close at once (keep the 10 s
   re-check as a backstop).
-- [ ] O3. Login back-off counters survive restarts (local table, classified
+- [x] O3. Login back-off counters survive restarts (local table, classified
   Local, pruned).
 - [ ] O4. Login audit view in the console (sign-ins, failures, MFA, from the
   audit log; filter by user/IP/result).
@@ -1596,3 +1596,15 @@ Final
   disabled-account tests now require < 3 s),
   `follow::a_revocation_on_the_primary_closes_standby_streams_at_once`.
   No console change.
+- 2026-10-04 (phase O): O3 done. New local table `login_failures`
+  (classified `Local` in `replication/tables.rs`: per-server
+  bookkeeping, never replicated or changelogged, like sessions): the
+  guard's per-account and per-network counters are written through on
+  each failure (after its lock is released), deleted on success, loaded
+  at startup (`AttemptGuard::persist_to`, wall-clock ms converted to
+  `Instant`s), pruned by the 10-minute retention task once forgotten (30
+  min quiet and no wait left). Per-session code counters stay in memory.
+  An older binary ignores the table. Tests:
+  `api::guard::tests::backoff_survives_a_restart`,
+  `hardening::login_backoff_survives_a_restart`,
+  `replication::tables::tests::every_table_is_classified`.

@@ -223,6 +223,17 @@ CREATE TABLE IF NOT EXISTS replicas (
     data        TEXT NOT NULL,
     last_seen   TEXT NOT NULL
 );
+-- O3: failed sign-in counters (api::guard), so a restart does not reset
+-- the back-off. Local bookkeeping on each server (never replicated);
+-- rows are deleted on success and pruned once forgotten.
+CREATE TABLE IF NOT EXISTS login_failures (
+    scope             TEXT NOT NULL,     -- 'account' | 'network'
+    key               TEXT NOT NULL,     -- username, or username TAB network key (hex)
+    count             INTEGER NOT NULL,
+    last_ms           INTEGER NOT NULL,  -- Unix ms of the last failure
+    blocked_until_ms  INTEGER NOT NULL,
+    PRIMARY KEY (scope, key)
+);
 CREATE TABLE IF NOT EXISTS api_tokens (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -266,6 +277,16 @@ pub struct TokenInfo {
     /// exactly the owner's rights.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scope: Option<crate::model::TokenScope>,
+}
+
+/// O3: one stored failed sign-in counter (see `api::guard`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginFailureRow {
+    pub scope: String,
+    pub key: String,
+    pub count: u32,
+    pub last_ms: i64,
+    pub blocked_until_ms: i64,
 }
 
 /// `last_used_at` is refreshed at most this often while the IP is unchanged.
@@ -595,6 +616,60 @@ impl Storage {
             Err(TryLockError::WouldBlock) => return Ok(()),
         };
         f(&conn)
+    }
+
+    // ---- O3: failed sign-in counters (local bookkeeping) -------------------
+
+    /// Store one counter of `api::guard` (replacing it).
+    pub fn save_login_failure(&self, f: &LoginFailureRow) -> Result<()> {
+        self.bookkeeping(|c| {
+            c.execute(
+                "INSERT INTO login_failures (scope, key, count, last_ms, blocked_until_ms) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(scope, key) DO UPDATE SET count = excluded.count, last_ms = excluded.last_ms,
+                     blocked_until_ms = excluded.blocked_until_ms",
+                params![f.scope, f.key, f.count, f.last_ms, f.blocked_until_ms],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn delete_login_failure(&self, scope: &str, key: &str) -> Result<()> {
+        self.bookkeeping(|c| {
+            c.execute(
+                "DELETE FROM login_failures WHERE scope = ?1 AND key = ?2",
+                params![scope, key],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn load_login_failures(&self) -> Result<Vec<LoginFailureRow>> {
+        self.with_read(|c| {
+            let mut stmt = c.prepare(
+                "SELECT scope, key, count, last_ms, blocked_until_ms FROM login_failures ORDER BY scope, key",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok(LoginFailureRow {
+                    scope: r.get(0)?,
+                    key: r.get(1)?,
+                    count: r.get(2)?,
+                    last_ms: r.get(3)?,
+                    blocked_until_ms: r.get(4)?,
+                })
+            })?;
+            Ok(rows.collect::<rusqlite::Result<_>>()?)
+        })
+    }
+
+    /// Delete counters whose last failure is older than `forgotten_before_ms`
+    /// and whose wait is over at `now_ms`.
+    pub fn prune_login_failures(&self, forgotten_before_ms: i64, now_ms: i64) -> Result<usize> {
+        self.bookkeeping(|c| {
+            Ok(c.execute(
+                "DELETE FROM login_failures WHERE last_ms < ?1 AND blocked_until_ms <= ?2",
+                params![forgotten_before_ms, now_ms],
+            )?)
+        })
     }
 
     /// Replica tracking (primary side): bookkeeping like token `last_used_at`,

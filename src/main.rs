@@ -305,6 +305,14 @@ async fn main() -> anyhow::Result<()> {
         started: std::time::Instant::now(),
         repl: repl.clone(),
     });
+    // O3: failed sign-in counters survive restarts.
+    match state.guard.persist_to(storage.clone()) {
+        Ok(n) if n > 0 => {
+            tracing::info!(counters = n, "failed sign-in counters restored")
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "could not load failed sign-in counters"),
+    }
     let web_task = tokio::spawn(api::serve(state.clone()));
     // N1: the key rollover driver (acts only while this server is writable).
     api::rollover::spawn_driver(state.clone());
@@ -351,6 +359,11 @@ async fn main() -> anyhow::Result<()> {
                     _ => {}
                 }
                 let _ = storage.prune_sessions();
+                let now_ms = api::guard::unix_ms_now();
+                let _ = storage.prune_login_failures(
+                    now_ms - api::guard::FORGET_AFTER.as_millis() as i64,
+                    now_ms,
+                );
             }
         });
     }

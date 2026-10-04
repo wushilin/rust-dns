@@ -519,6 +519,45 @@ fn totp_replay_rejected_after_restart() {
     assert_eq!(s, 200);
 }
 
+/// O3: the failed sign-in back-off is stored, so a restart does not give
+/// an attacker a fresh set of attempts.
+#[test]
+fn login_backoff_survives_a_restart() {
+    let mut srv = Server::start("backoff-restart", "", "login_backoff_after = 1", "");
+    let web = srv.web.clone();
+    // (status, Retry-After seconds)
+    let attempt = |pw: &str| -> (u16, u64) {
+        let r = match agent()
+            .post(&format!("{web}/api/auth/login"))
+            .send_json(serde_json::json!({ "username": "root", "password": pw }))
+        {
+            Ok(r) | Err(ureq::Error::Status(_, r)) => r,
+            Err(e) => panic!("{e}"),
+        };
+        let wait = r
+            .header("retry-after")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        (r.status(), wait)
+    };
+    // Four counted failures (each after the previous wait): waits 1, 2, 4 s.
+    let mut counted = 0;
+    while counted < 4 {
+        match attempt("wrong-password") {
+            (401, _) => counted += 1,
+            (429, w) => std::thread::sleep(Duration::from_millis(w * 1000 + 100)),
+            other => panic!("{other:?}"),
+        }
+    }
+    let (s, before) = attempt("rootpass123");
+    assert_eq!(s, 429, "waiting before the restart");
+    assert!(before >= 3, "a 4 s wait: {before}");
+    srv.restart();
+    let (s, after) = attempt("rootpass123");
+    assert_eq!(s, 429, "still waiting after the restart");
+    assert!(after >= 1 && after <= before, "{after} vs {before}");
+}
+
 /// Open a websocket with raw HTTP; returns the stream (after the headers)
 /// and the response head.
 fn ws_open(web: &str, path: &str, extra_headers: &str) -> (TcpStream, String) {

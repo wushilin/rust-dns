@@ -1,4 +1,6 @@
-//! Failed sign-in bookkeeping (in memory; a restart forgets it).
+//! Failed sign-in bookkeeping: in memory, written through to the local
+//! `login_failures` table (O3) so a restart does not reset a back-off
+//! (`AttemptGuard::persist_to` loads it at startup).
 //!
 //! Three independent brakes, on top of the per-client request rate limit:
 //!
@@ -21,11 +23,14 @@
 //! password or code is checked, so refusals reveal nothing. Failures older
 //! than [`FORGET_AFTER`] are forgotten; a successful sign-in clears the
 //! caller's own per-network counter (not the account-wide one).
+//! The per-session code counters stay in memory only (a restart ends
+//! nothing: the session is still limited by the account back-off).
 
+use crate::storage::{LoginFailureRow, Storage};
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Defaults; the per-network value is `[web_console].login_backoff_after`
 /// and the account-wide one four times that.
@@ -94,9 +99,42 @@ impl<K: std::hash::Hash + Eq + Clone> Table<K> {
         }
     }
 
-    fn clear(&mut self, k: &K) {
-        self.map.remove(k);
+    fn clear(&mut self, k: &K) -> bool {
+        self.map.remove(k).is_some()
     }
+}
+
+const SCOPE_ACCOUNT: &str = "account";
+const SCOPE_NETWORK: &str = "network";
+
+fn network_key(username: &str, net: u128) -> String {
+    format!("{username}\t{net:x}")
+}
+
+/// Wall-clock milliseconds of `at` (an `Instant` near now).
+fn wall_ms(at: Instant, now: Instant, now_ms: i64) -> i64 {
+    if at >= now {
+        now_ms.saturating_add(at.duration_since(now).as_millis() as i64)
+    } else {
+        now_ms.saturating_sub(now.duration_since(at).as_millis() as i64)
+    }
+}
+
+/// The `Instant` of wall-clock `ms` (clamped to what `Instant` can hold).
+fn instant_of(ms: i64, now: Instant, now_ms: i64) -> Instant {
+    if ms >= now_ms {
+        now + Duration::from_millis((ms - now_ms) as u64)
+    } else {
+        let back = Duration::from_millis((now_ms - ms) as u64);
+        now.checked_sub(back).unwrap_or(now)
+    }
+}
+
+pub fn unix_ms_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 #[derive(Default)]
@@ -110,6 +148,8 @@ pub struct AttemptGuard {
     inner: Mutex<Inner>,
     free_client: u32,
     free_account: u32,
+    /// O3: where counters are written through (unset in unit tests).
+    store: OnceLock<Arc<Storage>>,
 }
 
 impl Default for AttemptGuard {
@@ -126,6 +166,67 @@ impl AttemptGuard {
             inner: Mutex::new(Inner::default()),
             free_client: free,
             free_account: free.saturating_mul(4),
+            store: OnceLock::new(),
+        }
+    }
+
+    /// O3: load the stored counters (those not yet forgotten) and write
+    /// every later change through to `storage`. Call once, at startup.
+    pub fn persist_to(&self, storage: Arc<Storage>) -> anyhow::Result<usize> {
+        let (now, now_ms) = (Instant::now(), unix_ms_now());
+        let forget_ms = FORGET_AFTER.as_millis() as i64;
+        let rows = storage.load_login_failures()?;
+        let mut loaded = 0;
+        {
+            let mut g = self.lock();
+            for r in rows {
+                if r.last_ms < now_ms - forget_ms && r.blocked_until_ms <= now_ms {
+                    continue; // forgotten; the prune task deletes it
+                }
+                let f = Failures {
+                    count: r.count,
+                    last: instant_of(r.last_ms, now, now_ms),
+                    blocked_until: instant_of(r.blocked_until_ms, now, now_ms),
+                };
+                match r.scope.as_str() {
+                    SCOPE_ACCOUNT => {
+                        g.per_account.map.insert(r.key, f);
+                    }
+                    SCOPE_NETWORK => {
+                        let Some((user, net)) = r.key.split_once('\t') else {
+                            continue;
+                        };
+                        let Ok(net) = u128::from_str_radix(net, 16) else {
+                            continue;
+                        };
+                        g.per_client.map.insert((user.to_string(), net), f);
+                    }
+                    _ => continue,
+                }
+                loaded += 1;
+            }
+        }
+        let _ = self.store.set(storage);
+        Ok(loaded)
+    }
+
+    /// Write counters through (after the lock is released).
+    fn save(&self, rows: &[(&str, String, Failures)], now: Instant) {
+        let Some(store) = self.store.get() else {
+            return;
+        };
+        let now_ms = unix_ms_now();
+        for (scope, key, f) in rows {
+            let row = LoginFailureRow {
+                scope: scope.to_string(),
+                key: key.clone(),
+                count: f.count,
+                last_ms: wall_ms(f.last, now, now_ms),
+                blocked_until_ms: wall_ms(f.blocked_until, now, now_ms),
+            };
+            if let Err(e) = store.save_login_failure(&row) {
+                tracing::warn!(error = %e, "could not store a failed sign-in counter");
+            }
         }
     }
 
@@ -155,26 +256,36 @@ impl AttemptGuard {
 
     pub fn failure_at(&self, username: &str, ip: IpAddr, now: Instant) {
         let (free_client, free_account) = (self.free_client, self.free_account);
-        let mut g = self.lock();
-        g.per_client.fail(
-            (username.to_string(), crate::ratelimit::client_key(ip)),
-            now,
-            free_client,
-            MAX_CLIENT_DELAY,
-        );
-        let n = g
-            .per_account
-            .fail(username.to_string(), now, free_account, MAX_ACCOUNT_DELAY);
+        let net = crate::ratelimit::client_key(ip);
+        let (client, account, n) = {
+            let mut g = self.lock();
+            let ck = (username.to_string(), net);
+            g.per_client
+                .fail(ck.clone(), now, free_client, MAX_CLIENT_DELAY);
+            let n = g
+                .per_account
+                .fail(username.to_string(), now, free_account, MAX_ACCOUNT_DELAY);
+            (g.per_client.map[&ck], g.per_account.map[username], n)
+        };
         if n == free_account + 1 {
             tracing::warn!(user = %username, "repeated failed sign-ins for this account; slowing down attempts from every address");
         }
+        self.save(
+            &[
+                (SCOPE_NETWORK, network_key(username, net), client),
+                (SCOPE_ACCOUNT, username.to_string(), account),
+            ],
+            now,
+        );
     }
 
     /// A successful sign-in clears this network's counter for the account.
     pub fn success(&self, username: &str, ip: IpAddr) {
-        self.lock()
-            .per_client
-            .clear(&(username.to_string(), crate::ratelimit::client_key(ip)));
+        let net = crate::ratelimit::client_key(ip);
+        let had = self.lock().per_client.clear(&(username.to_string(), net));
+        if let (true, Some(store)) = (had, self.store.get()) {
+            let _ = store.delete_login_failure(SCOPE_NETWORK, &network_key(username, net));
+        }
     }
 
     /// Count a wrong code on `session_id`. Returns true when the session has
@@ -251,6 +362,68 @@ mod tests {
         // Forgotten after a quiet period.
         let later = t0 + FORGET_AFTER + Duration::from_secs(1);
         assert!(g.wait_at("root", fresh, later).is_none());
+    }
+
+    /// O3: counters written through to the local table come back after a
+    /// "restart" (a new guard on the same database): a back-off in effect
+    /// stays in effect; success deletes the network row; forgotten rows are
+    /// skipped and pruned.
+    #[test]
+    fn backoff_survives_a_restart() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        let g = AttemptGuard::new(2);
+        g.persist_to(storage.clone()).unwrap();
+        for _ in 0..4 {
+            g.failure("alice", ip);
+        }
+        let before = g.wait("alice", ip).expect("waiting");
+        assert!(before >= Duration::from_millis(1500), "{before:?}");
+        let rows = storage.load_login_failures().unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows.iter().all(|r| r.count == 4));
+
+        let g2 = AttemptGuard::new(2);
+        assert_eq!(g2.persist_to(storage.clone()).unwrap(), 2);
+        let after = g2
+            .wait("alice", ip)
+            .expect("still waiting after the restart");
+        assert!(
+            after.abs_diff(before) < Duration::from_millis(500),
+            "{after:?} vs {before:?}"
+        );
+        // The count goes on from where it was.
+        g2.failure("alice", ip);
+        assert!(storage
+            .load_login_failures()
+            .unwrap()
+            .iter()
+            .all(|r| r.count == 5));
+        g2.success("alice", ip);
+        let rows = storage.load_login_failures().unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "the network row is gone, the account row stays"
+        );
+        assert_eq!(rows[0].scope, "account");
+
+        // A row forgotten long ago is not loaded, and the prune deletes it.
+        let old = unix_ms_now() - FORGET_AFTER.as_millis() as i64 - 60_000;
+        storage
+            .save_login_failure(&LoginFailureRow {
+                scope: "account".into(),
+                key: "bob".into(),
+                count: 50,
+                last_ms: old,
+                blocked_until_ms: old,
+            })
+            .unwrap();
+        let g3 = AttemptGuard::new(2);
+        g3.persist_to(storage.clone()).unwrap();
+        assert!(g3.wait("bob", ip).is_none());
+        let cut = unix_ms_now() - FORGET_AFTER.as_millis() as i64;
+        assert_eq!(storage.prune_login_failures(cut, unix_ms_now()).unwrap(), 1);
     }
 
     #[test]

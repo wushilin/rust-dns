@@ -160,6 +160,10 @@ pub const TABLES: &[Table] = &[
     local("replication_state"),
     // Primary side: the standbys that follow this server.
     local("replicas"),
+    // O3: failed sign-in counters; each server slows down attempts made
+    // against it (like sessions). Bookkeeping in storage.rs, not audited:
+    // the failures themselves are (O4).
+    local("login_failures"),
     // SQLite's AUTOINCREMENT counters.
     local("sqlite_sequence"),
 ];
