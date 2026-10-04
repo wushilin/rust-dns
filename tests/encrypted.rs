@@ -350,11 +350,11 @@ fn dns_over_tls_and_https_inbound_and_upstream() {
     drop(s);
 
     // ---- upstream: rust-dns forwards over DoT and DoH to named ----
+    // The upstream part needs `named` (CI installs only BIND's utilities):
+    // skipped without it unless REQUIRE_NAMED=1.
     let Some(named) = tool("named") else {
-        assert!(
-            std::env::var("REQUIRE_BIND_TOOLS").is_err(),
-            "named not found"
-        );
+        assert!(std::env::var("REQUIRE_NAMED").is_err(), "named not found");
+        eprintln!("encrypted: named not found; skipping the upstream part");
         return;
     };
     let wd = dir.join("bind");

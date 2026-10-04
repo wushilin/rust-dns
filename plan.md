@@ -2669,3 +2669,12 @@ Final
   (browser suite), O14 / O18-O20 (CI), O13 soak, O23 (follow tests).
   Group 6 outcome: O24-O29 done, O30 skipped with the reason and O30a
   proposed; O8a (passkeys) stays parked for the owner.
+- 2026-10-05 (phase O): CI fit for the two new suites (after the O31
+  gate; test-only change). CI installs BIND's utilities but not `named`
+  and sets `REQUIRE_BIND_TOOLS=1`; `tests/secondary.rs` (needs `named` as
+  the primary) and the upstream part of `tests/encrypted.rs` now skip
+  without `named` (as `tests/tsig.rs` already did) unless `REQUIRE_NAMED=1`;
+  locally both ran with `REQUIRE_BIND_TOOLS=1 REQUIRE_NAMED=1` (pass),
+  both clippies clean. Secondary zones stay covered in CI by
+  `tests/follow.rs` (rust-dns as the zone's primary). Proposed for the
+  gate: add `REQUIRE_NAMED=1` to the local test runs.
