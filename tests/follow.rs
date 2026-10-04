@@ -445,7 +445,11 @@ fn primary_standby_failover_and_rejoin() {
     });
     let r = replica(&pr);
     assert_eq!(r["lag_changes"], 0);
-    assert_eq!(r["version"], env!("CARGO_PKG_VERSION"));
+    // The version with what the standby can follow (N1).
+    assert_eq!(
+        r["version"],
+        format!("{}+dnssec-rollover", env!("CARGO_PKG_VERSION"))
+    );
     assert_eq!(r["address"], "127.0.0.1");
     assert_eq!(r["conflict"], false);
     assert!(pst["replicas"].to_string().contains("dns2"), "{pst}");
