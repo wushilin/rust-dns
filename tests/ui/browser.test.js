@@ -343,7 +343,9 @@ async function phaseO(b, p, rootApi, admin) {
   await olive.eval(`document.querySelector('#pw-revoke').checked = true; return true`);
   await olive.click('#pw-btn');
   await olive.wait('password changed', `return document.querySelector('#toasts').textContent.includes('API tokens revoked') || document.querySelector('#pw-err').textContent`);
-  const after = await bearer(otok, 'GET', '/me'); ok('O1: password change from the console revokes the tokens', after === 401, String(after));
+  // On failure, say what the console showed (error text, toasts), not only the status.
+  const pwShown = await olive.eval(`return 'pw-err: ' + document.querySelector('#pw-err').textContent + ' | toasts: ' + document.querySelector('#toasts').textContent`);
+  const after = await bearer(otok, 'GET', '/me'); ok('O1: password change from the console revokes the tokens', after === 401, `${after} :: ${pwShown}`);
 
   // O4: the sign-in log, filtered on user and result.
   await fetch(`${p.url}/api/auth/login`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ username: 'olive', password: 'not-olive-password' }) });
