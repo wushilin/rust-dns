@@ -49,6 +49,10 @@ echo "--- del"
 ip addr del 192.0.2.77/32 dev lo
 wait_log "interface address gone" 30
 kill $pid; wait $pid || true
+# The server runs with umask 0077: under `sudo` its log is root-only, so
+# print it from inside the namespace (same privileges as the server).
+echo "=== server.log"
+cat "$DIR/server.log" 2>/dev/null || true
 "#;
 
 #[test]
@@ -74,7 +78,13 @@ fn interface_addresses_are_followed_through_netlink() {
         .arg(&dir)
         .output()
         .expect("run the namespace script");
-    let log = std::fs::read_to_string(dir.join("server.log")).unwrap_or_default();
+    // The log as printed by the script (readable even when the server ran as
+    // root under `sudo`), else the file.
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let log = match stdout.split_once("=== server.log\n") {
+        Some((_, l)) if !l.trim().is_empty() => l.to_string(),
+        _ => std::fs::read_to_string(dir.join("server.log")).unwrap_or_default(),
+    };
     let ctx = format!(
         "script: {}{}\nlog:\n{log}",
         String::from_utf8_lossy(&out.stdout),
