@@ -2678,3 +2678,18 @@ Final
   both clippies clean. Secondary zones stay covered in CI by
   `tests/follow.rs` (rust-dns as the zone's primary). Proposed for the
   gate: add `REQUIRE_NAMED=1` to the local test runs.
+- 2026-10-05: DEPLOYED the release build of fdd2cb7 (linux-x86_64 sha256
+  9a9f9e99…, mimalloc) to baba2 (dns2) first, then gate (dns1); commits after
+  fdd2cb7 are test/CI only (nsec3hash optional, --no-fail-fast, netlink log via
+  the namespace script, O1 browser diagnostics). CI green on fa28308 (first run
+  of the netlink, nginx-proxy, windows-service jobs; deb-install and docker green
+  in the release). Verified after each host: config check, allocator=mimalloc,
+  RSS 26-35 MB, delv 158/158 fully validated, baba2 following/up_to_date at
+  offset 125, lag 0, not halted, no conflict; both serial 15; Google/Cloudflare/
+  Quad9 return AD; forwarding works; single-label NXDOMAIN locally. One
+  intermittent CI-only failure seen once (O1 password change, likely the 1 s
+  KDF wait on a 2-core runner with a debug build; gate and baba2 also have 2
+  cores = 1 KDF slot): follow-up below.
+- [ ] P-1. Console: retry automatically on 503 + Retry-After from the KDF
+  limiter (password change, sign-in, user create) instead of showing an error;
+  consider a longer KDF wait for interactive account actions on 1-slot hosts.
