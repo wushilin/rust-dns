@@ -1308,8 +1308,13 @@ fn nsec3_validates_and_switching_denial_keeps_every_answer_valid() {
         &query_bytes("wushilin.test.", RecordType::NSEC3PARAM, None, false),
     ));
     assert_eq!(m.answers.len(), 1);
-    // BIND's own hash of the apex is the NSEC3 owner it validated.
-    if let Some(nsec3hash) = bind_tool("nsec3hash") {
+    // BIND's own hash of the apex is the NSEC3 owner it validated. An extra
+    // cross-check only: Ubuntu's bind9 packages do not ship `nsec3hash`
+    // (CI), and the hash itself is pinned against the RFC 5155 vectors in
+    // `dnssec::wire::tests::nsec3_hashes_match_rfc5155_and_bind`; delv and
+    // dnssec-verify above already validated the NSEC3 chain. So never
+    // required, even with REQUIRE_BIND_TOOLS.
+    if let Some(nsec3hash) = tool("nsec3hash") {
         let (ok, out) = run(&nsec3hash, &["-", "1", "0", "wushilin.test."]);
         let h = out.split_whitespace().next().unwrap_or("").to_lowercase();
         assert!(

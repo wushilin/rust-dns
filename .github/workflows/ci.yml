@@ -22,7 +22,7 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y bind9-utils bind9-dnsutils
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test -- --test-threads=1
+      - run: cargo test --no-fail-fast -- --test-threads=1
         env:
           REQUIRE_BIND_TOOLS: "1"
           # tests/netlink.rs: a network namespace through `sudo -n unshare -n`.
