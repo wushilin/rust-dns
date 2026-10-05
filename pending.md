@@ -21,7 +21,7 @@ Status as of 2026-10-03 (phase L). Live on gate (dns1) and baba2 (dns2) since d3
 - [x] Mixed-version safety while signing is off: `zones.dnssec` is left out of the table checksum (covered by the per-zone checksum, where it appears only when on); an empty table unknown to an older primary is not a reconcile difference. Upgrade standbys before turning signing on.
 - [x] Tests: dnspython known-answer vectors + BIND DS (`src/dnssec/vectors.rs`, `scripts/dnssec-vectors.py`), unit tests (canonical order, bitmaps, key tag/DS RFC 4034 examples, chain/positions, window), mutation tests (enable/disable/key lifecycle, secrecy, re-sign, cache), randomized replay covers the new change kinds, replica snapshot/secrets tests, `tests/dnssec.rs` (dnssec-verify, dnssec-dsfromkey, delv x40 + negative control, validating named with AD, no-DO answers unchanged, truncation, re-sign, parent DS refusal with a second rust-dns as parent), `tests/follow.rs` (standby signs with the replicated key, delv + dnssec-verify against it, reconcile ok, no halt), conformance 86 -> 123.
 - [x] N1 (phase N). Key rollover wizard with manual DS steps (pre-publish CSK rollover; parent servers checked one by one with RD=0; timers from the real DNSKEY/DS TTLs; cancel before the switch; replicated as `dnssec_key_set`; standby features gate the start). See plan.md N1 and README "Key rollover wizard".
-- [ ] Not done: automated key rollover through CDS/CDNSKEY (RFC 7344/8078; `.net` does not scan CDS), NSEC3, other algorithms, DS query at an apex whose parent zone is here but unsigned and has no DS keeps the child NODATA (pre-existing behaviour), wildcards whose `*` label is itself an empty non-terminal (records under `*.x`) are answered NXDOMAIN as before and their NSEC proof would not validate (unusual; not blocked in the editor).
+- [ ] Not done: automated key rollover through CDS/CDNSKEY (RFC 7344/8078; `.net` does not scan CDS; the manual rollover wizard is done, N1), DS query at an apex whose parent zone is here but unsigned and has no DS keeps the child NODATA (pre-existing behaviour), wildcards whose `*` label is itself an empty non-terminal are answered NXDOMAIN and their NSEC proof would not validate (unusual). NSEC3 and Ed25519 are done (O24, O25).
 - [x] Owner notes for deployment (done: deployed to baba2 then gate, signing on for wushilin.net, DS published, delv and public resolvers validate; see plan.md Rollout and Log, 2026-10-03): build, deploy with signing off (no answer changes except the DO echo), upgrade baba2 before gate if possible (either order is safe while signing is off), then enable on wushilin.net, run the check, confirm baba2's DNSSEC tab shows the same key, publish the DS at the registrar, confirm with the parent lookup (needs a forwarding upstream on gate, else `dig +short DS wushilin.net`).
 
 ## Open resolver mode (2026-09-27, implemented, committed since)
@@ -30,7 +30,7 @@ Status as of 2026-10-03 (phase L). Live on gate (dns1) and baba2 (dns2) since d3
 - [x] Console/API override: `ForwardingSettings.open_resolver: Option<bool>` (absent in old overrides = the file's value; new saves always store it explicitly). `ForwardingInput.open_resolver` (omitted = file value), `ForwardingView.open_resolver/_max_udp_payload/_rate_per_second`, `config.open_resolver`. Audited in `settings.forwarding.update` before/after; replicated as part of the `setting_set` JSON (replay test data, snapshot test, `tests/follow.rs`).
 - [x] Runtime: effective mode = override ?? file; an ACL the guard would refuse always gets the safeguards (defence in depth). Safeguards only while on and upstreams exist: UDP cap on forwarded answers (upstream and cache; TC=1), ANY for foreign names -> RFC 8482 HINFO (not forwarded), per-client forwarding limiter (`DnsServer::fwd_limiter`, same count-min + slip; UDP drop/slip, TCP REFUSED).
 - [x] Visibility: gauge `rustdns_open_resolver`, counters `rustdns_open_resolver_{truncated,any,rate_limited}_total`, `/api/status` `forwarding.open_resolver` + `dns.open_resolver_*`; console badge on dashboard and Server settings, two-step in-dialog enable, turn-off dialog with a narrowed ACL.
-- [ ] Not done: exempting clients with a valid server cookie from the UDP cap (cookie proves the source address); per-mode limits configurable from the console (file only).
+- [x] Not done: exempting clients with a valid server cookie from the UDP cap (cookie proves the source address); per-mode limits configurable from the console (file only). Done: O15 (cookie exemption and console rate-limit settings).
 
 ## Replica tracking and halting (2026-09-27, implemented, committed since)
 
@@ -64,7 +64,7 @@ Status as of 2026-10-03 (phase L). Live on gate (dns1) and baba2 (dns2) since d3
 - [x] Promotion: console (Admin -> Replication, two-click), API, `--promote` (stopped server), or removing `[follow]` by hand (recorded at next start). New history id with parent + fork offset; `[follow]` removed from the config file.
 - [x] Console: banner on every page, write controls disabled, Replication page; checked in Chrome (banner in sync / unreachable, disabled edits, promote flow, no console errors).
 - [x] Tests: `tests/follow.rs` (two binaries, full failover and rejoin), unit tests in `mutation::replica`, `replication::lineage`, `api::tests` (every mutating route refused), contract test promotes a real standby.
-- [ ] Not done: cascading standbys (a standby refuses to serve replication), gzip of snapshots, custom CA file for the primary's certificate (OS trust store only), websocket signal for account changes (long-poll used instead).
+- [x] Cascading standbys, gzip of snapshots and a custom CA file are done (O21, O22, O23). Websocket signal for account changes: not needed (changes arrive through the changelog long-poll).
 
 ## Security review fixes (2026-09-27)
 
@@ -75,9 +75,9 @@ Status as of 2026-10-03 (phase L). Live on gate (dns1) and baba2 (dns2) since d3
 - [x] L1 web header timeout / connection cap, L11 PROXY header timeout and split v1 headers, L2 `__Host-` Secure cookies over HTTPS, L3 CSP with script hashes, L8 member events / actor IPs redacted below owner, L9 renamed root disables the previous root, L10 open-resolver coverage check in config and API.
 - [x] Conformance: 86/86 (new check: rate-limit slip replies). cargo-audit: no vulnerabilities (only the informational `paste` notice).
 - [x] Forward cache TTL caps (`cache_max_ttl`, `cache_negative_max_ttl`, console-overridable), cache stats and `POST /api/settings/forwarding/cache/flush`.
-- [ ] L13 admin-initiated MFA enrollment (forced enrollment still trusts the first sign-in after `mfa_required` is set). Not implemented: needs an out-of-band delivery of the secret (QR to the admin, handed over), a new state and UI.
-- [ ] Per-account back-off and code-attempt counters are in memory (reset on restart; the per-network request limit still applies). Persisting them would need an audited table.
-- [ ] Websocket rights are re-checked every 10 s and on zone/member changes, not instantly on session/token revocation (no revocation event on the bus yet).
+- [x] L13 admin-initiated MFA enrollment (forced enrollment still trusts the first sign-in after `mfa_required` is set). Not implemented: needs an out-of-band delivery of the secret (QR to the admin, handed over), a new state and UI. Done: O5 (administrator-initiated MFA enrollment).
+- [x] Per-account back-off and code-attempt counters are in memory (reset on restart; the per-network request limit still applies). Persisting them would need an audited table. Done: O3 (counters survive restarts).
+- [x] Websocket rights are re-checked every 10 s and on zone/member changes, not instantly on session/token revocation (no revocation event on the bus yet). Done: O2 (instant cut-off through access signals; 10 s re-check kept as backstop).
 
 ## TSIG for zone transfers and NOTIFY (2026-09-27, verified)
 
@@ -87,7 +87,7 @@ Status as of 2026-10-03 (phase L). Live on gate (dns1) and baba2 (dns2) since d3
 - [x] Tests: known-answer vectors from dnspython 2.8 (all four algorithms, request + 2-message chained response), unit error cases, `tests/tsig.rs` end to end, 9 new conformance checks (85/85).
 - [x] Interop with BIND 9.20 (`named` as secondary, `dig -y`): multi-message signed AXFR, signed NOTIFY triggers refresh and BIND's signed ack verifies, wrong key refused on both sides.
 - [x] Console: Admin → TSIG keys (create generate/import, zone scope, secret once with BIND/dig snippets, two-step reveal, two-click delete, transfer policy read-only) checked in Chrome.
-- [ ] Not done: replay protection by caching the last Time Signed per key (RFC 8945 §5.2.3 SHOULD); inbound signed NOTIFY/UPDATE (not applicable: primary only).
+- [x] Replay protection by the last Time Signed per key is done (M3). Inbound signed NOTIFY is done for secondary zones (O27).
 
 ## Forwarding settings from the console/API (2026-09-27, verified)
 
@@ -108,7 +108,7 @@ Status as of 2026-10-03 (phase L). Live on gate (dns1) and baba2 (dns2) since d3
 - [x] Collapsible sidebar with sections and icons; drawer on phones.
 - [x] SOA fields explained; Delegation tab with nameservers, glue and registrar steps (reverse zones explained separately).
 - [x] Dashboard "DNS listeners" card and per-zone dig commands (UDP/TCP, port, AXFR when allowed).
-- [ ] Live updates through a reverse proxy not exercised in a browser (no nginx on the dev machine in phase L either). How to check it by hand is in README.md (Configuration, after the logging block); `examples/proxy/nginx.conf` and `haproxy.cfg` pass the upgrade.
+- [x] Live updates through a reverse proxy not exercised in a browser (no nginx on the dev machine in phase L either). How to check it by hand is in README.md (Configuration, after the logging block); `examples/proxy/nginx.conf` and `haproxy.cfg` pass the upgrade. Done: O14 (tests/proxy.rs behind nginx, a CI job; skipped locally without nginx).
 
 ## Earlier in-flight notes (2026-09-27; all committed since)
 
@@ -145,7 +145,7 @@ Status as of 2026-10-03 (phase L). Live on gate (dns1) and baba2 (dns2) since d3
 - [x] Console: Owner column on API tokens (click for effective rights), Rights button on Users, link on Account.
 - [x] Live query feed limited to zones the user owns, attributed to the most specific zone.
 - [x] Fixed: websocket `?token=` authentication never worked (nested-router path).
-- [ ] Per-token scopes (zones, max role, expiry); token creation only from a browser session; revoke tokens on password change.
+- [x] Per-token scopes (zones, max role, expiry); token creation only from a browser session; revoke tokens on password change. Done: M1 (token scopes) and O1 (session-only token creation, revoke on password change).
 
 ## API explorer (2026-09-27, verified)
 
@@ -159,7 +159,7 @@ Status as of 2026-10-03 (phase L). Live on gate (dns1) and baba2 (dns2) since d3
 - [x] `expires_at` / `expires_in` on records; expired records leave the catalog at once (answers, AXFR, BIND export, auto-PTR).
 - [x] Sweeper wakes at the next expiry: commits `record_expired` + serial bump; reaps after `[expiry].retention_days` (default 30) as `record_reaped`.
 - [x] Identical record with an expiry renews (200); expired records don't block new ones; console Expires column and editor.
-- [ ] Zone-level default and maximum expiry for self-registration zones.
+- [x] Zone-level default and maximum expiry for self-registration zones. Done: M2 (zone record expiry policy).
 
 ## Spec/API consistency and console polish (2026-09-27, verified)
 
@@ -167,7 +167,7 @@ Status as of 2026-10-03 (phase L). Live on gate (dns1) and baba2 (dns2) since d3
 - [x] Framework rejections (bad JSON, wrong types, bad path/query values, missing content type) now return the JSON `Error` with `code: invalid_request` (was plain text, 415/422).
 - [x] Console: "TTL (seconds)" labels; expiry durations `1m`, `1h`, `1d`, `6d12h14s` (units d/h/m/s, largest first, each once) with live preview; parser tested in CI.
 - [x] OpenAPI generated from the code (utoipa 5 + utoipa-axum `OpenApiRouter`): each route is declared once with `routes!`, bodies are `ToSchema` types, ad-hoc `json!` responses replaced by typed structs; the hand-written `src/api/openapi.json` is gone. Snapshot at `docs/openapi.json` with a staleness test (`UPDATE_OPENAPI=1 cargo test --bin rust-dns openapi` refreshes it). Document is OpenAPI 3.1.
-- [ ] Consider utoipa 6 / utoipa-axum 0.3 (released 2026-09-23) once it has settled.
+- [ ] Consider utoipa 6 / utoipa-axum 0.3 (released 2026-09-23) once it has settled. Tried in O17: skipped, the generated spec is not equivalent (invalid allOf for enum query parameters); retry when upstream fixes it.
 
 ## Stage 4: operations and testing
 
@@ -176,7 +176,7 @@ Status as of 2026-10-03 (phase L). Live on gate (dns1) and baba2 (dns2) since d3
 - [x] `rust-dns --check` validates a config file and exits non-zero on problems.
 - [x] GitHub Actions workflow runs fmt, clippy, cargo test, conformance against a spawned and seeded instance, and a short load probe.
 - [x] README: document stages 1 to 3 and refresh the testing section.
-- [ ] Record Linux load-test results. `scripts/load-test-local.sh` now runs in CI; local macOS smoke run returned valid replies but is not a performance measurement.
+- [ ] Record Linux load-test results. `scripts/load-test-local.sh` now runs in CI; local macOS smoke run returned valid replies but is not a performance measurement. Partly: O13 2-hour soak on dns-test (latency, replication, memory; led to the mimalloc fix O13a); a long Linux soak of the mimalloc build is optional (owner: not important).
 - [x] Prometheus alert examples for `rate_limited`, `refused`, `errors`, `bad_cookie`.
 
 ## DNS features not started
@@ -184,30 +184,30 @@ Status as of 2026-10-03 (phase L). Live on gate (dns1) and baba2 (dns2) since d3
 - [x] DNSSEC signing (NSEC, CSK, DS publication): see above. NSEC3 and automated rollover remain.
 - [x] TSIG for AXFR and NOTIFY: see "TSIG for zone transfers and NOTIFY" above (`src/dns/tsig.rs`, `tests/tsig.rs`, `[transfer]`).
 - [x] Changelog-based follower mode (standby mode, 2026-09-27).
-- [ ] Inbound NOTIFY / acting as a secondary for zones hosted elsewhere.
-- [ ] DNS over TLS / HTTPS (inbound and upstream). Deliberately deferred.
-- [ ] Response Rate Limiting per response tuple in addition to per-client limiting.
+- [x] Inbound NOTIFY / acting as a secondary for zones hosted elsewhere. Done: O27 (secondary zones, interop with BIND).
+- [x] DNS over TLS / HTTPS (inbound and upstream). Deliberately deferred. Done: O29 (DoT/DoH inbound and upstream, off by default).
+- [x] Response Rate Limiting per response tuple in addition to per-client limiting. Done: O26 (RRL, off by default).
 - [x] Per-zone forwarding: override zones (phase I, I6; README "Resolver features" -> Override zones).
-- [ ] Per-zone settings still missing: auto-PTR toggle, transfer ACL and NOTIFY targets.
-- [ ] Record types hickory-proto's text parser does not cover (LOC and others).
+- [x] Per-zone settings still missing: auto-PTR toggle, transfer ACL and NOTIFY targets. Done: O16 (per-zone auto-PTR, transfer ACL, NOTIFY targets).
+- [x] Record types hickory-proto's text parser does not cover (LOC and others). Done: O28 (LOC, RP, AFSDB, URI, SPF, EUI48, EUI64).
 
 ## Console and API
 
-- [ ] Explicit CSRF token instead of the `X-Requested-With` header check (header check is enforced today).
-- [ ] Bulk record editing (multi-select delete, paste-many).
-- [ ] Zone cloning and rename; search across all zones.
-- [ ] Login audit view (currently only in logs).
-- [ ] Password policy options and lockout beyond per-address login rate limiting.
-- [ ] WebAuthn / passkeys as an alternative second factor.
-- [ ] Column sorting and keyboard shortcuts in the records table.
+- [x] Explicit CSRF token instead of the `X-Requested-With` header check (header check is enforced today). Done: O7 (per-session X-CSRF-Token for cookie writes).
+- [x] Bulk record editing (multi-select delete, paste-many). Done: O10.
+- [x] Zone cloning and rename; search across all zones. Done: O9 (search) and O11 (clone, rename).
+- [x] Login audit view (currently only in logs). Done: O4 (sign-in log).
+- [x] Password policy options and lockout beyond per-address login rate limiting. Done: O6 (password policy, optional lockout).
+- [ ] WebAuthn / passkeys as an alternative second factor. Tried in O8: blocked (the pure-Rust crate pulls rsa with RUSTSEC-2023-0071; webauthn-rs needs OpenSSL). Narrower O8a (ES256/Ed25519 via ring) parked for the owner.
+- [x] Column sorting and keyboard shortcuts in the records table. Done: O12.
 - [ ] Console TLS is intentionally out of scope (reverse proxy).
 
 ## Packaging
 
 - [x] Static musl build: `.github/workflows/release.yml` builds x86_64 and aarch64 `*-unknown-linux-musl` (plus macOS and Windows).
-- [ ] Multi-arch Docker image publish (`deploy/Dockerfile` exists; nothing publishes an image).
-- [ ] Debian package and Homebrew formula.
-- [ ] Windows service wrapper (untested platform).
+- [x] Multi-arch Docker image publish (`deploy/Dockerfile` exists; nothing publishes an image). Done: O18 (release workflow builds and pushes to GHCR on a tag; first CI run pending).
+- [x] Debian package and Homebrew formula. Done: O19 (.deb and Homebrew formula; first CI run pending).
+- [x] Windows service wrapper (untested platform). Done: O20 (windows-service; CI service test pending its first run).
 - [x] Git repository: private GitHub repository `wushilin/rust-dns` (CI in `.github/workflows/ci.yml`, releases in `release.yml`).
 
 ## Known limitations to document
