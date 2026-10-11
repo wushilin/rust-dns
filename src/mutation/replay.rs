@@ -3,11 +3,10 @@
 //! Each changelog payload is the exact committed fact (ids, timestamps,
 //! serials), so applying the payloads in offset order to an empty database
 //! reproduces the zones, records and zone members of the source. This is the
-//! basis for a follower server and is checked by the replay tests.
-// `apply` is used by standby mode (mutation::replica); `replay` by the tests.
-#![allow(dead_code)]
+//! user-facing changelog's accuracy check: the replay tests compare a
+//! database with its replay. (Replication itself is changelog v2.)
 
-use super::acct_sql::{self, Ctx};
+use super::acct_sql;
 use super::{sql, Change, DnsChange, TOKEN};
 use crate::model::ChangeEvent;
 use crate::storage::Storage;
@@ -16,12 +15,12 @@ use rusqlite::Connection;
 
 /// Apply one committed fact. The match is exhaustive: a new kind of change
 /// does not compile until it can be replayed.
-pub(super) fn apply(c: &Connection, change: &Change, ctx: &Ctx) -> Result<()> {
+pub(super) fn apply(c: &Connection, change: &Change) -> Result<()> {
     match change {
         Change::Dns(d) => apply_dns(c, d)?,
         // Account class: one entry point, which hands back a receipt; this
-        // is a replay (the caller copies the primary's changelog row).
-        Change::Secret(s) => acct_sql::write(c, ctx, s)?.replayed(),
+        // is a replay.
+        Change::Secret(s) => acct_sql::write(c, s)?.replayed(),
     }
     Ok(())
 }
@@ -88,7 +87,7 @@ pub fn replay(target: &Storage, events: &[ChangeEvent]) -> Result<usize> {
                     ev.offset
                 )
             })?;
-            apply(c, &change, &Ctx::verbatim())
+            apply(c, &change)
                 .with_context(|| format!("applying changelog offset {}", ev.offset))?;
         }
         Ok(events.len())

@@ -732,8 +732,15 @@ impl Store {
 
     /// Problems a self-check finds right now (empty when healthy).
     pub fn health(&self) -> Result<Vec<String>> {
-        // On the writer: TEMP triggers exist only there.
-        let c = self.lock();
+        // On the writer (TEMP triggers exist only there), but only when it
+        // is free: never wait for a long write from a status request.
+        let c = match self.w.try_lock() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Ok(Vec::new());
+            }
+        };
         let mut p = trigger_problems(&c, &self.tables, &self.cfg)?;
         let v: i64 = c.query_row("PRAGMA schema_version", [], |r| r.get(0))?;
         if v != self.schema_version {
@@ -790,8 +797,12 @@ impl Store {
         Ok(c)
     }
 
+    /// The committed state, read through a read-only connection: never
+    /// waits for the writer (which a snapshot load holds for a long time;
+    /// waiting for it from async code can starve the very task that feeds
+    /// the load).
     pub fn state(&self) -> Result<State> {
-        Ok(read_state(&self.lock())?)
+        Ok(read_state(&self.reader()?)?)
     }
 
     fn spec(&self, name: &str) -> Result<&TableSpec> {
@@ -1087,6 +1098,29 @@ impl Store {
         drop(w);
         self.committed.send_replace(id);
         Ok(id)
+    }
+
+    /// A leader asked to follow (its host became a standby): it may hold
+    /// transactions the new upstream lacks, so it never follows silently.
+    /// It becomes a halted follower; an operator rebootstraps it (which
+    /// replaces its data) to continue. Its data and log stay as they are.
+    pub fn demote_halted(&self, detail: &str) -> Result<()> {
+        let w = self.lock();
+        let st = read_state(&w)?;
+        if st.role != Role::Leader {
+            return Ok(());
+        }
+        sset(&w, "role", Some("follower"))?;
+        let v = json!({
+            "kind": "former_leader",
+            "detail": format!("this database led history {} up to txn {}: it may hold changes the new primary does not have ({detail})", st.history.as_deref().unwrap_or("?"), st.last_txn),
+            "at": now(),
+            "options": [REBOOTSTRAP_HINT],
+        });
+        sset(&w, "halted", Some(&v.to_string()))?;
+        self.set_fk(&w, Role::Follower)?;
+        tracing::error!(history = ?st.history, txn = st.last_txn, "a former leader is now a follower: halted until an operator rebootstraps it");
+        Ok(())
     }
 
     /// Stop accepting writes: another leader of this history exists.

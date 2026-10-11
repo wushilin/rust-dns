@@ -5,21 +5,14 @@
 //! No write without a change, enforced by the compiler: the functions are
 //! private to this file and the only way in is [`write`], which takes the
 //! typed [`Change`] and returns a [`Written`] receipt. The receipt is
-//! `#[must_use]` and can only be turned in two ways: [`Written::log_into`]
-//! (the primary: the change joins the transaction's changelog rows) or
-//! [`Written::replayed`] (a standby replaying the primary's change, whose
-//! changelog row it copies; a snapshot entity). Dropping it unused does not
-//! build (`-D warnings`).
-//!
-//! The same code runs on the primary and on a standby, so both write
-//! identical rows. On a standby, [`Ctx::local_root`] names the account from
-//! its own config: that account keeps its local password, MFA and recovery
-//! codes (see `mutation::replica`).
+//! `#[must_use]` and is turned in with [`Written::log_into`]: the change
+//! joins the transaction's changelog rows (in tests also
+//! `Written::replayed`: the replay of a changelog). Dropping it unused does
+//! not build (`-D warnings`).
 //!
 //! Second line: `tests::only_acct_sql_writes_account_tables` scans the
 //! mutation sources and fails if any other file contains SQL that writes
-//! these tables (the snapshot loader and `--prepare-standby` in
-//! `replica.rs` excepted).
+//! these tables (`--prepare-standby` in `replica.rs` excepted).
 
 use super::{Change, SecretChange};
 use crate::replication::data;
@@ -27,22 +20,8 @@ use crate::replication::types::{ReplSetting, ReplToken, ReplTsigKey, ReplUser};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 
-/// How a change is applied.
-#[derive(Clone, Copy, Default)]
-pub struct Ctx<'a> {
-    /// On a standby: the username of its own config root.
-    pub local_root: Option<&'a str>,
-}
-
-impl Ctx<'_> {
-    /// On the primary (or in tests): write the fact as it is.
-    pub fn verbatim() -> Ctx<'static> {
-        Ctx { local_root: None }
-    }
-}
-
 /// Proof that an account change was written to its table. It must be
-/// turned in: logged (primary) or declared a replay (standby, snapshot).
+/// turned in: logged (or, in the replay tests, declared a replay).
 #[must_use = "an account write must be changelogged (log_into) or be a replay (replayed)"]
 pub(super) struct Written(());
 
@@ -52,8 +31,9 @@ impl Written {
         changes.push(Change::Secret(change));
     }
 
-    /// The change comes from the primary's changelog (the caller copies its
-    /// row) or from a snapshot: nothing to log here.
+    /// The change comes from a changelog being replayed (tests): nothing to
+    /// log here.
+    #[cfg(test)]
     pub(super) fn replayed(self) {}
 }
 
@@ -61,22 +41,22 @@ impl Written {
 /// of this file. It takes only the secret half of [`Change`], so a DNS
 /// change cannot reach it; exhaustive, so a new kind of secret change does
 /// not compile until it is handled here.
-pub(super) fn write(c: &Connection, ctx: &Ctx, change: &SecretChange) -> Result<Written> {
+pub(super) fn write(c: &Connection, change: &SecretChange) -> Result<Written> {
     match change {
         SecretChange::UserCreated { user } | SecretChange::UserUpdated { user } => {
-            put_user(c, ctx, user)?
+            put_user(c, user)?
         }
-        SecretChange::UserDeleted { user_id, username } => delete_user(c, ctx, *user_id, username)?,
-        SecretChange::TotpStepAccepted { user_id, step } => totp_step(c, ctx, *user_id, *step)?,
+        SecretChange::UserDeleted { user_id, username } => delete_user(c, *user_id, username)?,
+        SecretChange::TotpStepAccepted { user_id, step } => totp_step(c, *user_id, *step)?,
         SecretChange::RecoveryCodesReplaced {
             user_id,
             code_hashes,
-        } => recovery_codes(c, ctx, *user_id, &code_hashes.0)?,
+        } => recovery_codes(c, *user_id, &code_hashes.0)?,
         SecretChange::RecoveryCodeUsed {
             user_id,
             code_hash,
             used_at,
-        } => recovery_code_used(c, ctx, *user_id, &code_hash.0, used_at)?,
+        } => recovery_code_used(c, *user_id, &code_hash.0, used_at)?,
         SecretChange::TokenCreated { token } => put_token(c, token)?,
         SecretChange::TokenTagsSet {
             token_id,
@@ -115,63 +95,8 @@ pub(super) fn next_id(c: &Connection, table: &str) -> Result<i64> {
     Ok(seq.max(max) + 1)
 }
 
-/// Give a user a new id, carrying every reference along (foreign keys are
-/// deferred for the transaction).
-fn move_user_id(c: &Connection, from: i64, to: i64) -> Result<()> {
-    c.execute_batch("PRAGMA defer_foreign_keys = ON")?;
-    for (table, col) in [
-        ("sessions", "user_id"),
-        ("recovery_codes", "user_id"),
-        ("api_tokens", "user_id"),
-        ("zone_members", "user_id"),
-        ("zones", "owner_id"),
-    ] {
-        c.execute(
-            &format!("UPDATE {table} SET {col} = ?2 WHERE {col} = ?1"),
-            params![from, to],
-        )?;
-    }
-    c.execute("UPDATE users SET id = ?2 WHERE id = ?1", params![from, to])?;
-    Ok(())
-}
-
-/// Is `user_id` the standby's own root account?
-fn is_local_root(c: &Connection, ctx: &Ctx, user_id: i64) -> Result<bool> {
-    let Some(root) = ctx.local_root else {
-        return Ok(false);
-    };
-    let name: Option<String> = c
-        .query_row(
-            "SELECT username FROM users WHERE id = ?1",
-            params![user_id],
-            |r| r.get(0),
-        )
-        .optional()?;
-    Ok(name.as_deref() == Some(root))
-}
-
 /// UserCreated / UserUpdated: the row becomes `u`.
-fn put_user(c: &Connection, ctx: &Ctx, u: &ReplUser) -> Result<()> {
-    if let Some(root) = ctx.local_root {
-        let local = data::user_by_name(c, root)?;
-        if u.username == root {
-            // The primary's namesake of our root: same id, local credentials.
-            if let Some(r) = local {
-                if r.id != u.id {
-                    c.execute("DELETE FROM users WHERE id = ?1", params![u.id])?;
-                    move_user_id(c, r.id, u.id)?;
-                }
-                return Ok(());
-            }
-        } else if let Some(r) = local.filter(|r| r.id == u.id) {
-            // Our local-only root sits on an id the primary now uses.
-            let lowest: i64 =
-                c.query_row("SELECT min(COALESCE(MIN(id), 0), 0) FROM users", [], |r| {
-                    r.get(0)
-                })?;
-            move_user_id(c, r.id, lowest - 1)?;
-        }
-    }
+fn put_user(c: &Connection, u: &ReplUser) -> Result<()> {
     // A stale row holding this username (ids swapped) gives it up.
     c.execute(
         "UPDATE users SET username = '~replica-' || id WHERE username = ?1 AND id <> ?2",
@@ -186,8 +111,6 @@ fn put_user(c: &Connection, ctx: &Ctx, u: &ReplUser) -> Result<()> {
         },
         _ => u.totp_last_step,
     };
-    // Only the local config root is `root` on a standby.
-    let is_root = u.is_root && ctx.local_root.is_none();
     c.execute(
         "INSERT INTO users (id, username, password_hash, display_name, is_admin, is_root, mfa_required, totp_secret,
                             totp_enrolled_at, totp_last_step, disabled_at, created_at, updated_at, password_history)
@@ -204,7 +127,7 @@ fn put_user(c: &Connection, ctx: &Ctx, u: &ReplUser) -> Result<()> {
             u.password_hash,
             u.display_name,
             u.is_admin as i64,
-            is_root as i64,
+            u.is_root as i64,
             u.mfa_required as i64,
             u.totp_secret,
             u.totp_enrolled_at,
@@ -225,22 +148,7 @@ fn put_user(c: &Connection, ctx: &Ctx, u: &ReplUser) -> Result<()> {
     Ok(())
 }
 
-fn delete_user(c: &Connection, ctx: &Ctx, user_id: i64, username: &str) -> Result<()> {
-    if ctx.local_root == Some(username) {
-        // Our root stays (as a local-only account), but the replicated
-        // rows that the primary's foreign keys removed with the account
-        // go here too, or the tables' checksums would differ and the
-        // standby halt: its API tokens, and (written by a version without
-        // `Mutator::release_user`) zone memberships and ownership.
-        for sql in [
-            "DELETE FROM api_tokens WHERE user_id = ?1",
-            "DELETE FROM zone_members WHERE user_id = ?1",
-            "UPDATE zones SET owner_id = NULL WHERE owner_id = ?1",
-        ] {
-            c.execute(sql, params![user_id])?;
-        }
-        return Ok(());
-    }
+fn delete_user(c: &Connection, user_id: i64, username: &str) -> Result<()> {
     c.execute(
         "DELETE FROM users WHERE id = ?1 AND username = ?2",
         params![user_id, username],
@@ -248,10 +156,7 @@ fn delete_user(c: &Connection, ctx: &Ctx, user_id: i64, username: &str) -> Resul
     Ok(())
 }
 
-fn totp_step(c: &Connection, ctx: &Ctx, user_id: i64, step: i64) -> Result<()> {
-    if is_local_root(c, ctx, user_id)? {
-        return Ok(());
-    }
+fn totp_step(c: &Connection, user_id: i64, step: i64) -> Result<()> {
     c.execute(
         "UPDATE users SET totp_last_step = ?2 WHERE id = ?1 AND (totp_last_step IS NULL OR totp_last_step < ?2)",
         params![user_id, step],
@@ -259,10 +164,7 @@ fn totp_step(c: &Connection, ctx: &Ctx, user_id: i64, step: i64) -> Result<()> {
     Ok(())
 }
 
-fn recovery_codes(c: &Connection, ctx: &Ctx, user_id: i64, hashes: &[String]) -> Result<()> {
-    if is_local_root(c, ctx, user_id)? {
-        return Ok(());
-    }
+fn recovery_codes(c: &Connection, user_id: i64, hashes: &[String]) -> Result<()> {
     c.execute(
         "DELETE FROM recovery_codes WHERE user_id = ?1",
         params![user_id],
@@ -276,16 +178,7 @@ fn recovery_codes(c: &Connection, ctx: &Ctx, user_id: i64, hashes: &[String]) ->
     Ok(())
 }
 
-fn recovery_code_used(
-    c: &Connection,
-    ctx: &Ctx,
-    user_id: i64,
-    hash: &str,
-    used_at: &str,
-) -> Result<()> {
-    if is_local_root(c, ctx, user_id)? {
-        return Ok(());
-    }
+fn recovery_code_used(c: &Connection, user_id: i64, hash: &str, used_at: &str) -> Result<()> {
     c.execute(
         "UPDATE recovery_codes SET used_at = ?3 WHERE user_id = ?1 AND code_hash = ?2 AND used_at IS NULL",
         params![user_id, hash, used_at],
@@ -434,15 +327,9 @@ mod tests {
             .collect();
         for l in &public {
             assert!(
-                [
-                    "fn verbatim(",
-                    "fn log_into(",
-                    "fn replayed(",
-                    "fn write(",
-                    "fn next_id("
-                ]
-                .iter()
-                .any(|ok| l.contains(ok)),
+                ["fn log_into(", "fn replayed(", "fn write(", "fn next_id("]
+                    .iter()
+                    .any(|ok| l.contains(ok)),
                 "acct_sql exposes a write function besides `write`: {l}"
             );
         }
@@ -466,9 +353,9 @@ mod tests {
                 },
             };
             let mut log = Vec::new();
-            write(c, &Ctx::verbatim(), &set)?.log_into(set.clone(), &mut log);
+            write(c, &set)?.log_into(set.clone(), &mut log);
             assert_eq!(log.len(), 1);
-            write(c, &Ctx::verbatim(), &set)?.replayed();
+            write(c, &set)?.replayed();
             Ok(())
         });
         r.unwrap();
@@ -476,7 +363,7 @@ mod tests {
     }
 
     /// Structural guarantee: no file of the mutation module other than this
-    /// one (and the snapshot loader / `--prepare-standby` in replica.rs)
+    /// one (and `--prepare-standby` in replica.rs)
     /// writes an account table.
     #[test]
     fn only_acct_sql_writes_account_tables() {

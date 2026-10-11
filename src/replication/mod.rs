@@ -7,23 +7,19 @@
 //!   (an old primary whose `[peer]` was promoted from its history:
 //!   read-only). The role is decided at startup from the config and the
 //!   database; promotion switches a standby to `promoted` at runtime.
-//! * The standby pulls from the primary's admin-only replication API
-//!   (`/rust-dns/api/replication/*`, see `api::replication`) over HTTPS: a snapshot
-//!   (logical entities read in one transaction) to start, then a long-poll
-//!   of the changelog (whole transactions of DNS and account/settings/TSIG
-//!   changes in one sequence, applied with the primary's offsets), plus a
-//!   periodic checksum reconcile. All writes go through `mutation::replica`.
-//! * Every database has a history id. A standby adopts its primary's; a
-//!   promotion starts a new one whose parent is the old one (forked at the
-//!   current offset). [`lineage::plan`] uses this to continue, adopt a
-//!   promoted primary's history, refuse to follow a stale old primary, or
-//!   re-bootstrap within the same lineage (gap, reconcile mismatch) or
-//!   copy the primary into a fresh database. A database with other data is
-//!   never replaced implicitly: `--prepare-standby` backs it up and empties
-//!   it on the operator's explicit request.
+//! * Replication is changelog v2 (`crates/sqlite-cdc`): the primary serves
+//!   its trigger-captured log at `/rust-dns/changelog-api/v2` (behind the
+//!   `replicate` permission); a standby follows it with the crate's `Node`
+//!   (a snapshot first, then a stream, with periodic verification), and
+//!   halts on any divergence until an operator rebootstraps it.
+//! * Every database also keeps a v1 history id (`replication_state`): a
+//!   promotion starts a new one whose parent is the old one, which is how
+//!   a returning old primary with `[peer]` finds out it was replaced
+//!   (fencing). A database with other data is never replaced implicitly:
+//!   `--prepare-standby` backs it up and empties it on the operator's
+//!   explicit request.
 
 pub mod data;
-pub mod lineage;
 pub mod replicas;
 pub mod tables;
 pub mod types;
@@ -31,78 +27,34 @@ pub mod types;
 use crate::config::{FollowConfig, PeerConfig};
 use crate::dns::DnsServer;
 use crate::model::{now_rfc3339, Actor};
-use crate::mutation::replica::{LocalRoot, K_FOLLOWING};
+use crate::mutation::replica::K_FOLLOWING;
 use crate::mutation::{Mutator, WriteGate};
 use crate::storage::Storage;
 use anyhow::{anyhow, Context, Result};
-use lineage::{LocalView, Plan, RemoteView};
-use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use types::*;
-
-/// Long-poll wait the standby asks for (seconds).
-const POLL_WAIT_SECS: u64 = 25;
-/// Changes per long-poll answer (extended to whole transactions).
-const POLL_LIMIT: usize = 2000;
-/// A primary contacted within this long counts as reachable for promotion.
-const REACHABLE_WITHIN: Duration = Duration::from_secs(60);
-
-/// Why a request to the primary failed.
-#[derive(Debug)]
-enum CallError {
-    /// 401/403: the token was rejected or is not an administrator's.
-    Auth(String),
-    /// 409 or similar: the server is not a writable primary.
-    Refused(String),
-    Other(String),
-    /// Divergence or an invariant violation: stop for good (see `halt`).
-    Halt {
-        reason: &'static str,
-        detail: String,
-        evidence: serde_json::Value,
-    },
-}
-
-impl std::fmt::Display for CallError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CallError::Auth(m) | CallError::Refused(m) | CallError::Other(m) => f.write_str(m),
-            CallError::Halt { reason, detail, .. } => write!(f, "{reason}: {detail}"),
-        }
-    }
-}
 
 /// Everything the replication runtime needs from the rest of the server.
 pub struct Replication {
     storage: Arc<Storage>,
     mutator: Arc<Mutator>,
     gate: Arc<WriteGate>,
-    dns: Arc<DnsServer>,
     reloader: Arc<crate::reload::Reloader>,
     config_path: PathBuf,
-    follow: Option<FollowConfig>,
+    /// `[follow]`: changes at runtime only through a rebootstrap with new
+    /// parameters (which also rewrites the config file).
+    follow: RwLock<Option<FollowConfig>>,
+    /// Changelog v2: the follower on a standby, the client tracker and the
+    /// served protocol on a primary (`/rust-dns/changelog-api/v2`).
+    cdc: Option<Arc<sqlite_cdc::node::Node>>,
     peer: Option<PeerConfig>,
     role: RwLock<Role>,
-    follow_status: Mutex<FollowStatus>,
     peer_status: Mutex<Option<PeerStatus>>,
     warning: RwLock<Option<String>>,
-    last_contact: Mutex<Option<Instant>>,
-    // Primary side.
-    /// Ticks when an account transaction appended to the changelog
-    /// (account changes are not on the event bus): wakes long-polls.
-    changelog_tick: tokio::sync::watch::Sender<u64>,
-    replicas: replicas::Tracker,
-    /// Sent with every request as `X-Rust-DNS-Session` (conflict detection).
-    session: String,
-    // Standby side.
-    follower: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Serializes promotion and rebootstrap.
     promote_lock: tokio::sync::Mutex<()>,
-    reconnects: AtomicU64,
-    rebootstraps: AtomicU64,
-    reconcile_mismatches: AtomicU64,
     /// To the primary (`[follow]`, its `ca_file`).
     http: reqwest::Client,
     /// To the standby of `[peer]` (its `ca_file`).
@@ -151,47 +103,46 @@ impl Replication {
             "[peer].ca_file",
         )
         .expect("HTTP client for [peer]");
-        let follow_status = FollowStatus {
-            primary: cfg
+        let cdc = storage.cdc().map(|store| {
+            let mut nc = sqlite_cdc::node::NodeConfig::new("");
+            nc.client = Some(sqlite_cdc::client::ClientTemplate {
+                http: http.clone(),
+                headers: cdc_headers(cfg.follow.as_ref()),
+            });
+            nc.name = cfg
                 .follow
                 .as_ref()
-                .map(|f| f.primary.clone())
-                .unwrap_or_default(),
-            instance_id: cfg
+                .map(|f| f.instance_id.trim().to_string());
+            nc.mode = sqlite_cdc::node::FollowMode::Stream;
+            nc.verify_every = cfg
                 .follow
                 .as_ref()
-                .map(|f| f.instance_id.trim().to_string())
-                .unwrap_or_default(),
-            state: "starting".into(),
-            ..Default::default()
-        };
-        let (changelog_tick, _) = tokio::sync::watch::channel(0u64);
+                .map(|f| Duration::from_secs(f.reconcile_interval_secs.max(60)));
+            nc.on_applied = Some(applied_hook(
+                storage.clone(),
+                mutator.clone(),
+                dns,
+                reloader.clone(),
+            ));
+            sqlite_cdc::node::Node::new(store.clone(), nc)
+        });
         Arc::new(Replication {
             gate: mutator.gate(),
             storage,
             mutator,
-            dns,
             reloader,
             config_path,
-            follow: cfg.follow.clone(),
+            follow: RwLock::new(cfg.follow.clone()),
+            cdc,
             peer: cfg.peer.clone(),
             role: RwLock::new(Role::Primary),
-            follow_status: Mutex::new(follow_status),
             peer_status: Mutex::new(cfg.peer.as_ref().map(|p| PeerStatus {
                 url: p.url.clone(),
                 last_check_at: None,
                 last_result: None,
             })),
             warning: RwLock::new(None),
-            last_contact: Mutex::new(None),
-            changelog_tick,
-            replicas: replicas::Tracker::default(),
-            session: crate::auth::random_token(8),
-            follower: Mutex::new(None),
             promote_lock: tokio::sync::Mutex::new(()),
-            reconnects: AtomicU64::new(0),
-            rebootstraps: AtomicU64::new(0),
-            reconcile_mismatches: AtomicU64::new(0),
             http,
             peer_http,
         })
@@ -205,7 +156,7 @@ impl Replication {
 
     fn set_role(&self, r: Role) {
         *self.role.write().unwrap_or_else(|p| p.into_inner()) = r;
-        // Changelog v2 (shadow mode) follows the role: only a primary is
+        // Changelog v2 follows the role: only a writable primary is
         // its leader.
         self.storage
             .cdc_set_leader(matches!(r, Role::Primary | Role::Promoted));
@@ -220,67 +171,23 @@ impl Replication {
         self.gate.read_only().then(|| self.gate.reason())
     }
 
-    /// O21: why this server does not serve replication data (snapshot,
-    /// changes, checksums) to a standby right now; `None`: it does. A
-    /// writable primary serves. So does a standby (cascading standbys) once
-    /// it holds a copy of its primary's history (it loaded a snapshot), as
-    /// long as its replication has not halted: a halted standby's data is
-    /// not trusted, and its followers halt too (`halted`).
-    pub fn source_refusal(&self) -> Option<SourceRefusal> {
-        if self.writable() {
-            return None;
-        }
-        if self.role() != Role::Standby {
-            return Some(SourceRefusal {
-                halted: false,
-                message: self.gate.reason(),
-            });
-        }
-        let halted = self
-            .follow_status
-            .lock()
-            .unwrap()
-            .halted
+    /// The current `[follow]` (None on a primary).
+    fn follow(&self) -> Option<FollowConfig> {
+        self.follow
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
             .clone()
-            .or_else(|| crate::mutation::replica::halted(&self.storage));
-        if let Some(h) = halted {
-            return Some(SourceRefusal {
-                halted: true,
-                message: format!(
-                    "this standby's replication halted ({}: {}); the standbys that follow it must stop too and be rebuilt (rust-dns --prepare-standby --yes) after it",
-                    h.reason, h.detail
-                ),
-            });
-        }
-        let copied = self
-            .storage
-            .replication_state()
-            .map(|st| st.contains_key(K_FOLLOWING))
-            .unwrap_or(false);
-        if !copied {
-            return Some(SourceRefusal {
-                halted: false,
-                message: format!(
-                    "this standby has not loaded the data of its primary {} yet; try again later",
-                    self.primary_url()
-                ),
-            });
-        }
-        None
     }
 
     fn primary_url(&self) -> String {
-        self.follow
-            .as_ref()
+        self.follow()
             .map(|f| f.primary.trim().trim_end_matches('/').to_string())
             .unwrap_or_default()
     }
 
-    fn local_root(&self) -> LocalRoot {
-        let cfg = self.reloader.current.load();
-        LocalRoot {
-            username: cfg.root.username.clone(),
-        }
+    /// This server's own `[root]` username.
+    fn local_root(&self) -> String {
+        self.reloader.current.load().root.username.clone()
     }
 
     fn history(&self) -> History {
@@ -292,7 +199,7 @@ impl Replication {
     /// write, not even briefly.
     pub async fn start(self: &Arc<Self>) -> Result<()> {
         let st = self.storage.replication_state()?;
-        if self.follow.is_some() {
+        if self.follow().is_some() {
             let url = self.primary_url();
             self.set_role(Role::Standby);
             self.gate.close(format!(
@@ -305,11 +212,15 @@ impl Replication {
                 *self.warning.write().unwrap() = Some(w);
             }
             tracing::info!(primary = %url, "standby mode: mirroring the primary, writes refused");
-            // O21: standbys may follow this one; keep their list too.
-            self.start_replica_tracking();
-            let me = self.clone();
-            *self.follower.lock().unwrap() =
-                Some(tokio::spawn(async move { me.run_follower().await }));
+            // Changelog v2: follow the primary's v2 log (a fresh database
+            // first loads a snapshot, then streams).
+            let node = self.cdc.clone().ok_or_else(|| {
+                anyhow!("changelog v2 is not attached: this server cannot follow")
+            })?;
+            let v2 = format!("{url}/rust-dns/changelog-api/v2");
+            node.start_follow(&v2)
+                .await
+                .map_err(|e| anyhow!("starting to follow {v2}: {e}"))?;
             return Ok(());
         }
         // Not following. A database that was a standby and has no promotion
@@ -329,7 +240,6 @@ impl Replication {
                 .await
                 .map_err(|e| anyhow!("recording the promotion: {e}"))?;
         }
-        self.start_replica_tracking();
         let h = self.history();
         self.set_role(if h.promoted_at.is_some() {
             Role::Promoted
@@ -353,78 +263,59 @@ impl Replication {
         Ok(())
     }
 
-    // ---- primary side -------------------------------------------------------
-
-    /// Account data changed: wake long-polling standbys.
-    pub fn changelog_appended(&self) {
-        self.changelog_tick.send_modify(|g| *g += 1);
-    }
-
-    pub fn subscribe_changelog_tick(&self) -> tokio::sync::watch::Receiver<u64> {
-        self.changelog_tick.subscribe()
-    }
-
-    fn replication_cfg(&self) -> crate::config::ReplicationConfig {
-        self.reloader.current.load().replication.clone()
-    }
-
-    /// Load the persisted replica list and prune it now and daily.
-    fn start_replica_tracking(self: &Arc<Self>) {
-        match self.storage.load_replicas() {
-            Ok(rows) => self.replicas.load(
-                rows.iter()
-                    .filter_map(|r| serde_json::from_str::<replicas::Entry>(r).ok())
-                    .collect(),
-            ),
-            Err(e) => tracing::warn!(error = %e, "cannot load the replica list"),
-        }
-        let me = self.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(3600));
-            loop {
-                tick.tick().await;
-                let days = me.replication_cfg().forget_after_days;
-                let now = chrono::Utc::now();
-                for id in me.replicas.prune(now, days) {
-                    tracing::info!(instance = %id, days, "forgetting a replica not seen for a long time");
-                }
-                let cutoff = (now - chrono::Duration::days(days as i64))
-                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-                let _ = me.storage.prune_replicas(&cutoff);
-            }
-        });
-    }
-
-    /// Record a standby's request (primary side).
-    pub fn note_replica(&self, seen: &replicas::Seen, report: replicas::Report) {
-        let cfg = self.replication_cfg();
-        let head = self.storage.changelog_head().unwrap_or(0);
-        let now = chrono::Utc::now();
-        let (save, conflict) = self.replicas.note(seen, report, head, now, &cfg);
-        if conflict {
-            tracing::warn!(instance = %seen.instance, address = %seen.address, "CONFLICT: two standbys use the same [follow].instance_id; give each a unique instance_id");
-        }
-        if let Some(e) = save {
-            if let Ok(json) = serde_json::to_string(&e) {
-                let at = e
-                    .last_seen
-                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-                if let Err(err) = self.storage.save_replica(&e.instance, &json, &at) {
-                    tracing::warn!(error = %err, "cannot save the replica list");
-                }
-            }
-        }
-    }
-
+    /// The standbys following this server's v2 log.
     pub fn replica_list(&self) -> Vec<replicas::ReplicaInfo> {
-        let head = self.storage.changelog_head().unwrap_or(0);
-        self.replicas
-            .list(head, chrono::Utc::now(), &self.replication_cfg())
+        let Some(n) = &self.cdc else {
+            return Vec::new();
+        };
+        let head = n.store.state().map(|s| s.last_txn).unwrap_or(0);
+        let cfg = self.reloader.current.load().replication.clone();
+        let now = chrono::Utc::now();
+        n.clients
+            .list(head)
+            .into_iter()
+            .map(|c| {
+                let seen = chrono::DateTime::from_timestamp(c.last_seen as i64, 0).unwrap_or(now);
+                let first = chrono::DateTime::from_timestamp(c.first_seen as i64, 0).unwrap_or(now);
+                let idle = (now - seen).num_seconds().max(0);
+                let state = if c.mode == "snapshot" && !c.up_to_date {
+                    replicas::ReplicaState::Bootstrapping
+                } else if !c.connected && idle as u64 > cfg.offline_after_secs {
+                    replicas::ReplicaState::Offline
+                } else if c.up_to_date {
+                    replicas::ReplicaState::UpToDate
+                } else if c.lag_txns > cfg.max_lag_changes {
+                    replicas::ReplicaState::FallingBehind
+                } else {
+                    replicas::ReplicaState::CatchingUp
+                };
+                replicas::ReplicaInfo {
+                    instance: c.name.clone(),
+                    state,
+                    conflict: false,
+                    applied_offset: c.position as i64,
+                    head: head as i64,
+                    lag_changes: c.lag_txns as i64,
+                    lag_seconds: if c.up_to_date { 0 } else { idle },
+                    last_seen_at: seen.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    last_caught_up_at: c
+                        .up_to_date
+                        .then(|| seen.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+                    first_seen_at: first.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    address: c.addr.clone().unwrap_or_default(),
+                    version: "changelog v2".into(),
+                    user: c.principal.clone().unwrap_or_default(),
+                    bootstrapping: c.mode == "snapshot" && !c.up_to_date,
+                    halted_reason: None,
+                }
+            })
+            .collect()
     }
 
-    /// Forget an instance (after the audited database delete).
-    pub fn forget_replica(&self, instance: &str) -> bool {
-        self.replicas.forget(instance)
+    /// Whether `instance` is in the replica list (changelog v2 keeps it in
+    /// memory and drops a follower by itself a day after its last request).
+    pub fn knows_replica(&self, instance: &str) -> bool {
+        self.replica_list().iter().any(|r| r.instance == instance)
     }
 
     // ---- status -------------------------------------------------------------
@@ -435,21 +326,74 @@ impl Replication {
             role: self.role(),
             writable: self.writable(),
             history: self.history(),
+            changelog_v2: self.cdc_identity(),
         }
     }
 
+    fn cdc_identity(&self) -> Option<CdcIdentity> {
+        let st = self.cdc.as_ref()?.store.state().ok()?;
+        Some(CdcIdentity {
+            history: st.history,
+            role: st.role.as_str().into(),
+            last_txn: st.last_txn,
+        })
+    }
+
+    /// The v2 follower's state, in the shape the API and console know.
     fn follow_snapshot(&self) -> FollowStatus {
-        let mut f = self.follow_status.lock().unwrap().clone();
-        f.reconnects = self.reconnects.load(Ordering::Relaxed);
-        f.rebootstraps = self.rebootstraps.load(Ordering::Relaxed);
-        f.last_applied_offset = self.storage.changelog_head().unwrap_or(0);
-        f.lag_changes = f.primary_head.map(|h| (h - f.last_applied_offset).max(0));
-        f.seconds_since_last_applied = f.last_applied_at.as_deref().and_then(|t| {
-            chrono::DateTime::parse_from_rfc3339(t)
-                .ok()
-                .map(|t| (chrono::Utc::now() - t.with_timezone(&chrono::Utc)).num_seconds())
+        let cfg = self.follow();
+        let mut f = FollowStatus {
+            primary: cfg.as_ref().map(|c| c.primary.clone()).unwrap_or_default(),
+            instance_id: cfg
+                .as_ref()
+                .map(|c| c.instance_id.trim().to_string())
+                .unwrap_or_default(),
+            state: "starting".into(),
+            ..Default::default()
+        };
+        let Some(n) = &self.cdc else {
+            f.state = "stopped".into();
+            f.last_error = Some("changelog v2 is not attached".into());
+            return f;
+        };
+        let fs = n.follow_status();
+        let st = n.store.state().ok();
+        f.state = match fs.state.as_str() {
+            s if s.starts_with("following") => "following",
+            "snapshotting" => "bootstrapping",
+            "halted" => "halted",
+            s if s.starts_with("blocked") => "refused",
+            "retrying" => "error",
+            "stopped" => "stopped",
+            _ => "connecting",
+        }
+        .into();
+        f.connected = fs.up_to_date || f.state == "following";
+        f.last_applied_offset = st.as_ref().map_or(0, |s| s.last_txn as i64);
+        f.primary_head = Some(fs.upstream_last as i64);
+        f.lag_changes = Some((fs.upstream_last as i64 - f.last_applied_offset).max(0));
+        f.last_error = fs.last_error.clone();
+        f.rebootstraps = fs.snapshots;
+        f.last_reconcile_result = fs.last_verify.as_ref().map(|v| {
+            format!(
+                "verify at txn {}: {}",
+                v["at"],
+                if v["ok"] == true { "ok" } else { "DIFFERENCES" }
+            )
+        });
+        f.halted = st.and_then(|s| s.halted).map(|h| HaltInfo {
+            reason: h["kind"].as_str().unwrap_or("diverged").to_string(),
+            detail: h["detail"].as_str().unwrap_or_default().to_string(),
+            at: h["at"].as_str().unwrap_or_default().to_string(),
+            offset: f.last_applied_offset,
+            report_file: None,
         });
         f
+    }
+
+    /// The changelog v2 node (the router serves its protocol).
+    pub fn cdc_node(&self) -> Option<Arc<sqlite_cdc::node::Node>> {
+        self.cdc.clone()
     }
 
     pub fn status(&self) -> ReplicationStatus {
@@ -465,7 +409,7 @@ impl Replication {
             peer: self.peer_status.lock().unwrap().clone(),
             replicas: self.replica_list(),
             warning: self.warning.read().unwrap().clone(),
-            local_root: (role == Role::Standby).then(|| self.local_root().username),
+            local_root: (role == Role::Standby).then(|| self.local_root()),
         }
     }
 
@@ -611,140 +555,34 @@ impl Replication {
                 f.seconds_since_last_applied.unwrap_or(-1),
             );
             out.push_str(&format!("# HELP rustdns_replication_reconnects_total Connections to the primary lost or refused\n# TYPE rustdns_replication_reconnects_total counter\nrustdns_replication_reconnects_total {}\n", f.reconnects));
-            out.push_str(&format!("# HELP rustdns_replication_reconcile_mismatches_total Reconciles that found data differing from the primary\n# TYPE rustdns_replication_reconcile_mismatches_total counter\nrustdns_replication_reconcile_mismatches_total {}\n", self.reconcile_mismatches.load(Ordering::Relaxed)));
             out.push_str(&format!("# HELP rustdns_replication_rebootstraps_total Snapshots loaded from the primary\n# TYPE rustdns_replication_rebootstraps_total counter\nrustdns_replication_rebootstraps_total {}\n", f.rebootstraps));
         }
         out
-    }
-
-    fn update(&self, f: impl FnOnce(&mut FollowStatus)) {
-        f(&mut self.follow_status.lock().unwrap());
-    }
-
-    fn contact_ok(&self) {
-        *self.last_contact.lock().unwrap() = Some(Instant::now());
-        self.update(|s| {
-            s.connected = true;
-            s.disconnected_since = None;
-            s.last_contact_at = Some(now_rfc3339());
-        });
-    }
-
-    // ---- HTTP ---------------------------------------------------------------
-
-    async fn get<T: serde::de::DeserializeOwned>(
-        &self,
-        base: &str,
-        token: Option<&str>,
-        path: &str,
-        timeout: Duration,
-    ) -> std::result::Result<T, CallError> {
-        self.get_with(&self.http, base, token, path, timeout).await
-    }
-
-    async fn get_with<T: serde::de::DeserializeOwned>(
-        &self,
-        http: &reqwest::Client,
-        base: &str,
-        token: Option<&str>,
-        path: &str,
-        timeout: Duration,
-    ) -> std::result::Result<T, CallError> {
-        let (body, _) = self
-            .get_bytes(http, base, token, path, timeout, false)
-            .await?;
-        serde_json::from_slice(&body)
-            .map_err(|e| CallError::Other(format!("bad answer from {base}{path}: {e}")))
-    }
-
-    /// A GET's body; with `gzip` (O22, snapshots) it asks for a compressed
-    /// answer and returns whether it got one (an older primary answers
-    /// plain JSON). The body is still compressed then.
-    async fn get_bytes(
-        &self,
-        http: &reqwest::Client,
-        base: &str,
-        token: Option<&str>,
-        path: &str,
-        timeout: Duration,
-        gzip: bool,
-    ) -> std::result::Result<(Vec<u8>, bool), CallError> {
-        let url = format!("{base}{path}");
-        let mut req = http
-            .get(&url)
-            .timeout(timeout)
-            .header(replicas::HEADER_VERSION, replicas::VERSION_WITH_FEATURES)
-            .header(replicas::HEADER_SESSION, &self.session);
-        if gzip {
-            req = req.header(reqwest::header::ACCEPT_ENCODING, "gzip");
-        }
-        if let Some(f) = &self.follow {
-            req = req.header(replicas::HEADER_INSTANCE, f.instance_id.trim());
-        }
-        if let Some(t) = token {
-            req = req.bearer_auth(t);
-        }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| CallError::Other(format!("cannot reach {base}: {}", error_chain(&e))))?;
-        let status = resp.status();
-        if status.is_success() {
-            let compressed = resp
-                .headers()
-                .get(reqwest::header::CONTENT_ENCODING)
-                .and_then(|v| v.to_str().ok())
-                .is_some_and(|v| v.trim().eq_ignore_ascii_case("gzip"));
-            if compressed && !gzip {
-                return Err(CallError::Other(format!(
-                    "bad answer from {base}{path}: compressed without being asked"
-                )));
-            }
-            let body = resp
-                .bytes()
-                .await
-                .map_err(|e| CallError::Other(format!("bad answer from {base}{path}: {e}")))?;
-            return Ok((body.to_vec(), compressed));
-        }
-        let body: serde_json::Value = resp.json().await.unwrap_or_default();
-        let msg = body["error"].as_str().unwrap_or("").to_string();
-        if status.as_u16() == 409 && body["code"] == "replication_halted" {
-            return Err(upstream_halted(base, &msg));
-        }
-        Err(match status.as_u16() {
-            401 => CallError::Auth(format!(
-                "the primary rejected the replication token ({msg}); create a new API token of an administrator on the primary and put it in [follow].token"
-            )),
-            403 => CallError::Auth(format!(
-                "the replication token's user is not an administrator on the primary ({msg})"
-            )),
-            409 => CallError::Refused(format!("{base} refused: {msg}")),
-            404 => CallError::Other(format!(
-                "{base}{path}: not found (is it a rust-dns web API URL, and a version with standby support?)"
-            )),
-            s => CallError::Other(format!("{base}{path}: HTTP {s} {msg}")),
-        })
     }
 
     // ---- fencing (primary with [peer]) --------------------------------------
 
     async fn check_peer(&self, p: &PeerConfig) {
         let base = p.url.trim().trim_end_matches('/').to_string();
-        let r: std::result::Result<Identity, _> = self
-            .get_with(
-                &self.peer_http,
-                &base,
-                None,
-                "/rust-dns/api/replication/identity",
-                Duration::from_secs(5),
-            )
-            .await;
+        let r = self.peer_identity(&base).await;
         let mine = self.history();
         let result = match r {
             Err(e) => format!("peer not reachable: {e}"),
             Ok(id) => {
+                // The peer took over this server's replication: it leads
+                // the same changelog v2 history (a promoted standby keeps
+                // it, in a new epoch) and was promoted after this server
+                // last was. (v1: its history's parent is this history.)
+                let mine_v2 = self.cdc_identity();
+                let same_v2 = matches!(
+                    (&id.changelog_v2, &mine_v2),
+                    (Some(p), Some(m)) if p.history.is_some() && p.history == m.history && p.role == "leader" && m.role == "leader"
+                );
+                let peer_newer = id.history.promoted_at.is_some()
+                    && mine.promoted_at.as_deref() < id.history.promoted_at.as_deref();
                 if id.writable
-                    && id.history.parent_history_id.as_deref() == Some(mine.history_id.as_str())
+                    && (id.history.parent_history_id.as_deref() == Some(mine.history_id.as_str())
+                        || (same_v2 && peer_newer))
                 {
                     let why = format!(
                         "this server is an old primary: {base} was promoted from its history{} and accepts writes; this server is read-only now. Make it a standby of the new primary ([follow] primary = \"{base}\" with an administrator token) or promote nothing and investigate",
@@ -772,6 +610,25 @@ impl Replication {
         }
     }
 
+    /// The peer's public identity (`GET /replication/identity`).
+    async fn peer_identity(&self, base: &str) -> std::result::Result<Identity, String> {
+        let url = format!("{base}/rust-dns/api/replication/identity");
+        let resp = self
+            .peer_http
+            .get(&url)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|e| format!("cannot reach {base}: {}", error_chain(&e)))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(format!("{url}: HTTP {status}"));
+        }
+        resp.json()
+            .await
+            .map_err(|e| format!("bad answer from {url}: {e}"))
+    }
+
     // ---- promotion ------------------------------------------------------------
 
     /// Promote this standby. `Err((status, message))` for the API.
@@ -793,12 +650,10 @@ impl Replication {
             ));
         }
         let url = self.primary_url();
-        let reachable = self.follow_status.lock().unwrap().connected
-            && self
-                .last_contact
-                .lock()
-                .unwrap()
-                .is_some_and(|t| t.elapsed() < REACHABLE_WITHIN);
+        let reachable = self
+            .cdc
+            .as_ref()
+            .is_some_and(|n| n.follow_status().up_to_date);
         if reachable && !force {
             return Err((409, format!("the primary {url} is reachable: promoting now makes two writable servers. Stop the primary first, or send \"force\": true")));
         }
@@ -825,8 +680,8 @@ impl Replication {
             self.reloader.current.store(Arc::new(c));
         }
         // 2. Stop following (an apply in flight completes or rolls back atomically).
-        if let Some(h) = self.follower.lock().unwrap().take() {
-            h.abort();
+        if let Some(n) = &self.cdc {
+            n.stop_follow().await;
         }
         // 3. The database: new history, forked at the current offset.
         let h = self
@@ -834,13 +689,20 @@ impl Replication {
             .replica_promote(actor, url.clone(), how)
             .await
             .map_err(|e| (500, format!("recording the promotion failed: {e}; the config no longer has [follow], so a restart completes the promotion")))?;
+        // 3b. Changelog v2: this server leads now, in a new epoch (a random
+        // nonce), so its log differs from anything the old primary writes.
+        if let Some(n) = &self.cdc {
+            let store = n.store.clone();
+            let e = tokio::task::spawn_blocking(move || store.promote(true))
+                .await
+                .map_err(|e| (500, e.to_string()))?;
+            if let Err(e) = e {
+                tracing::error!(error = %e, "changelog v2: promotion failed");
+            }
+        }
         // 4. Writable now; standbys will report to this server.
         self.set_role(Role::Promoted);
         self.gate.open();
-        self.update(|s| {
-            s.state = "stopped".into();
-            s.connected = false;
-        });
         let _ = self.mutator.rebuild();
         self.mutator.wake_expiry();
         *self.warning.write().unwrap() = None;
@@ -865,694 +727,102 @@ impl Replication {
         })
     }
 
-    // ---- standby side -----------------------------------------------------------
-
-    async fn run_follower(self: Arc<Self>) {
-        if let Some(h) = crate::mutation::replica::halted(&self.storage) {
-            tracing::error!(reason = %h.reason, detail = %h.detail, since = %h.at, report = ?h.report_file, "REPLICATION HALTED: this standby's data diverged from the primary; it serves its last state read-only and does not follow. Investigate, then rebuild it: stop it and run rust-dns --prepare-standby --yes");
-            self.enter_halted(h).await;
-            return;
+    /// Operator rebootstrap (changelog v2): replace this standby's data with
+    /// a fresh snapshot of the primary, atomically (it keeps serving its
+    /// data until the snapshot replaces everything in one transaction),
+    /// clearing a halt. With new `[follow]` parameters it also repoints:
+    /// the config file is rewritten first (nothing changes if that fails).
+    /// A fenced old primary becomes a standby this way. The snapshot is
+    /// loaded by the follow loop: progress and outcome are in the status
+    /// (the request returns once it started). Audited.
+    pub async fn rebootstrap(
+        self: &Arc<Self>,
+        actor: Actor,
+        primary: Option<String>,
+        token: Option<String>,
+        instance_id: Option<String>,
+    ) -> std::result::Result<String, (u16, String)> {
+        let _g = self.promote_lock.lock().await;
+        let role = self.role();
+        if !matches!(role, Role::Standby | Role::Fenced) {
+            return Err((409, format!("only a standby (or a fenced old primary) can rebootstrap; this server is {role:?}").to_lowercase()));
         }
-        let mut backoff = Duration::from_secs(1);
-        loop {
-            let started = Instant::now();
-            let err = self.follow_session().await;
-            if let CallError::Halt {
-                reason,
-                detail,
-                evidence,
-            } = err
-            {
-                let h = self.halt(reason, detail, evidence).await;
-                self.enter_halted(h).await;
-                return;
-            }
-            let refused = matches!(err, CallError::Auth(_) | CallError::Refused(_));
-            tracing::error!(primary = %self.primary_url(), error = %err, "replication: not following the primary; retrying");
-            self.reconnects.fetch_add(1, Ordering::Relaxed);
-            self.update(|s| {
-                s.connected = false;
-                s.state = if refused { "refused" } else { "error" }.into();
-                s.last_error = Some(err.to_string());
-                if s.disconnected_since.is_none() {
-                    s.disconnected_since = Some(now_rfc3339());
-                }
-            });
-            if started.elapsed() > Duration::from_secs(60) {
-                backoff = Duration::from_secs(1);
-            }
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(Duration::from_secs(if refused { 300 } else { 60 }));
-        }
-    }
-
-    fn follow_cfg(&self) -> (String, String, Duration, Duration) {
-        let f = self.follow.as_ref().expect("standby");
-        (
-            self.primary_url(),
-            f.token.trim().to_string(),
-            Duration::from_secs(f.timeout_secs.max(1)),
-            Duration::from_secs(f.reconcile_interval_secs.max(1)),
-        )
-    }
-
-    /// One connection: validate, align histories, then tail until an error.
-    async fn follow_session(&self) -> CallError {
-        match self.follow_session_inner().await {
-            Ok(()) => CallError::Other("stopped".into()),
-            Err(e) => e,
-        }
-    }
-
-    async fn follow_session_inner(&self) -> std::result::Result<(), CallError> {
-        let (base, token, timeout, reconcile_every) = self.follow_cfg();
-        self.update(|s| s.state = "connecting".into());
-        // Token valid and an administrator's (also re-checked by every call).
-        let remote: ReplicationStatus = self
-            .get(
-                &base,
-                Some(&token),
-                "/rust-dns/api/replication/status",
-                timeout,
-            )
-            .await?;
-        if remote.protocol != REPLICATION_PROTOCOL {
-            return Err(CallError::Refused(format!(
-                "{base} speaks replication protocol {} and this server {}: run the same rust-dns version on both (upgrade the primary first)",
-                remote.protocol, REPLICATION_PROTOCOL
-            )));
-        }
-        if !remote.writable {
-            match remote.role {
-                // O21: cascading standbys. Its data is ours to copy only while
-                // it follows its own primary without having halted.
-                Role::Standby => {
-                    if let Some(h) = remote.follow.as_ref().and_then(|f| f.halted.as_ref()) {
-                        return Err(upstream_halted(&base, &format!("{}: {}", h.reason, h.detail)));
-                    }
-                    let mine = self.local_root().username;
-                    match remote.local_root.as_deref() {
-                        Some(r) if r == mine => {}
-                        Some(r) => return Err(CallError::Refused(format!(
-                            "{base} is a standby whose [root] username is '{r}' and this server's is '{mine}': a standby that follows another standby must use the same [root] username (each keeps its own root account local)"
-                        ))),
-                        None => return Err(CallError::Refused(format!(
-                            "{base} is a standby of a version that does not serve standbys; follow its primary, or upgrade it"
-                        ))),
-                    }
-                }
-                _ => {
-                    return Err(CallError::Refused(format!(
-                        "{base} is not a writable primary or a standby (role {:?}); a standby can only follow a primary or another standby",
-                        remote.role
-                    )))
-                }
-            }
-        }
-        self.contact_ok();
-        self.update(|s| s.last_error = None);
-        let local = self
-            .local_view()
-            .map_err(|e| CallError::Other(e.to_string()))?;
-        let oldest = self
-            .get::<ChangesResponse>(
-                &base,
-                Some(&token),
-                &format!(
-                    "/rust-dns/api/replication/changes?after={}&limit=1&wait=0&probe=true",
-                    (local.head - 1).max(0)
-                ),
-                timeout,
-            )
-            .await?;
-        let txn_matches = if local.history.history_id == remote.history.history_id && local.head > 0
-        {
-            let mine = self
-                .storage
-                .read_tx(|c| data::changelog_row(c, local.head))
-                .ok()
-                .flatten();
-            match (mine, oldest.events.iter().find(|e| e.offset == local.head)) {
-                (Some(a), Some(b)) => Some(a.txn == b.txn && a.ts == b.ts),
-                _ => None,
-            }
-        } else {
-            None
+        let Some(node) = self.cdc.clone() else {
+            return Err((409, "changelog v2 is not attached".into()));
         };
-        let rv = RemoteView {
-            history: remote.history.clone(),
-            head: oldest.head,
-            oldest: oldest.oldest_offset,
-            txn_matches_at_local_head: txn_matches,
+        let cur = self.follow();
+        let pick = |new: Option<String>, old: Option<String>| {
+            new.map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .or(old)
         };
-        let mut history_id = remote.history.history_id.clone();
-        match lineage::plan(&local, &rv) {
-            Plan::Refuse(why) => return Err(CallError::Refused(format!("{base}: {why}"))),
-            Plan::Diverged { reason, detail } => {
-                return Err(CallError::Halt {
-                    reason,
-                    detail,
-                    evidence: serde_json::json!({
-                        "local_history": local.history,
-                        "local_head": local.head,
-                        "primary_history": remote.history,
-                        "primary_head": rv.head,
-                        "primary_oldest": rv.oldest,
-                    }),
-                })
-            }
-            Plan::Tail { adopt } => {
-                if adopt {
-                    tracing::warn!(from = %local.history.history_id, to = %remote.history.history_id, "the primary was promoted from this server's history; continuing in its history");
-                    self.mutator
-                        .replica_adopt_history(remote.history.clone(), base.clone())
-                        .await
-                        .map_err(|e| CallError::Other(e.to_string()))?;
-                }
-            }
-            Plan::NeedsFresh { why, data } => {
-                return Err(CallError::Refused(format!(
-                    "refusing to follow {base}: {why}. This server has data that following would replace: {}. Nothing was changed and it stays read-only. To discard its data on purpose (a backup and a divergence report are written first), stop the server and run: rust-dns --prepare-standby --yes --config {}",
-                    data.join(", "),
-                    self.config_path.display()
-                )))
-            }
-            Plan::Bootstrap { reason } => {
-                tracing::info!(reason = %reason, "replication: loading a snapshot from the primary");
-                history_id = self.bootstrap(&base, &token, &reason).await?;
-            }
-        }
-        // Display only: a failure here never stops following.
-        match self.fetch_history(&base, &token, timeout).await {
-            Ok(0) => {}
-            Ok(n) => tracing::info!(
-                rows = n,
-                "replication: copied the primary's earlier DNS changelog"
-            ),
-            Err(e) => {
-                tracing::warn!(error = %e, "replication: could not copy the primary's earlier DNS changelog (the changelog page starts at the snapshot)")
-            }
-        }
-        let mut last_reconcile = Instant::now();
-        self.update(|s| s.state = "following".into());
-        loop {
-            let head = self.storage.changelog_head().unwrap_or(0);
-            // Wake up in time for the next reconcile.
-            let wait = POLL_WAIT_SECS.min(
-                reconcile_every
-                    .saturating_sub(last_reconcile.elapsed())
-                    .as_secs()
-                    .max(1),
+        let primary = pick(primary, cur.as_ref().map(|f| f.primary.clone())).ok_or((
+            400,
+            "no primary: pass \"primary\" (this server has no [follow])".to_string(),
+        ))?;
+        let token = pick(token, cur.as_ref().map(|f| f.token.clone()))
+            .ok_or((400, "no token: pass \"token\"".to_string()))?;
+        let instance_id = pick(instance_id, cur.as_ref().map(|f| f.instance_id.clone()))
+            .ok_or((400, "no instance_id: pass \"instance_id\"".to_string()))?;
+        let primary = primary.trim_end_matches('/').to_string();
+        let changed = cur.as_ref().is_none_or(|f| {
+            f.primary.trim_end_matches('/') != primary
+                || f.token.trim() != token
+                || f.instance_id.trim() != instance_id
+        });
+        if changed {
+            crate::config::set_follow_section(&self.config_path, &primary, &token, &instance_id)
+                .map_err(|e| {
+                    (
+                        500,
+                        format!(
+                            "cannot write [follow] to {}: {e:#}; nothing was changed",
+                            self.config_path.display()
+                        ),
+                    )
+                })?;
+            let mut f = cur.clone().unwrap_or_default();
+            f.primary = primary.clone();
+            f.token = token.clone();
+            f.instance_id = instance_id.clone();
+            let mut c = (*self.reloader.current.load_full()).clone();
+            c.follow = Some(f.clone());
+            self.reloader.current.store(Arc::new(c));
+            *self.follow.write().unwrap_or_else(|p| p.into_inner()) = Some(f.clone());
+            node.set_client(
+                sqlite_cdc::client::ClientTemplate {
+                    http: self.http.clone(),
+                    headers: cdc_headers(Some(&f)),
+                },
+                Some(instance_id.clone()),
             );
-            let resp: ChangesResponse = self
-                .get(
-                    &base,
-                    Some(&token),
-                    &format!(
-                        "/rust-dns/api/replication/changes?after={head}&limit={POLL_LIMIT}&wait={wait}"
-                    ),
-                    timeout + Duration::from_secs(wait),
-                )
-                .await?;
-            self.contact_ok();
-            if resp.history_id != history_id {
-                return Err(CallError::Other(format!(
-                    "the primary's history changed ({} -> {}); reconnecting",
-                    history_id, resp.history_id
-                )));
-            }
-            self.update(|s| s.primary_head = Some(resp.head));
-            if resp.gap {
-                // Snapshots are loaded only when connecting: reconnect, and
-                // the connection decides (same lineage + gap = snapshot).
-                return Err(CallError::Other(
-                    "the primary no longer has the changes this standby needs (retention); reconnecting".into(),
-                ));
-            }
-            if !resp.events.is_empty() {
-                // After the initial snapshot everything is changelog driven.
-                // A change that does not apply means this copy is not the
-                // primary's: halt, never "fix" it by reloading.
-                let first = resp.events.first().map(|e| e.offset);
-                let last = resp.events.last().map(|e| e.offset);
-                if let Err(e) = self.apply(&history_id, resp.events).await {
-                    return Err(CallError::Halt {
-                        reason: "apply_failed",
-                        detail: format!("a change from the primary did not apply: {e:#}"),
-                        evidence: serde_json::json!({
-                            "local_head": self.storage.changelog_head().unwrap_or(0),
-                            "batch_first_offset": first,
-                            "batch_last_offset": last,
-                            "history_id": history_id,
-                        }),
-                    });
-                }
-            }
-            let caught_up = self.storage.changelog_head().unwrap_or(0) == resp.head;
-            if caught_up && last_reconcile.elapsed() >= reconcile_every {
-                self.reconcile(&base, &token, timeout).await?;
-                last_reconcile = Instant::now();
-            }
         }
-    }
-
-    async fn apply(&self, history_id: &str, events: Vec<crate::model::ChangeEvent>) -> Result<()> {
-        let n = events.len();
-        let (head, runtime) = self
-            .mutator
-            .replica_apply(history_id.to_string(), events, self.local_root())
+        if role == Role::Fenced {
+            self.set_role(Role::Standby);
+            self.gate.close(format!(
+                "this server is a read-only standby of {primary}; make changes on the primary"
+            ));
+        }
+        let v2 = format!("{primary}/rust-dns/changelog-api/v2");
+        tracing::warn!(actor = %actor.name, primary = %primary, repointed = changed, "REBOOTSTRAP: loading a fresh snapshot of the primary (the current data stays until it is replaced)");
+        node.rebootstrap(Some(&v2))
             .await
-            .map_err(|e| anyhow!("{e}"))?;
-        if runtime {
-            self.after_accounts_change();
-        }
-        // O21: standbys following this one wait for it (account changes are
-        // not on the event bus).
-        self.changelog_appended();
-        tracing::debug!(changes = n, head, "replication: applied");
-        self.update(|s| s.last_applied_at = Some(now_rfc3339()));
-        Ok(())
-    }
-
-    /// Copy the primary's DNS changelog rows older than our first own row
-    /// (a snapshot starts the local changelog empty) through its changelog
-    /// API, the one the console reads: DNS rows only, any version.
-    async fn fetch_history(
-        &self,
-        base: &str,
-        token: &str,
-        timeout: Duration,
-    ) -> std::result::Result<usize, CallError> {
-        #[derive(serde::Deserialize)]
-        struct Page {
-            entries: Vec<crate::model::ChangeEvent>,
-        }
-        const PAGE: usize = 2000;
-        let (mut after, floor) = self
+            .map_err(|e| (502, format!("rebootstrap: {e}")))?;
+        if let Err(e) = self
             .mutator
-            .history_window()
-            .map_err(|e| CallError::Other(e.to_string()))?;
-        let mut added = 0;
-        while after + 1 < floor {
-            let page: Page = self
-                .get(
-                    base,
-                    Some(token),
-                    &format!("/rust-dns/api/changelog?after={after}&limit={PAGE}"),
-                    timeout,
-                )
-                .await?;
-            let Some(last) = page.entries.last().map(|e| e.offset) else {
-                break;
-            };
-            let full = page.entries.len() >= PAGE;
-            added += self
-                .mutator
-                .replica_store_history(page.entries)
-                .await
-                .map_err(|e| CallError::Other(e.to_string()))?;
-            if !full || last <= after {
-                break;
-            }
-            after = last;
-        }
-        Ok(added)
-    }
-
-    fn local_view(&self) -> Result<LocalView> {
-        let root = self.local_root().username;
-        self.storage.read_tx(|c| {
-            let head = data::changelog_head(c)?;
-            Ok(LocalView {
-                history: data::history(c)?,
-                head,
-                data: data::fresh_problems(c, &root)?,
-            })
-        })
-    }
-
-    /// Load a snapshot. Returns its history id.
-    async fn bootstrap(
-        &self,
-        base: &str,
-        token: &str,
-        reason: &str,
-    ) -> std::result::Result<String, CallError> {
-        self.update(|s| s.state = "bootstrapping".into());
-        let timeout = Duration::from_secs(
-            self.follow
-                .as_ref()
-                .map(|f| f.timeout_secs)
-                .unwrap_or(30)
-                .max(120),
-        );
-        let snap: Snapshot = match self.get_snapshot(base, token, timeout).await {
-            Ok(s) => s,
-            Err(e) => {
-                self.update(|s| {
-                    s.last_snapshot_at = Some(now_rfc3339());
-                    s.last_snapshot_result = Some(format!("failed: {e}"));
-                });
-                return Err(e);
-            }
-        };
-        if snap.format != REPLICATION_PROTOCOL {
-            return Err(CallError::Refused(format!(
-                "{base} sent a snapshot of format {} and this server reads {}: run the same rust-dns version on both",
-                snap.format, REPLICATION_PROTOCOL
-            )));
-        }
-        let h = snap.history.history_id.clone();
-        let result = self
-            .mutator
-            .replica_bootstrap(snap, self.local_root(), base.to_string())
-            .await;
-        self.rebootstraps.fetch_add(1, Ordering::Relaxed);
-        match result {
-            Ok(sum) => {
-                tracing::warn!(
-                    reason,
-                    offset = sum.offset,
-                    zones = sum.zones,
-                    records = sum.records,
-                    users = sum.users,
-                    "replication: snapshot loaded"
-                );
-                self.after_accounts_change();
-                self.update(|s| {
-                    s.last_snapshot_at = Some(now_rfc3339());
-                    s.last_snapshot_result = Some(format!(
-                        "ok: {} zones, {} records, {} users at offset {} ({reason})",
-                        sum.zones, sum.records, sum.users, sum.offset
-                    ));
-                    s.last_applied_at = Some(now_rfc3339());
-                    s.primary_head = Some(sum.offset);
-                    s.state = "following".into();
-                });
-                Ok(h)
-            }
-            Err(e) => {
-                self.update(|s| {
-                    s.last_snapshot_at = Some(now_rfc3339());
-                    s.last_snapshot_result = Some(format!("failed: {e}"));
-                });
-                Err(CallError::Other(format!(
-                    "loading the snapshot failed: {e}"
-                )))
-            }
-        }
-    }
-
-    /// O22: the snapshot, gzip-compressed when the primary supports it
-    /// (negotiated with `Accept-Encoding`; an older primary sends plain JSON).
-    async fn get_snapshot(
-        &self,
-        base: &str,
-        token: &str,
-        timeout: Duration,
-    ) -> std::result::Result<Snapshot, CallError> {
-        let path = "/rust-dns/api/replication/snapshot";
-        let (body, gzip) = self
-            .get_bytes(&self.http, base, Some(token), path, timeout, true)
-            .await?;
-        let received = body.len();
-        let base_ = base.to_string();
-        tokio::task::spawn_blocking(move || {
-            let json = if gzip {
-                use std::io::Read;
-                let mut out = Vec::with_capacity(received.saturating_mul(4));
-                flate2::read::GzDecoder::new(&body[..])
-                    .read_to_end(&mut out)
-                    .map_err(|e| {
-                        CallError::Other(format!("bad answer from {base_}{path}: gzip: {e}"))
-                    })?;
-                out
-            } else {
-                body
-            };
-            tracing::info!(
-                bytes = received,
-                json_bytes = json.len(),
-                gzip,
-                "replication: snapshot received"
-            );
-            serde_json::from_slice(&json)
-                .map_err(|e| CallError::Other(format!("bad answer from {base_}{path}: {e}")))
-        })
-        .await
-        .map_err(|e| CallError::Other(e.to_string()))?
-    }
-
-    /// Settings and TSIG keys may have changed: apply them to DNS now.
-    fn after_accounts_change(&self) {
-        if let Err(e) = self.dns.reload_tsig_keys(&self.storage) {
-            tracing::error!(error = %e, "reloading TSIG keys after replication failed");
-        }
-        let cfg = self.reloader.current.load_full();
-        // Forwarding, resolver and blocklist settings.
-        self.dns.load_console_settings(&self.storage, &cfg);
-    }
-
-    /// Compare checksums with the primary. A difference means a change was
-    /// lost or misapplied (a bug): it is reported (log, status, metric) and
-    /// following continues; the standby does not reload by itself (rebuild
-    /// it on purpose with `--prepare-standby`).
-    async fn reconcile(
-        &self,
-        base: &str,
-        token: &str,
-        timeout: Duration,
-    ) -> std::result::Result<(), CallError> {
-        let root = self.local_root().username;
-        let remote: Checksums = self
-            .get(
-                base,
-                Some(token),
-                &format!(
-                    "/rust-dns/api/replication/checksum?exclude_user={}",
-                    url_encode(&root)
-                ),
-                timeout,
+            .replica_audit(
+                actor,
+                "replication.rebootstrap",
+                primary.clone(),
+                serde_json::json!({"primary": primary, "instance_id": instance_id, "repointed": changed}),
             )
-            .await?;
-        let (head, tables, zones) = self
-            .storage
-            .read_tx(|c| {
-                Ok((
-                    data::changelog_head(c)?,
-                    tables::checksums(c, &root)?,
-                    data::zone_checksums(c)?,
-                ))
-            })
-            .map_err(|e| CallError::Other(e.to_string()))?;
-        if remote.offset != head {
-            // The primary moved on meanwhile; compare next time.
-            return Ok(());
-        }
-        let mut diffs = Vec::new();
-        let lmap: HashMap<&str, &ZoneChecksum> =
-            zones.iter().map(|z| (z.name.as_str(), z)).collect();
-        let rmap: HashMap<&str, &ZoneChecksum> =
-            remote.zones.iter().map(|z| (z.name.as_str(), z)).collect();
-        for (n, r) in &rmap {
-            match lmap.get(n) {
-                None => diffs.push(format!("zone {n}: missing here")),
-                Some(l) if l.checksum != r.checksum => diffs.push(format!(
-                    "zone {n}: differs (serial here {}, primary {})",
-                    l.serial, r.serial
-                )),
-                _ => {}
-            }
-        }
-        for n in lmap.keys() {
-            if !rmap.contains_key(n) {
-                diffs.push(format!("zone {n}: not on the primary"));
-            }
-        }
-        for t in &tables {
-            match remote.tables.iter().find(|r| r.table == t.table) {
-                Some(r) if r.checksum == t.checksum => {}
-                Some(r) => diffs.push(format!(
-                    "table {}: differs ({} rows here, {} on the primary)",
-                    t.table, t.rows, r.rows
-                )),
-                // An empty table an older primary does not have yet.
-                None if t.rows == 0 => {}
-                None => diffs.push(format!("table {}: unknown to the primary", t.table)),
-            }
-        }
-        diffs.sort();
-        let result = if diffs.is_empty() {
-            format!(
-                "ok: {} tables and {} zones match at offset {head}",
-                tables.len(),
-                zones.len()
-            )
-        } else {
-            self.reconcile_mismatches.fetch_add(1, Ordering::Relaxed);
-            format!("MISMATCH at offset {head}: {}", diffs.join("; "))
-        };
-        self.update(|s| {
-            s.last_reconcile_at = Some(now_rfc3339());
-            s.last_reconcile_result = Some(result);
-        });
-        if diffs.is_empty() {
-            return Ok(());
-        }
-        Err(CallError::Halt {
-            reason: "diverged",
-            detail: format!(
-                "reconcile at offset {head} found data that differs from the primary: {}",
-                diffs.join("; ")
-            ),
-            evidence: serde_json::json!({
-                "offset": head,
-                "history_id": remote.history_id,
-                "differences": diffs,
-                "local": { "tables": tables, "zones": zones },
-                "primary": { "tables": remote.tables, "zones": remote.zones },
-            }),
-        })
-    }
-
-    /// Record a halt: divergence report next to the database (no secrets:
-    /// names, offsets and checksums), the terminal state in the database,
-    /// the error log.
-    async fn halt(
-        &self,
-        reason: &'static str,
-        detail: String,
-        evidence: serde_json::Value,
-    ) -> HaltInfo {
-        let offset = self.storage.changelog_head().unwrap_or(0);
-        let db = self.reloader.current.load().database.path.clone();
-        let dir = db
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        let path = dir.join(format!(
-            "diverged-{}.json",
-            chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ")
-        ));
-        let doc = serde_json::json!({
-            "written_at": now_rfc3339(),
-            "instance_id": self.follow.as_ref().map(|f| f.instance_id.clone()),
-            "primary": self.primary_url(),
-            "reason": reason,
-            "detail": detail,
-            "offset": offset,
-            "local_history": self.history(),
-            "evidence": evidence,
-            "what_now": "This standby stopped replicating because its copy differs from the primary (a bug: a standby never changes replicated data itself). It keeps answering DNS from its last state. Keep this file and the logs for the bug report, then rebuild the standby: stop it and run rust-dns --prepare-standby --yes --config <config>.",
-        });
-        let report_file = match serde_json::to_string_pretty(&doc)
-            .map_err(anyhow::Error::from)
-            .and_then(|t| crate::config::create_private(&path, &t))
+            .await
         {
-            Ok(()) => Some(path.display().to_string()),
-            Err(e) => {
-                tracing::error!(error = %e, "cannot write the divergence report");
-                None
-            }
-        };
-        let info = HaltInfo {
-            reason: reason.to_string(),
-            detail,
-            at: now_rfc3339(),
-            offset,
-            report_file,
-        };
-        tracing::error!(reason = %info.reason, detail = %info.detail, offset, report = ?info.report_file, "REPLICATION HALTED: this standby's data diverged from the primary; it stops following and serves its last state read-only. Investigate, then rebuild it: stop it and run rust-dns --prepare-standby --yes");
-        if let Err(e) = self.mutator.replica_halt(info.clone()).await {
-            tracing::error!(error = %e, "cannot record the halt in the database (it is re-detected at the next start)");
+            tracing::error!(error = %e, "auditing the rebootstrap failed");
         }
-        self.update(|s| s.halted = Some(info.clone()));
-        // O21: standbys long-polling this one learn it now (they halt too).
-        self.changelog_appended();
-        info
+        *self.warning.write().unwrap() = None;
+        Ok(format!("rebootstrap started from {primary}: the snapshot loads in the background; follow its progress in the replication status"))
     }
-
-    /// Halted: stop replicating; tell the primary (until it has heard it,
-    /// once per start).
-    async fn enter_halted(&self, h: HaltInfo) {
-        self.update(|s| {
-            s.state = "halted".into();
-            s.connected = false;
-            s.halted = Some(h.clone());
-            s.last_error = Some(format!("replication halted ({}): {}", h.reason, h.detail));
-        });
-        let (base, token, timeout, _) = self.follow_cfg();
-        let Some(f) = &self.follow else { return };
-        let body = ReplicaReport {
-            state: "halted".into(),
-            reason: h.reason.clone(),
-            detail: h.detail.clone(),
-        };
-        let url = format!(
-            "{base}/rust-dns/api/replication/replicas/{}/report",
-            url_encode(f.instance_id.trim())
-        );
-        let mut backoff = Duration::from_secs(1);
-        loop {
-            let r = self
-                .http
-                .post(&url)
-                .timeout(timeout)
-                .bearer_auth(&token)
-                .header(replicas::HEADER_INSTANCE, f.instance_id.trim())
-                .header(replicas::HEADER_VERSION, replicas::VERSION_WITH_FEATURES)
-                .header(replicas::HEADER_SESSION, &self.session)
-                .json(&body)
-                .send()
-                .await;
-            match r {
-                Ok(resp) if resp.status().is_success() => {
-                    tracing::info!("reported the halt to the primary");
-                    return;
-                }
-                Ok(resp) if resp.status().is_client_error() => {
-                    tracing::warn!(status = %resp.status(), "the primary refused the halt report; not retrying");
-                    return;
-                }
-                _ => {}
-            }
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(Duration::from_secs(300));
-        }
-    }
-}
-
-/// O21: why [`Replication::source_refusal`] refuses.
-#[derive(Debug, Clone)]
-pub struct SourceRefusal {
-    /// The standby's replication halted (its followers halt too).
-    pub halted: bool,
-    pub message: String,
-}
-
-/// O21: the standby this server follows halted. Its data (and so ours,
-/// copied from it) is not trusted: stop for good, like any divergence.
-fn upstream_halted(base: &str, detail: &str) -> CallError {
-    CallError::Halt {
-        reason: "upstream_halted",
-        detail: format!(
-            "the standby this server follows ({base}) halted its own replication ({detail}); this server's copy came from it"
-        ),
-        evidence: serde_json::json!({ "upstream": base, "upstream_detail": detail }),
-    }
-}
-
-/// Percent-encode a query value.
-fn url_encode(v: &str) -> String {
-    v.bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                (b as char).to_string()
-            }
-            _ => format!("%{b:02X}"),
-        })
-        .collect()
 }
 
 /// `reqwest` errors hide the useful part (connection refused, TLS) in the
@@ -1647,7 +917,7 @@ pub async fn prepare_standby_offline(config_path: &std::path::Path, yes: bool) -
     }
     let root = cfg.root.username.clone();
     // Inspect read-only: a dry run must not touch the database at all.
-    let (data_list, rows, head, local_hist, lineage_markers) = {
+    let (data_list, rows, head, local_hist, lineage_markers, v2_history) = {
         let ro =
             rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let rows: i64 = ro.query_row("SELECT COUNT(*) FROM changelog", [], |r| r.get(0))?;
@@ -1658,9 +928,18 @@ pub async fn prepare_standby_offline(config_path: &std::path::Path, yes: bool) -
             data::changelog_head(&ro)?,
             data::history(&ro).unwrap_or_default(),
             st.keys().any(|k| k != "history_id"),
+            // Changelog v2 has a history (a database of an older version
+            // has no `_cdc_state` yet).
+            ro.query_row(
+                "SELECT COUNT(*) FROM _cdc_state WHERE k = 'history'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n > 0)
+            .unwrap_or(false),
         )
     };
-    if data_list.is_empty() && rows == 0 && !lineage_markers {
+    if data_list.is_empty() && rows == 0 && !lineage_markers && !v2_history {
         println!("{} is already fresh: nothing to delete", db.display());
         return Ok(true);
     }
@@ -1676,6 +955,9 @@ pub async fn prepare_standby_offline(config_path: &std::path::Path, yes: bool) -
     }
     if lineage_markers {
         println!("  - the replication lineage (history, promotion and standby records)");
+    }
+    if v2_history {
+        println!("  - the changelog v2 log and history (the standby starts a fresh copy)");
     }
     println!("and keep: the config root '{root}', the audit log.");
     if !yes {
@@ -1768,6 +1050,13 @@ pub async fn prepare_standby_offline(config_path: &std::path::Path, yes: bool) -
         &backup.display().to_string(),
         divergence.as_deref(),
     )?;
+    // Changelog v2: drop the log and its history (after the deletes above,
+    // which it may have captured), so the server starts as a fresh follower
+    // and loads a snapshot of the primary.
+    if let Some(cdc) = storage.cdc() {
+        cdc.forget_history()
+            .context("dropping the changelog v2 history")?;
+    }
     println!(
         "deleted: {} zones, {} records, {} zone members, {} changelog rows, {} TSIG keys, {} settings, {} API tokens, {} users, {} sessions",
         sum.zones, sum.records, sum.zone_members, sum.changelog_rows, sum.tsig_keys, sum.settings, sum.api_tokens, sum.users, sum.sessions
@@ -1777,4 +1066,135 @@ pub async fn prepare_standby_offline(config_path: &std::path::Path, yes: bool) -
         base = follow.primary
     );
     Ok(true)
+}
+
+/// Headers of the v2 follower's requests: the `[follow]` token (the crate
+/// names the follower itself, `NodeConfig::name`).
+fn cdc_headers(f: Option<&FollowConfig>) -> reqwest::header::HeaderMap {
+    let mut h = reqwest::header::HeaderMap::new();
+    if let Some(Ok(v)) = f.map(|f| format!("Bearer {}", f.token.trim()).parse()) {
+        h.insert(reqwest::header::AUTHORIZATION, v);
+    }
+    h
+}
+
+/// After the v2 follower changed data: rebuild the catalog, wake the
+/// expiry sweeper, refresh the console's live views, and reload what is
+/// kept in memory from the database (TSIG keys, forwarding, resolver and
+/// blocklist settings).
+fn applied_hook(
+    storage: Arc<Storage>,
+    mutator: Arc<Mutator>,
+    dns: Arc<DnsServer>,
+    reloader: Arc<crate::reload::Reloader>,
+) -> sqlite_cdc::node::AppliedHook {
+    Arc::new(move |applied| {
+        let (storage, mutator, dns, reloader) = (
+            storage.clone(),
+            mutator.clone(),
+            dns.clone(),
+            reloader.clone(),
+        );
+        let everything = matches!(applied, sqlite_cdc::node::Applied::Everything);
+        let events = match &applied {
+            sqlite_cdc::node::Applied::Txns(txns) => replicated_events(&storage, txns),
+            sqlite_cdc::node::Applied::Everything => Vec::new(),
+        };
+        tokio::spawn(async move {
+            if everything {
+                // The users were replaced wholesale: a session could now
+                // name another account. Everyone signs in again.
+                match storage.delete_all_sessions() {
+                    Ok(n) => tracing::warn!(
+                        sessions = n,
+                        "replicated data replaced (snapshot): everyone signs in again"
+                    ),
+                    Err(e) => {
+                        tracing::error!(error = %e, "deleting sessions after a snapshot failed")
+                    }
+                }
+            }
+            mutator.replica_applied().await;
+            for ev in events {
+                mutator.publish_replicated(ev);
+            }
+            if let Err(e) = dns.reload_tsig_keys(&storage) {
+                tracing::error!(error = %e, "reloading TSIG keys after replication failed");
+            }
+            dns.load_console_settings(&storage, &reloader.current.load_full());
+        });
+    })
+}
+
+/// Console events for applied v2 transactions: one per (transaction, zone)
+/// of the DNS tables, with entity, action and who did it. No row data.
+fn replicated_events(
+    storage: &Storage,
+    txns: &[sqlite_cdc::wire::Txn],
+) -> Vec<crate::model::ChangeEvent> {
+    let mut out = Vec::new();
+    for t in txns {
+        let meta: serde_json::Value = serde_json::from_str(t.meta.get()).unwrap_or_default();
+        let s = |k: &str| meta[k].as_str().unwrap_or_default().to_string();
+        // Zone names this transaction knows from its own zone rows (a
+        // deleted zone is gone from the database by now).
+        let mut names: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
+        for r in t.rows.iter().filter(|r| r.tbl == "zones") {
+            for img in [&r.before, &r.after].into_iter().flatten() {
+                let v: serde_json::Value = serde_json::from_str(img.get()).unwrap_or_default();
+                if let (Some(id), Some(n)) = (v["id"].as_i64(), v["name"].as_str()) {
+                    names.insert(id, n.to_string());
+                }
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        for r in &t.rows {
+            let entity = match r.tbl.as_str() {
+                "zones" => "zone",
+                "records" => "record",
+                "zone_members" => "member",
+                "dnssec_keys" => "dnssec",
+                _ => continue,
+            };
+            let img = r.after.as_ref().or(r.before.as_ref());
+            let v: serde_json::Value = img
+                .and_then(|i| serde_json::from_str(i.get()).ok())
+                .unwrap_or_default();
+            let zid = if r.tbl == "zones" {
+                v["id"].as_i64()
+            } else {
+                v["zone_id"].as_i64()
+            };
+            let Some(zid) = zid else { continue };
+            let zone = match names.get(&zid) {
+                Some(n) => n.clone(),
+                None => match storage.read_tx(|c| crate::storage::get_zone_by_id(c, zid)) {
+                    Ok(Some(z)) => z.name,
+                    _ => continue,
+                },
+            };
+            let action = match r.op.as_str() {
+                "I" => "create",
+                "D" => "delete",
+                _ => "update",
+            };
+            if !seen.insert((zone.clone(), entity, action)) {
+                continue;
+            }
+            out.push(crate::model::ChangeEvent {
+                offset: t.txn_id as i64,
+                ts: now_rfc3339(),
+                actor: s("actor"),
+                actor_ip: s("ip"),
+                action: action.into(),
+                entity: entity.into(),
+                zone,
+                entity_id: v["id"].as_i64(),
+                payload: serde_json::json!({ "kind": "replicated", "txn_id": t.txn_id }),
+                txn: s("v1_txn"),
+                command: s("command"),
+            });
+        }
+    }
+    out
 }

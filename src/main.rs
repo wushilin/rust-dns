@@ -268,15 +268,25 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             f.primary.trim().trim_end_matches('/')
         ));
     }
-    let root = accounts.sync_root(
-        &cfg.root.username,
-        &cfg.root.password,
-        cfg.root.mfa_required,
-    )?;
-    if let Some(pw) = generated {
-        // stderr only: the plaintext must never reach the log files.
-        tracing::warn!(username = %root.username, config = %cli.config.display(), "generated a new configuration with a random root password (printed once on stderr, not logged)");
-        eprintln!("\n  Root login: {}  /  {}\n  (the plaintext is only shown once; the config now holds a hash)\n", root.username, pw);
+    // Changelog v2: a standby's users are an exact copy of the primary's
+    // (sign in with the primary's accounts); its config root is not
+    // written, which would be a local change to replicated data.
+    if cfg.follow.is_some() {
+        tracing::info!(root = %cfg.root.username, "standby: [root] is not synced into the users table; sign in with the primary's accounts");
+        if generated.is_some() {
+            eprintln!("\n  This server is a standby: sign in with the primary's accounts (the generated root password is not used while following).\n");
+        }
+    } else {
+        let root = accounts.sync_root(
+            &cfg.root.username,
+            &cfg.root.password,
+            cfg.root.mfa_required,
+        )?;
+        if let Some(pw) = generated {
+            // stderr only: the plaintext must never reach the log files.
+            tracing::warn!(username = %root.username, config = %cli.config.display(), "generated a new configuration with a random root password (printed once on stderr, not logged)");
+            eprintln!("\n  Root login: {}  /  {}\n  (the plaintext is only shown once; the config now holds a hash)\n", root.username, pw);
+        }
     }
     mutator.set_dnssec_config(cfg.dnssec.clone());
     // O27: secondary zones serve their last transfer until it expires.
@@ -347,14 +357,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         reloader.clone(),
         cli.config.clone(),
     );
-    {
-        let r = repl.clone();
-        accounts.set_commit_hook(Box::new(move |_records, logged| {
-            if logged > 0 {
-                r.changelog_appended();
-            }
-        }));
-    }
     repl.start().await?;
     // Record expiry: stop serving at expires_at, delete after [expiry].retention_days.
     {

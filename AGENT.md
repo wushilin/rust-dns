@@ -1,120 +1,59 @@
 # House rules for rust-dns
 
-These rules are for every contributor, human or agent. `CLAUDE.md` is a link
-to this file. They exist because the changelog is the replication stream: a
-standby (follower) rebuilds its data only from it, so a change that is not
-in the changelog, is recorded wrongly, or is lost after a crash, is a
-divergence. Divergence halts the standby.
+These rules are for every contributor, human or agent. `CLAUDE.md` is a link to this file.
 
-## 1. Every change is changelogged
+They exist because of how replication works: a standby rebuilds its data only from the replication stream, changelog v2 (`crates/sqlite-cdc`). If a change escapes the stream, is recorded wrongly, or is lost after a crash, the standby diverges, and divergence halts it.
 
-- Every mutation of replicated state is a typed change, recorded **in the
-  same SQLite transaction** as the data it changes. There is no write
-  without its changelog row, and no changelog row without its write.
-- DNS data (zones, records, members, DNSSEC flags, re-signs, serials) goes
-  through `mutation::Tx`; each `Tx` write method records its `DnsChange`.
-  Accounts, MFA, tokens, TSIG keys, DNSSEC keys and settings go through
-  `AuditTx` / `acct_sql::write`, which take a `SecretChange` and return a
-  `#[must_use]` receipt; the audit row commits with them.
-- Only the mutation module can open a write transaction (`WriteToken`).
-  Never add SQL that writes a replicated table anywhere else. All reads go
-  through the read-only connections.
-- When in doubt, changelog it. The only writes outside the changelog are
-  **local bookkeeping**, each listed and classified `Local` in
-  `src/replication/tables.rs`: sessions, `last_seen_at`, token `last_used_*`,
-  replication state and the replica list, pruning and retention, schema
-  migrations. Adding to that list needs a reason in the code comment and in
-  the commit message.
-- A new table or column must be classified (replicated or local) in
-  `src/replication/tables.rs`; the test `every_table_is_classified` fails
-  otherwise.
+## 1. Every change is captured
 
-## 2. The changelog is accurate
+- **What captures a write.** Every write to a replicated table is captured by changelog v2's triggers, in the same SQLite transaction as the data. The capture is the row SQLite actually wrote, before and after. There is no write without its log rows, and no log rows without the write.
+- **Only one place may write.** Only the mutation module can open a write transaction (`WriteToken`), and every such transaction goes through `Storage::write`, which opens and closes the capture.
+  - DNS data still goes through `mutation::Tx`.
+  - Accounts, MFA, tokens, TSIG keys, DNSSEC keys and settings go through `AuditTx` / `acct_sql::write`.
+  - Both write the v1 changelog too. That is now only the user-facing history (the changelog page, the websocket, the event bus).
+  - Never add SQL that writes a replicated table anywhere else.
+- **Lenient shadow capture.** In rust-dns the capture is lenient. A write to a captured table outside `Storage::write` is not refused. It is counted, and the next transaction marks the v2 log `broken`, loudly. A broken log means a bug to fix, never something to live with.
+- **What is captured.** The captured set is `replication::tables::cdc_tables()`: every replicated table, plus `audit_log`.
+  - Per-server columns are excluded per table (`node_columns`).
+  - Everything else is local bookkeeping, each listed and classified `Local` in `src/replication/tables.rs`: sessions, login failures, `audit_local` (a standby's own audit events), the v1 changelog, replication state, v2's own tables (`_cdc*`), pruning and retention, schema migrations.
+  - Adding to the local list needs a reason in the code comment and in the commit message.
+- **Classify new tables.** A new table or column must be classified (replicated or local) in `src/replication/tables.rs`; the test `every_table_is_classified` fails otherwise. A new replicated table needs a declared primary key, and its key never changes.
 
-- A change is a **fact**, not an intent: it records the resulting state
-  (whole rows where a row changed), so replaying it reproduces identical
-  rows. Never record "user asked to X"; record what X produced.
-- Changes are applied by one exhaustive `replay::apply` on both the primary
-  (which applies its own change through the same path) and the standby. A
-  new kind does not compile until it is handled.
-- Offsets are one ordered sequence for DNS and secret changes, so a change
-  never refers to something the follower has not seen yet (a user is
-  created before a grant that names it). A transaction is never split
-  across replication batches.
-- The randomized replay test compares the full contents of every replicated
-  table between a database and its replay. Keep it covering every kind.
+## 2. The log is accurate
 
-## 3. The changelog is durable and compatible
+- **Facts, not intents.** The log records what SQLite wrote (whole rows), so applying it reproduces identical rows. Values are carried exactly: BLOBs as hex, REALs as their shortest exact decimal.
+- **The follower checks every row.** A follower applies rows generically, and its own triggers capture the result. That capture must equal the received rows byte for byte, which also checks every `before` image. Any difference is a divergence.
+- **The chain.**
+  - Transactions form one ordered sequence and are never split across batches.
+  - Each one carries `hash = blake3(previous hash ‖ transaction)`. The chain starts from a random history id, and every promotion starts a new epoch with a random nonce.
+  - A follower presents its position (history, transaction, hash) on every request.
+- **Tests.** The crate's tests and `mutation::replica::tests::changelog_v2_captures_every_change_exactly` replay the log into an empty database and compare every captured table. Keep them covering every write path.
 
-- SQLite runs with `journal_mode = WAL` and `synchronous = FULL`. Do not
-  lower it: losing the last commits on power loss leaves a standby ahead of
-  its primary, and it halts.
-- The wire format of a stored change (its `kind` tag and fields) never
-  changes in place. `tests/fixtures/changelog_payloads.jsonl` holds real
-  payloads of every kind; `stored_changelog_payloads_round_trip_byte_for_byte`
-  must pass unchanged. **Never regenerate that fixture.** Add lines only for
-  new kinds.
-- New fields are optional with a default, so an older peer still reads the
-  row. A change an older standby cannot apply needs a replication protocol
-  bump and a documented upgrade order (standby first).
-- Retention removes old rows only by offset and age. Payloads of secret
-  changes are scrubbed after `[changelog].account_retention_days`; a
-  follower that needs a pruned or scrubbed row gets `gap` and takes a
-  snapshot.
-- Secret changes (password hashes, TOTP, TSIG and DNSSEC keys) never leave
-  through the user-facing changelog API, the websocket or the event bus, and
-  never appear in logs or audit detail. The type split (`DnsChange` /
-  `SecretChange`) enforces this; keep it that way.
+## 3. The log is durable and compatible
 
-## 4. Followers replicate as soon as possible, and verify periodically
+- **Durability.** SQLite runs with `journal_mode = WAL` and `synchronous = FULL`. Do not lower it: losing the last commits on power loss leaves a standby ahead of its primary, and it halts.
+- **Schema changes.** A follower presents its schema fingerprint; while it differs from the primary's, it is `blocked` (logged with the column differences) and resumes by itself once both run the same schema. A schema change is a startup migration on every node, never a write inside a replicated transaction (refused).
+- **Secrets.** The v2 log and snapshots contain secrets (password hashes, TOTP, TSIG and DNSSEC keys): they are served only behind the `replicate` permission, never through the user-facing changelog API, the websocket or the event bus, and never appear in logs or audit detail. The v1 type split (`DnsChange` / `SecretChange`) still keeps secrets out of the user-facing history.
+- **The v1 payload fixture.** The v1 changelog's stored payload format is still frozen for the user-facing history: `stored_changelog_payloads_round_trip_byte_for_byte` must pass unchanged. **Never regenerate that fixture.**
 
-- A standby follows its primary continuously: after a snapshot it
-  long-polls `/rust-dns/api/replication/changes?after=<offset>` and applies each
-  batch as soon as it arrives, in one transaction that also stores the
-  offset. A restart resumes from the stored offset.
-- It reconciles periodically (`[follow] reconcile_interval_secs`, default
-  one hour): per-table and per-zone checksums against the primary.
-- A standby **never writes replicated data by itself**. Every write path is
-  closed on it (`WriteGate`, the API's `STANDBY_WRITABLE` allowlist, and the
-  console's default-deny controls). Its only writer is the replication apply
-  path.
-- Any divergence is a bug, never something to repair silently: a reconcile
-  mismatch, a change that does not apply, a transaction-id mismatch or a
-  standby ahead of its primary puts it in a persistent `halted` state with a
-  report file. It keeps serving its last good data and does not follow until
-  an operator rebuilds it with `rust-dns --prepare-standby --yes`. Do not add
-  automatic re-bootstrapping or self-healing.
-- The only automatic snapshot is a gap in the same history (the rows it
-  needs were pruned or scrubbed): nothing deviated, the history is just gone.
-- Only a fresh database, or one already in this primary's history, may start
-  following. Discarding data is always an explicit operator action.
+## 4. Followers replicate as soon as possible, and verify
+
+- **Following.** A standby streams its primary's log (`/rust-dns/changelog-api/v2/stream`) and applies each batch as it arrives, in one transaction with its new position. A restart resumes from the stored position. A fresh standby first loads a consistent snapshot, verifies every table against the primary, then streams.
+- **Verification.** It verifies periodically (`[follow] reconcile_interval_secs`): bucketed row hashes of every table against the primary, as of the same transaction.
+- **No local writes.** A standby **never writes replicated data by itself**. Every write path is closed on it: the `WriteGate`, the API's `STANDBY_WRITABLE` allowlist, the console's default-deny controls, and its config root is not synced. Its only writer is the v2 apply path.
+- **Divergence halts.** Any divergence is a bug, never something to repair silently: a row that does not match, a chain mismatch, another history, a standby ahead of its primary. It puts the standby in a persistent `halted` state, and the standby keeps serving its last good data.
+  - The operator rebuilds it with **Rebootstrap** (console or `POST /replication/rebootstrap`), which replaces all replicated data with a fresh snapshot in one transaction, or offline with `rust-dns --prepare-standby --yes`.
+  - Do not add automatic re-bootstrapping or self-healing.
+- **The only automatic snapshot** is a gap in the same history: the rows it needs were pruned, the position is still on the primary's chain, nothing deviated.
+- **Who may start following.** Only a fresh database, or one already in this primary's history, may start following. Discarding data is always an explicit operator action.
 
 ## 5. Rights are checked in one place
 
-- Every permission comes from the table in `model.rs` (`ZonePerm`,
-  `GlobalPerm`), checked through the `Caller`: `require`, `has`,
-  `require_zone`, `visible_zones`, `ws::View::build`. These apply the API
-  token's scope (M1), which only ever removes rights. Never decide access
-  from `caller.user` directly (`is_admin`, `owner_id`, memberships): that
-  would ignore the scope.
-- A new column that older versions do not have and that changes what a row
-  means (a token's scope) goes in `optional_columns` (in the table checksum
-  only where set), so an older standby halts rather than serving it wrong.
-- A process the standby must represent while it runs (N1: a DNSKEY
-  rollover) is refused on the primary while a following standby does not
-  advertise it (`replicas::VERSION_WITH_FEATURES`, the `+feature` build
-  metadata of its version header): the older standby keeps following
-  instead of halting. Add a feature name there for the next such case.
+- **Every permission comes from the table in `model.rs`** (`ZonePerm`, `GlobalPerm`), checked through the `Caller`: `require`, `has`, `require_zone`, `visible_zones`, `ws::View::build`. These apply the API token's scope (M1), which only ever removes rights.
+- **Never decide access from `caller.user` directly** (`is_admin`, `owner_id`, memberships): that would ignore the scope.
 
 ## 6. Before a change is done
 
-- Tests prove the change is logged and replays: a unit test on the change
-  kind, the replay equality test, and for anything that crosses servers a
-  case in `tests/follow.rs`, including the mixed-version test against the
-  previous deployed binary (`RUST_DNS_PREV_BIN`, `REQUIRE_PREV_BIN=1`).
-- The full gate in `plan.md` passes (fmt, clippy `-D warnings`, all tests
-  with BIND tools required, UI tests, OpenAPI snapshot and validator,
-  conformance, smoke test, cargo-audit).
-- Deploy standby first, then the primary; verify after each host (config
-  check, DNSSEC validation of every record, replica `up_to_date`, not
-  halted). See the Rollout section of `plan.md`.
+- **Tests.** They prove the change is captured and replays: the v2 replay test and, for anything that crosses servers, a case in `tests/follow.rs`.
+- **The gate.** The full gate in `plan.md` passes: fmt, clippy `-D warnings`, all tests with BIND tools required, UI tests, OpenAPI snapshot and validator, conformance, smoke test, cargo-audit.
+- **Rollout.** Deploy the standbys first, then the primary. Verify after each host: config check, DNSSEC validation of every record, replica `up_to_date`, not halted. See the Rollout section of `plan.md`.

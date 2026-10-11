@@ -103,8 +103,9 @@ const DEDICATED: &[&str] = &[
     "revoke_my_session",
     "revoke_other_sessions",
     "websocket",
-    // Needs a second server following this one (see the promotion flow).
+    // Need a second server following this one (see the promotion flow).
     "promote_standby",
+    "rebootstrap_standby",
     // O11: needs an unsigned zone and no standby without the feature.
     "rename_zone",
     // O5/O6: change who can sign in; exercised in their own flow.
@@ -1239,8 +1240,18 @@ fn live_api_matches_spec() {
         .call(Auth::Session(&root), "get", "/me", &[], "", Body::None)
         .json();
     let root_id = me["user"]["id"].as_i64().unwrap().to_string();
-    // Replication requests carry the documented example instance id
-    // (header parameter examples), so that replica exists.
+    // A replica row stored by an earlier version (changelog v1 kept a
+    // replica list; v2 tracks live followers in memory): the documented
+    // DELETE removes it. Local bookkeeping, so seeding it directly is fine.
+    {
+        let db = rusqlite::Connection::open(srv.dir.join("test.db")).unwrap();
+        db.busy_timeout(Duration::from_secs(5)).unwrap();
+        db.execute(
+            "INSERT OR REPLACE INTO replicas (instance, data, last_seen) VALUES ('dns2', '{}', '2026-01-01T00:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+    }
     c.ctx.insert("replicas.id".into(), "dns2".into());
 
     // ---- generic driver: every non-dedicated operation, except deletes -------
@@ -2207,13 +2218,54 @@ fn live_api_matches_spec() {
             .set("Authorization", &format!("Bearer {token}"))
             .timeout(Duration::from_secs(5))
             .call()
-            .ok()
-            .and_then(|r| r.into_json().ok())
-            .unwrap_or(Value::Null)
+            .map_err(|e| match e {
+                ureq::Error::Status(code, r) => {
+                    json!({"http": code, "body": r.into_string().unwrap_or_default()})
+                }
+                other => json!({"transport": other.to_string()}),
+            })
+            .and_then(|r| r.into_json().map_err(|e| json!({"json": e.to_string()})))
+            .unwrap_or_else(|e| json!({ "error": e }))
     };
     let deadline = Instant::now() + Duration::from_secs(20);
     while status_of(&standby.web)["follow"]["state"] != "following" {
         assert!(Instant::now() < deadline, "standby did not start following");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    // Rebootstrap (the spec's example): a fresh copy, atomically; it follows again.
+    let sroot = agent();
+    let saved = c.web.clone();
+    c.web = standby.web.clone();
+    let r = c.call(
+        Auth::Session(&sroot),
+        "post",
+        "/auth/login",
+        &[],
+        "",
+        Body::Json(&serde_json::json!({ "username": "root", "password": "rootpass123" })),
+    );
+    c.expect("standby root login (the primary's account)", &r, 200);
+    let ex = c.example("/replication/rebootstrap", "post");
+    let r = c.send_example(
+        Auth::Session(&sroot),
+        "post",
+        "/replication/rebootstrap",
+        &[],
+        "",
+        &ex,
+    );
+    c.expect("rebootstrap the standby", &r, 200);
+    c.capture("/replication/rebootstrap", &r);
+    c.web = saved;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while status_of(&standby.web)["follow"]["rebootstraps"].as_u64() < Some(2)
+        || status_of(&standby.web)["follow"]["state"] != "following"
+    {
+        assert!(
+            Instant::now() < deadline,
+            "standby did not follow again after the rebootstrap: {}",
+            status_of(&standby.web)
+        );
         std::thread::sleep(Duration::from_millis(200));
     }
     // The primary goes away; then the standby is promoted with the spec's example.

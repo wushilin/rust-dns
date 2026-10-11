@@ -251,19 +251,6 @@ impl Change {
             Change::Secret(c) => c.catalog_zone(),
         }
     }
-
-    /// Settings or TSIG keys changed: the DNS server must reload them.
-    pub fn affects_dns_runtime(&self) -> bool {
-        matches!(
-            self,
-            Change::Secret(
-                SecretChange::TsigKeySet { .. }
-                    | SecretChange::TsigKeyDeleted { .. }
-                    | SecretChange::SettingSet { .. }
-                    | SecretChange::SettingCleared { .. }
-            )
-        )
-    }
 }
 
 impl DnsChange {
@@ -833,8 +820,7 @@ impl<'a> Tx<'a> {
     /// key reaches standbys but never the changelog API or websocket.
     pub fn set_dnssec_key(&mut self, key: crate::replication::types::ReplDnssecKey) -> MResult<()> {
         let change = SecretChange::DnssecKeySet { key };
-        acct_sql::write(self.conn, &acct_sql::Ctx::verbatim(), &change)?
-            .log_into(change, &mut self.changes);
+        acct_sql::write(self.conn, &change)?.log_into(change, &mut self.changes);
         Ok(())
     }
 
@@ -843,8 +829,7 @@ impl<'a> Tx<'a> {
             zone_id: zone.id,
             zone: zone.name.clone(),
         };
-        acct_sql::write(self.conn, &acct_sql::Ctx::verbatim(), &change)?
-            .log_into(change, &mut self.changes);
+        acct_sql::write(self.conn, &change)?.log_into(change, &mut self.changes);
         Ok(())
     }
 
@@ -941,7 +926,7 @@ fn read_only(zone: &Zone) -> MResult<()> {
     Ok(())
 }
 
-pub(crate) fn catalog_zones<'a>(changes: impl IntoIterator<Item = &'a Change>) -> Vec<i64> {
+fn catalog_zones<'a>(changes: impl IntoIterator<Item = &'a Change>) -> Vec<i64> {
     let ids: std::collections::BTreeSet<i64> = changes
         .into_iter()
         .filter_map(Change::catalog_zone)

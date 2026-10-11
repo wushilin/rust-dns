@@ -457,3 +457,29 @@ fn self_check_finds_rows_changed_behind_the_log() {
     assert_eq!(r["ok"], false, "{r}");
     assert_eq!(r["problems"][0]["table"], "records", "{r}");
 }
+
+#[test]
+fn a_follower_can_take_its_schema_from_the_leader() {
+    let d = tempfile::tempdir().unwrap();
+    let l = leader(d.path(), "l.db");
+    workload(&l, 50, 100, 4);
+    // A follower with no schema of its own: tables from the leader's specs.
+    let specs = l.tables().to_vec();
+    let cfg = sqlite_cdc::store::Config::new(
+        specs
+            .iter()
+            .map(|t| sqlite_cdc::schema::TableConfig::new(&t.name))
+            .collect(),
+    );
+    let f = std::sync::Arc::new(
+        sqlite_cdc::store::Store::open(&d.path().join("f.db"), cfg, |c| {
+            sqlite_cdc::schema::create_tables(c, &specs)
+        })
+        .unwrap(),
+    );
+    assert_eq!(f.schema_fp(), l.schema_fp(), "same specs, same fingerprint");
+    bootstrap(&l, &f);
+    workload(&l, 51, 200, 4);
+    catch_up(&l, &f).unwrap();
+    assert_eq!(dump(&l), dump(&f));
+}

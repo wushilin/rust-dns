@@ -1124,6 +1124,35 @@ pub fn remove_follow_section(path: &Path, note: &str) -> Result<bool> {
     Ok(true)
 }
 
+/// Rebootstrap with new parameters: set `[follow]` `primary`, `token` and
+/// `instance_id` in the config file (atomic, owner-only rewrite), keeping
+/// the section's other keys and the rest of the file. The result must be
+/// a valid configuration.
+pub fn set_follow_section(
+    path: &Path,
+    primary: &str,
+    token: &str,
+    instance_id: &str,
+) -> Result<()> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut doc: toml_edit::DocumentMut = text.parse().context("parsing config for rewrite")?;
+    if !doc.contains_table("follow") {
+        doc["follow"] = toml_edit::table();
+    }
+    doc["follow"]["primary"] = toml_edit::value(primary);
+    doc["follow"]["token"] = toml_edit::value(token);
+    doc["follow"]["instance_id"] = toml_edit::value(instance_id);
+    // A standby has no [peer] (the config check refuses both): a fenced old
+    // primary that is rebootstrapped as a standby drops it.
+    doc.remove("peer");
+    let out = doc.to_string();
+    let cfg: Config = toml::from_str(&out).context("config after setting [follow]")?;
+    validate(&cfg)?;
+    rewrite_private(path, &out)?;
+    Ok(())
+}
+
 fn warn_if_world_readable(path: &Path) {
     #[cfg(unix)]
     {

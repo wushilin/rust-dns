@@ -24,6 +24,7 @@ mod expiry;
 mod gate;
 mod import_export;
 mod ops;
+#[cfg(test)]
 pub mod replay;
 pub mod replica;
 pub mod settings;
@@ -43,7 +44,6 @@ pub use import_export::{
     export_zone, parse_hosts, ExportDoc, ExportRecord, ExportZone, HostsRecord, HostsSkip,
     ImportMode, ImportSummary,
 };
-pub(crate) use tx::catalog_zones;
 #[allow(unused_imports)]
 pub use tx::{Change, DnsChange, DnsEvent, SecretChange, Tx, CLASS_ACCOUNT, CLASS_DNS};
 

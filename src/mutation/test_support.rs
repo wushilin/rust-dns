@@ -242,15 +242,41 @@ pub(crate) fn fixture_path() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/changelog_payloads.jsonl")
 }
 
+/// Every replicated table (minus the per-server token columns), rows as
+/// JSON arrays of their columns in a stable order: two databases with the
+/// same replicated data dump equal.
 pub(crate) fn dump(s: &Storage) -> serde_json::Value {
     s.read_tx(|c| {
         let mut v = serde_json::Map::new();
         for t in crate::replication::tables::replicated_tables() {
-            v.insert(
-                t.name.into(),
-                crate::replication::tables::dump(c, t, &["last_used_at", "last_used_ip"], None)?
-                    .into(),
-            );
+            let mut stmt = c.prepare(&format!(
+                "SELECT name FROM pragma_table_info('{}') WHERE name NOT IN ('last_used_at', 'last_used_ip')",
+                t.name
+            ))?;
+            let cols: Vec<String> = stmt
+                .query_map([], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            let mut stmt = c.prepare(&format!("SELECT {} FROM {}", cols.join(", "), t.name))?;
+            let mut rows: Vec<serde_json::Value> = stmt
+                .query_map([], |r| {
+                    (0..cols.len())
+                        .map(|i| {
+                            Ok(match r.get_ref(i)? {
+                                rusqlite::types::ValueRef::Null => serde_json::Value::Null,
+                                rusqlite::types::ValueRef::Integer(x) => x.into(),
+                                rusqlite::types::ValueRef::Real(x) => x.into(),
+                                rusqlite::types::ValueRef::Text(x) => {
+                                    String::from_utf8_lossy(x).into_owned().into()
+                                }
+                                rusqlite::types::ValueRef::Blob(x) => hex::encode(x).into(),
+                            })
+                        })
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .map(serde_json::Value::Array)
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            rows.sort_by_key(|r| r.to_string());
+            v.insert(t.name.into(), rows.into());
         }
         Ok(serde_json::Value::Object(v))
     })

@@ -14,9 +14,9 @@
 //! the DNSKEY wait, a mistyped DS (the differing field is reported and the
 //! wizard does not move), a restart in the middle, the switch (new key
 //! signs, self-check ok), removal of the old DS, retirement, cancel before
-//! the switch, no cancel after it, the standby never moving a stage, and
-//! a previous release as standby blocking the start, or following the
-//! rollover when it advertises `dnssec-rollover` (mixed version).
+//! the switch, no cancel after it, the standby never moving a stage nor
+//! diverging. No mixed-version part: releases before changelog v2 cannot
+//! follow a v2 primary at all.
 
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -66,8 +66,11 @@ struct Node {
     dns: u16,
     web: u16,
     password: &'static str,
+    /// The root password to sign in with: a standby has its primary's
+    /// accounts (changelog v2 copies the users table; its own `[root]` is
+    /// not synced), so a standby signs in with the primary's.
+    signin: &'static str,
     child: Option<Child>,
-    bin: PathBuf,
 }
 
 impl Node {
@@ -80,8 +83,8 @@ impl Node {
             dns: free_port(),
             web: free_port(),
             password,
+            signin: password,
             child: None,
-            bin: PathBuf::from(env!("CARGO_BIN_EXE_rust-dns")),
         }
     }
     fn url(&self) -> String {
@@ -135,7 +138,7 @@ dir = ""
                 "{} never came up with all its listeners",
                 self.name
             );
-            let mut child = Command::new(&self.bin)
+            let mut child = Command::new(env!("CARGO_BIN_EXE_rust-dns"))
                 .arg("--config")
                 .arg(self.dir.join("rust-dns.toml"))
                 .stdout(Stdio::null())
@@ -172,18 +175,26 @@ dir = ""
             let _ = c.wait();
         }
     }
+    /// Sign in as root; a fresh standby has no accounts until its
+    /// snapshot loaded, so this retries for a while.
     fn root(&self) -> ureq::Agent {
         let a = ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(20))
             .build();
-        let (s, v) = call(
-            &a,
-            "POST",
-            &self.api("/auth/login"),
-            Some(json!({ "username": "root", "password": self.password })),
-        );
-        assert_eq!(s, 200, "{}: {v}", self.name);
-        a
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let (s, v) = call(
+                &a,
+                "POST",
+                &self.api("/auth/login"),
+                Some(json!({ "username": "root", "password": self.signin })),
+            );
+            if s == 200 {
+                return a;
+            }
+            assert!(Instant::now() < deadline, "{}: {s} {v}", self.name);
+            std::thread::sleep(Duration::from_millis(200));
+        }
     }
 }
 
@@ -518,6 +529,7 @@ fn rollover_wizard(algorithm: u8) {
         "[follow]\nprimary = \"{}\"\ninstance_id = \"dns2\"\ntoken = \"{repl}\"\nreconcile_interval_secs = 2\ntimeout_secs = 5\n",
         p.url()
     ));
+    s.signin = p.password;
     s.start();
     let sr = s.root();
     let (pdns, sdns) = (p.dns, s.dns);
@@ -766,114 +778,46 @@ fn rollover_wizard(algorithm: u8) {
     );
     assert_eq!((st, ss), (vec![new_tag], new_tag));
 
-    // The standby never wrote and never diverged.
-    let st = ok(
-        call(&sr, "GET", &s.api("/replication/status"), None),
-        "status",
-    );
-    assert!(st["follow"]["halted"].is_null(), "{st}");
-    wait_for("reconcile ok", 20, || {
+    // The standby never wrote and never diverged: not halted, and its
+    // data equals the primary's (changelog v2 verifies every table against
+    // the primary after the snapshot; then every applied row is checked
+    // against its before image, a mismatch halts).
+    let v2_head = || {
+        ok(
+            call(
+                &pr,
+                "GET",
+                &format!("{}/rust-dns/changelog-api/v2/status", p.url()),
+                None,
+            ),
+            "primary v2 status",
+        )["last_txn"]
+            .clone()
+    };
+    wait_for("the standby is at the primary's head", 20, || {
         let st = ok(
             call(&sr, "GET", &s.api("/replication/status"), None),
             "status",
         );
+        assert!(st["follow"]["halted"].is_null(), "{st}");
+        st["follow"]["state"] == "following" && st["follow"]["last_applied_offset"] == v2_head()
+    });
+    let st = ok(
+        call(&sr, "GET", &s.api("/replication/status"), None),
+        "status",
+    );
+    assert!(
         st["follow"]["last_reconcile_result"]
             .as_str()
-            .is_some_and(|r| r.starts_with("ok"))
-    });
+            .is_some_and(|r| r.ends_with(": ok")),
+        "the verify after the snapshot passed: {st}"
+    );
 
-    // ---- mixed versions: a previous release without `dnssec-rollover`
-    // following blocks the start; one with it follows the rollover ----
-    if algorithm != 13 {
-        // See ed25519_key_rollover_wizard_with_a_real_parent.
-    } else if let Some(prev) = std::env::var_os("RUST_DNS_PREV_BIN")
-        .map(PathBuf::from)
-        .filter(|p| p.is_file())
-    {
-        let mut old = Node::new(&root, "old", "rootpass-old");
-        old.bin = prev;
-        old.configure(&format!(
-            "[follow]\nprimary = \"{}\"\ninstance_id = \"dns3\"\ntoken = \"{repl}\"\nreconcile_interval_secs = 2\ntimeout_secs = 5\n",
-            p.url()
-        ));
-        old.start();
-        wait_for("the old standby is known", 20, || {
-            ok(
-                call(&pr, "GET", &p.api("/replication/replicas"), None),
-                "replicas",
-            )
-            .to_string()
-            .contains("dns3")
-        });
-        // Whether the previous release can represent a rollover: the
-        // `dnssec-rollover` feature in the version it reports to the
-        // primary (what the primary decides on).
-        let mut version = String::new();
-        wait_for("the old standby reports its version", 20, || {
-            let v = ok(
-                call(&pr, "GET", &p.api("/replication/replicas"), None),
-                "replicas",
-            );
-            version = v["replicas"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|r| r["instance"] == "dns3")
-                .and_then(|r| r["version"].as_str())
-                .unwrap_or_default()
-                .to_string();
-            !version.is_empty()
-        });
-        let rolls = version
-            .split_once('+')
-            .is_some_and(|(_, meta)| meta.split(['.', '+']).any(|f| f == "dnssec-rollover"));
-        eprintln!("rollover: previous release {version}, dnssec-rollover: {rolls}");
-        let (code, v) = call(
-            &pr,
-            "POST",
-            &p.api("/zones/roll.test/dnssec/rollover"),
-            None,
-        );
-        if rolls {
-            // It follows a rollover like a standby of this version: the
-            // same keys published, the same signer, validated.
-            assert_eq!(code, 200, "{v}");
-            assert_eq!(v["stage"], "prepublish", "{v}");
-            let third = v["new_key"]["key_tag"].as_u64().unwrap() as u16;
-            assert!(!ro(&pr, &p)["blocked_by"].to_string().contains("dns3"));
-            wait_for("the old standby has the new key", 30, || {
-                serial(&dig, pdns) == serial(&dig, old.dns)
-            });
-            let (mut pt, ps) = validate(&t, &root, &parent, pdns, "old standby (primary)");
-            let (mut ot, os) = validate(&t, &root, &parent, old.dns, "old standby");
-            pt.sort();
-            ot.sort();
-            let mut want = vec![new_tag, third];
-            want.sort();
-            assert_eq!((pt, ps), (want.clone(), new_tag));
-            assert_eq!((ot, os), (want, new_tag), "old standby: both published");
-        } else {
-            assert_eq!(code, 409, "{v}");
-            assert!(v.to_string().contains("dns3"), "{v}");
-            assert!(ro(&pr, &p)["blocked_by"].to_string().contains("dns3"));
-        }
-        let or = old.root();
-        wait_for("the old standby follows, reconcile ok", 30, || {
-            let st = ok(
-                call(&or, "GET", &old.api("/replication/status"), None),
-                "status",
-            );
-            assert!(st["follow"]["halted"].is_null(), "{st}");
-            st["follow"]["last_reconcile_result"]
-                .as_str()
-                .is_some_and(|r| r.starts_with("ok"))
-        });
-    } else {
-        assert!(
-            std::env::var("REQUIRE_PREV_BIN").is_err(),
-            "RUST_DNS_PREV_BIN is not set"
-        );
-    }
+    // Mixed versions (a previous release as standby) are not covered any
+    // more: releases before changelog v2 cannot follow a v2 primary at all
+    // (the v1 replication endpoints are gone), so there is no previous
+    // release to run a rollover against. The `dnssec-rollover` gating
+    // returns with the next release that follows v2.
     drop(s);
     drop(p);
     drop(parent);

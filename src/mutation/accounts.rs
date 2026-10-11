@@ -13,7 +13,7 @@
 //! session `last_seen_at`, API token `last_used_at` / `last_used_ip`, and
 //! pruning of expired sessions and old log rows.
 
-use super::acct_sql::{self, Ctx};
+use super::acct_sql;
 use super::{Change, SecretChange, TOKEN};
 use crate::model::*;
 use crate::replication::data;
@@ -124,16 +124,17 @@ impl<'a> AuditTx<'a> {
     }
 
     /// Write the collected audit rows (same transaction). Recorded changes
-    /// are not changelogged on this path (replication writes its own rows).
+    /// are not changelogged on this path (replication bookkeeping: promotion,
+    /// rebootstrap, `--prepare-standby`).
     pub(super) fn commit_entries(self, actor: &Actor, operation: &str) -> Result<Vec<AuditRecord>> {
         let txn = crate::auth::random_token(9);
-        self.finish(actor, operation, &txn, false).map(|(a, _)| a)
+        self.finish(actor, operation, &txn, false)
     }
 
     /// Apply an account change and queue it for the changelog. The only
     /// way to write a replicated account table (see `acct_sql`).
     pub(super) fn record(&mut self, change: SecretChange) -> Result<()> {
-        acct_sql::write(self.conn, &Ctx::verbatim(), &change)?.log_into(change, &mut self.changes);
+        acct_sql::write(self.conn, &change)?.log_into(change, &mut self.changes);
         Ok(())
     }
 
@@ -809,14 +810,21 @@ impl<'a> AuditTx<'a> {
         operation: &str,
         txn: &str,
         changelog: bool,
-    ) -> Result<(Vec<AuditRecord>, usize)> {
+    ) -> Result<Vec<AuditRecord>> {
         let ts = now_rfc3339();
         let mut out = Vec::with_capacity(self.entries.len());
         for e in self.entries {
             let detail = serde_json::to_string(&e.detail)?;
+            // A read-only server (a standby) records its own events locally:
+            // its audit_log is the primary's (changelog v2).
+            let table = if changelog {
+                "audit_log"
+            } else {
+                "audit_local"
+            };
             self.conn.execute(
-                "INSERT INTO audit_log (ts, txn, operation, actor, actor_ip, action, target_user_id, target, detail)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                &format!("INSERT INTO {table} (ts, txn, operation, actor, actor_ip, action, target_user_id, target, detail)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"),
                 params![ts, txn, operation, actor.name, actor.ip, e.action, e.target_user_id, e.target, detail],
             )?;
             out.push(AuditRecord {
@@ -832,14 +840,12 @@ impl<'a> AuditTx<'a> {
                 detail: e.detail,
             });
         }
-        let mut logged = 0;
         if changelog {
             for c in &self.changes {
                 super::sql::append_changelog(self.conn, actor, operation, txn, c)?;
-                logged += 1;
             }
         }
-        Ok((out, logged))
+        Ok(out)
     }
 }
 
@@ -861,15 +867,9 @@ impl SignInFailure {
     }
 }
 
-/// Called after every committed account transaction with its audit rows
-/// and the number of changes it added to the changelog (replication uses it
-/// to wake long-polling standbys).
-pub type CommitHook = Box<dyn Fn(&[AuditRecord], usize) + Send + Sync>;
-
 /// Entry point for account and security writes.
 pub struct Accounts {
     storage: Arc<Storage>,
-    on_commit: std::sync::OnceLock<CommitHook>,
     /// Closed on a standby: account changes made there (its own root, TOTP
     /// steps and recovery codes used at sign-in) stay local and are not
     /// added to the changelog, which mirrors the primary's offsets.
@@ -911,7 +911,6 @@ impl Accounts {
     pub fn new(storage: Arc<Storage>) -> Self {
         Accounts {
             storage,
-            on_commit: std::sync::OnceLock::new(),
             gate: std::sync::OnceLock::new(),
             bus: std::sync::OnceLock::new(),
         }
@@ -920,11 +919,6 @@ impl Accounts {
     /// O2: publish access signals on `bus` after each commit (once).
     pub fn set_bus(&self, bus: Arc<crate::events::Bus>) {
         let _ = self.bus.set(bus);
-    }
-
-    /// Install the commit hook (once).
-    pub fn set_commit_hook(&self, hook: CommitHook) {
-        let _ = self.on_commit.set(hook);
     }
 
     /// Share the server's write gate (once).
@@ -944,23 +938,20 @@ impl Accounts {
         let changelog = !self.gate.get().is_some_and(|g| g.read_only());
         let result = self
             .storage
-            .write(&TOKEN, |conn| -> Result<(T, Vec<AuditRecord>, usize)> {
+            .write(&TOKEN, |conn| -> Result<(T, Vec<AuditRecord>)> {
                 let mut t = AuditTx::begin(conn);
                 let out = f(&mut t)?;
                 let txn = crate::auth::random_token(9);
-                let (records, logged) = t.finish(actor, operation, &txn, changelog)?;
+                let records = t.finish(actor, operation, &txn, changelog)?;
                 crate::storage::set_cdc_meta(serde_json::json!({
                     "actor": actor.name, "ip": actor.ip.to_string(), "command": operation, "v1_txn": txn,
                 }));
-                Ok((out, records, logged))
+                Ok((out, records))
             });
         match result {
-            Ok((out, records, logged)) => {
+            Ok((out, records)) => {
                 for r in &records {
                     tracing::info!(audit_id = r.id, txn = %r.txn, operation, actor = %r.actor, ip = %r.actor_ip, action = %r.action, target = %r.target, "audit");
-                }
-                if let Some(hook) = self.on_commit.get() {
-                    hook(&records, logged);
                 }
                 if let Some(bus) = self.bus.get() {
                     for ev in access_events(&records) {

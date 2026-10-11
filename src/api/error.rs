@@ -27,9 +27,6 @@ pub enum ErrorCode {
     /// 409: DNSSEC signing cannot be turned off while the parent publishes a
     /// DS record for the zone (or that cannot be ruled out).
     DsPublished,
-    /// 409 (O21): this standby's replication halted, so it does not serve
-    /// the standbys that follow it; they halt too.
-    ReplicationHalted,
 }
 
 /// Every non-2xx JSON error has this shape.
@@ -46,8 +43,6 @@ pub struct ErrorBody {
     /// `read_only_standby` (409): this server is a read-only standby; write
     /// to the primary named in the message. `ds_published` (409): DNSSEC
     /// signing cannot be turned off while the parent publishes a DS.
-    /// `replication_halted` (409): a standby asked for replication data
-    /// from a standby whose replication halted.
     #[schema(required = true)]
     pub code: Option<ErrorCode>,
 }

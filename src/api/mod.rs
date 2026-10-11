@@ -88,9 +88,7 @@ pub const STANDBY_WRITABLE: &[(&str, &str)] = &[
     ("POST", "/blocklists/test"),
     ("POST", "/tsig/keys/{name}/reveal"),
     ("POST", "/replication/promote"),
-    // O21: standbys that follow this standby report a halt to it (local
-    // replica list, not replicated).
-    ("POST", "/replication/replicas/{id}/report"),
+    ("POST", "/replication/rebootstrap"),
 ];
 
 /// [`STANDBY_WRITABLE`] as published in `GET /status` (`replication.standby_writable`),
@@ -465,13 +463,10 @@ fn api_router() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(tsig::get_transfer_settings))
         .routes(routes!(replication::identity))
         .routes(routes!(replication::status))
-        .routes(routes!(replication::snapshot))
-        .routes(routes!(replication::changes))
-        .routes(routes!(replication::checksum))
         .routes(routes!(replication::promote))
         .routes(routes!(replication::list_replicas))
         .routes(routes!(replication::forget_replica))
-        .routes(routes!(replication::report_replica))
+        .routes(routes!(replication::rebootstrap))
 }
 
 /// Documented routes mounted at `/rust-dns/` rather than under `/rust-dns/api`.
@@ -510,13 +505,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             .route("/docs/swagger-ui-bundle.js", get(swagger_js))
             .route("/docs/swagger-ui.css", get(swagger_css));
     }
-    // Changelog v2 (shadow mode): the generic protocol of crates/sqlite-cdc
-    // at /rust-dns/changelog-api/v2, read-only (no admin routes while v1 is
-    // the replication of record), behind the same check as v1 replication.
-    if let Some(store) = state.storage.cdc() {
-        let mut ncfg = sqlite_cdc::node::NodeConfig::new("");
-        ncfg.verify_every = None;
-        let node = sqlite_cdc::node::Node::new(store.clone(), ncfg);
+    // Changelog v2: the generic protocol of crates/sqlite-cdc at
+    // /rust-dns/changelog-api/v2 (the replication stream; no admin routes),
+    // behind the `replicate` permission.
+    if let Some(node) = state.repl.cdc_node() {
         let v2 = sqlite_cdc::server::router(
             node,
             sqlite_cdc::server::RouterOptions {

@@ -22,8 +22,19 @@ struct Args {
     db: std::path::PathBuf,
     #[arg(long, default_value = "127.0.0.1:0")]
     listen: String,
-    #[arg(long)]
+    /// Bearer token (for the API it serves and for its upstream).
+    #[arg(long, default_value = "")]
     token: String,
+    /// Read the token from this file instead (keeps it off the command line).
+    #[arg(long)]
+    token_file: Option<std::path::PathBuf>,
+    /// Follow any leader: create the tables from the upstream's
+    /// `GET <api>/schema` instead of the demo schema.
+    #[arg(long)]
+    schema_from_upstream: bool,
+    /// The name this node reports to its upstream.
+    #[arg(long)]
+    name: Option<String>,
     /// Start a new history if the database is fresh.
     #[arg(long)]
     leader: bool,
@@ -58,12 +69,37 @@ async fn main() -> anyhow::Result<()> {
         )
         .with_writer(std::io::stderr)
         .init();
-    let a = Args::parse();
-    let store = Arc::new(Store::open(&a.db, demo::config(), demo::migrate)?);
+    let mut a = Args::parse();
+    if let Some(f) = &a.token_file {
+        a.token = std::fs::read_to_string(f)?.trim().to_string();
+    }
+    let store = if a.schema_from_upstream {
+        let up = a
+            .follow
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("--schema-from-upstream needs --follow"))?;
+        let specs = sqlite_cdc::client::Client::new(&up, &a.token)
+            .schema()
+            .await
+            .map_err(|e| anyhow::anyhow!("reading the upstream schema: {e}"))?;
+        eprintln!("upstream schema: {} tables", specs.len());
+        let cfg = sqlite_cdc::store::Config::new(
+            specs
+                .iter()
+                .map(|t| sqlite_cdc::schema::TableConfig::new(&t.name))
+                .collect(),
+        );
+        Arc::new(Store::open(&a.db, cfg, |c| {
+            sqlite_cdc::schema::create_tables(c, &specs)
+        })?)
+    } else {
+        Arc::new(Store::open(&a.db, demo::config(), demo::migrate)?)
+    };
     if a.leader {
         store.init_leader()?;
     }
     let mut cfg = NodeConfig::new(&a.token);
+    cfg.name = a.name.clone();
     cfg.mode = match a.mode.as_str() {
         "stream" => FollowMode::Stream,
         _ => FollowMode::Poll(PollOpts {

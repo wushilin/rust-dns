@@ -103,6 +103,13 @@ impl Bus {
         let _ = self.changes.send(ev.into_event());
     }
 
+    /// A standby applied a replicated DNS change (changelog v2): what the
+    /// console needs to refresh (zone, entity, action, who), never row data,
+    /// so no secret can travel this way.
+    pub fn publish_replicated(&self, ev: ChangeEvent) {
+        let _ = self.changes.send(ev);
+    }
+
     pub fn publish_query(&self, ev: QueryEvent) {
         let _ = self.queries.send(ev);
     }

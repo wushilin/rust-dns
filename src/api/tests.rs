@@ -1084,7 +1084,7 @@ async fn scoped_tokens_never_exceed_their_owner() {
     for (m, path) in [
         ("GET", "/users"),
         ("GET", "/audit"),
-        ("GET", "/replication/snapshot"),
+        ("GET", "/replication/status"),
         ("GET", "/tsig/keys"),
     ] {
         let st = h.call(m, path, Some(&t3), None).await.status;

@@ -594,13 +594,6 @@ pub async fn create_zone(
     s.require(&caller, GlobalPerm::CreateZones)?;
     if let Some(sec) = &input.secondary {
         check_secondary_key(&s, input.name.as_deref().unwrap_or(""), sec)?;
-        let blocked = standbys_without(&s, "secondary-zones");
-        if !blocked.is_empty() {
-            return Err(ApiError::conflict(format!(
-                "standbys of an older version follow this server and could not serve a secondary zone (they would serve it as an empty zone of their own): {}. Upgrade them first (or forget a standby that no longer follows, on the Replication page)",
-                blocked.join(", ")
-            )));
-        }
     }
     let owner_id = match &input.owner {
         Some(name) if !name.is_empty() => Some(
@@ -619,32 +612,6 @@ pub async fn create_zone(
         StatusCode::CREATED,
         Json(zone_view(&s, &z, ZoneRole::Owner, 0)),
     ))
-}
-
-/// O28: records of the types added in O28 (LOC, RP, AFSDB, URI, SPF,
-/// EUI48, EUI64) are refused (409) while a standby of a version without
-/// them follows this server: it could not read the change and would halt.
-fn refuse_o28_types(
-    s: &AppState,
-    types: impl IntoIterator<Item = crate::model::RecordType>,
-) -> ApiResult<()> {
-    let new: Vec<&str> = types
-        .into_iter()
-        .filter(|t| t.is_o28())
-        .map(|t| t.as_str())
-        .collect();
-    if new.is_empty() {
-        return Ok(());
-    }
-    let blocked = standbys_without(s, "rrtypes-o28");
-    if blocked.is_empty() {
-        return Ok(());
-    }
-    Err(ApiError::conflict(format!(
-        "standbys of an older version follow this server and cannot store {} records (they would halt): {}. Upgrade them first (or forget a standby that no longer follows, on the Replication page)",
-        new.join(", "),
-        blocked.join(", ")
-    )))
 }
 
 /// O27: a secondary zone's TSIG key must exist and be allowed for it.
@@ -712,19 +679,13 @@ pub struct ZoneNameBody {
     pub records: Option<bool>,
 }
 
-/// Standbys known to this primary that cannot follow a zone rename (an
-/// older version would ignore the new name and halt at its reconcile).
-fn rename_blocked_by(s: &AppState) -> Vec<String> {
-    standbys_without(s, "zone-rename")
-}
-
 #[utoipa::path(
     post,
     path = "/zones/{zone}/rename",
     tag = "Zones",
     operation_id = "rename_zone",
     summary = "Rename a zone",
-    description = "Gives the zone a new name; its records (relative names), members, owner, settings and signing key stay with it, and the serial is bumped. The registrar's delegation must follow. Refused while a standby of an older version follows this server (it could not apply it), while a DNSSEC key rollover runs, and for a signed zone unless the parent is confirmed to publish no DS record for the current name (a DS for the old name would otherwise point at a zone that no longer exists, and the new name needs its own DS step): `code` `ds_published`. API tokens scoped to the old name do not follow the rename. Needs the owner role and `create_zones`.",
+    description = "Gives the zone a new name; its records (relative names), members, owner, settings and signing key stay with it, and the serial is bumped. The registrar's delegation must follow. Refused while a DNSSEC key rollover runs, and for a signed zone unless the parent is confirmed to publish no DS record for the current name (a DS for the old name would otherwise point at a zone that no longer exists, and the new name needs its own DS step): `code` `ds_published`. API tokens scoped to the old name do not follow the rename. Needs the owner role and `create_zones`.",
     params(ZonePath),
     request_body(content = ZoneNameBody, example = json!({ "name": "renamed.example.com" })),
     responses(
@@ -745,13 +706,6 @@ pub async fn rename_zone(
     let (z, role) = s.require_zone(&caller, &zone, ZonePerm::DeleteZone)?;
     s.require(&caller, GlobalPerm::CreateZones)?;
     let new_name = normalize_zone_name(&b.name)?;
-    let blocked = rename_blocked_by(&s);
-    if !blocked.is_empty() {
-        return Err(ApiError::conflict(format!(
-            "standbys of an older version follow this server and could not apply a rename: {}. Upgrade them first (or forget a standby that no longer follows, on the Replication page)",
-            blocked.join(", ")
-        )));
-    }
     if z.dnssec {
         let p = super::dnssec::parent_check(&s, &z).await;
         let apex = z.fqdn();
@@ -769,27 +723,6 @@ pub async fn rename_zone(
         .await?;
     let n = s.storage.list_records(renamed.id)?.len();
     Ok(Json(zone_view(&s, &renamed, role, n)))
-}
-
-/// Standbys known to this primary that lack `feature` ("instance
-/// (version v)" each).
-pub(crate) fn standbys_without(s: &AppState, feature: &str) -> Vec<String> {
-    s.repl
-        .replica_list()
-        .into_iter()
-        .filter(|r| !crate::replication::replicas::has_feature(&r.version, feature))
-        .map(|r| {
-            format!(
-                "{} (version {})",
-                r.instance,
-                if r.version.is_empty() {
-                    "unknown"
-                } else {
-                    &r.version
-                }
-            )
-        })
-        .collect()
 }
 
 #[utoipa::path(
@@ -834,15 +767,6 @@ pub async fn set_zone_settings(
                 )))
             }
             Some(_) => {}
-        }
-    }
-    if !b.is_empty() {
-        let blocked = standbys_without(&s, "zone-settings");
-        if !blocked.is_empty() {
-            return Err(ApiError::conflict(format!(
-                "standbys of an older version follow this server and could not keep per-zone settings: {}. Upgrade them first (or forget a standby that no longer follows, on the Replication page)",
-                blocked.join(", ")
-            )));
         }
     }
     let after = s
@@ -1082,7 +1006,6 @@ pub async fn bulk_records(
 ) -> ApiResult<Json<BulkResult>> {
     let (z, _) = s.require_zone(&caller, &zone, ZonePerm::EditRecords)?;
     let (lines, parse_errors) = crate::mutation::bulk::parse_bulk(&b.add);
-    refuse_o28_types(&s, lines.iter().map(|l| l.rtype))?;
     if b.delete.is_empty() && lines.is_empty() && parse_errors.is_empty() {
         return Err(ApiError::bad_request(
             "nothing to do: give records to delete or lines to add",
@@ -1248,7 +1171,6 @@ pub async fn create_record(
     Json(input): Json<RecordInput>,
 ) -> ApiResult<(StatusCode, Json<Record>)> {
     let (z, _) = s.require_zone(&caller, &zone, ZonePerm::EditRecords)?;
-    refuse_o28_types(&s, input.rtype)?;
     let (record, renewed) = s
         .mutator
         .create_record(caller.actor(), &z.name, input)
@@ -1289,7 +1211,6 @@ pub async fn update_record(
     Json(input): Json<RecordInput>,
 ) -> ApiResult<Json<Record>> {
     let (z, _) = s.require_zone(&caller, &zone, ZonePerm::EditRecords)?;
-    refuse_o28_types(&s, input.rtype)?;
     Ok(Json(
         s.mutator
             .update_record(caller.actor(), &z.name, id, input)
@@ -1556,12 +1477,6 @@ pub async fn import(
     Query(q): Query<ImportQuery>,
     Json(doc): Json<ExportDoc>,
 ) -> ApiResult<Json<ImportSummary>> {
-    refuse_o28_types(
-        &s,
-        doc.zones
-            .iter()
-            .flat_map(|z| z.records.iter().map(|r| r.rtype)),
-    )?;
     let allowed = if s.has(&caller, GlobalPerm::CreateZones) {
         None
     } else {

@@ -180,6 +180,29 @@ CREATE TABLE IF NOT EXISTS audit_log (
     detail          TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS audit_ts ON audit_log(ts);
+-- A standby's own audit events (sign-ins on it, its rebootstrap): the
+-- replicated audit_log is a copy of the primary's (changelog v2). Ids start
+-- at 10^12, so they never collide with the primary's in audit_all.
+CREATE TABLE IF NOT EXISTS audit_local (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts              TEXT NOT NULL,
+    txn             TEXT NOT NULL,
+    operation       TEXT NOT NULL,
+    actor           TEXT NOT NULL,
+    actor_ip        TEXT NOT NULL,
+    action          TEXT NOT NULL,
+    target_user_id  INTEGER,
+    target          TEXT NOT NULL,
+    detail          TEXT NOT NULL
+);
+INSERT INTO sqlite_sequence (name, seq)
+    SELECT 'audit_local', 1000000000000
+    WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'audit_local');
+CREATE INDEX IF NOT EXISTS audit_local_ts ON audit_local(ts);
+CREATE VIEW IF NOT EXISTS audit_all AS
+    SELECT id, ts, txn, operation, actor, actor_ip, action, target_user_id, target, detail FROM audit_log
+    UNION ALL
+    SELECT id, ts, txn, operation, actor, actor_ip, action, target_user_id, target, detail FROM audit_local;
 -- Settings changed from the console/API. They override the config file; written
 -- only through audited transactions (src/mutation/settings.rs).
 CREATE TABLE IF NOT EXISTS settings (
@@ -722,8 +745,10 @@ impl Storage {
                     tracing::info!(history = ?st.history, "changelog v2: started a history (shadow mode)");
                 }
                 (false, sqlite_cdc::store::Role::Leader) => {
-                    c.forget_history()?;
-                    tracing::info!("changelog v2: not a primary; history dropped (data kept)");
+                    // A former primary may hold changes its new primary
+                    // does not have: never follow silently (AGENT.md §4).
+                    // It halts; an operator rebootstraps it.
+                    c.demote_halted("it is a standby or fenced now")?;
                 }
                 _ => {}
             }
@@ -831,19 +856,6 @@ impl Storage {
         })
     }
 
-    /// Replica tracking (primary side): bookkeeping like token `last_used_at`,
-    /// written outside the mutation module and never replicated.
-    pub fn save_replica(&self, instance: &str, data: &str, last_seen: &str) -> Result<()> {
-        self.bookkeeping(|c| {
-            c.execute(
-                "INSERT INTO replicas (instance, data, last_seen) VALUES (?1, ?2, ?3)
-                 ON CONFLICT(instance) DO UPDATE SET data = excluded.data, last_seen = excluded.last_seen",
-                params![instance, data, last_seen],
-            )?;
-            Ok(())
-        })
-    }
-
     /// O27 bookkeeping: the transferred data of a secondary zone (local).
     pub fn save_secondary_transfer(
         &self,
@@ -894,21 +906,6 @@ impl Storage {
                 ))
             })?;
             Ok(rows.collect::<Result<_, _>>()?)
-        })
-    }
-
-    pub fn load_replicas(&self) -> Result<Vec<String>> {
-        self.with_read(|c| {
-            let mut stmt = c.prepare("SELECT data FROM replicas ORDER BY instance")?;
-            let rows = stmt.query_map([], |r| r.get(0))?;
-            Ok(rows.collect::<Result<_, _>>()?)
-        })
-    }
-
-    /// Bookkeeping: forget replicas not seen since `cutoff`.
-    pub fn prune_replicas(&self, cutoff: &str) -> Result<usize> {
-        self.bookkeeping(|c| {
-            Ok(c.execute("DELETE FROM replicas WHERE last_seen < ?1", params![cutoff])?)
         })
     }
 
@@ -1158,7 +1155,7 @@ impl Storage {
         self.with_read(|c| {
             let mut stmt = c.prepare(
                 "SELECT id, ts, txn, operation, actor, actor_ip, action, target_user_id, target, detail
-                 FROM audit_log WHERE id > ?1 ORDER BY id ASC LIMIT ?2",
+                 FROM audit_all WHERE id > ?1 ORDER BY id ASC LIMIT ?2",
             )?;
             let rows = stmt.query_map(params![after, limit as i64], row_to_audit)?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -1179,7 +1176,7 @@ impl Storage {
         self.with_read(|c| {
             let mut stmt = c.prepare(&format!(
                 "SELECT id, ts, txn, operation, actor, actor_ip, action, target_user_id, target, detail
-                 FROM audit_log WHERE ({SIGN_IN_ROWS})
+                 FROM audit_all WHERE ({SIGN_IN_ROWS})
                    AND (?1 IS NULL OR target = ?1) AND (?2 IS NULL OR actor_ip = ?2)
                    AND (?3 IS NULL OR (CASE WHEN {SIGN_IN_FAILURE} THEN 'failure' ELSE 'success' END) = ?3)
                    AND (?4 IS NULL OR id < ?4)
@@ -1200,7 +1197,7 @@ impl Storage {
         self.with_read(|c| {
             let mut stmt = c.prepare(
                 "SELECT id, ts, txn, operation, actor, actor_ip, action, target_user_id, target, detail
-                 FROM audit_log ORDER BY id DESC LIMIT ?1",
+                 FROM audit_all ORDER BY id DESC LIMIT ?1",
             )?;
             let rows = stmt.query_map(params![limit as i64], row_to_audit)?;
             let mut v = rows.collect::<Result<Vec<_>, _>>()?;
@@ -1378,6 +1375,13 @@ impl Storage {
                 |r| r.get(0),
             )?)
         })
+    }
+
+    /// Sign everyone out (local bookkeeping): a follower's users were
+    /// replaced wholesale (a snapshot load or a rebootstrap), so a session
+    /// row could now name a different account.
+    pub fn delete_all_sessions(&self) -> Result<usize> {
+        self.bookkeeping(|c| Ok(c.execute("DELETE FROM sessions", [])?))
     }
 
     pub fn prune_sessions(&self) -> Result<usize> {

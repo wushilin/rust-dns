@@ -2589,7 +2589,7 @@ async function viewReplication() {
   const when = t => t ? `<span title="${esc(fmtTime(t))}">${ago(t)}</span>` : '<span class="hint">never</span>';
   const opt = v => v == null || v === '' ? '<span class="hint">–</span>' : esc(v);
   const stateBadge = s => ({ following: '<span class="badge ok">following</span>', bootstrapping: '<span class="badge warn">loading snapshot</span>', connecting: '<span class="badge warn">connecting</span>', starting: '<span class="badge warn">starting</span>', refused: '<span class="badge bad">refused</span>', error: '<span class="badge bad">error</span>', stopped: '<span class="badge muted">stopped</span>', halted: '<span class="badge bad">halted</span>' }[s] || `<span class="badge">${esc(s)}</span>`);
-  $('#main').innerHTML = `<div class="topbar"><h1>Replication</h1>${r.role === 'standby' ? '<button class="btn danger" id="rp-promote" data-perm="replicate" data-ro-ok>Promote to primary…</button>' : ''}</div>
+  $('#main').innerHTML = `<div class="topbar"><h1>Replication</h1><div class="row" style="gap:8px">${r.role === 'standby' || r.role === 'fenced' ? '<button class="btn" id="rp-rebootstrap" data-perm="replicate" data-ro-ok>Rebootstrap…</button>' : ''}${r.role === 'standby' ? '<button class="btn danger" id="rp-promote" data-perm="replicate" data-ro-ok>Promote to primary…</button>' : ''}</div></div>
     ${r.warning ? `<div class="note warn" style="max-width:900px">${ico('warn', 's')}<span>${esc(r.warning)}</span></div>` : ''}
     <div class="grid two" style="max-width:1100px">
       <div class="card panel"><h2>This server</h2><div class="kv">
@@ -2604,7 +2604,7 @@ async function viewReplication() {
       ${f ? `<div class="card panel"><h2>Primary</h2><div class="kv">
         <span class="k">URL</span><span class="mono">${esc(f.primary)}</span>
         <span class="k">This instance</span><span class="mono">${esc(f.instance_id)}</span>
-        ${f.halted ? `<span class="k">Halted</span><span style="color:var(--danger)"><b>${esc(f.halted.reason)}</b> at offset ${num(f.halted.offset)}, ${when(f.halted.at)}: ${esc(f.halted.detail)}${f.halted.report_file ? `<br>Report: <span class="mono">${esc(f.halted.report_file)}</span>` : ''}<br>Rebuild: stop this server and run <code>rust-dns --prepare-standby --yes</code>.</span>` : ''}
+        ${f.halted ? `<span class="k">Halted</span><span style="color:var(--danger)"><b>${esc(f.halted.reason)}</b> at offset ${num(f.halted.offset)}, ${when(f.halted.at)}: ${esc(f.halted.detail)}${f.halted.report_file ? `<br>Report: <span class="mono">${esc(f.halted.report_file)}</span>` : ''}<br>Rebuild it with <b>Rebootstrap…</b> (above): a fresh copy of the primary replaces this server's data in one step.</span>` : ''}
         <span class="k">State</span><span>${stateBadge(f.state)} ${f.connected ? '<span class="badge ok">connected</span>' : '<span class="badge bad">not connected</span>'}</span>
         ${f.disconnected_since ? `<span class="k">Unreachable since</span><span>${esc(fmtTime(f.disconnected_since))}</span>` : ''}
         ${f.last_error ? `<span class="k">Last error</span><span style="color:var(--danger)">${esc(f.last_error)}</span>` : ''}
@@ -2612,7 +2612,7 @@ async function viewReplication() {
         <span class="k">Last change applied</span><span>${when(f.last_applied_at)}</span>
         <span class="k">Last contact</span><span>${when(f.last_contact_at)}</span>
         <span class="k">Last snapshot</span><span>${when(f.last_snapshot_at)}${f.last_snapshot_result ? ` · ${opt(f.last_snapshot_result)}` : ''}</span>
-        <span class="k">Last reconcile</span><span>${when(f.last_reconcile_at)}${f.last_reconcile_result ? ` · ${opt(f.last_reconcile_result)}` : ''}</span>
+        <span class="k">Last verify</span><span>${when(f.last_reconcile_at)}${f.last_reconcile_result ? ` · ${opt(f.last_reconcile_result)}` : ''}</span>
         <span class="k">Reconnects / snapshots</span><span>${num(f.reconnects)} / ${num(f.rebootstraps)}</span>
       </div></div>` : ''}${!f || r.replicas.length ? `<div class="card panel"><h2>${f ? 'Standbys following this standby' : 'Replicas'}</h2>${r.replicas.length ? `<div class="tw"><table><thead><tr><th>Instance</th><th>State</th><th>Applied</th><th>Lag</th><th>Last seen</th><th>Address</th><th>Version</th><th></th></tr></thead><tbody>${r.replicas.map(x => `<tr><td><b class="mono">${esc(x.instance)}</b></td><td>${REPLICA_BADGE[x.state] || esc(x.state)}${x.conflict ? ' <span class="badge bad" title="Two processes use this instance id">conflict</span>' : ''}${x.halted_reason ? `<div class="hint" style="color:var(--danger)">${esc(x.halted_reason)}</div>` : ''}</td><td>${num(x.applied_offset)}</td><td>${x.lag_changes ? `${num(x.lag_changes)} changes · ${num(x.lag_seconds)} s` : '<span class="hint">none</span>'}</td><td>${when(x.last_seen_at)}</td><td class="mono">${esc(x.address)}</td><td class="mono">${esc(x.version)}</td><td class="actions"><button class="btn sm ghost danger" data-forget="${esc(x.instance)}" data-perm="replicate" title="Remove from this list (a running standby reappears)">Forget</button></td></tr>`).join('')}</tbody></table></div>` : '<p class="hint">No standby has followed this server yet.</p>'}
         ${r.peer ? `<div class="kv" style="margin-top:12px"><span class="k">[peer]</span><span class="mono">${esc(r.peer.url)}</span><span class="k">Last check</span><span>${when(r.peer.last_check_at)}${r.peer.last_result ? ` · ${esc(r.peer.last_result)}` : ''}</span></div>` : ''}</div>` : ''}
@@ -2622,7 +2622,7 @@ async function viewReplication() {
         <li>This server stops following <span class="mono">${esc(f.primary)}</span> and accepts writes at once (zones, records, users, tokens, settings, TSIG keys). Nothing is restarted; DNS answers continue.</li>
         <li><code>[follow]</code> is removed from its configuration file, and it starts a new history (forked from the current one at offset ${num(r.head)}), so the old primary can tell it was replaced.</li>
         <li>Users sign in with their usual passwords, MFA codes and API tokens (replicated). Sessions are not replicated: everyone signs in again.</li>
-        <li>Stop the old primary first if it is still running, or give it <code>[peer] url</code> pointing here so it starts read-only. Then make it a standby of this server: stop it and run <code>rust-dns --prepare-standby --yes</code> on it (backs up its database and saves its changes after the fork to a file for review).</li>
+        <li>Stop the old primary first if it is still running, or give it <code>[peer] url</code> pointing here so it starts read-only. Then make it a standby of this server: on it, <b>Rebootstrap…</b> with this server's URL (its data is replaced by a copy of this server's), or stop it and run <code>rust-dns --prepare-standby --yes</code>.</li>
         <li>Update zone secondaries and the registrar's NS/glue if they name the old primary.</li>
       </ul></div>` : ''}
     ${r.role !== 'standby' ? `<div class="card panel" style="margin-top:14px;max-width:1100px"><h2>Add a standby</h2>
@@ -2631,11 +2631,39 @@ async function viewReplication() {
       <p class="hint">And here, so this server stays read-only if it ever comes back after the standby was promoted:</p>
       ${snip(`[peer]\nurl = "https://standby.example.net:8053"`, 'Copy example')}</div>` : ''}`;
   const pb = $('#rp-promote'); if (pb) pb.onclick = () => promoteModal(r);
+  const rb = $('#rp-rebootstrap'); if (rb) rb.onclick = () => rebootstrapModal(r);
   $$('[data-forget]').forEach(b => b.onclick = async () => {
     if (b.dataset.armed !== '1') { b.dataset.armed = '1'; b.textContent = 'Click again to forget'; return; }
     try { await DEL('/replication/replicas/' + encodeURIComponent(b.dataset.forget)); toast('Replica forgotten', 'ok'); viewReplication(); } catch (e) { toast(e.message, 'err'); }
   });
   replTimer = setInterval(async () => { if (!location.hash.startsWith('#/replication')) { clearInterval(replTimer); return; } if (!modalOpen()) viewReplication().catch(() => {}); }, 5000);
+}
+function rebootstrapModal(r) {
+  const f = r.follow || { primary: '', instance_id: '' };
+  openModal(`<h2>Rebootstrap this ${r.role === 'fenced' ? 'server as a standby' : 'standby'}</h2>
+    <p>A fresh copy of the primary replaces <b>all replicated data</b> on this server (zones, records, users, tokens, settings, TSIG and DNSSEC keys, audit log) <b>in one step</b>: it keeps answering from its current data until the copy is loaded. A halt is cleared. ${r.role === 'fenced' ? 'This server becomes a read-only standby of the primary below.' : ''}</p>
+    <p class="hint">Change the primary, token or instance id to repoint it (the configuration file's <code>[follow]</code> is rewritten first). Leave the token empty to keep the current one. You may be signed out if your account is not on the primary; sign in again with an account of the primary.</p>
+    <label>Primary URL</label><input id="rb-primary" class="mono" value="${esc(f.primary)}" placeholder="https://dns1.example.net">
+    <label>Instance id</label><input id="rb-instance" class="mono" value="${esc(f.instance_id)}" placeholder="dns2">
+    <label>Token</label><input id="rb-token" class="mono" type="password" autocomplete="off" placeholder="(keep the current token)">
+    <label>Type the instance id to confirm</label><input id="rb-confirm" class="mono" autocomplete="off">
+    <div class="error" id="m-err"></div>
+    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn danger" id="rb-go" data-perm="replicate" data-ro-ok>Rebootstrap</button></div>`, m => {
+    $('#rb-go').onclick = async () => {
+      $('#m-err').textContent = '';
+      const instance = $('#rb-instance').value.trim();
+      if (!instance || $('#rb-confirm').value.trim() !== instance) { $('#m-err').textContent = 'Type the instance id to confirm.'; return; }
+      const body = { confirm: true, primary: $('#rb-primary').value.trim() || null, instance_id: instance };
+      const tok = $('#rb-token').value.trim(); if (tok) body.token = tok;
+      $('#rb-go').disabled = true;
+      try {
+        const res = await POST('/replication/rebootstrap', body);
+        closeModal();
+        toast(res.message || 'Rebootstrap started', 'ok');
+        viewReplication().catch(() => {});
+      } catch (e) { $('#m-err').textContent = e.message; $('#rb-go').disabled = false; }
+    };
+  });
 }
 function promoteModal(r) {
   const reachable = !!(r.follow && r.follow.connected);

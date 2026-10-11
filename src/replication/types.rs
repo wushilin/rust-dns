@@ -3,7 +3,7 @@
 //! token hashes, TSIG secrets): `Debug` is implemented by hand where a
 //! secret could otherwise end up in a log line.
 
-use crate::model::{ChangeEvent, RecordType};
+use crate::model::RecordType;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -108,22 +108,6 @@ impl std::fmt::Debug for ReplUser {
             .field("id", &self.id)
             .field("username", &self.username)
             .field("is_admin", &self.is_admin)
-            .finish_non_exhaustive()
-    }
-}
-
-#[derive(Clone, PartialEq, Serialize, Deserialize, ToSchema)]
-pub struct ReplRecoveryCode {
-    pub user_id: i64,
-    pub code_hash: String,
-    #[schema(required = true)]
-    pub used_at: Option<String>,
-}
-
-impl std::fmt::Debug for ReplRecoveryCode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ReplRecoveryCode")
-            .field("user_id", &self.user_id)
             .finish_non_exhaustive()
     }
 }
@@ -255,72 +239,6 @@ pub struct RolloverKey {
     pub created_at: String,
 }
 
-/// A consistent copy of everything replicated, read in one transaction,
-/// as logical entities: the same facts as changelog changes (`user_created`,
-/// `token_created`, `recovery_codes_replaced`, `tsig_key_set`,
-/// `setting_set`, `zone_created`, `record_created`, `record_expired`,
-/// `member_set`, ...). A standby loads it through the same replay code as
-/// the changelog, so the format does not depend on the storage engine.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct Snapshot {
-    /// Replication protocol version (2).
-    pub format: u32,
-    pub history: History,
-    /// The changelog offset this snapshot corresponds to: tail from here.
-    pub offset: i64,
-    #[schema(format = DateTime)]
-    pub taken_at: String,
-    /// Users first, then their credentials and tokens, settings, TSIG keys,
-    /// zones, records and memberships (references come after their targets).
-    #[schema(value_type = Vec<Object>)]
-    pub entities: Vec<crate::mutation::Change>,
-}
-
-/// One long-poll answer: committed changes after the cursor (whole
-/// transactions only), DNS and account changes in one sequence.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ChangesResponse {
-    /// Replication protocol version (2).
-    pub protocol: u32,
-    pub history_id: String,
-    /// Latest assigned offset.
-    pub head: i64,
-    #[schema(required = true)]
-    pub oldest_offset: Option<i64>,
-    /// The cursor fell behind retention (changelog pruned, or account
-    /// changes scrubbed after `[changelog].account_retention_days`): fetch a
-    /// snapshot.
-    pub gap: bool,
-    pub events: Vec<ChangeEvent>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
-pub struct ZoneChecksum {
-    pub name: String,
-    #[schema(format = Int64, maximum = 4294967295_u64)]
-    pub serial: u32,
-    /// SHA-256 over the zone row, its records (with expiry state) and members.
-    pub checksum: String,
-}
-
-/// Checksum of one replicated table (local columns and the standby's own
-/// root account left out).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
-pub struct TableChecksum {
-    pub table: String,
-    pub rows: i64,
-    pub checksum: String,
-}
-
-/// Checksums of every replicated table, and per zone, at one offset.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct Checksums {
-    pub history_id: String,
-    pub offset: i64,
-    pub tables: Vec<TableChecksum>,
-    pub zones: Vec<ZoneChecksum>,
-}
-
 /// This node's replication role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
@@ -346,6 +264,20 @@ pub struct Identity {
     pub role: Role,
     pub writable: bool,
     pub history: History,
+    /// Changelog v2: the history this server's replication log belongs to
+    /// (shared by a primary and every standby that follows it, and kept by
+    /// a promoted standby). Absent on older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changelog_v2: Option<CdcIdentity>,
+}
+
+/// Changelog v2 identity: history id, role and position. No secrets.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct CdcIdentity {
+    pub history: Option<String>,
+    /// `leader` | `follower` | `fresh` | `fenced`
+    pub role: String,
+    pub last_txn: u64,
 }
 
 /// A standby stopped following because its data diverged from the primary
@@ -406,9 +338,40 @@ pub struct FollowStatus {
     pub last_reconcile_result: Option<String>,
     pub reconnects: u64,
     pub rebootstraps: u64,
-    /// Set when replication halted (terminal until `--prepare-standby`).
+    /// Set when replication halted (until a rebootstrap, a reset or
+    /// `--prepare-standby`).
     #[schema(required = true)]
     pub halted: Option<HaltInfo>,
+    /// The last operator job on this standby (rebootstrap, reset), running
+    /// or finished. Kept in memory; the audit log has every one.
+    #[serde(default)]
+    #[schema(required = true)]
+    pub operator_job: Option<OperatorJob>,
+}
+
+/// An operator action on a standby, run by the server (not by the request
+/// that started it): it may sign the operator out (non-root sessions go
+/// with the users a snapshot replaces), so its progress and outcome are
+/// kept here and in the audit log.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct OperatorJob {
+    pub id: String,
+    /// `rebootstrap` | `reset`
+    pub operation: String,
+    /// `running` | `done` | `failed`
+    pub state: String,
+    /// The step running or reached last: stopping, backup, loading, following.
+    pub step: String,
+    pub actor: String,
+    #[schema(format = DateTime)]
+    pub started_at: String,
+    #[schema(required = true, format = DateTime)]
+    pub finished_at: Option<String>,
+    /// The verified backup taken before anything changed.
+    #[schema(required = true)]
+    pub backup: Option<String>,
+    #[schema(required = true)]
+    pub result: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -516,15 +479,4 @@ pub struct ReplicationSummary {
 pub struct WritableRoute {
     pub method: String,
     pub path: String,
-}
-
-/// `POST /replication/replicas/{id}/report`: a standby tells its primary
-/// that it stopped (currently only `halted`).
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[schema(example = json!({ "state": "halted", "reason": "diverged", "detail": "table users: differs (3 rows here, 3 on the primary)" }))]
-pub struct ReplicaReport {
-    /// `halted`.
-    pub state: String,
-    pub reason: String,
-    pub detail: String,
 }

@@ -20,7 +20,19 @@ pub enum FollowMode {
     Stream,
 }
 
+/// What changed the data on a follower, for the host's caches.
 #[derive(Debug, Clone)]
+pub enum Applied {
+    /// These transactions were applied (committed).
+    Txns(Vec<Txn>),
+    /// Everything was replaced: a snapshot load, a reset or a rewind.
+    Everything,
+}
+
+/// Called after data changed on a follower (in the follow loop's task).
+pub type AppliedHook = Arc<dyn Fn(Applied) + Send + Sync>;
+
+#[derive(Clone)]
 pub struct NodeConfig {
     /// Bearer token for [`Node::serve`] and for outgoing requests (when
     /// `client` is not set).
@@ -35,6 +47,20 @@ pub struct NodeConfig {
     pub auto_snapshot_on_gap: bool,
     pub verify_every: Option<Duration>,
     pub verify_buckets: u64,
+    /// The host's caches follow the data (rebuild what changed).
+    pub on_applied: Option<AppliedHook>,
+}
+
+impl std::fmt::Debug for NodeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeConfig")
+            .field("client", &self.client)
+            .field("name", &self.name)
+            .field("mode", &self.mode)
+            .field("auto_snapshot_on_gap", &self.auto_snapshot_on_gap)
+            .field("verify_every", &self.verify_every)
+            .finish_non_exhaustive()
+    }
 }
 
 impl NodeConfig {
@@ -47,6 +73,7 @@ impl NodeConfig {
             auto_snapshot_on_gap: true,
             verify_every: Some(Duration::from_secs(3600)),
             verify_buckets: 256,
+            on_applied: None,
         }
     }
 }
@@ -83,6 +110,8 @@ pub struct Node {
     pub clients: crate::clients::Clients,
     follow: tokio::sync::Mutex<Option<FollowTask>>,
     last_contact: std::sync::Mutex<Option<Instant>>,
+    /// Replaces `cfg.client` / `cfg.name` (a repoint with new credentials).
+    client_override: std::sync::Mutex<Option<(crate::client::ClientTemplate, Option<String>)>>,
     fstat: std::sync::Mutex<FollowStatus>,
 }
 
@@ -104,6 +133,7 @@ impl Node {
             clients: crate::clients::Clients::default(),
             follow: tokio::sync::Mutex::new(None),
             last_contact: std::sync::Mutex::new(None),
+            client_override: std::sync::Mutex::new(None),
             fstat: std::sync::Mutex::new(FollowStatus::default()),
         })
     }
@@ -142,14 +172,33 @@ impl Node {
 
     /// A client for `base`, identifying this node.
     pub fn client(&self, base: &str) -> Client {
-        let t = self
-            .cfg
-            .client
-            .clone()
-            .unwrap_or_else(|| crate::client::ClientTemplate::bearer(&self.token));
+        let over = self
+            .client_override
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let (t, name) = match over {
+            Some((t, n)) => (t, n),
+            None => (
+                self.cfg
+                    .client
+                    .clone()
+                    .unwrap_or_else(|| crate::client::ClientTemplate::bearer(&self.token)),
+                self.cfg.name.clone(),
+            ),
+        };
         let id = self.store.state().map(|s| s.node_id).unwrap_or_default();
-        let name = self.cfg.name.clone().unwrap_or_else(|| id.clone());
+        let name = name.unwrap_or_else(|| id.clone());
         t.client(base).identify(&id, &name)
+    }
+
+    /// New credentials or name for requests to upstreams and peers (a
+    /// repoint); takes effect at the next (re)start of following.
+    pub fn set_client(&self, template: crate::client::ClientTemplate, name: Option<String>) {
+        *self
+            .client_override
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some((template, name));
     }
 
     fn contact(&self) {
@@ -325,6 +374,12 @@ impl Node {
         }
     }
 
+    fn notify(&self, a: Applied) {
+        if let Some(h) = &self.cfg.on_applied {
+            h(a);
+        }
+    }
+
     /// Tell the upstream what this stream follower has applied: when it
     /// catches up, and at most twice a second while catching up. Keeps the
     /// upstream's answer (its view of this follower).
@@ -342,10 +397,13 @@ impl Node {
     async fn apply(&self, batch: Vec<Txn>) -> Result<(), CdcError> {
         let n = batch.len() as u64;
         let store = self.store.clone();
-        blocking(move || store.apply(&batch)).await?;
-        let mut f = self.fs();
-        f.batches += 1;
-        f.applied_txns += n;
+        let batch = blocking(move || store.apply(&batch).map(|_| batch)).await?;
+        {
+            let mut f = self.fs();
+            f.batches += 1;
+            f.applied_txns += n;
+        }
+        self.notify(Applied::Txns(batch));
         Ok(())
     }
 
@@ -377,6 +435,8 @@ impl Node {
             FollowMode::Stream => {
                 self.set_state("following (stream)");
                 let s = client.stream(&pos, self.store.schema_fp()).await?;
+                // The upstream accepted the position: it is reachable now.
+                self.contact();
                 let mut s = std::pin::pin!(s);
                 let mut batch: Vec<Txn> = Vec::new();
                 let mut up_last = 0u64;
@@ -475,7 +535,9 @@ impl Node {
         let pos = loader
             .await
             .map_err(|e| err(Kind::Internal, e.to_string()))??;
+        self.contact();
         self.fs().snapshots += 1;
+        self.notify(Applied::Everything);
         tracing::info!(txn = pos.txn_id, "snapshot loaded");
         Ok(())
     }
@@ -579,6 +641,7 @@ impl Node {
                 ),
             )
         })?;
+        self.notify(Applied::Everything);
         let file = if discarded.is_empty() {
             None
         } else {
@@ -612,9 +675,11 @@ impl Node {
         Ok(0) // the genesis: same history id
     }
 
-    /// Wipe this node's replicated data and load a fresh snapshot from
-    /// `upstream` (default: its current one). The answer to any divergence:
-    /// an explicit operator action, never automatic. Refused on a leader.
+    /// Replace this node's replicated data with a fresh snapshot from
+    /// `upstream` (default: its current one), atomically: the data stays
+    /// until the snapshot replaces it in one transaction. The answer to any
+    /// divergence: an explicit operator action, never automatic. Refused on
+    /// a leader.
     pub async fn rebootstrap(self: &Arc<Node>, upstream: Option<&str>) -> Result<(), CdcError> {
         let st = self.store.state()?;
         if st.role == Role::Leader {
@@ -635,8 +700,11 @@ impl Node {
             ));
         }
         self.stop_follow().await;
+        // Atomic: only the replication state is dropped here (the node
+        // keeps serving its data); the follow loop then loads a snapshot,
+        // which replaces every table in one transaction.
         let store = self.store.clone();
-        blocking(move || store.reset()).await?;
+        blocking(move || store.forget_history()).await?;
         self.start_follow(&up).await
     }
 

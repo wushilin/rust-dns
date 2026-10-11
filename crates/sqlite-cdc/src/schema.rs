@@ -291,3 +291,36 @@ END;
         )
     }
 }
+
+/// Create tables for a follower that has no schema of its own, from the
+/// leader's specs (`GET <api>/schema`): declared types that reproduce the
+/// same specs (BLOB, INTEGER for numeric affinity, TEXT otherwise) and the
+/// primary key. Excluded (per-node) columns are not part of a spec, so
+/// such a follower does not have them. Existing tables are left alone.
+pub fn create_tables(conn: &Connection, specs: &[TableSpec]) -> Result<()> {
+    for t in specs {
+        check_ident(&t.name)?;
+        let cols: Vec<String> = t
+            .columns
+            .iter()
+            .map(|c| {
+                let ty = if c.blob {
+                    "BLOB"
+                } else if c.numeric {
+                    "INTEGER"
+                } else {
+                    "TEXT"
+                };
+                format!("\"{}\" {ty}", c.name)
+            })
+            .collect();
+        let pk: Vec<String> = t.pk.iter().map(|p| format!("\"{p}\"")).collect();
+        conn.execute_batch(&format!(
+            "CREATE TABLE IF NOT EXISTS \"{}\" ({}, PRIMARY KEY ({}))",
+            t.name,
+            cols.join(", "),
+            pk.join(", ")
+        ))?;
+    }
+    Ok(())
+}

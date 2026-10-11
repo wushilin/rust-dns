@@ -2728,3 +2728,31 @@ Final
   they pass against acc6914 (24 follow + rollover). Gate: 391 tests (BIND
   tools and prev binary required), fmt, clippy, conformance 158/158, smoke,
   UI + browser, cargo-audit (only `paste`).
+- 2026-10-11: REPLICATION IS CHANGELOG V2 (owner's decisions: switch everything,
+  a standby uses only the primary's accounts). A standby follows
+  <primary>/rust-dns/changelog-api/v2 (stream) with the crate's follower on
+  rust-dns's writer: snapshot (atomic, verified against the primary) then
+  stream, periodic verify, halt on any divergence; after each applied batch
+  the catalog, expiry sweeper, live views, TSIG keys and console settings are
+  refreshed; after a snapshot everyone signs in again (sessions deleted:
+  user ids may now name other accounts). Removed: the v1 follower and the v1
+  endpoints (replication/snapshot, changes, checksum, replicas/{id}/report),
+  lineage, checksum reconcile, the v1 replica tracker, the version feature
+  gates (rollover, rename, NSEC3, Ed25519, O28 types, secondary zones, zone
+  settings). Kept: the v1 changelog write path as the user-facing history,
+  --prepare-standby (also drops the v2 history), --promote, [peer] fencing
+  (now compares the v2 history: a peer leading the same v2 history and
+  promoted later fences this server). New: POST /replication/rebootstrap
+  (+ console button): atomic re-copy, clears a halt, optional repoint (writes
+  [follow], drops [peer]), turns a fenced old primary into a standby. A
+  standby's own audit events go to the local audit_local (ids from 10^12),
+  the audit API reads audit_all. A former v2 leader started as a standby
+  never follows silently: it halts (former_leader) until rebootstrapped.
+  A standby's [root] is not synced (users = the primary's). AGENT.md
+  rewritten for v2. tests/follow.rs rewritten as a v2 suite (8 scenarios);
+  mixed-version tests dropped: every previous release speaks only v1.
+  Rollout: standbys first (they follow the v2 API dns1 already serves in
+  shadow mode, from a fresh v2 copy = a rebootstrap), then dns1 (keeps its v2
+  history). Rollback: previous binaries are kept on each host; a standby
+  rolled back to v1 needs --prepare-standby to take a v1 copy again.
+

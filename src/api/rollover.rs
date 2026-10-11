@@ -13,8 +13,7 @@
 //!
 //! Cancel is allowed before the switch. Only the primary moves stages on
 //! (its driver writes through the mutation layer, which a standby refuses);
-//! a standby signs with the replicated key set. Starting is refused while a
-//! following standby cannot represent a rollover (an older version).
+//! a standby signs with the replicated key set.
 
 use super::dnssec::{ds_views, self_check, DnssecCheck, DsRecordView};
 use super::error::{ApiError, ApiResult};
@@ -120,8 +119,8 @@ pub struct RolloverView {
     /// new key).
     #[schema(required = true)]
     pub self_check: Option<DnssecCheck>,
-    /// Standbys that cannot follow a rollover (older versions): starting
-    /// is refused until they are upgraded (or removed from the list).
+    /// Always empty since changelog v2 (every standby copies the key rows
+    /// as they are); kept for API clients and the console.
     pub blocked_by: Vec<String>,
 }
 
@@ -144,26 +143,6 @@ fn other_key(k: &ReplDnssecKey) -> Option<KeyInfo> {
             .decode(r.key.public_key.as_bytes())
             .ok()?,
     })
-}
-
-/// Standbys known to this primary that cannot follow a rollover.
-fn blocked_by(s: &AppState) -> Vec<String> {
-    s.repl
-        .replica_list()
-        .into_iter()
-        .filter(|r| !crate::replication::replicas::has_feature(&r.version, "dnssec-rollover"))
-        .map(|r| {
-            format!(
-                "{} (version {})",
-                r.instance,
-                if r.version.is_empty() {
-                    "unknown"
-                } else {
-                    &r.version
-                }
-            )
-        })
-        .collect()
 }
 
 /// Whole seconds until `t`, rounded up (0 only once it has passed).
@@ -217,7 +196,7 @@ fn view(s: &AppState, z: &Zone) -> ApiResult<RolloverView> {
         parent: None,
         parent_error: None,
         self_check: None,
-        blocked_by: blocked_by(s),
+        blocked_by: Vec::new(),
     };
     let Some(k) = key else {
         v.instructions
@@ -229,12 +208,6 @@ fn view(s: &AppState, z: &Zone) -> ApiResult<RolloverView> {
             "Start a rollover to replace key {} with a new key of the same algorithm. Nothing changes for resolvers until you change the DS at your registrar, and the wizard tells you exactly when and what.",
             k.key_tag
         ));
-        if !v.blocked_by.is_empty() {
-            v.instructions.push(format!(
-                "Blocked: upgrade these standbys first (they cannot follow a rollover): {}.",
-                v.blocked_by.join(", ")
-            ));
-        }
         return Ok(v);
     };
     let me = KeyInfo::from_stored(&k).map_err(ApiError::internal)?;
@@ -383,7 +356,7 @@ pub async fn get_rollover(
     tag = "DNSSEC",
     operation_id = "start_key_rollover",
     summary = "Start a key rollover",
-    description = "Generates a new key of the same algorithm and publishes it next to the current one, which keeps signing (a serial bump). Then follow `GET .../rollover`. Refused (409) when signing is off, a rollover runs already, or a following standby is too old to represent it. Needs the owner role.",
+    description = "Generates a new key of the same algorithm and publishes it next to the current one, which keeps signing (a serial bump). Then follow `GET .../rollover`. Refused (409) when signing is off or a rollover runs already. Needs the owner role.",
     params(ZonePath),
     responses(
         (status = 200, description = "Started.", body = RolloverView),
@@ -400,13 +373,6 @@ pub async fn start_rollover(
     Path(ZonePath { zone }): Path<ZonePath>,
 ) -> ApiResult<Json<RolloverView>> {
     let (z, _) = s.require_zone(&caller, &zone, ZonePerm::EditSettings)?;
-    let blocked = blocked_by(&s);
-    if !blocked.is_empty() {
-        return Err(ApiError::conflict(format!(
-            "these standbys cannot follow a key rollover (older versions): {}. Upgrade them first (or remove a standby that is gone from Replication > Standbys)",
-            blocked.join(", ")
-        )));
-    }
     s.mutator.rollover_start(caller.actor(), &z.name).await?;
     observe(&z.name, |o| *o = Observed::default());
     let z = s.storage.get_zone(&z.name)?.unwrap_or(z);

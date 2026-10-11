@@ -285,11 +285,11 @@ async function main() {
   const vr = await veraApi('POST', '/zones/ui.test/records', { name: 'x', type: 'A', value: '192.0.2.1' });
   ok('viewer: the server refuses too', vr.status === 403, JSON.stringify(vr));
 
-  // ---- the standby: read-only ----
-  const sApi = await apiLogin(s, 'root', 'rootpass-standby');
+  // ---- the standby: read-only (changelog v2: it has the primary's accounts) ----
+  const sApi = await apiLogin(s, 'root', 'rootpass-primary');
   await waitUntil('standby has the zone', async () => (await sApi('GET', '/zones/ui.test/records')).json?.records?.length === 1, 30000);
   const st = await b.page('admin@standby');
-  await st.signIn(s, 'root', 'rootpass-standby');
+  await st.signIn(s, 'root', 'rootpass-primary');
   await st.route('#/zones/ui.test', `return document.querySelector('#records')?.textContent.includes('192.0.2.20') && !!document.querySelector('#r-add')`);
   await st.wait('standby banner', `return document.querySelector('#repl-banner')?.textContent.includes('Standby of')`);
   const sstate = await st.eval(`
@@ -553,8 +553,8 @@ async function rolloverWalk(b) {
 
   // The standby: same stage, read-only.
   const sp = await b.page('rollover@standby');
-  await sp.signIn(rs, 'root', 'rootpass-rs');
-  await waitUntil('standby has the rollover', async () => (await (await apiLogin(rs, 'root', 'rootpass-rs'))('GET', '/zones/roll.test/dnssec/rollover')).json?.stage === 'prepublish', 20000);
+  await sp.signIn(rs, 'root', 'rootpass-rp');
+  await waitUntil('standby has the rollover', async () => (await (await apiLogin(rs, 'root', 'rootpass-rp'))('GET', '/zones/roll.test/dnssec/rollover')).json?.stage === 'prepublish', 20000);
   await openTab(sp);
   const sv = await sp.eval(`return { text: document.querySelector('#sec-roll').textContent, buttons: [...document.querySelectorAll('#sec-roll [id^=roll-]')].map(b => b.id) }`);
   ok('rollover: the standby shows the stage, no wizard buttons', sv.text.includes('New key published') && sv.text.includes('the primary runs the wizard') && sv.buttons.length === 0, JSON.stringify(sv).slice(0, 300));
@@ -587,7 +587,7 @@ async function rolloverWalk(b) {
   await waitUntil('primary signs with NSEC3', async () => (await rpApi('GET', '/zones/roll.test/dnssec')).json.denial === 'nsec3');
   await pg.wait('the panel shows NSEC3', `return /Switch to NSEC…/.test(document.querySelector('#sec-denial')?.textContent || '') && (document.querySelector('.facts')?.textContent || '').includes('NSEC3')`);
   ok('nsec3: switched from the console, same key', (await rpApi('GET', '/zones/roll.test/dnssec')).json.key.key_tag === nd.key_tag);
-  const rsApi = await apiLogin(rs, 'root', 'rootpass-rs');
+  const rsApi = await apiLogin(rs, 'root', 'rootpass-rp');
   await waitUntil('standby signs with NSEC3', async () => (await rsApi('GET', '/zones/roll.test/dnssec')).json.denial === 'nsec3', 20000);
   await openTab(sp);
   await sp.wait('standby panel shows NSEC3', `return (document.querySelector('.facts')?.textContent || '').includes('NSEC3')`, 15000);

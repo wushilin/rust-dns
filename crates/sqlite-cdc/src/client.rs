@@ -88,8 +88,17 @@ impl Default for PollOpts {
     }
 }
 
+/// A transport error with its whole cause chain (reqwest's own message
+/// says only "error sending request").
 fn net(e: reqwest::Error) -> CdcError {
-    err(Kind::Unreachable, e.to_string())
+    let mut msg = e.to_string();
+    let mut src = std::error::Error::source(&e);
+    while let Some(s) = src {
+        msg.push_str(": ");
+        msg.push_str(&s.to_string());
+        src = s.source();
+    }
+    err(Kind::Unreachable, msg)
 }
 
 fn is_gzip(r: &reqwest::Response) -> bool {
