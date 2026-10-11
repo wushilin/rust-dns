@@ -188,7 +188,37 @@ pub const TABLES: &[Table] = &[
     local("secondary_transfers"),
     // SQLite's AUTOINCREMENT counters.
     local("sqlite_sequence"),
+    // Changelog v2 (crates/sqlite-cdc), in shadow mode next to the v1
+    // changelog: its own log, chain and position. Local because it IS the
+    // replication stream of v2 (a follower stores the leader's rows
+    // verbatim through its own apply path), never data replicated by v1.
+    local("_cdc"),
+    local("_cdc_txn"),
+    local("_cdc_state"),
+    local("_cdc_pending"),
 ];
+
+/// Tables changelog v2 captures: every replicated data table, plus the
+/// audit log (the leader's audit trail; a follower's own audit events will
+/// need a local table once v2 is authoritative). Per-server columns are
+/// left out; a primary key column is always captured. The v1 changelog and
+/// per-server bookkeeping (sessions, login failures, replica list,
+/// replication state, secondary transfers) are not captured.
+pub fn cdc_tables() -> Vec<sqlite_cdc::schema::TableConfig> {
+    let mut v: Vec<sqlite_cdc::schema::TableConfig> = replicated_tables()
+        .map(|t| {
+            let exclude: Vec<&str> = t
+                .node_columns
+                .iter()
+                .copied()
+                .filter(|c| *c != "id")
+                .collect();
+            sqlite_cdc::schema::TableConfig::new(t.name).exclude(&exclude)
+        })
+        .collect();
+    v.push(sqlite_cdc::schema::TableConfig::new("audit_log"));
+    v
+}
 
 pub fn replicated_tables() -> impl Iterator<Item = &'static Table> {
     TABLES.iter().filter(|t| t.class == Class::Replicated)

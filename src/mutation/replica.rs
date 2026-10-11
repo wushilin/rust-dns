@@ -834,6 +834,172 @@ mod tests {
         assert_catalog_is_current(&ss, &sm, "after a snapshot");
     }
 
+    /// Changelog v2 (shadow mode): every write through the real mutation
+    /// paths (DNS, accounts, settings, TSIG, DNSSEC, cascades, expiry,
+    /// audit) is captured, and replaying the v2 log into an empty database
+    /// reproduces every captured table exactly; nothing escaped the capture.
+    #[tokio::test]
+    async fn changelog_v2_captures_every_change_exactly() {
+        use rand::SeedableRng;
+        let (ps, pm, pa) = node();
+        ps.cdc_set_leader(true);
+        let leader = ps.cdc().expect("v2 attached").clone();
+        // A follower database: same schema, applying the v2 log.
+        // Foreign keys stay on (as rust-dns runs): the crate turns them off
+        // around replays itself.
+        let fs = Storage::open_memory().unwrap();
+        let follower = fs.cdc().expect("v2 attached").clone();
+        let mut lines = Vec::new();
+        leader
+            .snapshot(|mut b| {
+                b.pop();
+                lines.push(b);
+                Ok(())
+            })
+            .unwrap();
+        follower
+            .load_snapshot(lines.into_iter().map(Ok), None, &Default::default())
+            .unwrap();
+
+        // Accounts, MFA, tokens, settings, TSIG, zones, DNSSEC, members.
+        let root = pa.sync_root("root", PRIMARY_ROOT_HASH, false).unwrap();
+        let alice = pa
+            .create_user(
+                &actor(),
+                &NewUser {
+                    username: "alice".into(),
+                    password_hash: "$argon2id$alice-hash".into(),
+                    display_name: "Alice".into(),
+                    is_admin: false,
+                    mfa_required: true,
+                },
+            )
+            .unwrap();
+        pa.run(&actor(), "mfa_enroll", |t| {
+            let u = t.set_mfa(alice.id, Some("ALICETOTPSECRET"))?;
+            t.accept_totp_step(&u, 1000)?;
+            t.set_recovery_codes(&u, &["rc-hash-1".into(), "rc-hash-2".into()])
+        })
+        .unwrap();
+        pa.create_token(&actor(), &alice, "ci", "token-hash-alice", &["ci".into()])
+            .unwrap();
+        pa.run(&actor(), "settings", |t| {
+            t.set_forwarding(
+                "tester",
+                None,
+                &crate::mutation::settings::ForwardingSettings {
+                    upstreams: vec!["192.0.2.53:53".parse().unwrap()],
+                    allowed_clients: vec!["10.0.0.0/8".into()],
+                    timeout_ms: 1500,
+                    cache_max_ttl: None,
+                    cache_negative_max_ttl: None,
+                    open_resolver: None,
+                },
+            )?;
+            t.create_tsig_key(
+                "tester",
+                &crate::mutation::tsig::NewTsigKey {
+                    name: "k1.".into(),
+                    algorithm: crate::dns::tsig::Algorithm::HmacSha256,
+                    secret: b"tsig-secret-bytes".to_vec(),
+                    zones: vec![],
+                    imported: true,
+                },
+            )
+        })
+        .unwrap();
+        pm.create_zone(
+            actor(),
+            ZoneInput {
+                name: Some("a.test".into()),
+                ..Default::default()
+            },
+            Some(alice.id),
+        )
+        .await
+        .unwrap();
+        pm.set_dnssec(actor(), "a.test", true, false).await.unwrap();
+        pm.set_member(actor(), "a.test", root.id, ZoneRole::Viewer)
+            .await
+            .unwrap();
+        pm.create_record(
+            actor(),
+            "a.test",
+            RecordInput {
+                expires_in: Some(1),
+                ..rec("tmp", RecordType::A, "192.0.2.2")
+            },
+        )
+        .await
+        .unwrap();
+        pm.expire_due(chrono::Utc::now() + chrono::Duration::seconds(5))
+            .await
+            .unwrap();
+        // Random DNS operations.
+        let mut rng = rand::rngs::StdRng::seed_from_u64(20261011);
+        for step in 0..250 {
+            let _ = crate::mutation::test_support::random_dns_op(&mut rng, &ps, &pm, step).await;
+        }
+        // Deleting a user and a zone (cascades), and token use bookkeeping
+        // (a per-server column: not a change).
+        let alice = ps.get_user_by_name("alice").unwrap().unwrap();
+        pa.run(&actor(), "delete_user", |t| {
+            t.delete_user(&alice).map(|_| ())
+        })
+        .unwrap();
+        let _ = pm.delete_zone(actor(), "a.test").await;
+
+        // Replay into the follower.
+        loop {
+            let pos = follower.state().unwrap().position().unwrap();
+            let (txns, _) = leader.changes(&pos, 1 << 20, 1000).unwrap();
+            if txns.is_empty() {
+                break;
+            }
+            follower.apply(&txns).unwrap();
+        }
+        let st = leader.state().unwrap();
+        assert!(
+            st.broken.is_none(),
+            "a write escaped the capture: {:?}",
+            st.broken
+        );
+        assert!(st.last_txn > 100, "{}", st.last_txn);
+        assert!(leader.health().unwrap().is_empty(), "{:?}", leader.health());
+        let check = leader.self_check().unwrap();
+        assert_eq!(check["ok"], true, "{check}");
+        for t in leader.tables() {
+            let a = leader.bucket_hashes(&t.name, st.last_txn, 16).unwrap();
+            let b = follower.bucket_hashes(&t.name, st.last_txn, 16).unwrap();
+            assert_eq!(
+                a.buckets, b.buckets,
+                "table {} differs after replay",
+                t.name
+            );
+        }
+        // Every captured table really was exercised.
+        let c = ps.cdc().unwrap().reader().unwrap();
+        for t in [
+            "zones",
+            "records",
+            "zone_members",
+            "users",
+            "recovery_codes",
+            "api_tokens",
+            "settings",
+            "tsig_keys",
+            "dnssec_keys",
+            "audit_log",
+        ] {
+            let n: i64 = c
+                .query_row("SELECT count(*) FROM _cdc WHERE tbl = ?1", [t], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert!(n > 0, "no change captured for {t}");
+        }
+    }
+
     #[tokio::test]
     async fn snapshot_then_changes_reproduce_the_primary() {
         let (ps, pm, pa) = populated_primary().await;

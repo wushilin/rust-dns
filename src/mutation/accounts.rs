@@ -949,6 +949,9 @@ impl Accounts {
                 let out = f(&mut t)?;
                 let txn = crate::auth::random_token(9);
                 let (records, logged) = t.finish(actor, operation, &txn, changelog)?;
+                crate::storage::set_cdc_meta(serde_json::json!({
+                    "actor": actor.name, "ip": actor.ip.to_string(), "command": operation, "v1_txn": txn,
+                }));
                 Ok((out, records, logged))
             });
         match result {

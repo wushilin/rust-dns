@@ -1,0 +1,34 @@
+[package]
+name = "sqlite-cdc"
+version = "0.1.0"
+edition = "2024"
+description = "Prototype: trigger-captured, hash-chained SQLite change log replicated over a JSON/HTTP protocol"
+publish = false
+
+[dependencies]
+rusqlite = { version = "0.37", features = ["bundled", "functions"] }
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+blake3 = "1"
+flate2 = "1"
+hex = "0.4"
+rand = "0.9"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures = "0.3"
+bytes = "1"
+subtle = "2"
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
+# Tests and examples install a crypto provider, as a host application
+# must: in a workspace whose reqwest uses `rustls-no-provider` (rust-dns),
+# building an HTTP client without one panics.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rusqlite = { version = "0.37", features = ["bundled"] }

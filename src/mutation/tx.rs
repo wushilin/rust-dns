@@ -911,6 +911,9 @@ impl<'a> Tx<'a> {
             }));
         }
         let txn = crate::auth::random_token(9);
+        crate::storage::set_cdc_meta(serde_json::json!({
+            "actor": actor.name, "ip": actor.ip.to_string(), "command": command, "v1_txn": txn,
+        }));
         let mut events = Vec::with_capacity(self.changes.len());
         for c in &self.changes {
             let ev = sql::append_changelog(self.conn, actor, command, &txn, c)?;

@@ -20,7 +20,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 /// Read connections per database. Reads are short; a handful lets API reads
 /// go on while one connection serves a long one (a snapshot, the catalog
@@ -323,8 +323,12 @@ pub struct LoginFailureRow {
 pub const TOKEN_USE_WRITE_INTERVAL_SECS: i64 = 60;
 
 pub struct Storage {
-    /// The write connection.
-    conn: Mutex<Connection>,
+    /// The write connection (shared with the changelog v2 store, which
+    /// captures through it).
+    conn: Arc<Mutex<Connection>>,
+    /// Changelog v2 in shadow mode: captures every write next to the v1
+    /// changelog. `None` if it could not attach (logged; v1 is unaffected).
+    cdc: Option<Arc<sqlite_cdc::store::Store>>,
     /// Read-only connections (`query_only`), see the module documentation.
     readers: Vec<Mutex<Connection>>,
     next_reader: AtomicUsize,
@@ -515,6 +519,44 @@ fn ensure_history_id(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+thread_local! {
+    /// Who and what the current write transaction is, for its changelog v2
+    /// entry. Set on the writing thread just before the transaction ends
+    /// (`Tx::finish`, `AuditTx`), taken by [`Storage::write`].
+    static CDC_META: std::cell::RefCell<Option<serde_json::Value>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Describe the running write transaction for changelog v2.
+pub fn set_cdc_meta(meta: serde_json::Value) {
+    CDC_META.with(|m| *m.borrow_mut() = Some(meta));
+}
+
+fn take_cdc_meta() -> serde_json::Value {
+    CDC_META
+        .with(|m| m.borrow_mut().take())
+        .unwrap_or_else(|| serde_json::json!({"command": "internal"}))
+}
+
+/// Attach changelog v2 to the write connection in shadow mode: TEMP
+/// triggers (nothing stored in the file, so an older binary still opens it
+/// cleanly), lenient (a missed capture marks v2 broken instead of failing a
+/// write), foreign keys left to rust-dns.
+fn attach_cdc(path: &Path, conn: &Arc<Mutex<Connection>>) -> Option<Arc<sqlite_cdc::store::Store>> {
+    let cfg = sqlite_cdc::store::Config {
+        tables: crate::replication::tables::cdc_tables(),
+        strict: false,
+        manage_foreign_keys: false,
+        temp_triggers: true,
+    };
+    match sqlite_cdc::store::Store::attach(path, conn.clone(), cfg) {
+        Ok(s) => Some(Arc::new(s)),
+        Err(e) => {
+            tracing::error!(error = %e, "changelog v2 could not attach; running without it (v1 is unaffected)");
+            None
+        }
+    }
+}
+
 impl Storage {
     pub fn open(path: &Path) -> Result<Self> {
         Self::open_with(path, "FULL")
@@ -531,11 +573,14 @@ impl Storage {
         ))?;
         conn.execute_batch(SCHEMA)?;
         migrate(&conn)?;
+        let conn = Arc::new(Mutex::new(conn));
+        let cdc = attach_cdc(path, &conn);
         let readers = (0..READERS)
             .map(|_| open_reader(path).map(Mutex::new))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn,
+            cdc,
             readers,
             next_reader: AtomicUsize::new(0),
             #[cfg(test)]
@@ -624,13 +669,69 @@ impl Storage {
     ) -> std::result::Result<T, E> {
         // Waiting for the write lock and the fsync at commit may take long:
         // never on a runtime worker's time (see [`blocking`]).
-        blocking(|| {
-            let mut conn = self.writer();
-            let tx = conn.transaction()?;
-            let out = f(&tx)?;
-            tx.commit()?;
-            Ok(out)
-        })
+        blocking(|| self.captured_write(f))
+    }
+
+    /// One write transaction with changelog v2 capturing it (shadow mode:
+    /// a capture problem never fails the write; it marks the v2 log broken,
+    /// loudly, and v1 goes on).
+    fn captured_write<T, E: From<rusqlite::Error>>(
+        &self,
+        f: impl FnOnce(&Transaction) -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E> {
+        let mut conn = self.writer();
+        let tx = conn.transaction()?;
+        let scope = self.cdc.as_ref().map(|c| c.host_begin());
+        let out = f(&tx)?;
+        let meta = take_cdc_meta();
+        let captured = match (&self.cdc, &scope) {
+            (Some(c), Some(sc)) => Some(c.host_finish(sc, &tx, meta)),
+            _ => None,
+        };
+        drop(scope);
+        tx.commit()?;
+        drop(conn);
+        if let Some(c) = &self.cdc {
+            match captured {
+                Some(Ok(id)) => c.host_committed(id),
+                Some(Err(e)) => {
+                    tracing::error!(error = %e, "changelog v2: capture failed; marking the v2 log broken (v1 is unaffected)");
+                    let _ = c.mark_broken(&e.to_string());
+                }
+                None => {}
+            }
+        }
+        Ok(out)
+    }
+
+    /// Changelog v2 (shadow mode), when attached.
+    pub fn cdc(&self) -> Option<&Arc<sqlite_cdc::store::Store>> {
+        self.cdc.as_ref()
+    }
+
+    /// Keep v2's role in step with replication: a primary is the v2 leader
+    /// (a fresh v2 store starts a history over the current data); anything
+    /// else drops its v2 history (the data stays) and captures nothing.
+    pub fn cdc_set_leader(&self, leader: bool) {
+        let Some(c) = &self.cdc else { return };
+        let res = blocking(|| -> std::result::Result<(), sqlite_cdc::store::CdcError> {
+            let st = c.state()?;
+            match (leader, st.role) {
+                (true, sqlite_cdc::store::Role::Fresh) => {
+                    let st = c.init_leader()?;
+                    tracing::info!(history = ?st.history, "changelog v2: started a history (shadow mode)");
+                }
+                (false, sqlite_cdc::store::Role::Leader) => {
+                    c.forget_history()?;
+                    tracing::info!("changelog v2: not a primary; history dropped (data kept)");
+                }
+                _ => {}
+            }
+            Ok(())
+        });
+        if let Err(e) = res {
+            tracing::error!(error = %e, "changelog v2: role change failed");
+        }
     }
 
     /// Run `f` inside one read transaction on a read connection, so
@@ -1183,8 +1284,15 @@ impl Storage {
     }
 
     pub fn prune_audit(&self, older_than: DateTime<Utc>) -> Result<usize> {
+        // Captured by changelog v2 (the audit log is part of it): a follower
+        // prunes with its leader.
         let cutoff = older_than.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        self.bookkeeping(|c| Ok(c.execute("DELETE FROM audit_log WHERE ts < ?1", params![cutoff])?))
+        set_cdc_meta(serde_json::json!({"command": "prune_audit", "actor": "retention"}));
+        blocking(|| {
+            self.captured_write(|c| -> Result<usize> {
+                Ok(c.execute("DELETE FROM audit_log WHERE ts < ?1", params![cutoff])?)
+            })
+        })
     }
 
     // ---- users ---------------------------------------------------------

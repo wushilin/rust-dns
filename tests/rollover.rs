@@ -15,7 +15,8 @@
 //! wizard does not move), a restart in the middle, the switch (new key
 //! signs, self-check ok), removal of the old DS, retirement, cancel before
 //! the switch, no cancel after it, the standby never moving a stage, and
-//! a previous release as standby blocking the start (mixed version).
+//! a previous release as standby blocking the start, or following the
+//! rollover when it advertises `dnssec-rollover` (mixed version).
 
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -781,7 +782,8 @@ fn rollover_wizard(algorithm: u8) {
             .is_some_and(|r| r.starts_with("ok"))
     });
 
-    // ---- mixed versions: a previous release following blocks the start ----
+    // ---- mixed versions: a previous release without `dnssec-rollover`
+    // following blocks the start; one with it follows the rollover ----
     if algorithm != 13 {
         // See ed25519_key_rollover_wizard_with_a_real_parent.
     } else if let Some(prev) = std::env::var_os("RUST_DNS_PREV_BIN")
@@ -803,15 +805,58 @@ fn rollover_wizard(algorithm: u8) {
             .to_string()
             .contains("dns3")
         });
+        // Whether the previous release can represent a rollover: the
+        // `dnssec-rollover` feature in the version it reports to the
+        // primary (what the primary decides on).
+        let mut version = String::new();
+        wait_for("the old standby reports its version", 20, || {
+            let v = ok(
+                call(&pr, "GET", &p.api("/replication/replicas"), None),
+                "replicas",
+            );
+            version = v["replicas"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["instance"] == "dns3")
+                .and_then(|r| r["version"].as_str())
+                .unwrap_or_default()
+                .to_string();
+            !version.is_empty()
+        });
+        let rolls = version
+            .split_once('+')
+            .is_some_and(|(_, meta)| meta.split(['.', '+']).any(|f| f == "dnssec-rollover"));
+        eprintln!("rollover: previous release {version}, dnssec-rollover: {rolls}");
         let (code, v) = call(
             &pr,
             "POST",
             &p.api("/zones/roll.test/dnssec/rollover"),
             None,
         );
-        assert_eq!(code, 409, "{v}");
-        assert!(v.to_string().contains("dns3"), "{v}");
-        assert!(ro(&pr, &p)["blocked_by"].to_string().contains("dns3"));
+        if rolls {
+            // It follows a rollover like a standby of this version: the
+            // same keys published, the same signer, validated.
+            assert_eq!(code, 200, "{v}");
+            assert_eq!(v["stage"], "prepublish", "{v}");
+            let third = v["new_key"]["key_tag"].as_u64().unwrap() as u16;
+            assert!(!ro(&pr, &p)["blocked_by"].to_string().contains("dns3"));
+            wait_for("the old standby has the new key", 30, || {
+                serial(&dig, pdns) == serial(&dig, old.dns)
+            });
+            let (mut pt, ps) = validate(&t, &root, &parent, pdns, "old standby (primary)");
+            let (mut ot, os) = validate(&t, &root, &parent, old.dns, "old standby");
+            pt.sort();
+            ot.sort();
+            let mut want = vec![new_tag, third];
+            want.sort();
+            assert_eq!((pt, ps), (want.clone(), new_tag));
+            assert_eq!((ot, os), (want, new_tag), "old standby: both published");
+        } else {
+            assert_eq!(code, 409, "{v}");
+            assert!(v.to_string().contains("dns3"), "{v}");
+            assert!(ro(&pr, &p)["blocked_by"].to_string().contains("dns3"));
+        }
         let or = old.root();
         wait_for("the old standby follows, reconcile ok", 30, || {
             let st = ok(

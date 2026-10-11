@@ -336,6 +336,20 @@ async fn swagger_css(headers: axum::http::HeaderMap) -> Response {
 /// the routes from this file.)
 pub const PREFIX: &str = "/rust-dns";
 
+/// Changelog v2 needs what v1 replication needs: a signed-in caller (or
+/// API token) with the `Replicate` permission.
+async fn changelog_v2_guard(
+    axum::extract::State(s): axum::extract::State<Arc<AppState>>,
+    caller: session::Caller,
+    req: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    if let Err(e) = s.require(&caller, crate::model::GlobalPerm::Replicate) {
+        return e.into_response();
+    }
+    next.run(req).await
+}
+
 /// `GET /` and `GET /rust-dns` answer 308 Permanent Redirect to the console.
 async fn redirect_to_console() -> Response {
     axum::response::Redirect::permanent(&format!("{PREFIX}/")).into_response()
@@ -495,6 +509,26 @@ pub fn router(state: Arc<AppState>) -> Router {
             .route("/docs", get(ui_docs))
             .route("/docs/swagger-ui-bundle.js", get(swagger_js))
             .route("/docs/swagger-ui.css", get(swagger_css));
+    }
+    // Changelog v2 (shadow mode): the generic protocol of crates/sqlite-cdc
+    // at /rust-dns/changelog-api/v2, read-only (no admin routes while v1 is
+    // the replication of record), behind the same check as v1 replication.
+    if let Some(store) = state.storage.cdc() {
+        let mut ncfg = sqlite_cdc::node::NodeConfig::new("");
+        ncfg.verify_every = None;
+        let node = sqlite_cdc::node::Node::new(store.clone(), ncfg);
+        let v2 = sqlite_cdc::server::router(
+            node,
+            sqlite_cdc::server::RouterOptions {
+                auth: None,
+                admin: false,
+            },
+        )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            changelog_v2_guard,
+        ));
+        site = site.nest_service("/changelog-api/v2", v2);
     }
     // Everything is served under PREFIX (a hard cut: nothing answers at the
     // old root paths). Nesting at "/rust-dns/" (with the slash) puts the

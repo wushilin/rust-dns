@@ -205,6 +205,10 @@ impl Replication {
 
     fn set_role(&self, r: Role) {
         *self.role.write().unwrap_or_else(|p| p.into_inner()) = r;
+        // Changelog v2 (shadow mode) follows the role: only a primary is
+        // its leader.
+        self.storage
+            .cdc_set_leader(matches!(r, Role::Primary | Role::Promoted));
     }
 
     pub fn writable(&self) -> bool {

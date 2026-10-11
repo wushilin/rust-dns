@@ -1971,6 +1971,97 @@ fn has_path_prefix(p: &Path) -> bool {
     bin.windows(needle.len()).any(|w| w == needle)
 }
 
+/// What the previous release supports, read from the previous release
+/// itself, so the mixed-version tests assert the right behaviour for
+/// whichever release is the previous one: a release without a feature must
+/// be refused or halt; one with it must follow normally.
+///
+/// The `X-Rust-DNS-Version` header the previous release sends as a standby
+/// (`replicas::VERSION_WITH_FEATURES`, e.g. `0.2.0+dnssec-rollover.nsec3`):
+/// exactly what a primary decides on. Captured once from a throwaway
+/// standby of the previous release pointed at a listener of this test,
+/// which answers its first request with 503.
+fn prev_version(prev: &Path) -> &'static str {
+    static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    V.get_or_init(|| {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        l.set_nonblocking(true).unwrap();
+        let root = temp_root("prev-version");
+        let mut n = Node::new(&root, "probe", "rootpass-probe");
+        n.bin = prev.to_path_buf();
+        n.configure(&format!(
+            "[follow]\nprimary = \"http://127.0.0.1:{port}\"\ninstance_id = \"probe\"\ntoken = \"rdns_probe\"\nreconcile_interval_secs = 2\ntimeout_secs = 5\n"
+        ));
+        n.start();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let version = loop {
+            assert!(
+                Instant::now() < deadline,
+                "the previous release never called its primary; log:\n{}",
+                n.log()
+            );
+            let Ok((mut c, _)) = l.accept() else {
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            };
+            c.set_nonblocking(false).unwrap();
+            c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                match c.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(k) => buf.extend_from_slice(&chunk[..k]),
+                }
+            }
+            let _ = c.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            let head = String::from_utf8_lossy(&buf).to_string();
+            if let Some(v) = head.lines().find_map(|line| {
+                let (k, v) = line.split_once(':')?;
+                k.trim()
+                    .eq_ignore_ascii_case("x-rust-dns-version")
+                    .then(|| v.trim().to_string())
+            }) {
+                break v;
+            }
+        };
+        drop(n);
+        let _ = std::fs::remove_dir_all(&root);
+        eprintln!("follow: the previous release reports version {version}");
+        version
+    })
+}
+
+/// Whether the previous release advertises `feature` in its version
+/// (the same rule as `replicas::has_feature` on the primary).
+fn prev_supports(prev: &Path, feature: &str) -> bool {
+    let has = prev_version(prev)
+        .split_once('+')
+        .is_some_and(|(_, meta)| meta.split(['.', '+']).any(|f| f == feature));
+    eprintln!("follow: previous release supports {feature}: {has}");
+    has
+}
+
+/// For what is not a version feature (columns an older release halts on,
+/// status fields, gzip snapshots): whether a running node's own API
+/// document (`/rust-dns/api/openapi.json`, generated from the code of the
+/// binary it runs) contains `needle`, a field or description that came
+/// with the feature. Checked against the committed `docs/openapi.json` of
+/// the releases before and after each feature.
+fn openapi_has(n: &Node, needle: &str) -> bool {
+    let (head, body) = raw_get(n, "/rust-dns/api/openapi.json", &[]);
+    assert!(
+        head.starts_with("http/1.1 200"),
+        "{} openapi: {head}",
+        n.name
+    );
+    let has = String::from_utf8_lossy(&body).contains(needle);
+    eprintln!("follow: {} API document has {needle}: {has}", n.name);
+    has
+}
+
 fn dnssec_status(n: &Node, a: &ureq::Agent, zone: &str) -> Value {
     ok(
         call(
@@ -3033,9 +3124,23 @@ fn a_new_standby_follows_an_old_primary_and_copies_its_changelog() {
         allow.contains(&json!({ "method": "POST", "path": "/replication/promote" })),
         "{st}"
     );
-    assert!(server_status(&p, &pr)["replication"]
-        .get("standby_writable")
-        .is_none());
+    // The old primary publishes the list only if its release has it (its
+    // own API document names the field).
+    let old_status = server_status(&p, &pr);
+    if openapi_has(&p, "\"standby_writable\"") {
+        let old_allow = old_status["replication"]["standby_writable"]
+            .as_array()
+            .unwrap();
+        assert!(
+            old_allow.contains(&json!({ "method": "POST", "path": "/replication/promote" })),
+            "{old_status}"
+        );
+    } else {
+        assert!(
+            old_status["replication"].get("standby_writable").is_none(),
+            "{old_status}"
+        );
+    }
     let me = ok(call(&Auth::Session(&sr), "GET", &s.api("/me"), None), "me");
     assert_eq!(me["recovery_codes_left"], 0, "{me}");
     let cases = [
@@ -3106,6 +3211,8 @@ fn a_new_standby_follows_an_old_primary_and_copies_its_changelog() {
 /// reconcile stays ok. With the previous release as standby: unscoped
 /// tokens keep it following, and the first scoped token makes it halt
 /// (diverged) — it cannot enforce a scope, so it must not look healthy.
+/// A previous release that has scopes (its API document names `max_role`)
+/// follows the scoped token and enforces it instead.
 /// Recorded in plan.md (Rollout): upgrade the standby first, create scoped
 /// tokens only once both run this version.
 #[test]
@@ -3223,12 +3330,42 @@ fn token_scopes_replicate_and_are_enforced_on_the_standby() {
     old.start();
     let or = old.root();
     wait_reconciled(&p, &pr, &old, &or, "old standby, no scoped token");
-    post(
+    // A release with scopes names `max_role` in its API document.
+    let old_has_scopes = openapi_has(&old, "\"max_role\"");
+    let ro2 = post(
         &p,
         &alice,
         "/tokens",
         json!({ "name": "ro2", "scope": { "zones": ["a.test"] } }),
-    );
+    )["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    if old_has_scopes {
+        // It follows, reconciles and enforces the scope like the primary.
+        wait_reconciled(&p, &pr, &old, &or, "old standby with scopes, scoped token");
+        let v = ok(
+            call(&Auth::Token(&ro2), "GET", &old.api("/zones"), None),
+            "zones by the scoped token on the old standby",
+        );
+        let names: Vec<&str> = v["zones"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|z| z["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["a.test"], "{v}");
+        assert_eq!(
+            call(&Auth::Token(&ro2), "GET", &old.api("/zones/b.test"), None).0,
+            404
+        );
+        let st = status(&old, &or);
+        assert!(st["follow"]["halted"].is_null(), "{st}");
+        drop(old);
+        drop(p);
+        let _ = std::fs::remove_dir_all(&root_dir);
+        return;
+    }
     let mut last = Value::Null;
     wait_for("the old standby halts on the scoped token", 30, || {
         last = status(&old, &or);
@@ -3245,7 +3382,8 @@ fn token_scopes_replicate_and_are_enforced_on_the_standby() {
 /// the standby (snapshot and `zone_updated`), reconcile stays ok. With the
 /// previous release as standby: no policy, it follows; the first policy
 /// makes it halt (the per-zone checksum covers the zone row) — recorded in
-/// plan.md (Rollout): upgrade the standby first.
+/// plan.md (Rollout): upgrade the standby first. A previous release that
+/// has policies (its API document names `record_policy`) follows it.
 #[test]
 fn a_zone_record_policy_replicates() {
     let nanos = std::time::SystemTime::now()
@@ -3319,11 +3457,25 @@ fn a_zone_record_policy_replicates() {
     old.start();
     let or = old.root();
     wait_reconciled(&p, &pr, &old, &or, "old standby, no policy");
+    // A release with record policies names the field in its API document.
+    let old_has_policy = openapi_has(&old, "\"record_policy\"");
     req(
         "PUT",
         "/zones/dyn.test",
         json!({ "record_policy": { "max_expiry_secs": 600 } }),
     );
+    if old_has_policy {
+        // It follows (reconcile ok, never halted) and has the policy.
+        wait_reconciled(&p, &pr, &old, &or, "old standby with policies");
+        assert_eq!(
+            policy(&old, &or, "dyn.test"),
+            json!({ "max_expiry_secs": 600 })
+        );
+        drop(old);
+        drop(p);
+        let _ = std::fs::remove_dir_all(&root_dir);
+        return;
+    }
     let mut last = Value::Null;
     wait_for("the old standby halts on the policy", 30, || {
         last = status(&old, &or);
@@ -3545,7 +3697,8 @@ fn an_admin_enrolled_authenticator_works_on_the_standby() {
 /// (reconcile stays ok: the history is part of the user row). With the previous
 /// release as standby: it follows while no history is kept, and halts
 /// (`diverged`) once one is (it would drop it): set a history only after
-/// every standby is upgraded (plan.md, Rollout).
+/// every standby is upgraded (plan.md, Rollout). A previous release that
+/// has the history (its API document names `password_history`) follows it.
 #[test]
 fn a_password_history_replicates_and_an_old_standby_halts_on_it() {
     let nanos = std::time::SystemTime::now()
@@ -3614,7 +3767,26 @@ fn a_password_history_replicates_and_an_old_standby_halts_on_it() {
         "standby settings",
     );
     assert_eq!(v["settings"]["password_history"], 3, "{v}");
+    // A release with password history names the setting in its API
+    // document: it follows (reconcile ok, never halted) and has it.
+    let mut old_halts = true;
     if let (Some(o), Some(oa)) = (&old, &or) {
+        if openapi_has(o, "\"password_history\"") {
+            old_halts = false;
+            wait_reconciled(&p, &pr, o, oa, "old standby with password history");
+            let v = ok(
+                call(
+                    &Auth::Session(oa),
+                    "GET",
+                    &o.api("/settings/security"),
+                    None,
+                ),
+                "old standby settings",
+            );
+            assert_eq!(v["settings"]["password_history"], 3, "{v}");
+        }
+    }
+    if let (Some(o), Some(oa), true) = (&old, &or, old_halts) {
         let mut last = Value::Null;
         wait_for("the old standby halts on the password history", 30, || {
             last = status(o, oa);
@@ -3633,7 +3805,8 @@ fn a_password_history_replicates_and_an_old_standby_halts_on_it() {
 /// the name; reconcile stays ok; DNS answers move to the new name), and
 /// bulk edits and clones replicate as ordinary changes. With the previous
 /// release following, the primary refuses a rename and names it (that
-/// standby would ignore the new name and halt).
+/// standby would ignore the new name and halt), unless that release
+/// advertises `zone-rename`: then it follows the rename.
 #[test]
 fn a_zone_rename_replicates_and_waits_for_old_standbys() {
     let nanos = std::time::SystemTime::now()
@@ -3696,6 +3869,7 @@ fn a_zone_rename_replicates_and_waits_for_old_standbys() {
     drop(s);
 
     if let Some(prev) = prev_bin() {
+        let renames = prev_supports(&prev, "zone-rename");
         let mut old = Node::new(&root_dir, "old", "rootpass-old");
         old.bin = prev;
         old.configure(&follow_cfg(&p, "dns3", &repl));
@@ -3703,8 +3877,24 @@ fn a_zone_rename_replicates_and_waits_for_old_standbys() {
         let or = old.root();
         wait_reconciled(&p, &pr, &old, &or, "old standby");
         let (st, v) = post("/zones/new.test/rename", json!({ "name": "newer.test" }));
-        assert_eq!(st, 409, "{v}");
-        assert!(v["error"].as_str().unwrap().contains("dns3"), "{v}");
+        if renames {
+            // A release with `zone-rename` follows the rename.
+            assert_eq!(st, 200, "{v}");
+            wait_reconciled(&p, &pr, &old, &or, "old standby, renamed");
+            let (rc, a) = answers(old.dns, "www.newer.test.", RecordType::A);
+            assert_eq!(
+                (rc, a),
+                (
+                    ResponseCode::NoError,
+                    vec!["www.newer.test. 300 192.0.2.7".to_string()]
+                )
+            );
+            let (rc, _) = answers(old.dns, "www.new.test.", RecordType::A);
+            assert_ne!(rc, ResponseCode::NoError, "the old name is gone");
+        } else {
+            assert_eq!(st, 409, "{v}");
+            assert!(v["error"].as_str().unwrap().contains("dns3"), "{v}");
+        }
         drop(old);
     }
     drop(p);
@@ -3737,6 +3927,7 @@ fn axfr_rcode(port: u16, zone: &str) -> ResponseCode {
 /// the zone's automatic PTR; clearing them replicates too; reconcile ok
 /// throughout. A standby of the previous release (no `zone-settings`
 /// feature) blocks setting them (409, naming it); clearing stays allowed.
+/// One that advertises `zone-settings` follows and applies them.
 #[test]
 fn zone_settings_replicate_and_wait_for_old_standbys() {
     let nanos = std::time::SystemTime::now()
@@ -3812,6 +4003,7 @@ fn zone_settings_replicate_and_wait_for_old_standbys() {
     drop(s);
 
     if let Some(prev) = prev_bin() {
+        let zone_settings = prev_supports(&prev, "zone-settings");
         let mut old = Node::new(&root_dir, "old", "rootpass-old");
         old.bin = prev;
         old.configure(&format!("{xfer}{}", follow_cfg(&p, "dns3", &repl)));
@@ -3819,10 +4011,19 @@ fn zone_settings_replicate_and_wait_for_old_standbys() {
         let or = old.root();
         wait_reconciled(&p, &pr, &old, &or, "old standby");
         let (st, v) = put(json!({ "auto_ptr": false }));
-        assert_eq!(st, 409, "{v}");
-        assert!(v["error"].as_str().unwrap().contains("dns3"), "{v}");
+        if zone_settings {
+            // A release with `zone-settings` follows and applies them.
+            assert_eq!(st, 200, "{v}");
+            wait_reconciled(&p, &pr, &old, &or, "old standby, settings set");
+            assert_eq!(ptr(old.dns, "1.7.7.10.in-addr.arpa."), 0, "auto PTR off");
+            assert_eq!(ptr(old.dns, "2.7.7.10.in-addr.arpa."), 1, "other zone's");
+        } else {
+            assert_eq!(st, 409, "{v}");
+            assert!(v["error"].as_str().unwrap().contains("dns3"), "{v}");
+        }
         ok(put(json!({})), "clearing is allowed");
         wait_reconciled(&p, &pr, &old, &or, "old standby, after a no-op clear");
+        assert_eq!(ptr(old.dns, "1.7.7.10.in-addr.arpa."), 1, "auto PTR back");
         drop(old);
     }
     drop(p);
@@ -3877,7 +4078,8 @@ fn add_record(n: &Node, a: &ureq::Agent, zone: &str, name: &str, value: &str) {
 /// O21: cascading standbys. A -> B -> C: C follows B (a standby) with the
 /// same offsets and history; B lists C as its replica, A only B. Account
 /// changes reach C promptly. A standby with another [root] username, and
-/// a previous-release standby, are refused by B (not halted). Promoting B
+/// a previous-release standby without O21, are refused by B (not halted);
+/// a previous release with O21 follows B. Promoting B
 /// in the middle of the chain: C adopts B's new history and keeps
 /// following it.
 #[test]
@@ -3998,18 +4200,33 @@ fn cascading_standbys_follow_and_survive_a_promotion_in_the_middle() {
         );
         assert!(record_names(&d, &dr, "c.test").is_empty());
     }
-    // A previous-release standby cannot follow a standby: refused, not halted.
+    // A previous-release standby without cascading standbys cannot follow
+    // a standby: refused, not halted. One with them (its API document
+    // names the status field `local_root`, which came with them) follows
+    // B like C does.
     if let Some(prev) = prev_bin() {
         let mut e = Node::new(&root_dir, "e", "rootpass-e");
         e.bin = prev;
         e.configure(&follow_cfg(&b, "dns5", &token));
         e.start();
         let er = e.root();
-        wait_for("old E refused", 15, || {
-            follow_state(&e, &er)["state"] == "refused"
-        });
-        assert!(follow_state(&e, &er)["halted"].is_null());
-        assert!(record_names(&e, &er, "c.test").is_empty());
+        if openapi_has(&e, "\"local_root\"") {
+            wait_reconciled(&b, &br, &e, &er, "old E follows B");
+            assert_eq!(
+                record_names(&e, &er, "c.test"),
+                record_names(&b, &br, "c.test")
+            );
+            assert_eq!(follow_state(&e, &er)["state"], "following");
+            wait_for("B lists dns5 up to date", 15, || {
+                replica_of(&b, &br, "dns5")["state"] == "up_to_date"
+            });
+        } else {
+            wait_for("old E refused", 15, || {
+                follow_state(&e, &er)["state"] == "refused"
+            });
+            assert!(follow_state(&e, &er)["halted"].is_null());
+            assert!(record_names(&e, &er, "c.test").is_empty());
+        }
     }
 
     // Promotion in the middle: A goes away, B is promoted, C follows B's
@@ -4195,6 +4412,13 @@ fn log_has(n: &Node, message: &str, field: &str) -> bool {
         .any(|l| l.contains(message) && l.split_whitespace().any(|w| w == field))
 }
 
+fn log_count(n: &Node, message: &str, field: &str) -> usize {
+    n.log()
+        .lines()
+        .filter(|l| l.contains(message) && l.split_whitespace().any(|w| w == field))
+        .count()
+}
+
 /// A raw HTTP/1.1 GET (headers lower-cased, body as sent: no decoding).
 fn raw_get(n: &Node, path: &str, headers: &[(&str, &str)]) -> (String, Vec<u8>) {
     use std::io::{Read, Write};
@@ -4233,7 +4457,9 @@ fn raw_get(n: &Node, path: &str, headers: &[(&str, &str)]) -> (String, Vec<u8>) 
 /// (`Accept-Encoding: gzip`), identical once decompressed, and plain
 /// otherwise. Mixed versions both ways: a previous-release standby (does
 /// not ask) gets plain JSON from this primary, and a standby of this
-/// version loads a previous-release primary's plain snapshot.
+/// version loads a previous-release primary's plain snapshot. A previous
+/// release with O22 (its API document describes gzip snapshots) asks for
+/// and serves gzip instead.
 #[test]
 fn snapshots_are_gzip_compressed_when_the_standby_asks() {
     use std::io::Read;
@@ -4322,7 +4548,9 @@ fn snapshots_are_gzip_compressed_when_the_standby_asks() {
     );
 
     if let Some(prev) = prev_bin() {
-        // A previous-release standby of this primary: plain JSON.
+        // A previous-release standby of this primary: plain JSON unless it
+        // has O22. (The plain request above is in the log already.)
+        let plain_before = log_count(&p, "replication snapshot served", "gzip=false");
         let mut o = Node::new(&root_dir, "old-standby", "rootpass-o");
         o.bin = prev.clone();
         o.configure(&follow_cfg(&p, "dns3", &token));
@@ -4331,11 +4559,24 @@ fn snapshots_are_gzip_compressed_when_the_standby_asks() {
         wait_for("old standby has the zone", 20, || {
             record_names(&o, &or, "gz.test").len() == 40
         });
-        assert!(
-            log_has(&p, "replication snapshot served", "gzip=false"),
-            "{}",
-            p.log()
-        );
+        // A release with gzip snapshots (O22) describes them in its API
+        // document: it asks for gzip, and this primary sends it.
+        let prev_gzip = openapi_has(&o, "Sent gzip-compressed");
+        if prev_gzip {
+            assert!(log_has(&o, "snapshot received", "gzip=true"), "{}", o.log());
+            assert_eq!(
+                log_count(&p, "replication snapshot served", "gzip=false"),
+                plain_before,
+                "no plain snapshot for the old standby: {}",
+                p.log()
+            );
+        } else {
+            assert!(
+                log_has(&p, "replication snapshot served", "gzip=false"),
+                "{}",
+                p.log()
+            );
+        }
         drop(o);
         // A standby of this version of a previous-release primary: plain.
         let mut op = Node::new(&root_dir, "old-primary", "rootpass-op");
@@ -4372,11 +4613,16 @@ fn snapshots_are_gzip_compressed_when_the_standby_asks() {
         wait_for("new standby has the old primary's zone", 20, || {
             record_names(&n, &nr, "old.test") == vec!["www A 192.0.2.9".to_string()]
         });
-        assert!(
-            log_has(&n, "snapshot received", "gzip=false"),
-            "{}",
-            n.log()
-        );
+        // The previous-release primary compresses only if it can.
+        let field = if prev_gzip { "gzip=true" } else { "gzip=false" };
+        assert!(log_has(&n, "snapshot received", field), "{}", n.log());
+        if prev_gzip {
+            assert!(
+                log_has(&op, "replication snapshot served", "gzip=true"),
+                "{}",
+                op.log()
+            );
+        }
     }
     drop((p, s));
     let _ = std::fs::remove_dir_all(&root_dir);
@@ -4594,7 +4840,8 @@ fn a_private_ca_from_ca_file_is_trusted_for_the_primary_and_the_peer() {
 /// delv, its self-check is ok, and the reconcile stays ok through the
 /// switch to NSEC3 and back. A standby of the previous release (no `nsec3`
 /// feature) blocks the switch (409, naming it) and keeps following;
-/// switching back to NSEC stays allowed.
+/// switching back to NSEC stays allowed. One that advertises `nsec3`
+/// follows the switch with the same proofs.
 #[test]
 fn nsec3_replicates_and_waits_for_old_standbys() {
     let root_dir = temp_root("follow-nsec3");
@@ -4725,6 +4972,7 @@ fn nsec3_replicates_and_waits_for_old_standbys() {
     drop(s);
 
     if let Some(prev) = prev_bin() {
+        let nsec3 = prev_supports(&prev, "nsec3");
         let mut old = Node::new(&root_dir, "old", "rootpass-old");
         old.bin = prev;
         old.configure(&format!("{xfer}{}", follow_cfg(&p, "dns3", &repl)));
@@ -4732,9 +4980,19 @@ fn nsec3_replicates_and_waits_for_old_standbys() {
         let or = old.root();
         wait_reconciled(&p, &pr, &old, &or, "old standby");
         let (st, v) = put(json!({ "enabled": true, "denial": "nsec3" }));
-        assert_eq!(st, 409, "{v}");
-        assert!(v["error"].as_str().unwrap().contains("dns3"), "{v}");
-        assert_eq!(dnssec_status(&p, &pr, "n3.test")["denial"], "nsec");
+        if nsec3 {
+            // A release with `nsec3` follows and serves the same proofs.
+            assert_eq!(st, 200, "{v}");
+            wait_reconciled(&p, &pr, &old, &or, "old standby, NSEC3");
+            assert_eq!(proofs(old.dns), proofs(p.dns), "same NSEC3 proofs");
+            assert_eq!(dnssec_status(&old, &or, "n3.test")["denial"], "nsec3");
+            verify_zone(&root_dir, old.dns, "n3.test", "old standby nsec3");
+            delv_all(&root_dir, &dnskey, "n3.test", old.dns, &cases);
+        } else {
+            assert_eq!(st, 409, "{v}");
+            assert!(v["error"].as_str().unwrap().contains("dns3"), "{v}");
+            assert_eq!(dnssec_status(&p, &pr, "n3.test")["denial"], "nsec");
+        }
         ok(
             put(json!({ "enabled": true, "denial": "nsec" })),
             "NSEC stays allowed",
@@ -4759,7 +5017,8 @@ fn nsec3_replicates_and_waits_for_old_standbys() {
 /// refused (409; it stays `refused`, not halted, and serves nothing of
 /// it); once no zone is signed with Ed25519 it follows, and then turning
 /// Ed25519 signing on (kept key or a new zone) is refused naming it, while
-/// algorithm 13 stays allowed.
+/// algorithm 13 stays allowed. A previous release that advertises
+/// `ed25519` follows the zone with byte-identical signed answers instead.
 #[test]
 fn ed25519_replicates_and_older_standbys_are_refused() {
     let root_dir = temp_root("follow-ed25519");
@@ -4882,7 +5141,43 @@ fn ed25519_replicates_and_older_standbys_are_refused() {
     assert_eq!(st["key"]["algorithm"], 15, "{st}");
     drop(s);
 
-    if let Some(prev) = prev_bin() {
+    let prev = prev_bin();
+    if let Some(prev) = prev.clone().filter(|b| prev_supports(b, "ed25519")) {
+        // A release with `ed25519` follows the signed zone (Ed25519 +
+        // NSEC3) like a standby of this version: byte-identical signed
+        // answers, valid; and a new Ed25519 zone is allowed.
+        let mut old = Node::new(&root_dir, "old", "rootpass-old");
+        old.bin = prev;
+        old.configure(&format!("{xfer}{}", follow_cfg(&p, "dns3", &repl)));
+        old.start();
+        let or = old.root();
+        wait_reconciled(&p, &pr, &old, &or, "old standby with ed25519");
+        assert_eq!(
+            signed(p.dns),
+            signed(old.dns),
+            "old standby, byte-identical"
+        );
+        verify_zone(&root_dir, old.dns, "ed.test", "old standby ed25519 nsec3");
+        delv_all(&root_dir, &dnskey, "ed.test", old.dns, &cases);
+        ok(post("/zones", json!({ "name": "ed2.test" })), "zone 2");
+        add_record(&p, &pr, "ed2.test", "www", "192.0.2.91");
+        ok(
+            post(
+                "/zones/ed2.test/records",
+                json!({ "name": "@", "type": "NS", "value": "ns1.ed.test." }),
+            ),
+            "NS",
+        );
+        let on = ok(
+            put("ed2.test", json!({ "enabled": true, "algorithm": 15 })),
+            "new Ed25519 zone allowed",
+        );
+        assert_eq!(on["key"]["algorithm"], 15, "{on}");
+        wait_reconciled(&p, &pr, &old, &or, "old standby, second Ed25519 zone");
+        verify_zone(&root_dir, old.dns, "ed2.test", "old standby ed25519 zone 2");
+        assert_eq!(dnssec_status(&old, &or, "ed2.test")["key"]["algorithm"], 15);
+        drop(old);
+    } else if let Some(prev) = prev {
         // 1. An Ed25519 zone is signed: the old standby is refused.
         let mut old = Node::new(&root_dir, "old", "rootpass-old");
         old.bin = prev;
@@ -4954,7 +5249,8 @@ fn ed25519_replicates_and_older_standbys_are_refused() {
 /// release cannot represent a secondary zone (it would serve an empty
 /// zone of its own): while one exists its snapshot and change requests are
 /// refused (409, state `refused`, never halted), and once none exists it
-/// follows, and then creating one is refused naming it.
+/// follows, and then creating one is refused naming it. One that
+/// advertises `secondary-zones` follows and transfers the zone itself.
 #[test]
 fn secondary_zones_replicate_their_definition_and_every_server_transfers_itself() {
     let root_dir = temp_root("follow-secondary");
@@ -5062,7 +5358,28 @@ fn secondary_zones_replicate_their_definition_and_every_server_transfers_itself(
     wait_reconciled(&p, &pr, &s, &sr, "after refreshes");
     drop(s);
 
-    if let Some(prev) = prev_bin() {
+    let prev = prev_bin();
+    if let Some(prev) = prev.clone().filter(|b| prev_supports(b, "secondary-zones")) {
+        // A release with `secondary-zones` follows: it has the definition
+        // and transfers the zone from U itself, as S did.
+        let mut old = Node::new(&root_dir, "old", "rootpass-old");
+        old.bin = prev;
+        old.configure(&format!("{xfer}{}", follow_cfg(&p, "dns3", &repl)));
+        old.start();
+        let or = old.root();
+        wait_reconciled(&p, &pr, &old, &or, "old standby with secondary zones");
+        wait_for("the old standby transfers far.test", 20, || {
+            answers(old.dns, "new.far.test.", RecordType::A).1.len() == 1
+        });
+        let st = sec_status(&old, &or);
+        assert_eq!(st["state"], "ok", "{st}");
+        assert_eq!(st["source"], format!("127.0.0.1:{}", u.dns), "{st}");
+        assert_eq!(
+            answers(p.dns, "www.far.test.", RecordType::A),
+            answers(old.dns, "www.far.test.", RecordType::A)
+        );
+        drop(old);
+    } else if let Some(prev) = prev {
         // 1. A secondary zone exists: the old standby is refused.
         let mut old = Node::new(&root_dir, "old", "rootpass-old");
         old.bin = prev;
@@ -5114,7 +5431,8 @@ fn secondary_zones_replicate_their_definition_and_every_server_transfers_itself(
 /// A previous release cannot read them (it would fail to apply the change
 /// and halt): while such records exist its snapshot and change requests
 /// are refused (409, `refused`, never halted); once none exists it
-/// follows, and then creating one is refused naming it.
+/// follows, and then creating one is refused naming it. One that
+/// advertises `rrtypes-o28` follows and serves the same answers.
 #[test]
 fn o28_record_types_replicate_and_older_standbys_are_refused() {
     let root_dir = temp_root("follow-o28");
@@ -5161,7 +5479,37 @@ fn o28_record_types_replicate_and_older_standbys_are_refused() {
         assert_eq!(a, answers(s.dns, n, t), "{n}");
     }
     drop(s);
-    if let Some(prev) = prev_bin() {
+    let prev = prev_bin();
+    if let Some(prev) = prev.clone().filter(|b| prev_supports(b, "rrtypes-o28")) {
+        // A release with `rrtypes-o28` follows and serves the same
+        // answers; creating more of them stays allowed.
+        let mut old = Node::new(&root_dir, "old", "rootpass-old");
+        old.bin = prev;
+        old.configure(&follow_cfg(&p, "dns3", &repl));
+        old.start();
+        let or = old.root();
+        wait_reconciled(&p, &pr, &old, &or, "old standby with O28 types");
+        ok(
+            post(
+                "/zones/rt.test/records/bulk",
+                json!({ "add": "x 300 EUI48 00-00-5e-00-53-2b" }),
+            ),
+            "bulk",
+        );
+        wait_reconciled(&p, &pr, &old, &or, "old standby, more O28 records");
+        for (n, t) in [
+            ("loc.rt.test.", RecordType::Unknown(29)),
+            ("rp.rt.test.", RecordType::Unknown(17)),
+            ("mac.rt.test.", RecordType::Unknown(108)),
+            ("x.rt.test.", RecordType::Unknown(108)),
+            ("_http._tcp.rt.test.", RecordType::Unknown(256)),
+        ] {
+            let a = answers(p.dns, n, t);
+            assert_eq!(a.1.len(), 1, "{n}: {a:?}");
+            assert_eq!(a, answers(old.dns, n, t), "old standby {n}");
+        }
+        drop(old);
+    } else if let Some(prev) = prev {
         let mut old = Node::new(&root_dir, "old", "rootpass-old");
         old.bin = prev;
         old.configure(&follow_cfg(&p, "dns3", &repl));

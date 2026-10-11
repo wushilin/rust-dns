@@ -2693,3 +2693,38 @@ Final
 - [ ] P-1. Console: retry automatically on 503 + Retry-After from the KDF
   limiter (password change, sign-in, user create) instead of showing an error;
   consider a longer KDF wait for interactive account actions on 1-slot hosts.
+- 2026-10-11: DEPLOYED acc6914 (path prefix hard cut; GitHub Release run
+  38119089716, linux-x86_64 binary sha256 8e288545…) to baba2 (dns2) first,
+  then gate (dns1). Backups first on both (python sqlite3 backup API,
+  integrity_check ok): data/backups/pre-prefix-upgrade-20261011-144541.db on
+  both, plus 20261011-145803 on gate right before its upgrade. Rollback
+  binaries rust-dns.old.20261011-145727 (baba2) / -145820 (gate). Gate passed:
+  362 tests, clippy, fmt, UI + browser, OpenAPI snapshot + validator,
+  conformance 158/158, smoke, cargo-audit (only `paste`); the mixed-version
+  step (REQUIRE_PREV_BIN) is waived for this release: no pre-prefix binary
+  can replicate with a prefixed one. As expected baba2 retried (404, no
+  halt) between the two upgrades, then caught up (offset 171 = head,
+  version 0.2.0). Verified after each host: config check, DNS UDP+TCP
+  listening, delv with the published wushilin.net KSK as anchor 89/89 fully
+  validated on both, serials equal (19 / 10), `/` and `/rust-dns` 308 to
+  `/rust-dns/` through the dns1 TLS proxy, `/api/...` 404.
+- 2026-10-11: Changelog v2 in SHADOW mode (not deployed yet). crates/sqlite-cdc
+  (workspace member) attaches to the write connection: TEMP capture triggers
+  (nothing stored in the file: an older binary opens it unchanged), lenient
+  (a missed capture marks the v2 log `broken`, never fails a write), on every
+  replicated table plus `audit_log` (per-server columns excluded; v1
+  changelog and per-server bookkeeping not captured), meta per txn: actor,
+  ip, command, v1 txn id. Only a primary is the v2 leader (role follows
+  replication; a standby drops its v2 history, keeps its data). Served
+  read-only at /rust-dns/changelog-api/v2 behind GlobalPerm::Replicate:
+  status, snapshot, changes, stream, progress, clients, hashes, schema,
+  verify, self-check. v1 stays the replication of record. New tables `_cdc*`
+  classified local. Audit pruning goes through the capture. Found and fixed on
+  the way: reqwest `gzip` feature unification changed v1's client (the crate
+  decodes gzip itself now); the crate's gzip stream decoder lost the tail.
+  The mixed-version tests now detect what the previous binary supports
+  (`prev_version` / `prev_supports` from the X-Rust-DNS-Version header, the
+  served OpenAPI document) instead of assuming it lacks recent features;
+  they pass against acc6914 (24 follow + rollover). Gate: 391 tests (BIND
+  tools and prev binary required), fmt, clippy, conformance 158/158, smoke,
+  UI + browser, cargo-audit (only `paste`).

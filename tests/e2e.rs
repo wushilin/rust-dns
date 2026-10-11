@@ -1668,3 +1668,81 @@ fn account_dialog_flows() {
     assert_eq!(v["status"], "ok", "carol can sign in again");
     assert!(c4.get(&format!("{web}/rust-dns/api/me")).call().is_ok());
 }
+
+/// Changelog v2 (shadow mode): a primary captures every write and serves
+/// the v2 protocol at /rust-dns/changelog-api/v2, behind the replication
+/// permission; the captured rows match what was written.
+#[test]
+fn changelog_v2_is_captured_and_served_on_a_primary() {
+    let srv = start();
+    let web = &srv.web;
+    let v2 = format!("{web}/rust-dns/changelog-api/v2");
+    // Not signed in: refused like v1 replication.
+    match ureq::get(&format!("{v2}/status")).call() {
+        Err(ureq::Error::Status(s, _)) => assert_eq!(s, 401, "anonymous v2 status"),
+        other => panic!("anonymous v2 status: {other:?}"),
+    }
+    let a = agent();
+    login(&a, web);
+    let status: serde_json::Value = a
+        .get(&format!("{v2}/status"))
+        .call()
+        .unwrap()
+        .into_json()
+        .unwrap();
+    assert_eq!(status["role"], "leader", "{status}");
+    let history = status["history"].as_str().unwrap().to_string();
+    let start = status["last_txn"].as_u64().unwrap();
+    let start_hash = status["last_hash"].as_str().unwrap().to_string();
+
+    let (s, _) = post(
+        &a,
+        &format!("{web}/rust-dns/api/zones"),
+        serde_json::json!({ "name": "v2.test" }),
+    );
+    assert_eq!(s, 201);
+    let (s, _) = post(
+        &a,
+        &format!("{web}/rust-dns/api/zones/v2.test/records"),
+        serde_json::json!({ "name": "www", "type": "A", "value": "192.0.2.42" }),
+    );
+    assert_eq!(s, 201);
+
+    let changes: serde_json::Value = a
+        .get(&format!(
+            "{v2}/changes?history={history}&after={start}&hash={start_hash}"
+        ))
+        .call()
+        .unwrap()
+        .into_json()
+        .unwrap();
+    let txns = changes["txns"].as_array().unwrap();
+    assert!(txns.len() >= 2, "{changes}");
+    let rows: Vec<&serde_json::Value> = txns
+        .iter()
+        .flat_map(|t| t["rows"].as_array().unwrap())
+        .collect();
+    let zone = rows
+        .iter()
+        .find(|r| r["tbl"] == "zones" && r["op"] == "I")
+        .expect("zone insert captured");
+    assert_eq!(zone["after"]["name"], "v2.test");
+    let rec = rows
+        .iter()
+        .find(|r| r["tbl"] == "records" && r["op"] == "I")
+        .expect("record insert captured");
+    assert_eq!(rec["after"]["value"], "192.0.2.42");
+    // Who did it travels with the transaction.
+    assert!(
+        txns.iter().any(|t| t["meta"]["actor"] == "root"),
+        "{changes}"
+    );
+    // The log agrees with the live data.
+    let check: serde_json::Value = a
+        .get(&format!("{v2}/self-check"))
+        .call()
+        .unwrap()
+        .into_json()
+        .unwrap();
+    assert_eq!(check["ok"], true, "{check}");
+}
