@@ -95,18 +95,18 @@ ${extra}
   const child = spawn(BIN, ['--config', path.join(dir, 'rust-dns.toml')], { stdio: ['pipe', 'ignore', 'ignore'], env: { ...process.env, RUST_DNS_EXIT_WITH_STDIN: '1' } });
   children.push(child);
   const url = `http://127.0.0.1:${web}`;
-  await waitUntil(`${name} up`, async () => (await fetch(`${url}/api/health`)).ok, 20000);
+  await waitUntil(`${name} up`, async () => (await fetch(`${url}/rust-dns/api/health`)).ok, 20000);
   return { name, url, password };
 }
 
 // A minimal API client with a session cookie.
 async function apiLogin(srv, user, pw) {
-  const r = await fetch(`${srv.url}/api/auth/login`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-requested-with': 'rust-dns' }, body: JSON.stringify({ username: user, password: pw }) });
+  const r = await fetch(`${srv.url}/rust-dns/api/auth/login`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-requested-with': 'rust-dns' }, body: JSON.stringify({ username: user, password: pw }) });
   if (!r.ok) throw new Error(`login ${user}: ${r.status}`);
   const cookie = r.headers.getSetCookie().find(c => /rdns_session=/.test(c)).split(';')[0];
   const csrf = (await r.json()).csrf_token || '';
   return async (method, p, body) => {
-    const res = await fetch(`${srv.url}/api${p}`, { method, headers: { cookie, 'x-requested-with': 'rust-dns', 'x-csrf-token': csrf, ...(body ? { 'content-type': 'application/json' } : {}) }, body: body ? JSON.stringify(body) : undefined });
+    const res = await fetch(`${srv.url}/rust-dns/api${p}`, { method, headers: { cookie, 'x-requested-with': 'rust-dns', 'x-csrf-token': csrf, ...(body ? { 'content-type': 'application/json' } : {}) }, body: body ? JSON.stringify(body) : undefined });
     const text = await res.text();
     let json = null; try { json = JSON.parse(text); } catch {}
     return { status: res.status, json };
@@ -180,7 +180,7 @@ class Page {
       if (e.disabled) throw new Error(${JSON.stringify(sel)} + ' is disabled: ' + e.title); e.click(); return true;`);
   }
   async signIn(srv, user, pw) {
-    await this.goto(srv.url + '/');
+    await this.goto(srv.url + '/rust-dns/');
     await this.wait('login form', `return !!document.querySelector('#li-user') && !document.querySelector('#login').classList.contains('hidden')`);
     await this.fill('#li-user', user); await this.fill('#li-pass', pw); await this.click('#li-btn');
     await this.wait('signed in', `return !document.querySelector('#app').classList.contains('hidden')`);
@@ -330,7 +330,7 @@ async function main() {
 
 // Phase O flows on the primary `p` (root's API client `rootApi`, root's page `admin`).
 async function phaseO(b, p, rootApi, admin) {
-  const bearer = async (tok, method, pth) => (await fetch(`${p.url}/api${pth}`, { method, headers: { authorization: `Bearer ${tok}` } })).status;
+  const bearer = async (tok, method, pth) => (await fetch(`${p.url}/rust-dns/api${pth}`, { method, headers: { authorization: `Bearer ${tok}` } })).status;
   // O1: change own password and revoke own API tokens from the account page.
   await rootApi('POST', '/users', { username: 'olive', password: 'olive-password-1' });
   const oliveApi = await apiLogin(p, 'olive', 'olive-password-1');
@@ -348,7 +348,7 @@ async function phaseO(b, p, rootApi, admin) {
   const after = await bearer(otok, 'GET', '/me'); ok('O1: password change from the console revokes the tokens', after === 401, `${after} :: ${pwShown}`);
 
   // O4: the sign-in log, filtered on user and result.
-  await fetch(`${p.url}/api/auth/login`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ username: 'olive', password: 'not-olive-password' }) });
+  await fetch(`${p.url}/rust-dns/api/auth/login`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ username: 'olive', password: 'not-olive-password' }) });
   await admin.route('#/audit', `return !!document.querySelector('#au-signins')`);
   await admin.click('#au-signins');
   await admin.wait('sign-in log', `return location.hash === '#/audit/sign-ins' && !!document.querySelector('#si-go') && !document.querySelector('#si-body').textContent.includes('Loading')`);
@@ -372,7 +372,7 @@ async function phaseO(b, p, rootApi, admin) {
   await admin.click('#cf-ok');
   const secret = await admin.wait('QR shown once', `return document.querySelector('#ae-qr svg') ? [...document.querySelectorAll('#modal code')].map(c => c.textContent).find(t => /^[A-Z2-7]{16,}$/.test(t)) : null`);
   await admin.eval(`document.querySelector('#modal [data-close]').click(); return true`);
-  const login = await fetch(`${p.url}/api/auth/login`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ username: 'olive', password: 'olive-password-2' }) });
+  const login = await fetch(`${p.url}/rust-dns/api/auth/login`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ username: 'olive', password: 'olive-password-2' }) });
   const lj = await login.json();
   ok('O5: the user now needs a code from the administrator\'s QR', lj.status === 'mfa_required' && !!secret, JSON.stringify(lj));
   await rootApi('DELETE', '/settings/security');
@@ -394,7 +394,7 @@ async function phaseO(b, p, rootApi, admin) {
   await rootApi('DELETE', '/settings/security');
 
   // O7: the console sends the CSRF token; a cookie write without it is refused.
-  const csrf = await admin.eval(`const a = await fetch('/api/zones', { method: 'POST', headers: { 'x-requested-with': 'rust-dns', 'content-type': 'application/json' }, body: JSON.stringify({ name: 'nocsrf.test' }) });
+  const csrf = await admin.eval(`const a = await fetch('/rust-dns/api/zones', { method: 'POST', headers: { 'x-requested-with': 'rust-dns', 'content-type': 'application/json' }, body: JSON.stringify({ name: 'nocsrf.test' }) });
     return { status: a.status, code: (await a.json()).code };`);
   ok('O7: a cookie write without the CSRF token is refused', csrf.status === 403 && csrf.code === 'csrf', JSON.stringify(csrf));
 
@@ -603,7 +603,7 @@ async function rolloverWalk(b) {
     // A full load: the console learns of a zone created through the API
     // from its live feed, which may not have arrived yet.
     // (a new query string: a hash-only change would not reload).
-    await pg.goto(rp.url + '/?load=' + Date.now() + '#/zones/ed.test');
+    await pg.goto(rp.url + '/rust-dns/?load=' + Date.now() + '#/zones/ed.test');
     await pg.wait('zone page', `return !!document.querySelector('[data-panel=dnssec]')`);
     await pg.eval(`document.querySelector('[data-panel=dnssec]').click(); return true`);
     await pg.wait('turn-on button', `return !!document.querySelector('#sec-on')`);

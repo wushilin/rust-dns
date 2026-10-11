@@ -151,7 +151,7 @@ impl Harness {
     ) -> Resp {
         let mut b = HttpRequest::builder()
             .method(method)
-            .uri(format!("/api{path}"))
+            .uri(format!("/rust-dns/api{path}"))
             .header("x-requested-with", "rust-dns");
         match cookie {
             // An API token instead of a session cookie.
@@ -709,7 +709,7 @@ async fn api_reads_and_dns_stay_fast_during_a_long_write() {
     let read = |h: Arc<Harness>| async move {
         let t = Instant::now();
         let req = HttpRequest::builder()
-            .uri("/api/zones")
+            .uri("/rust-dns/api/zones")
             .header("authorization", format!("Bearer {token}"))
             .body(Body::empty())
             .unwrap();
@@ -1794,7 +1794,7 @@ async fn cookie_writes_need_the_csrf_token() {
     ) -> (StatusCode, serde_json::Value) {
         let mut b = HttpRequest::builder()
             .method("POST")
-            .uri("/api/zones")
+            .uri("/rust-dns/api/zones")
             .header("x-requested-with", "rust-dns")
             .header("content-type", "application/json");
         if !cookie.is_empty() {

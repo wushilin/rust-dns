@@ -285,14 +285,14 @@ pub async fn reload_config(State(s): St, caller: Caller) -> ApiResult<Json<Reloa
     }))
 }
 
-/// Prometheus metrics, mounted at the server root (not under /api).
+/// Prometheus metrics, mounted at /rust-dns/metrics (not under /rust-dns/api).
 #[utoipa::path(
     get,
     path = "/metrics",
     tag = "Server",
     operation_id = "get_metrics",
     summary = "Prometheus metrics",
-    description = "Mounted at the server root (`/metrics`), not under `/api`. Requires authentication (a bearer API token for scrapers).",
+    description = "Mounted at `/rust-dns/metrics`, not under `/rust-dns/api`. Requires authentication (a bearer API token for scrapers).",
     responses(
         (status = 200, description = "Prometheus text exposition format 0.0.4.", body = String, content_type = "text/plain",
             example = "# HELP rustdns_queries_total DNS queries received\n# TYPE rustdns_queries_total counter\nrustdns_queries_total 0\n"),

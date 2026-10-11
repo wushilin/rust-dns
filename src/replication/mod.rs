@@ -8,7 +8,7 @@
 //!   read-only). The role is decided at startup from the config and the
 //!   database; promotion switches a standby to `promoted` at runtime.
 //! * The standby pulls from the primary's admin-only replication API
-//!   (`/api/replication/*`, see `api::replication`) over HTTPS: a snapshot
+//!   (`/rust-dns/api/replication/*`, see `api::replication`) over HTTPS: a snapshot
 //!   (logical entities read in one transaction) to start, then a long-poll
 //!   of the changelog (whole transactions of DNS and account/settings/TSIG
 //!   changes in one sequence, applied with the primary's offsets), plus a
@@ -731,7 +731,7 @@ impl Replication {
                 &self.peer_http,
                 &base,
                 None,
-                "/api/replication/identity",
+                "/rust-dns/api/replication/identity",
                 Duration::from_secs(5),
             )
             .await;
@@ -925,7 +925,12 @@ impl Replication {
         self.update(|s| s.state = "connecting".into());
         // Token valid and an administrator's (also re-checked by every call).
         let remote: ReplicationStatus = self
-            .get(&base, Some(&token), "/api/replication/status", timeout)
+            .get(
+                &base,
+                Some(&token),
+                "/rust-dns/api/replication/status",
+                timeout,
+            )
             .await?;
         if remote.protocol != REPLICATION_PROTOCOL {
             return Err(CallError::Refused(format!(
@@ -970,7 +975,7 @@ impl Replication {
                 &base,
                 Some(&token),
                 &format!(
-                    "/api/replication/changes?after={}&limit=1&wait=0&probe=true",
+                    "/rust-dns/api/replication/changes?after={}&limit=1&wait=0&probe=true",
                     (local.head - 1).max(0)
                 ),
                 timeout,
@@ -1060,7 +1065,7 @@ impl Replication {
                     &base,
                     Some(&token),
                     &format!(
-                        "/api/replication/changes?after={head}&limit={POLL_LIMIT}&wait={wait}"
+                        "/rust-dns/api/replication/changes?after={head}&limit={POLL_LIMIT}&wait={wait}"
                     ),
                     timeout + Duration::from_secs(wait),
                 )
@@ -1149,7 +1154,7 @@ impl Replication {
                 .get(
                     base,
                     Some(token),
-                    &format!("/api/changelog?after={after}&limit={PAGE}"),
+                    &format!("/rust-dns/api/changelog?after={after}&limit={PAGE}"),
                     timeout,
                 )
                 .await?;
@@ -1262,7 +1267,7 @@ impl Replication {
         token: &str,
         timeout: Duration,
     ) -> std::result::Result<Snapshot, CallError> {
-        let path = "/api/replication/snapshot";
+        let path = "/rust-dns/api/replication/snapshot";
         let (body, gzip) = self
             .get_bytes(&self.http, base, Some(token), path, timeout, true)
             .await?;
@@ -1320,7 +1325,7 @@ impl Replication {
                 base,
                 Some(token),
                 &format!(
-                    "/api/replication/checksum?exclude_user={}",
+                    "/rust-dns/api/replication/checksum?exclude_user={}",
                     url_encode(&root)
                 ),
                 timeout,
@@ -1481,7 +1486,7 @@ impl Replication {
             detail: h.detail.clone(),
         };
         let url = format!(
-            "{base}/api/replication/replicas/{}/report",
+            "{base}/rust-dns/api/replication/replicas/{}/report",
             url_encode(f.instance_id.trim())
         );
         let mut backoff = Duration::from_secs(1);
@@ -1575,7 +1580,7 @@ pub async fn promote_offline(config_path: &std::path::Path) -> Result<History> {
     if let Err(e) = std::net::TcpListener::bind(cfg.web_console.bind) {
         if e.kind() == std::io::ErrorKind::AddrInUse {
             anyhow::bail!(
-                "the web console address {} is in use: is rust-dns running? Promote a running server from the console (Admin -> Replication) or with POST /api/replication/promote, or stop it first",
+                "the web console address {} is in use: is rust-dns running? Promote a running server from the console (Admin -> Replication) or with POST /rust-dns/api/replication/promote, or stop it first",
                 cfg.web_console.bind
             );
         }
@@ -1707,7 +1712,7 @@ pub async fn prepare_standby_offline(config_path: &std::path::Path, yes: bool) -
     if rows > 0 {
         let base = follow.primary.trim().trim_end_matches('/').to_string();
         let remote = https_client(Some(&follow.ca_file), "[follow].ca_file")?
-            .get(format!("{base}/api/replication/identity"))
+            .get(format!("{base}/rust-dns/api/replication/identity"))
             .timeout(Duration::from_secs(5))
             .send()
             .await

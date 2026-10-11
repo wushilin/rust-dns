@@ -110,7 +110,7 @@ dir = ""
         deadline = time.time() + 60
         while True:
             try:
-                urllib.request.urlopen(f"{self.url}/api/health", timeout=1).read()
+                urllib.request.urlopen(f"{self.url}/rust-dns/api/health", timeout=1).read()
                 break
             except Exception:
                 if self.proc.poll() is not None or time.time() > deadline:
@@ -155,7 +155,7 @@ class Api:
 
     def call(self, method, path, body=None, timeout=15):
         data = json.dumps(body).encode() if body is not None else None
-        req = urllib.request.Request(f"{self.base}/api{path}", data=data, method=method,
+        req = urllib.request.Request(f"{self.base}/rust-dns/api{path}", data=data, method=method,
                                      headers={"x-requested-with": "rust-dns", "content-type": "application/json",
                                               "x-csrf-token": csrf_of(self.opener)})
         try:

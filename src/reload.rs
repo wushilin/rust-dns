@@ -1,4 +1,4 @@
-//! Runtime configuration reload (SIGHUP or `POST /api/admin/reload`).
+//! Runtime configuration reload (SIGHUP or `POST /rust-dns/api/admin/reload`).
 
 use crate::config::{self, Config};
 use crate::dns::DnsServer;

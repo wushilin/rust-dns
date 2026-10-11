@@ -22,7 +22,7 @@ api() {
   if [ -n "$body" ]; then
     args+=(-H "Content-Type: application/json" --data "$body")
   fi
-  curl "${args[@]}" "${RDNS_URL}/api${path}"
+  curl "${args[@]}" "${RDNS_URL}/rust-dns/api${path}"
   echo
 }
 

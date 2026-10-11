@@ -114,7 +114,7 @@ doh_listen = ["127.0.0.1:{doh}"]
             if matches!(child.try_wait(), Ok(Some(_))) {
                 break;
             }
-            if ureq::get(&format!("{web}/api/health"))
+            if ureq::get(&format!("{web}/rust-dns/api/health"))
                 .timeout(Duration::from_millis(300))
                 .call()
                 .is_ok()
@@ -150,7 +150,7 @@ doh_listen = ["127.0.0.1:{doh}"]
 fn admin(web: &str) -> (ureq::Agent, String) {
     let a = ureq::AgentBuilder::new().build();
     let r: Value = a
-        .post(&format!("{web}/api/auth/login"))
+        .post(&format!("{web}/rust-dns/api/auth/login"))
         .set("X-Requested-With", "rust-dns")
         .send_json(json!({ "username": "root", "password": "rootpass123" }))
         .unwrap()
@@ -161,7 +161,7 @@ fn admin(web: &str) -> (ureq::Agent, String) {
 
 fn post(s: &(ureq::Agent, String), web: &str, path: &str, body: Value) {
     let r =
-        s.0.post(&format!("{web}/api{path}"))
+        s.0.post(&format!("{web}/rust-dns/api{path}"))
             .set("X-Requested-With", "rust-dns")
             .set("X-CSRF-Token", &s.1)
             .send_json(body);
@@ -284,7 +284,7 @@ fn dns_over_tls_and_https_inbound_and_upstream() {
     let plain = q(&["-p", &s.dns.to_string(), "+short", "www.enc.test", "A"]);
     assert_eq!(plain.trim(), "192.0.2.80");
     let metrics =
-        a.0.get(&format!("{}/metrics", s.web))
+        a.0.get(&format!("{}/rust-dns/metrics", s.web))
             .call()
             .unwrap()
             .into_string()

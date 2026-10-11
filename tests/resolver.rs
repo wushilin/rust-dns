@@ -203,7 +203,7 @@ impl Server {
                 .spawn()
                 .unwrap();
             let deadline = Instant::now() + Duration::from_secs(20);
-            while ureq::get(&format!("{web}/api/health"))
+            while ureq::get(&format!("{web}/rust-dns/api/health"))
                 .timeout(Duration::from_millis(300))
                 .call()
                 .is_err()
@@ -220,7 +220,7 @@ impl Server {
         let a = ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(20))
             .build();
-        a.post(&format!("{web}/api/auth/login"))
+        a.post(&format!("{web}/rust-dns/api/auth/login"))
             .send_json(json!({ "username": "root", "password": "rootpass123" }))
             .unwrap();
         Server {
@@ -235,7 +235,7 @@ impl Server {
     fn call(&self, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
         let req = self
             .a
-            .request(method, &format!("{}/api{path}", self.web))
+            .request(method, &format!("{}/rust-dns/api{path}", self.web))
             .set("X-Requested-With", "rust-dns")
             .set("X-CSRF-Token", &csrf_of(&self.a));
         let r = match body {
@@ -269,7 +269,7 @@ impl Server {
 
     fn metrics(&self) -> String {
         self.a
-            .get(&format!("{}/metrics", self.web))
+            .get(&format!("{}/rust-dns/metrics", self.web))
             .call()
             .unwrap()
             .into_string()

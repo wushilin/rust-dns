@@ -35,7 +35,7 @@ use std::time::Duration;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-/// The allocator this build uses (`rustdns_build_info` in `/metrics`).
+/// The allocator this build uses (`rustdns_build_info` in `/rust-dns/metrics`).
 pub const ALLOCATOR: &str = if cfg!(target_env = "musl") {
     "mimalloc"
 } else {
@@ -66,7 +66,7 @@ struct Cli {
     check: bool,
     /// Promote this standby to primary while the server is stopped: removes
     /// [follow] from the config file and records a new history in the
-    /// database. (A running standby: the console or POST /api/replication/promote.)
+    /// database. (A running standby: the console or POST /rust-dns/api/replication/promote.)
     #[arg(long)]
     promote: bool,
     /// Make this server fresh so it can follow its [follow] primary (server

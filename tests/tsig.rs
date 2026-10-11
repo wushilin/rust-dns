@@ -106,7 +106,7 @@ impl Server {
             .unwrap();
         let web = format!("http://127.0.0.1:{web_port}");
         let deadline = Instant::now() + Duration::from_secs(15);
-        while ureq::get(&format!("{web}/api/health"))
+        while ureq::get(&format!("{web}/rust-dns/api/health"))
             .timeout(Duration::from_millis(300))
             .call()
             .is_err()
@@ -133,7 +133,7 @@ fn login(web: &str, user: &str, pw: &str) -> ureq::Agent {
     let a = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(10))
         .build();
-    a.post(&format!("{web}/api/auth/login"))
+    a.post(&format!("{web}/rust-dns/api/auth/login"))
         .send_json(serde_json::json!({ "username": user, "password": pw }))
         .unwrap();
     a
@@ -264,7 +264,7 @@ fn tsig_keys_transfers_and_notify() {
     let dns = srv.dns;
     let web = format!("http://127.0.0.1:{web_port}");
     let root = login(&web, "root", "rootpass123");
-    let keys = format!("{web}/api/tsig/keys");
+    let keys = format!("{web}/rust-dns/api/tsig/keys");
 
     // ---- key lifecycle through the API ---------------------------------------
     let (s, created) = call(
@@ -363,7 +363,7 @@ fn tsig_keys_transfers_and_notify() {
     let (s, _) = call(
         &root,
         "POST",
-        &format!("{web}/api/users"),
+        &format!("{web}/rust-dns/api/users"),
         Some(serde_json::json!({ "username": "bob", "password": "bobpass123" })),
     );
     assert_eq!(s, 201);
@@ -374,12 +374,23 @@ fn tsig_keys_transfers_and_notify() {
         403
     );
     assert_eq!(
-        call(&bob, "GET", &format!("{web}/api/settings/transfer"), None).0,
+        call(
+            &bob,
+            "GET",
+            &format!("{web}/rust-dns/api/settings/transfer"),
+            None
+        )
+        .0,
         403
     );
 
     // Transfer policy view.
-    let (s, pol) = call(&root, "GET", &format!("{web}/api/settings/transfer"), None);
+    let (s, pol) = call(
+        &root,
+        "GET",
+        &format!("{web}/rust-dns/api/settings/transfer"),
+        None,
+    );
     assert_eq!(s, 200, "{pol}");
     assert_eq!(pol["require_tsig"], false);
     assert_eq!(pol["notify_key"], "hn-secondary.");
@@ -390,7 +401,7 @@ fn tsig_keys_transfers_and_notify() {
     let (s, v) = call(
         &root,
         "POST",
-        &format!("{web}/api/zones"),
+        &format!("{web}/rust-dns/api/zones"),
         Some(serde_json::json!({ "name": ZONE })),
     );
     assert_eq!(s, 201, "{v}");
@@ -405,7 +416,7 @@ fn tsig_keys_transfers_and_notify() {
         }));
     }
     let r = root
-        .post(&format!("{web}/api/import"))
+        .post(&format!("{web}/rust-dns/api/import"))
         .set("X-Requested-With", "rust-dns")
         .set("X-CSRF-Token", &csrf_of(&root))
         .send_json(serde_json::json!({
@@ -611,7 +622,7 @@ fn tsig_keys_transfers_and_notify() {
     let (s, _) = call(
         &root,
         "POST",
-        &format!("{web}/api/zones/{ZONE}/records"),
+        &format!("{web}/rust-dns/api/zones/{ZONE}/records"),
         Some(serde_json::json!({ "name": "changed", "type": "A", "value": "192.0.2.99" })),
     );
     assert_eq!(s, 201);
@@ -624,7 +635,12 @@ fn tsig_keys_transfers_and_notify() {
 
     // ---- require_tsig on (config reload): unsigned refused, signed fine ------
     write_config(&dir, dns, web_port, notify_port, true);
-    let (s, v) = call(&root, "POST", &format!("{web}/api/admin/reload"), None);
+    let (s, v) = call(
+        &root,
+        "POST",
+        &format!("{web}/rust-dns/api/admin/reload"),
+        None,
+    );
     assert_eq!(s, 200, "{v}");
     let msgs = tcp_exchange(dns, &query_bytes(0x8888, ZONE, RecordType::AXFR));
     assert_eq!(rcode(&msgs[0]), ResponseCode::Refused);
@@ -640,7 +656,7 @@ fn tsig_keys_transfers_and_notify() {
         v.verify(m, tsig::now()).unwrap();
     }
     assert_eq!(answer_count(&msgs), 1505, "includes the new record");
-    let status = call(&root, "GET", &format!("{web}/api/status"), None).1;
+    let status = call(&root, "GET", &format!("{web}/rust-dns/api/status"), None).1;
     assert_eq!(status["transfer"]["require_tsig"], true);
     assert!(status["dns"]["tsig_errors"].as_u64().unwrap() >= 5);
 
@@ -656,12 +672,24 @@ fn tsig_keys_transfers_and_notify() {
     assert_eq!(tsig_of(&msgs[0]).error, tsig::BADKEY);
     let (s, _) = call(&root, "DELETE", &format!("{keys}/hn-secondary."), None);
     assert_eq!(s, 404);
-    let pol = call(&root, "GET", &format!("{web}/api/settings/transfer"), None).1;
+    let pol = call(
+        &root,
+        "GET",
+        &format!("{web}/rust-dns/api/settings/transfer"),
+        None,
+    )
+    .1;
     assert_eq!(pol["notify"][0]["key_exists"], false);
     assert!(!pol["warnings"].as_array().unwrap().is_empty());
 
     // ---- audit rows: every step, never the secret ---------------------------------
-    let audit = call(&root, "GET", &format!("{web}/api/audit?limit=500"), None).1;
+    let audit = call(
+        &root,
+        "GET",
+        &format!("{web}/rust-dns/api/audit?limit=500"),
+        None,
+    )
+    .1;
     let entries = audit["entries"].as_array().unwrap();
     let actions: Vec<(&str, &str)> = entries
         .iter()
@@ -756,7 +784,7 @@ fn bind_interop_with_tsig_replay_protection() {
     let (s, k) = call(
         &root,
         "POST",
-        &format!("{web}/api/tsig/keys"),
+        &format!("{web}/rust-dns/api/tsig/keys"),
         Some(serde_json::json!({ "name": "hn-secondary." })),
     );
     assert_eq!(s, 201, "{k}");
@@ -764,7 +792,7 @@ fn bind_interop_with_tsig_replay_protection() {
     let (s, v) = call(
         &root,
         "POST",
-        &format!("{web}/api/zones"),
+        &format!("{web}/rust-dns/api/zones"),
         Some(serde_json::json!({ "name": "bind.test" })),
     );
     assert_eq!(s, 201, "{v}");
@@ -772,7 +800,7 @@ fn bind_interop_with_tsig_replay_protection() {
         let (s, v) = call(
             &root,
             "POST",
-            &format!("{web}/api/zones/bind.test/records"),
+            &format!("{web}/rust-dns/api/zones/bind.test/records"),
             Some(serde_json::json!({ "name": name, "type": t, "value": value })),
         );
         assert_eq!(s, 201, "{v}");
@@ -948,7 +976,7 @@ fn zone_settings_control_transfers_notify_and_auto_ptr() {
         let (s, v) = call(
             &root,
             "POST",
-            &format!("{web}/api/tsig/keys"),
+            &format!("{web}/rust-dns/api/tsig/keys"),
             Some(serde_json::json!({ "name": name, "zones": zones })),
         );
         assert_eq!(s, 201, "{v}");
@@ -963,14 +991,14 @@ fn zone_settings_control_transfers_notify_and_auto_ptr() {
         let (s, v) = call(
             &root,
             "POST",
-            &format!("{web}/api/zones"),
+            &format!("{web}/rust-dns/api/zones"),
             Some(serde_json::json!({ "name": zone })),
         );
         assert_eq!(s, 201, "{v}");
         let (s, v) = call(
             &root,
             "POST",
-            &format!("{web}/api/zones/{zone}/records"),
+            &format!("{web}/rust-dns/api/zones/{zone}/records"),
             Some(
                 serde_json::json!({ "name": "host", "type": "A", "value": if zone == "zs.test" { "10.9.8.7" } else { "10.9.8.6" } }),
             ),
@@ -981,7 +1009,7 @@ fn zone_settings_control_transfers_notify_and_auto_ptr() {
         let (s, v) = call(
             &root,
             "PUT",
-            &format!("{web}/api/zones/zs.test/settings"),
+            &format!("{web}/rust-dns/api/zones/zs.test/settings"),
             Some(b),
         );
         assert_eq!(s, 200, "{v}");
@@ -1031,7 +1059,7 @@ fn zone_settings_control_transfers_notify_and_auto_ptr() {
     let (s, _) = call(
         &root,
         "POST",
-        &format!("{web}/api/zones/zs.test/records"),
+        &format!("{web}/rust-dns/api/zones/zs.test/records"),
         Some(serde_json::json!({ "name": "changed", "type": "A", "value": "10.9.8.8" })),
     );
     assert_eq!(s, 201);

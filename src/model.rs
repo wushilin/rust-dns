@@ -1380,7 +1380,7 @@ pub struct ChangeEvent {
     pub command: String,
 }
 
-/// Emitted for every DNS query the server answers (streamed over `/ws`).
+/// Emitted for every DNS query the server answers (streamed over `/rust-dns/api/ws`).
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct QueryEvent {
     #[schema(format = DateTime)]

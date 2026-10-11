@@ -171,7 +171,7 @@ def exercise(web, dns, alive, allocator=None):
     """Health, sign-in, a zone and a record through the API, then the
     record over UDP and TCP. `alive()` raises when the server is gone.
     `allocator`: the one `/metrics` must report (O13a), if known."""
-    base = f"http://127.0.0.1:{web}/api"
+    base = f"http://127.0.0.1:{web}/rust-dns/api"
     jar = http.cookiejar.CookieJar()
     opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
 
@@ -206,7 +206,7 @@ def exercise(web, dns, alive, allocator=None):
     assert status == 201, f"create record: {status}"
     print("api: zone and record created")
 
-    req = urllib.request.Request(f"http://127.0.0.1:{web}/metrics")
+    req = urllib.request.Request(f"http://127.0.0.1:{web}/rust-dns/metrics")
     with opener.open(req, timeout=10) as r:
         metrics = r.read().decode()
     info = [l for l in metrics.splitlines() if l.startswith("rustdns_build_info{")]

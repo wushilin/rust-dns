@@ -75,7 +75,7 @@ fn call(a: &ureq::Agent, method: &str, url: &str, body: Option<Value>) -> Value 
 
 fn metric(a: &ureq::Agent, web: &str, name: &str) -> u64 {
     let text = a
-        .get(&format!("{web}/metrics"))
+        .get(&format!("{web}/rust-dns/metrics"))
         .call()
         .unwrap()
         .into_string()
@@ -132,7 +132,7 @@ fn single_changes_in_a_signed_zone_stay_valid() {
                 .unwrap(),
         );
         let deadline = Instant::now() + Duration::from_secs(20);
-        while ureq::get(&format!("{web}/api/health"))
+        while ureq::get(&format!("{web}/rust-dns/api/health"))
             .timeout(Duration::from_millis(300))
             .call()
             .is_err()
@@ -149,20 +149,20 @@ fn single_changes_in_a_signed_zone_stay_valid() {
     let a = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(20))
         .build();
-    a.post(&format!("{web}/api/auth/login"))
+    a.post(&format!("{web}/rust-dns/api/auth/login"))
         .send_json(json!({ "username": "root", "password": "rootpass123" }))
         .unwrap();
     call(
         &a,
         "POST",
-        &format!("{web}/api/zones"),
+        &format!("{web}/rust-dns/api/zones"),
         Some(json!({ "name": ZONE })),
     );
     let add = |name: &str, t: &str, v: &str| -> i64 {
         call(
             &a,
             "POST",
-            &format!("{web}/api/zones/{ZONE}/records"),
+            &format!("{web}/rust-dns/api/zones/{ZONE}/records"),
             Some(json!({ "name": name, "type": t, "value": v })),
         )["id"]
             .as_i64()
@@ -184,19 +184,19 @@ fn single_changes_in_a_signed_zone_stay_valid() {
     call(
         &a,
         "POST",
-        &format!("{web}/api/zones"),
+        &format!("{web}/rust-dns/api/zones"),
         Some(json!({ "name": "bystander.test" })),
     );
     call(
         &a,
         "PUT",
-        &format!("{web}/api/zones/bystander.test/dnssec"),
+        &format!("{web}/rust-dns/api/zones/bystander.test/dnssec"),
         Some(json!({ "enabled": true })),
     );
     let on = call(
         &a,
         "PUT",
-        &format!("{web}/api/zones/{ZONE}/dnssec"),
+        &format!("{web}/rust-dns/api/zones/{ZONE}/dnssec"),
         Some(json!({ "enabled": true })),
     );
     let dnskey = on["key"]["dnskey"].as_str().unwrap().to_string();
@@ -285,13 +285,20 @@ fn single_changes_in_a_signed_zone_stay_valid() {
     validate("freshly signed");
 
     let signed = || metric(&a, &web, "rustdns_dnssec_signatures_total");
-    let status = || call(&a, "GET", &format!("{web}/api/zones/{ZONE}/dnssec"), None);
+    let status = || {
+        call(
+            &a,
+            "GET",
+            &format!("{web}/rust-dns/api/zones/{ZONE}/dnssec"),
+            None,
+        )
+    };
     // Change one record: its RRset and the SOA are signed, nothing else.
     let before = signed();
     call(
         &a,
         "PUT",
-        &format!("{web}/api/zones/{ZONE}/records/{changed}"),
+        &format!("{web}/rust-dns/api/zones/{ZONE}/records/{changed}"),
         Some(json!({ "value": "192.0.2.99" })),
     );
     assert_eq!(signed() - before, 2, "a changed record");
@@ -311,7 +318,7 @@ fn single_changes_in_a_signed_zone_stay_valid() {
     call(
         &a,
         "DELETE",
-        &format!("{web}/api/zones/{ZONE}/records/{added}"),
+        &format!("{web}/rust-dns/api/zones/{ZONE}/records/{added}"),
         None,
     );
     assert_eq!(signed() - before, 2, "a removed name");

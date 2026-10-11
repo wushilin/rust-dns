@@ -375,7 +375,7 @@ level = "warn"
 
     def wait_ready(self, timeout=30):
         deadline = time.time() + timeout
-        url = f"http://127.0.0.1:{self.web}/api/health"
+        url = f"http://127.0.0.1:{self.web}/rust-dns/api/health"
         while time.time() < deadline:
             if self.proc.poll() is not None:
                 raise RuntimeError(f"{self.label} exited early:\n{self.tail()}")
@@ -514,13 +514,13 @@ def seed(api_url, workdir):
     if r.returncode != 0:
         raise RuntimeError(f"seed-conformance.py failed:\n{r.stdout}\n{r.stderr}")
     api = Api(api_url)
-    api.req("/api/auth/login", {"username": "root", "password": ROOT_PASSWORD})
+    api.req("/rust-dns/api/auth/login", {"username": "root", "password": ROOT_PASSWORD})
     doc = {"version": 1, "exported_at": "2026-01-01T00:00:00Z", "zones": EXTRA_ZONES}
-    st, res = api.req("/api/import?mode=merge", doc)
+    st, res = api.req("/rust-dns/api/import?mode=merge", doc)
     if st != 200:
         raise RuntimeError(f"extra import failed: {st} {res}")
     for z in ("kid.signed.test", "0.1.10.in-addr.arpa"):
-        st, res = api.req(f"/api/zones/{z}/dnssec", {"enabled": True}, "PUT")
+        st, res = api.req(f"/rust-dns/api/zones/{z}/dnssec", {"enabled": True}, "PUT")
         if st != 200 or res.get("state") != "signing":
             raise RuntimeError(f"DNSSEC not on for {z}: {st} {res}")
     keys = {
@@ -531,7 +531,7 @@ def seed(api_url, workdir):
     }
     for body in ({"name": "equiv-gen.", "algorithm": "hmac-sha256"},
                  {"name": "equiv-limited.", "algorithm": "hmac-sha512", "zones": ["example.test"]}):
-        st, res = api.req("/api/tsig/keys", body)
+        st, res = api.req("/rust-dns/api/tsig/keys", body)
         if st != 201 or not res.get("secret"):
             raise RuntimeError(f"TSIG key {body['name']} not created: {st} {res}")
         keys[body["name"]] = (body["algorithm"], res["secret"])
@@ -1403,7 +1403,7 @@ def main():
     ap.add_argument("--workdir", help="parent directory for the temporary directory")
     ap.add_argument("--show", type=int, default=25, help="differences printed in full (default 25)")
     ap.add_argument("--new-resolver", metavar="JSON",
-                    help="PUT this JSON to B's /api/settings/resolver before the matrix (e.g. "
+                    help="PUT this JSON to B's /rust-dns/api/settings/resolver before the matrix (e.g. "
                          "'{\"domain_needed\":false,\"bogus_priv\":false}' to compare a version "
                          "with the phase I filters against one without them, all switched off)")
     ap.add_argument("--self-test", action="store_true",
@@ -1451,10 +1451,10 @@ def main():
         if args.new_resolver:
             # Stored in B's database: applies to every later phase too.
             api = Api(f"http://127.0.0.1:{B.web}")
-            api.req("/api/auth/login", {"username": "root", "password": ROOT_PASSWORD})
-            code, res = api.req("/api/settings/resolver", json.loads(args.new_resolver), method="PUT")
+            api.req("/rust-dns/api/auth/login", {"username": "root", "password": ROOT_PASSWORD})
+            code, res = api.req("/rust-dns/api/settings/resolver", json.loads(args.new_resolver), method="PUT")
             if code != 200:
-                raise RuntimeError(f"B: PUT /api/settings/resolver: {code} {res}")
+                raise RuntimeError(f"B: PUT /rust-dns/api/settings/resolver: {code} {res}")
             log(f"B: resolver settings {json.dumps(res['settings'])}")
         serials = zone_serials(A.port, zones)
         if zone_serials(B.port, zones) != serials:

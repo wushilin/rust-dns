@@ -6,11 +6,11 @@ out="$(mktemp -d)"
 
 echo "== export one zone as JSON"
 curl -sS --fail-with-body -H "Authorization: Bearer $RDNS_TOKEN" \
-  "$RDNS_URL/api/zones/$ZONE/export?format=json" -o "$out/$ZONE.json"
+  "$RDNS_URL/rust-dns/api/zones/$ZONE/export?format=json" -o "$out/$ZONE.json"
 
 echo "== export every zone this token can see"
 curl -sS --fail-with-body -H "Authorization: Bearer $RDNS_TOKEN" \
-  "$RDNS_URL/api/export" -o "$out/all.json"
+  "$RDNS_URL/rust-dns/api/export" -o "$out/all.json"
 echo "saved to $out"
 
 echo "== import JSON (mode=merge adds missing zones/records; mode=replace replaces records of listed zones)"

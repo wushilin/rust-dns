@@ -69,7 +69,7 @@ divergence. Divergence halts the standby.
 ## 4. Followers replicate as soon as possible, and verify periodically
 
 - A standby follows its primary continuously: after a snapshot it
-  long-polls `/api/replication/changes?after=<offset>` and applies each
+  long-polls `/rust-dns/api/replication/changes?after=<offset>` and applies each
   batch as soon as it arrives, in one transaction that also stores the
   offset. A restart resumes from the stored offset.
 - It reconciles periodically (`[follow] reconcile_interval_secs`, default

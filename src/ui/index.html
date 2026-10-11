@@ -483,12 +483,12 @@ async function api(method, path, body, opts = {}) {
   // O7: the session's CSRF token with every request (the server checks it on writes).
   const csrf = csrfToken(); if (csrf) opt.headers['x-csrf-token'] = csrf;
   if (body !== undefined) { opt.headers['content-type'] = 'application/json'; opt.body = JSON.stringify(body); }
-  let r = await fetch('/api' + path, opt);
+  let r = await fetch('/rust-dns/api' + path, opt);
   if (r.status === 403 && method !== 'GET' && !opts.retried && (r.headers.get('content-type') || '').includes('json')) {
     const j = await r.clone().json().catch(() => null);
     if (j && j.code === 'csrf') {
       // A token from before a server upgrade or another sign-in: fetch the current one, retry once.
-      try { const si = await fetch('/api/auth/session').then(x => x.json()); if (si.csrf_token) { S.csrf = si.csrf_token; return api(method, path, body, { ...opts, retried: true }); } } catch {}
+      try { const si = await fetch('/rust-dns/api/auth/session').then(x => x.json()); if (si.csrf_token) { S.csrf = si.csrf_token; return api(method, path, body, { ...opts, retried: true }); } } catch {}
     }
   }
   let data = null;
@@ -704,7 +704,7 @@ async function enterApp() {
 // ---------------------------------------------------------------------------
 /*ACCESS-BEGIN*/
 const SAFE_METHODS = ['GET', 'HEAD', 'OPTIONS'];
-// `template` under /api with {x} = one non-empty segment; query strings ignored.
+// `template` under /rust-dns/api with {x} = one non-empty segment; query strings ignored.
 function pathMatches(template, path) {
   const t = String(template).split('?')[0].replace(/\/+$/, '').split('/');
   const p = String(path).split('?')[0].replace(/\/+$/, '').split('/');
@@ -850,7 +850,7 @@ function connectWs() {
   disconnectWs();
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const after = S.lastOffset != null ? `after=${S.lastOffset}&` : '';
-  const ws = new WebSocket(`${proto}://${location.host}/api/ws?${after}queries=true`);
+  const ws = new WebSocket(`${proto}://${location.host}/rust-dns/api/ws?${after}queries=true`);
   S.ws = ws; setWs('', 'connecting');
   ws.onopen = () => setWs('on', 'live');
   ws.onclose = () => { setWs('off', 'reconnecting'); S.wsTimer = setTimeout(connectWs, 2000); };
@@ -1921,7 +1921,7 @@ function ioModal(zoneName) {
     $('#ex-go').onclick = () => {
       const zone = $('#ex-scope').value;
       const a = document.createElement('a');
-      a.href = zone ? `/api/zones/${encodeURIComponent(zone)}/export?format=json` : '/api/export';
+      a.href = zone ? `/rust-dns/api/zones/${encodeURIComponent(zone)}/export?format=json` : '/rust-dns/api/export';
       a.download = ''; document.body.appendChild(a); a.click(); a.remove();
       toast('Download started', 'ok');
     };
@@ -2172,10 +2172,10 @@ async function rightsModal(userId, via, tokenName, tokenId) {
 // ---------------------------------------------------------------------------
 function viewApi() {
   $('#main').innerHTML = `<div class="topbar"><h1>API explorer</h1><div class="actions">
-      <a class="btn" href="/api/openapi.json" target="_blank">openapi.json</a>
-      <a class="btn" href="/docs" target="_blank">Open in new tab</a></div></div>
+      <a class="btn" href="/rust-dns/api/openapi.json" target="_blank">openapi.json</a>
+      <a class="btn" href="/rust-dns/docs" target="_blank">Open in new tab</a></div></div>
     <p class="hint" style="margin:-8px 0 12px">Every endpoint, with "Try it out". Requests run as <b>${esc(S.user.username)}</b> against this server and really change data.</p>
-    <div class="card" style="overflow:hidden"><iframe src="/docs" title="API explorer" style="display:block;width:100%;height:calc(100vh - 150px);border:0;background:#fff"></iframe></div>`;
+    <div class="card" style="overflow:hidden"><iframe src="/rust-dns/docs" title="API explorer" style="display:block;width:100%;height:calc(100vh - 150px);border:0;background:#fff"></iframe></div>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -2684,7 +2684,7 @@ async function viewTsig() {
         <span class="k">NOTIFY targets</span><span>${notifyRows}</span>
       </div>
       ${pol.warnings.map(w => `<div class="note warn">${ico('warn', 's')}<span>${esc(w)}</span></div>`).join('')}
-      <p class="hint" style="margin-top:12px">Change these in the <code>[transfer]</code> section of the configuration file, then reload (SIGHUP or <code>POST /api/admin/reload</code>). A transfer needs an allowed address <b>and</b>, when TSIG is required or the request is signed, a valid key that covers the zone. For a hidden primary:</p>
+      <p class="hint" style="margin-top:12px">Change these in the <code>[transfer]</code> section of the configuration file, then reload (SIGHUP or <code>POST /rust-dns/api/admin/reload</code>). A transfer needs an allowed address <b>and</b>, when TSIG is required or the request is signed, a valid key that covers the zone. For a hidden primary:</p>
       ${snip(`[transfer]\nallow = ["203.0.113.5/32"]       # the secondary's transfer addresses\nrequire_tsig = true\nnotify_key = "${keys[0] ? keys[0].name : 'hn-secondary.'}"\nnotify = ["203.0.113.5:53"]`, 'Copy example')}
     </div>`;
   $('#tk-new').onclick = () => tsigCreateModal(pol);
@@ -2974,10 +2974,10 @@ async function viewTokens() {
     <div class="tw"><table><thead><tr><th>Name / tags</th><th>Scope</th>${showOwner ? '<th>Owner</th>' : ''}<th>Created</th><th title="Updated at most once a minute, immediately when the address changes">Last used</th><th></th></tr></thead><tbody>
     ${tokens.length ? tokens.map(row).join('') : `<tr><td colspan="${cols}" class="empty">${tag ? 'No tokens with this tag' : 'No tokens'}</td></tr>`}
     </tbody></table></div></div>
-    <div class="card panel" style="margin-top:14px"><h2>Using the API</h2><p class="hint">Tokens carry the permissions of the user who created them, limited by their scope (zones, highest role, expiry); "effective rights" shows exactly what a token can do. Send them as a bearer header. Tags are labels for your own bookkeeping (<code>GET /api/tokens?tag=ci</code>); they do not change permissions. The full reference is in the API explorer and at <a href="/api/openapi.json" target="_blank">/api/openapi.json</a>.</p>
-    <pre>curl -H "Authorization: Bearer rdns_…" ${esc(location.origin)}/api/zones
+    <div class="card panel" style="margin-top:14px"><h2>Using the API</h2><p class="hint">Tokens carry the permissions of the user who created them, limited by their scope (zones, highest role, expiry); "effective rights" shows exactly what a token can do. Send them as a bearer header. Tags are labels for your own bookkeeping (<code>GET /rust-dns/api/tokens?tag=ci</code>); they do not change permissions. The full reference is in the API explorer and at <a href="/rust-dns/api/openapi.json" target="_blank">/rust-dns/api/openapi.json</a>.</p>
+    <pre>curl -H "Authorization: Bearer rdns_…" ${esc(location.origin)}/rust-dns/api/zones
 curl -H "Authorization: Bearer rdns_…" -H "content-type: application/json" \\
-     -d '{"name":"www","type":"A","value":"10.0.0.1"}' ${esc(location.origin)}/api/zones/example.com/records</pre></div>`;
+     -d '{"name":"www","type":"A","value":"10.0.0.1"}' ${esc(location.origin)}/rust-dns/api/zones/example.com/records</pre></div>`;
   const setTag = t => { S.tokenTag = t; viewTokens(); };
   $('#t-tag').onchange = e => setTag(e.target.value);
   if ($('#t-clear')) $('#t-clear').onclick = () => setTag('');

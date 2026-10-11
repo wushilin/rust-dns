@@ -45,14 +45,14 @@ Single static binary, one SQLite file, one TOML config. Zero JavaScript build.
   empty TC=1 answer. TCP, TSIG-signed queries, a valid server cookie and
   `exempt` networks are never limited. Counting is per one-second window
   in a bounded table; answers synthesized from a wildcard are counted per
-  query name (BIND counts them per wildcard). `/metrics`:
+  query name (BIND counts them per wildcard). `/rust-dns/metrics`:
   `rustdns_rrl_dropped_total`, `rustdns_rrl_slipped_total`.
 - DNS over TCP with per-read and per-write timeouts, per-connection query and
   age limits, and a per-client connection cap.
 - PROXY protocol v1/v2 for DNS-over-TCP behind HAProxy or a cloud NLB.
 - DNS Cookies (RFC 7873), EDNS NSID, outbound AXFR and NOTIFY for secondaries (TSIG-authenticated, RFC 8945),
   plus IDN zone and record names.
-- Config reload on SIGHUP or `POST /api/admin/reload`; listener, database, log
+- Config reload on SIGHUP or `POST /rust-dns/api/admin/reload`; listener, database, log
   target, and PROXY listener settings require a restart.
 
 **Console and API**
@@ -67,7 +67,7 @@ Single static binary, one SQLite file, one TOML config. Zero JavaScript build.
 - JSON export/import of everything (transactional). BIND zone-file import and
   export were removed.
 - Server side search and paging for large zones, and an
-  OpenAPI 3.1 document at `/api/openapi.json`, generated from the code (see
+  OpenAPI 3.1 document at `/rust-dns/api/openapi.json`, generated from the code (see
   [API documentation](#api-documentation)).
 - Recovery codes for MFA, session lists and revocation, and an admin action to
   sign a user out everywhere. Cookie-authenticated writes require
@@ -90,7 +90,7 @@ Single static binary, one SQLite file, one TOML config. Zero JavaScript build.
 - Real client IP behind proxies: PROXY protocol, then `X-Forwarded-For`, then
   `X-Real-IP`, then the socket address, honoured only from the proxies listed
   in `proxy_trust` (nothing is trusted by default).
-- Prometheus metrics at `/metrics`, structured logs (text or JSON).
+- Prometheus metrics at `/rust-dns/metrics`, structured logs (text or JSON).
 - Standby (follow) mode: a second server mirrors zones, records, users,
   MFA, API tokens, settings and TSIG keys over HTTPS, answers DNS while the
   primary is down, and is promoted by hand (see
@@ -200,12 +200,12 @@ compress = true              # gzip rotated files
 Put the console behind a TLS reverse proxy for anything beyond localhost
 (`examples/proxy/nginx.conf`, `examples/proxy/haproxy.cfg`). The live console
 (sidebar shows "live", changelog and live queries update without reloading)
-needs the proxy to pass the websocket at `/api/ws` (`Upgrade` / `Connection`
+needs the proxy to pass the websocket at `/rust-dns/api/ws` (`Upgrade` / `Connection`
 headers, long read timeout). To check a proxy: open the console through it,
 change a record in a second tab, and the first tab's changelog shows the new
 row at once; or `curl -i -N -H 'Connection: Upgrade' -H 'Upgrade: websocket'
 -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGVzdHRlc3R0ZXN0dGVzdA=='
--H 'Origin: https://<console host>' -b '<session cookie>' https://<console host>/api/ws`
+-H 'Origin: https://<console host>' -b '<session cookie>' https://<console host>/rust-dns/api/ws`
 answers `101 Switching Protocols` (a `400`/`426` or a closed connection means
 the proxy dropped the upgrade).
 `rust-dns --check --config rust-dns.toml` parses and validates a config without
@@ -238,7 +238,7 @@ Before exposing rust-dns to the internet, note:
   working until they expire. Cookie-authenticated writes need the session's
   CSRF token in `X-CSRF-Token` as well as `X-Requested-With: rust-dns`
   (the console sends both; the token comes with the sign-in response,
-  `GET /api/auth/session` and the `rdns_csrf` cookie). Scripts that sign in
+  `GET /rust-dns/api/auth/session` and the `rdns_csrf` cookie). Scripts that sign in
   with a cookie must send it, or set `[web_console] csrf_token_required =
   false`; API-token scripts are unaffected. Send HSTS at the TLS proxy (rust-dns adds
   `Strict-Transport-Security` itself only on requests a trusted proxy marks
@@ -251,11 +251,11 @@ Before exposing rust-dns to the internet, note:
   table `login_failures`), so a restart does not reset them; 5 wrong
   codes end an MFA-pending or signed-in session. Failed passwords and
   codes are audited (`login.failure`, `mfa.failure`; never the secret);
-  the console's Audit log -> Sign-in log (`GET /api/audit/sign-ins`) lists
+  the console's Audit log -> Sign-in log (`GET /rust-dns/api/audit/sign-ins`) lists
   sign-ins, failures, second factors and sign-outs, filtered by user,
   address and result.
 - **Administrator MFA enrollment.** Users -> Edit -> "Set up MFA for this
-  user" (`POST /api/users/{id}/mfa/enroll`) generates the user's
+  user" (`POST /rust-dns/api/users/{id}/mfa/enroll`) generates the user's
   authenticator and shows its QR code, `otpauth://` link and secret once,
   for delivery out of band (MFA becomes required, recovery codes are
   removed, the user is signed out). The secret replicates like any
@@ -305,13 +305,13 @@ Before exposing rust-dns to the internet, note:
 
 ## Console productivity
 
-- **Search** (Zones page, `GET /api/search?q=&type=&zone=`): records in
+- **Search** (Zones page, `GET /rust-dns/api/search?q=&type=&zone=`): records in
   every zone you may view whose name, type or value contains the text; a
   hit opens its zone and highlights the record.
 - **Bulk edit** (zone page): "Paste records" takes one record per line
   (`name [ttl] type value`), previews the result (nothing is written) and
   applies it as one change; row checkboxes and "Delete selected" delete
-  several records at once (`POST /api/zones/{zone}/records/bulk`).
+  several records at once (`POST /rust-dns/api/zones/{zone}/records/bulk`).
 - **Clone and rename** (zone page, administrators): a copy with the same
   settings and records, or a new name for the zone (a signed zone only
   once the parent publishes no DS for it; only while every standby runs a
@@ -324,8 +324,8 @@ Before exposing rust-dns to the internet, note:
 Queries run through a pipeline of filters (`src/dns/pipeline.rs`, order and
 contract in its module docs): EDNS and request checks, special queries,
 transfers, own zones, override zones, the forwarding ACL, then the resolver
-filters below and the forwarder. Every filter is counted in `/metrics`
-(`rustdns_filter_queries_total{filter,outcome}`) and `/api/status`
+filters below and the forwarder. Every filter is counted in `/rust-dns/metrics`
+(`rustdns_filter_queries_total{filter,outcome}`) and `/rust-dns/api/status`
 (`pipeline`); the live query view shows which filter answered. Settings are
 console settings (Server settings -> Resolver, and the Blocklists page),
 replicated to standbys, applied without a restart.
@@ -363,7 +363,7 @@ replicated to standbys, applied without a restart.
   default; not for private clients unless chosen) is sent upstream and
   answers are cached per subnet.
 - **Hosts-file import**: Import / Export -> Hosts file, or
-  `POST /api/zones/{zone}/import/hosts` (preview, then one transaction).
+  `POST /rust-dns/api/zones/{zone}/import/hosts` (preview, then one transaction).
 - **Following interfaces**: `[server] interfaces = ["eth0"]` listens on that
   interface's addresses and follows them as they change (on Linux at once,
   through netlink; elsewhere, or if netlink is unavailable, polled every
@@ -387,7 +387,7 @@ open_resolver_rate_per_second = 20       # optional; 0 = only [rate_limit] appli
 
 or in the console (*Server settings -> Forwarding -> Turn on open resolver
 mode*, a two-step confirmation that can also set the allowed clients to
-`0.0.0.0/0` and `::/0`), or with the API (`PUT /api/settings/forwarding` with
+`0.0.0.0/0` and `::/0`), or with the API (`PUT /rust-dns/api/settings/forwarding` with
 `"open_resolver": true`). The mode only lifts the guard on `allowed_clients`;
 it does not add anything to the list. A console/API setting overrides the
 file like the other forwarding settings (and always records the mode it was
@@ -436,11 +436,11 @@ nothing changes):
   Authoritative answers are not affected.
 - **DNS cookies** (RFC 7873, `[server].cookies`, on by default) stay on.
 - **Loud.** A WARN log line at startup, on every reload (SIGHUP or
-  `POST /api/admin/reload`) and when the mode changes; `--check` prints a
+  `POST /rust-dns/api/admin/reload`) and when the mode changes; `--check` prints a
   `WARNING:` line; the gauge `rustdns_open_resolver` is 1;
-  `/api/status` has `forwarding.open_resolver: true` and the counters
+  `/rust-dns/api/status` has `forwarding.open_resolver: true` and the counters
   `dns.open_resolver_truncated`, `dns.open_resolver_any` and
-  `dns.open_resolver_rate_limited` (also in `/metrics` as
+  `dns.open_resolver_rate_limited` (also in `/rust-dns/metrics` as
   `rustdns_open_resolver_*_total`); the console shows an *Open resolver*
   badge on the dashboard and on Server settings.
 
@@ -451,7 +451,7 @@ possible, restricting UDP/53 to known networks at the firewall instead.
 ## DNSSEC
 
 Signing is **off by default** and turned on per zone (console: zone page ->
-**DNSSEC**, or `PUT /api/zones/{zone}/dnssec`). With signing off nothing
+**DNSSEC**, or `PUT /rust-dns/api/zones/{zone}/dnssec`). With signing off nothing
 changes; the only protocol difference in this version for every zone is that
 the DO bit of a query is now copied into the response (RFC 3225).
 
@@ -488,7 +488,7 @@ signed zone** (they could not be signed); auto-PTR for names outside any zone
 is unchanged.
 
 **NSEC3.** Per zone, `denial: "nsec3"` (console: DNSSEC tab -> **Switch to
-NSEC3**, or when turning signing on; API: `PUT /api/zones/{zone}/dnssec` with
+NSEC3**, or when turning signing on; API: `PUT /rust-dns/api/zones/{zone}/dnssec` with
 `{"enabled": true, "denial": "nsec3"}`; `"nsec"` switches back) signs the zone
 with NSEC3 (RFC 5155) using the RFC 9276 parameters: hash SHA-1, no extra
 iterations, no salt, no opt-out (flags 0), and an `NSEC3PARAM 1 0 0 -` at the
@@ -518,7 +518,7 @@ casual zone walking but not from an offline dictionary attack on the hashes
 **Ed25519.** The algorithm is chosen for a **new key**: the first time
 signing is turned on, or when it is turned on again with a new key
 (console: the "Algorithm of a new key" choice in the turn-on dialog; API:
-`PUT /api/zones/{zone}/dnssec` with `{"enabled": true, "algorithm": 15}`,
+`PUT /rust-dns/api/zones/{zone}/dnssec` with `{"enabled": true, "algorithm": 15}`,
 plus `"new_key": true` to replace a kept key). 13 (ECDSA P-256 / SHA-256)
 stays the default; a replaced key keeps the old key's algorithm unless
 another is given. 15 is Ed25519 (RFC 8080): a 32-byte public key, 64-byte
@@ -583,14 +583,14 @@ resolvers until the parent zone publishes a DS record. The console's DNSSEC
 tab shows the DS (SHA-256, digest type 2; SHA-384 as well) with copy buttons
 and the individual fields registrars ask for, and:
 
-1. **Check before adding DS** (`GET /api/zones/{zone}/dnssec/check`): queries
+1. **Check before adding DS** (`GET /rust-dns/api/zones/{zone}/dnssec/check`): queries
    this server's own answers with DO (DNSKEY, SOA, NS, a sample of names,
    wildcards, a missing name and type) and validates every signature and
    denial proof with the key.
 2. Make sure every nameserver of the zone serves the signed zone (secondaries
    by zone transfer; standbys sign themselves).
 3. Publish the DS at the registrar.
-4. **Is the DS published at the parent?** (`GET /api/zones/{zone}/dnssec/parent`):
+4. **Is the DS published at the parent?** (`GET /rust-dns/api/zones/{zone}/dnssec/parent`):
    looks the DS up through the first forwarding upstream (RD, CD, DO) and
    reports `present` (matches the key), `absent`, `mismatch` (validating
    resolvers fail the zone) or `unknown` (no upstream, no answer).
@@ -603,7 +603,7 @@ the check (the console does not offer it). The key is kept when signing is
 turned off; turning it on again reuses it.
 
 **Key rollover wizard** (zone -> DNSSEC -> Key rollover; `GET/POST
-/api/zones/{zone}/dnssec/rollover`, `.../ds-added`, `.../cancel`,
+/rust-dns/api/zones/{zone}/dnssec/rollover`, `.../ds-added`, `.../cancel`,
 `.../check`). A pre-publish rollover of the combined signing key for
 registrars without an API: the DS change is always done by hand, and the
 wizard says exactly what to change and verifies it before moving on. The
@@ -636,10 +636,10 @@ represent a rollover (its version lacks `+dnssec-rollover`). Needs a
 forwarding upstream (to find the parent's servers). Test-only knobs:
 `[dnssec] rollover_max_wait_secs` (caps the waits) and `parent_port`.
 
-**API** (all with `#[utoipa::path]`, see `/docs`): `GET /api/zones/{zone}/dnssec`
-(status, key, DS, signature window), `PUT /api/zones/{zone}/dnssec`
-(`enabled`, `force`, `new_key`; owner role), `GET /api/zones/{zone}/dnssec/ds`,
-`GET /api/zones/{zone}/dnssec/check`, `GET /api/zones/{zone}/dnssec/parent`,
+**API** (all with `#[utoipa::path]`, see `/rust-dns/docs`): `GET /rust-dns/api/zones/{zone}/dnssec`
+(status, key, DS, signature window), `PUT /rust-dns/api/zones/{zone}/dnssec`
+(`enabled`, `force`, `new_key`; owner role), `GET /rust-dns/api/zones/{zone}/dnssec/ds`,
+`GET /rust-dns/api/zones/{zone}/dnssec/check`, `GET /rust-dns/api/zones/{zone}/dnssec/parent`,
 and the rollover endpoints above.
 
 ## Securing zone transfers with TSIG
@@ -657,10 +657,10 @@ shared keys in addition to the address allow-list.
    generated. Optionally limit the key to the zones that secondary serves.
    The secret is shown once, with a ready-to-paste BIND `key`/`zone`
    configuration and a `dig -y ... AXFR` test command. Showing it again later
-   (`POST /api/tsig/keys/{name}/reveal`) is recorded in the audit log; the
+   (`POST /rust-dns/api/tsig/keys/{name}/reveal`) is recorded in the audit log; the
    secret itself never appears in the audit log, changelog or server logs.
 2. Configure the policy in the config file and reload (SIGHUP or
-   `POST /api/admin/reload`):
+   `POST /rust-dns/api/admin/reload`):
 
 ```toml
 [transfer]
@@ -727,7 +727,7 @@ upstream_ca_file = ""                 # trust only this CA; empty = system trust
   connection (no pooling). They replace the plain upstreams for global
   forwarding; override zones keep their own plain upstreams. The health
   tracking and strategies of plain upstreams do not apply.
-- `/metrics`: `rustdns_dot_connections_total`, `rustdns_doh_requests_total`.
+- `/rust-dns/metrics`: `rustdns_dot_connections_total`, `rustdns_doh_requests_total`.
 - The certificate is read at startup (restart after renewing it).
 
 ## Secondary zones
@@ -736,7 +736,7 @@ A zone hosted on another server (BIND, NSD, Knot, another rust-dns) can be
 served here read-only as a *secondary zone* (off unless created):
 
 ```bash
-curl -X POST .../api/zones -d '{"name": "example.org",
+curl -X POST .../rust-dns/api/zones -d '{"name": "example.org",
   "secondary": {"primaries": ["192.0.2.53", "[2001:db8::53]:53"], "key": "xfr-key."}}'
 ```
 
@@ -765,7 +765,7 @@ curl -X POST .../api/zones -d '{"name": "example.org",
   no NSEC3 and are answered without a proof; record types this server does
   not serve (listed in the status) are not answered.
 - No automatic PTR answers from a secondary zone's addresses.
-- Status on this server: `GET /api/zones/{zone}/secondary` (serial, last
+- Status on this server: `GET /rust-dns/api/zones/{zone}/secondary` (serial, last
   AXFR / IXFR, last refresh and error, expiry, NOTIFYs, signed or not), and
   the *Secondary* tab of the zone in the console.
 
@@ -878,8 +878,8 @@ action in the console declares the permission it needs or that it is safe on
 a read-only server; anything undeclared is disabled, so a new control cannot
 slip through (a test fails the build otherwise). A control is enabled only
 when the server would accept it: the signed-in user's effective rights come
-from `GET /api/users/{id}/rights` (the same permission table every API check
-uses), the standby allowlist from `GET /api/status`
+from `GET /rust-dns/api/users/{id}/rights` (the same permission table every API check
+uses), the standby allowlist from `GET /rust-dns/api/status`
 (`replication.standby_writable`), and object state the page knows (your own
 account, the root account, a DS still published at the parent). Disabled
 controls say why in their tooltip; on a standby that is "Read-only standby:
@@ -891,7 +891,7 @@ on a standby before sending it; the server refuses it anyway (409
 `read_only_standby`).
 
 Account changes carry password hashes, TOTP and TSIG secrets. They never
-appear in `GET /api/changelog` or the websocket (not even for
+appear in `GET /rust-dns/api/changelog` or the websocket (not even for
 administrators), only in the admin-only replication API, and their payloads
 are scrubbed after `[changelog].account_retention_days` (default 3); a
 standby further behind than that loads a snapshot. The changelog API
@@ -901,7 +901,7 @@ therefore shows DNS offsets with holes where account changes were.
 it connects and cannot continue from its own offset (a fresh database, or
 the changes it needs were pruned); the snapshot carries the offset it
 corresponds to, and from there everything is fetched by offset from
-`GET /api/replication/changes` in batches of whole transactions (a standby
+`GET /rust-dns/api/replication/changes` in batches of whole transactions (a standby
 that is far behind fast-forwards batch by batch). Facts are complete new
 state, so re-applying changes from an earlier offset is harmless.
 
@@ -950,7 +950,7 @@ key, and promotion.
 2. Promote the standby, either
    - console: **Admin -> Replication -> Promote to primary...** (two clicks in
      the dialog), or
-   - API: `POST /api/replication/promote` with `{"confirm": true}`, or
+   - API: `POST /rust-dns/api/replication/promote` with `{"confirm": true}`, or
    - stopped server: `rust-dns --promote --config /opt/rust-dns/etc/rust-dns.toml`.
 
    Promotion removes `[follow]` from the config file (a comment records it; the
@@ -998,7 +998,7 @@ TSIG keys, console settings, API tokens, and no users besides the config
 root. Anything else (an old primary with changes after the fork, a server that
 was used on its own, a primary restored from an older backup) is refused:
 state `refused`, the error names the data found and the command to run, it is
-shown in `/api/replication/status`, the console banner and Replication page,
+shown in `/rust-dns/api/replication/status`, the console banner and Replication page,
 the log and `rust-dns --check`, and the server keeps serving its local data
 read-only.
 
@@ -1035,10 +1035,10 @@ States, with thresholds in `[replication]` (primary side, reloadable):
 (requests interleaving from two addresses or sessions; a restart or a move is
 not a conflict); a warning is logged. The list is kept in a local table
 (`replicas`, not replicated) so it survives restarts; entries not seen for
-`forget_after_days` (30) are dropped, and `DELETE /api/replication/replicas/{id}`
+`forget_after_days` (30) are dropped, and `DELETE /rust-dns/api/replication/replicas/{id}`
 forgets one (audited `replication.replica_forget`; local bookkeeping, not in
 the changelog). See **Admin -> Replication** (live table), `GET
-/api/replication/replicas`, and the metrics
+/rust-dns/api/replication/replicas`, and the metrics
 `rustdns_replication_replica_lag_changes{instance}`,
 `rustdns_replication_replica_lag_seconds{instance}`,
 `rustdns_replication_replica_state{instance,state}` (1 for the current
@@ -1080,8 +1080,8 @@ of those halt.
 When halted, the standby stops talking to the primary except to report the
 halt once (at the halt and at each start; the primary then lists it as
 `halted` with the reason), keeps answering DNS from its last applied state,
-and shows it everywhere: a red console banner, `/api/status` and
-`/api/replication/status` (`follow.halted` with reason, detail, offset),
+and shows it everywhere: a red console banner, `/rust-dns/api/status` and
+`/rust-dns/api/replication/status` (`follow.halted` with reason, detail, offset),
 `rust-dns --check`, the startup log (error), the metric
 `rustdns_replication_halted 1`, and a report `diverged-<time>.json` next to
 the database (what differed: tables, zones, both checksums, offsets; no
@@ -1095,7 +1095,7 @@ data; rebuild it first unless the primary is gone.
 
 ### Replication API
 
-All under `/api/replication/`, admin only (`replicate`) except `identity`:
+All under `/rust-dns/api/replication/`, admin only (`replicate`) except `identity`:
 `GET status` (both roles), `GET snapshot` (logical entities),
 `GET changes?after=&limit=&wait=` (long-poll), `GET checksum` (the data
 endpoints are served by a writable primary and by a standby that has loaded
@@ -1111,38 +1111,38 @@ a standby `rustdns_replication_connected`, `rustdns_replication_lag_changes`,
 
 ## API
 
-Everything the console does goes through `/api`. Authenticate with a session
+Everything the console does goes through `/rust-dns/api`. Authenticate with a session
 cookie (the console) or a bearer token (scripts):
 
 ```
-curl -H "Authorization: Bearer rdns_…" http://127.0.0.1:8053/api/zones
+curl -H "Authorization: Bearer rdns_…" http://127.0.0.1:8053/rust-dns/api/zones
 curl -H "Authorization: Bearer rdns_…" -H "content-type: application/json" \
      -d '{"name":"www","type":"A","value":"10.0.0.1","ttl":300}' \
-     http://127.0.0.1:8053/api/zones/example.com/records
+     http://127.0.0.1:8053/rust-dns/api/zones/example.com/records
 ```
 
 | Method | Path | Notes |
 |---|---|---|
-| POST | `/api/auth/login`, `/auth/mfa`, `/auth/enroll`, `/auth/logout` | session flow |
-| GET | `/api/zones`, `/api/zones/{zone}` | zones visible to the caller, with role |
-| POST/PUT/DELETE | `/api/zones`, `/api/zones/{zone}` | admin creates; owner edits/deletes |
-| POST/PUT/DELETE | `/api/zones/{zone}/records[/{id}]` | editor or owner |
-| PUT/DELETE | `/api/zones/{zone}/members/{username}` | owner grants `editor`/`viewer` |
-| GET | `/api/zones/{zone}/export`, `/api/export` | JSON export document |
-| POST | `/api/import?mode=merge\|replace` | JSON export document |
-| GET | `/api/changelog?after=<offset>&limit=` | DNS changes; rows of one transaction share `txn`. `resync_required` when the cursor fell behind retention |
-| GET | `/api/audit?after=<id>&limit=` | account and security changes (admin) |
-| GET | `/docs` | interactive API explorer (Swagger UI, bundled); also the console's "API explorer" section |
-| GET | `/api/users/{id}/rights?via=session\|token` | effective rights of a user or of their API tokens (self or admin) |
-| GET | `/api/ws?after=<offset>&queries=true` | websocket: `change` and `query` events; tokens as subprotocol `rust-dns.bearer.<token>` |
-| GET/POST/PUT/DELETE | `/api/users[/{id}]`, `/api/users/{id}/reset-mfa` | admin |
-| GET/POST | `/api/users/{id}/sessions`, `/sessions/revoke` | inspect or revoke all user sessions (admin) |
-| GET/POST/DELETE | `/api/tokens[/{id}]` | own tokens |
-| PUT/POST | `/api/me/password`, `/api/me/mfa/start|confirm|disable` | self service |
-| POST | `/api/me/mfa/recovery` | regenerate recovery codes with TOTP |
-| GET | `/api/status`, `/metrics`, `/api/health` | |
-| GET/PUT/DELETE | `/api/settings/forwarding`, POST `/api/settings/forwarding/cache/flush` | forwarding upstreams, ACL, cache caps; cache stats and flush (admin) |
-| GET/POST | `/api/replication/status`, `snapshot`, `changes`, `checksum`, `identity`, `promote` | standby mode (see [Standby / follow mode](#standby--follow-mode)) |
+| POST | `/rust-dns/api/auth/login`, `/auth/mfa`, `/auth/enroll`, `/auth/logout` | session flow |
+| GET | `/rust-dns/api/zones`, `/rust-dns/api/zones/{zone}` | zones visible to the caller, with role |
+| POST/PUT/DELETE | `/rust-dns/api/zones`, `/rust-dns/api/zones/{zone}` | admin creates; owner edits/deletes |
+| POST/PUT/DELETE | `/rust-dns/api/zones/{zone}/records[/{id}]` | editor or owner |
+| PUT/DELETE | `/rust-dns/api/zones/{zone}/members/{username}` | owner grants `editor`/`viewer` |
+| GET | `/rust-dns/api/zones/{zone}/export`, `/rust-dns/api/export` | JSON export document |
+| POST | `/rust-dns/api/import?mode=merge\|replace` | JSON export document |
+| GET | `/rust-dns/api/changelog?after=<offset>&limit=` | DNS changes; rows of one transaction share `txn`. `resync_required` when the cursor fell behind retention |
+| GET | `/rust-dns/api/audit?after=<id>&limit=` | account and security changes (admin) |
+| GET | `/rust-dns/docs` | interactive API explorer (Swagger UI, bundled); also the console's "API explorer" section |
+| GET | `/rust-dns/api/users/{id}/rights?via=session\|token` | effective rights of a user or of their API tokens (self or admin) |
+| GET | `/rust-dns/api/ws?after=<offset>&queries=true` | websocket: `change` and `query` events; tokens as subprotocol `rust-dns.bearer.<token>` |
+| GET/POST/PUT/DELETE | `/rust-dns/api/users[/{id}]`, `/rust-dns/api/users/{id}/reset-mfa` | admin |
+| GET/POST | `/rust-dns/api/users/{id}/sessions`, `/sessions/revoke` | inspect or revoke all user sessions (admin) |
+| GET/POST/DELETE | `/rust-dns/api/tokens[/{id}]` | own tokens |
+| PUT/POST | `/rust-dns/api/me/password`, `/rust-dns/api/me/mfa/start|confirm|disable` | self service |
+| POST | `/rust-dns/api/me/mfa/recovery` | regenerate recovery codes with TOTP |
+| GET | `/rust-dns/api/status`, `/rust-dns/metrics`, `/rust-dns/api/health` | |
+| GET/PUT/DELETE | `/rust-dns/api/settings/forwarding`, POST `/rust-dns/api/settings/forwarding/cache/flush` | forwarding upstreams, ACL, cache caps; cache stats and flush (admin) |
+| GET/POST | `/rust-dns/api/replication/status`, `snapshot`, `changes`, `checksum`, `identity`, `promote` | standby mode (see [Standby / follow mode](#standby--follow-mode)) |
 
 The zone records endpoint accepts `q`, `offset`, and `limit` for server side
 search and paging. The console displays 500 records per page by default.
@@ -1163,7 +1163,7 @@ The OpenAPI document is generated from the Rust code with
   (required, nullable); one skipped when empty carries `#[schema(nullable = false)]`.
 - Info, tags, security schemes and the shared error responses live in
   `src/api/openapi.rs`. The document is serialized once at startup and served
-  at `/api/openapi.json`; Swagger UI at `/docs` renders it.
+  at `/rust-dns/api/openapi.json`; Swagger UI at `/rust-dns/docs` renders it.
 
 A snapshot is committed at `docs/openapi.json` so API changes are visible in
 review. A unit test fails when it is stale; after an intended API change run
@@ -1270,7 +1270,7 @@ tail -f soak.out                # one line per interval; summary at the end
 Memory: the Linux release builds (static musl) use mimalloc as their
 allocator. With musl's own allocator the resident memory grew without a
 plateau under this load while the live heap stayed flat (fragmentation,
-found by the first soak; plan.md O13a). `/metrics` shows the allocator
+found by the first soak; plan.md O13a). `/rust-dns/metrics` shows the allocator
 (`rustdns_build_info{allocator="mimalloc"}`) and, on Linux, the resident
 memory (`rustdns_process_resident_memory_bytes`).
 

@@ -122,7 +122,7 @@ dir = ""
                 .spawn()
                 .expect("spawn rust-dns");
             let deadline = Instant::now() + Duration::from_secs(20);
-            while ureq::get(&format!("{}/api/health", self.url()))
+            while ureq::get(&format!("{}/rust-dns/api/health", self.url()))
                 .timeout(Duration::from_millis(500))
                 .call()
                 .is_err()
@@ -161,7 +161,7 @@ dir = ""
         let (s, v) = call(
             &Auth::Session(&a),
             "POST",
-            &format!("{}/api/auth/login", self.url()),
+            &format!("{}/rust-dns/api/auth/login", self.url()),
             Some(json!({ "username": user, "password": pw })),
         );
         assert_eq!(s, 200, "{} login {user}: {v}", self.name);
@@ -174,7 +174,7 @@ dir = ""
     }
 
     fn api(&self, path: &str) -> String {
-        format!("{}/api{path}", self.url())
+        format!("{}/rust-dns/api{path}", self.url())
     }
 }
 
@@ -527,7 +527,7 @@ fn primary_standby_failover_and_rejoin() {
             r["lag_changes"].as_i64().unwrap() >= 2 && r["lag_seconds"].as_i64().unwrap() >= 3,
             "{r}"
         );
-        let metrics = ureq::get(&format!("{}/metrics", p.url()))
+        let metrics = ureq::get(&format!("{}/rust-dns/metrics", p.url()))
             .set("Authorization", &format!("Bearer {admin_token}"))
             .call()
             .unwrap()
@@ -845,7 +845,7 @@ fn primary_standby_failover_and_rejoin() {
             "names the primary: {v}"
         );
     }
-    let metrics = ureq::get(&format!("{}/metrics", s.url()))
+    let metrics = ureq::get(&format!("{}/rust-dns/metrics", s.url()))
         .set("Authorization", &format!("Bearer {admin_token}"))
         .call()
         .unwrap()
@@ -1022,11 +1022,14 @@ fn primary_standby_failover_and_rejoin() {
             "tsig_key_set",
             "setting_set",
         ] {
-            assert!(!text.contains(kind), "{kind} leaked into /api/changelog");
+            assert!(
+                !text.contains(kind),
+                "{kind} leaked into /rust-dns/api/changelog"
+            );
         }
         assert!(
             !text.contains("argon2"),
-            "no password hashes in /api/changelog"
+            "no password hashes in /rust-dns/api/changelog"
         );
     }
     let head_before = status(&s, &sr)["head"].as_i64().unwrap();
@@ -1559,7 +1562,7 @@ fn a_diverged_standby_halts_until_rebuilt() {
         .as_str()
         .unwrap()
         .contains("Replication halted"));
-    let metrics = ureq::get(&format!("{}/metrics", s.url()))
+    let metrics = ureq::get(&format!("{}/rust-dns/metrics", s.url()))
         .set("Authorization", &format!("Bearer {token}"))
         .call()
         .unwrap()
@@ -1927,8 +1930,28 @@ fn dnssec_signing_on_the_primary_is_served_by_the_standby() {
 /// The previous release's binary (`RUST_DNS_PREV_BIN`: built from the
 /// commit that is deployed), for the mixed-version tests. Without it they
 /// are skipped (loudly), unless `REQUIRE_PREV_BIN` is set.
+///
+/// The `/rust-dns/` path prefix was a hard cut: a binary from before it
+/// serves the API at `/api/...` and asks its primary for `/api/...`, this
+/// one does neither, so the two cannot replicate at all (an old standby of
+/// a new primary gets 404 on its first call and retries with backoff, never
+/// following; see `get_bytes` / `run_follower` in src/replication/mod.rs).
+/// The mixed-version tests cannot pass against such a binary, so they do not
+/// run against it: skipped loudly, and a failure (with this explanation)
+/// under `REQUIRE_PREV_BIN`. They run again once the previous release is
+/// one with the prefix. A binary has the prefix when its replication client
+/// carries the prefixed path.
 fn prev_bin() -> Option<PathBuf> {
     match std::env::var_os("RUST_DNS_PREV_BIN").map(PathBuf::from) {
+        Some(p) if p.is_file() && !has_path_prefix(&p) => {
+            let why = format!(
+                "RUST_DNS_PREV_BIN ({}) predates the /rust-dns/ path prefix (a hard cut): it serves and calls /api/..., so it cannot replicate with this build at all; the mixed-version tests need a previous release with the prefix",
+                p.display()
+            );
+            assert!(std::env::var("REQUIRE_PREV_BIN").is_err(), "{why}");
+            eprintln!("follow: {why}; skipping the mixed-version test");
+            None
+        }
         Some(p) if p.is_file() => Some(p),
         _ => {
             assert!(
@@ -1939,6 +1962,13 @@ fn prev_bin() -> Option<PathBuf> {
             None
         }
     }
+}
+
+/// Whether the binary at `p` is from after the `/rust-dns/` prefix cut.
+fn has_path_prefix(p: &Path) -> bool {
+    let bin = std::fs::read(p).unwrap_or_default();
+    let needle = b"/rust-dns/api/replication/status";
+    bin.windows(needle.len()).any(|w| w == needle)
 }
 
 fn dnssec_status(n: &Node, a: &ureq::Agent, zone: &str) -> Value {
@@ -2738,7 +2768,7 @@ fn an_old_standby_cannot_represent_an_override_zone() {
     let _ = std::fs::remove_dir_all(&root_dir);
 }
 
-/// Every DNS changelog row of one node (`/api/changelog`, paged).
+/// Every DNS changelog row of one node (`/rust-dns/api/changelog`, paged).
 fn changelog_rows(node: &Node, a: &ureq::Agent) -> Vec<Value> {
     let mut out = Vec::new();
     let mut after = 0;
@@ -2884,7 +2914,7 @@ fn a_standby_shows_the_primarys_dns_changelog() {
 /// M0a, mixed versions with K3/K1/L2: a standby of this version follows a
 /// primary on the previous release (`RUST_DNS_PREV_BIN`) holding a signed
 /// zone, copies the old primary's earlier DNS changelog through its
-/// `/api/changelog` (the same rows, never an account row), publishes the
+/// `/rust-dns/api/changelog` (the same rows, never an account row), publishes the
 /// new status fields itself, and serves the signed zone. Then the primary
 /// is upgraded in place (nothing copied twice), and a standby on the
 /// previous release bootstraps from and follows the upgraded primary.
@@ -3397,7 +3427,7 @@ fn a_revocation_on_the_primary_closes_standby_streams_at_once() {
     wait_reconciled(&p, &pr, &s, &sr, "token in the snapshot");
     let (mut ws, head) = ws_open(
         &s.url(),
-        "/api/ws",
+        "/rust-dns/api/ws",
         &format!("Sec-WebSocket-Protocol: rust-dns, rust-dns.bearer.{tok}\r\n"),
     );
     assert!(head.starts_with("HTTP/1.1 101"), "{head}");
@@ -4268,8 +4298,8 @@ fn snapshots_are_gzip_compressed_when_the_standby_asks() {
         }
         v
     };
-    let (h_plain, plain) = raw_get(&p, "/api/replication/snapshot", &hdrs(false));
-    let (h_gz, gz) = raw_get(&p, "/api/replication/snapshot", &hdrs(true));
+    let (h_plain, plain) = raw_get(&p, "/rust-dns/api/replication/snapshot", &hdrs(false));
+    let (h_gz, gz) = raw_get(&p, "/rust-dns/api/replication/snapshot", &hdrs(true));
     assert!(h_plain.starts_with("http/1.1 200"), "{h_plain}");
     assert!(!h_plain.contains("content-encoding"), "{h_plain}");
     assert!(h_gz.contains("content-encoding: gzip"), "{h_gz}");

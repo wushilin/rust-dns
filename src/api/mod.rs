@@ -157,8 +157,8 @@ async fn client_ip_layer(
     req.extensions_mut().insert(ClientIp(ip));
     req.extensions_mut().insert(Https(https));
     let page = match req.uri().path() {
-        "/" | "/index.html" => Some(crate::ui::Page::Console),
-        "/docs" => Some(crate::ui::Page::Docs),
+        "/rust-dns/" | "/rust-dns/index.html" => Some(crate::ui::Page::Console),
+        "/rust-dns/docs" => Some(crate::ui::Page::Docs),
         _ => None,
     };
     let host = req
@@ -169,7 +169,7 @@ async fn client_ip_layer(
     let mut resp = next.run(req).await;
     let h = resp.headers_mut();
     h.insert("x-content-type-options", "nosniff".parse().unwrap());
-    // The console embeds its own API explorer (/docs) in a frame; other sites may not.
+    // The console embeds its own API explorer (/rust-dns/docs) in a frame; other sites may not.
     h.insert("x-frame-options", "SAMEORIGIN".parse().unwrap());
     let csp = match page {
         Some(p) => crate::ui::content_security_policy(p, host.as_deref()),
@@ -329,6 +329,18 @@ async fn swagger_css(headers: axum::http::HeaderMap) -> Response {
     )
 }
 
+/// Path prefix of every HTTP endpoint and static asset: the API is at
+/// `/rust-dns/api/...`, the console at `/rust-dns/`, metrics at
+/// `/rust-dns/metrics`.
+/// (The router spells it out as literals so tests/openapi_spec.rs can read
+/// the routes from this file.)
+pub const PREFIX: &str = "/rust-dns";
+
+/// `GET /` and `GET /rust-dns` answer 308 Permanent Redirect to the console.
+async fn redirect_to_console() -> Response {
+    axum::response::Redirect::permanent(&format!("{PREFIX}/")).into_response()
+}
+
 async fn ui_index() -> Response {
     (
         [
@@ -340,7 +352,7 @@ async fn ui_index() -> Response {
         .into_response()
 }
 
-/// Every API route, mounted under `/api`. Each `routes!` entry both mounts
+/// Every API route, mounted under `/rust-dns/api`. Each `routes!` entry both mounts
 /// the handler and adds its `#[utoipa::path]` operation to the OpenAPI
 /// document, so routes and documentation cannot drift apart. Handlers that
 /// share a path go into one `routes!` call.
@@ -448,7 +460,7 @@ fn api_router() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(replication::report_replica))
 }
 
-/// Documented routes mounted at the server root rather than under `/api`.
+/// Documented routes mounted at `/rust-dns/` rather than under `/rust-dns/api`.
 fn root_router() -> OpenApiRouter<Arc<AppState>> {
     OpenApiRouter::new().routes(routes!(routes::metrics))
 }
@@ -463,10 +475,10 @@ pub fn openapi_doc() -> utoipa::openapi::OpenApi {
 pub fn router(state: Arc<AppState>) -> Router {
     let (api, _) = api_router().split_for_parts();
     let (root, _) = root_router().split_for_parts();
-    // Serialize the document once, now, so /api/openapi.json only copies bytes.
+    // Serialize the document once, now, so /rust-dns/api/openapi.json only copies bytes.
     openapi::spec_json();
     // Console pages are not part of the API document.
-    let mut app = Router::new()
+    let mut site = Router::new()
         .nest(
             "/api",
             api.layer(middleware::from_fn(json_errors))
@@ -477,12 +489,22 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .merge(root);
     if state.cfg.web_console.enabled {
-        app = app
+        site = site
             .route("/", get(ui_index))
             .route("/index.html", get(ui_index))
             .route("/docs", get(ui_docs))
             .route("/docs/swagger-ui-bundle.js", get(swagger_js))
             .route("/docs/swagger-ui.css", get(swagger_css));
+    }
+    // Everything is served under PREFIX (a hard cut: nothing answers at the
+    // old root paths). Nesting at "/rust-dns/" (with the slash) puts the
+    // console at "/rust-dns/"; the bare prefix and the server root redirect
+    // there. Anything else outside the prefix is the default 404.
+    let mut app = Router::new().nest("/rust-dns/", site);
+    if state.cfg.web_console.enabled {
+        app = app
+            .route("/", get(redirect_to_console))
+            .route("/rust-dns", get(redirect_to_console));
     }
     // `read_body_first` wraps everything, the fallback (404) and the 405 of
     // root and console routes included: an early answer anywhere resets

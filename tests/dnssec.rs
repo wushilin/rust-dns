@@ -255,7 +255,7 @@ impl Server {
                 .spawn()
                 .unwrap();
             let deadline = Instant::now() + Duration::from_secs(20);
-            while ureq::get(&format!("{}/api/health", self.web))
+            while ureq::get(&format!("{}/rust-dns/api/health", self.web))
                 .timeout(Duration::from_millis(300))
                 .call()
                 .is_err()
@@ -274,7 +274,7 @@ impl Server {
             .build();
         let (st, _) = self.api(
             "POST",
-            "/api/auth/login",
+            "/rust-dns/api/auth/login",
             Some(json!({ "username": "root", "password": "rootpass123" })),
         );
         assert_eq!(st, 200);
@@ -318,7 +318,7 @@ impl Server {
         let doc = json!({ "version": 1, "exported_at": "2026-01-01T00:00:00Z", "zones": [{
             "name": zone, "soa_mname": format!("ns1.{zone}."), "soa_rname": format!("hostmaster.{zone}."),
             "default_ttl": 3600, "minimum": 300, "records": records }] });
-        let (st, r) = self.api("POST", "/api/import?mode=merge", Some(doc));
+        let (st, r) = self.api("POST", "/rust-dns/api/import?mode=merge", Some(doc));
         assert_eq!(st, 200, "{r}");
     }
 
@@ -736,7 +736,7 @@ fn signed_zone_validates_with_independent_validators() {
     // An expired record: stored, not served, not in the NSEC chain.
     let (st, r) = s.api(
         "POST",
-        &format!("/api/zones/{ZONE}/records"),
+        &format!("/rust-dns/api/zones/{ZONE}/records"),
         Some(json!({ "name": "expired", "type": "A", "value": "192.0.2.99", "expires_in": 1 })),
     );
     assert_eq!(st, 201, "{r}");
@@ -755,13 +755,21 @@ fn signed_zone_validates_with_independent_validators() {
     assert!(!m.edns.as_ref().unwrap().flags().dnssec_ok);
 
     // Signing off: status, no key, no DS.
-    let (st, off) = s.api("GET", &format!("/api/zones/{ZONE}/dnssec"), None);
+    let (st, off) = s.api("GET", &format!("/rust-dns/api/zones/{ZONE}/dnssec"), None);
     assert_eq!(st, 200);
     assert_eq!(off["state"], "off");
     assert!(off["key"].is_null() && off["ds"].as_array().unwrap().is_empty());
-    let (_, ds) = s.api("GET", &format!("/api/zones/{ZONE}/dnssec/ds"), None);
+    let (_, ds) = s.api(
+        "GET",
+        &format!("/rust-dns/api/zones/{ZONE}/dnssec/ds"),
+        None,
+    );
     assert!(ds["key_tag"].is_null());
-    let (st, _) = s.api("GET", &format!("/api/zones/{ZONE}/dnssec/check"), None);
+    let (st, _) = s.api(
+        "GET",
+        &format!("/rust-dns/api/zones/{ZONE}/dnssec/check"),
+        None,
+    );
     assert_eq!(st, 409, "self-check needs signing on");
     let before = no_do_answers(s.dns);
     let serial_before = soa_serial(s.dns);
@@ -769,7 +777,7 @@ fn signed_zone_validates_with_independent_validators() {
     // Turn signing on.
     let (st, on) = s.api(
         "PUT",
-        &format!("/api/zones/{ZONE}/dnssec"),
+        &format!("/rust-dns/api/zones/{ZONE}/dnssec"),
         Some(json!({ "enabled": true })),
     );
     assert_eq!(st, 200, "{on}");
@@ -795,7 +803,11 @@ fn signed_zone_validates_with_independent_validators() {
     let key_tag = on["key"]["key_tag"].as_u64().unwrap();
     let log = s.log();
     assert!(log.contains("zone signed"), "signing is logged");
-    let (_, dsl) = s.api("GET", &format!("/api/zones/{ZONE}/dnssec/ds"), None);
+    let (_, dsl) = s.api(
+        "GET",
+        &format!("/rust-dns/api/zones/{ZONE}/dnssec/ds"),
+        None,
+    );
     let ds_records: Vec<String> = dsl["ds"]
         .as_array()
         .unwrap()
@@ -806,11 +818,15 @@ fn signed_zone_validates_with_independent_validators() {
     assert_eq!(dsl["key_tag"], json!(key_tag));
 
     // Self-check through the API.
-    let (st, chk) = s.api("GET", &format!("/api/zones/{ZONE}/dnssec/check"), None);
+    let (st, chk) = s.api(
+        "GET",
+        &format!("/rust-dns/api/zones/{ZONE}/dnssec/check"),
+        None,
+    );
     assert_eq!(st, 200);
     assert_eq!(chk["ok"], true, "{chk:#}");
     // No private key anywhere in the API, the changelog API or the log.
-    let (_, cl) = s.api("GET", "/api/changelog?limit=1000", None);
+    let (_, cl) = s.api("GET", "/rust-dns/api/changelog?limit=1000", None);
     let blob = format!("{on}{dsl}{chk}{cl}");
     assert!(!blob.contains("private") && !blob.contains("dnssec_key_set"));
     let db = rusqlite::Connection::open(dir.join("t.db")).unwrap();
@@ -955,7 +971,7 @@ fn resign_bumps_the_serial_and_keeps_validating() {
     s.import(ZONE, &records()[..12]);
     let (st, _) = s.api(
         "PUT",
-        &format!("/api/zones/{ZONE}/dnssec"),
+        &format!("/rust-dns/api/zones/{ZONE}/dnssec"),
         Some(json!({ "enabled": true })),
     );
     assert_eq!(st, 200);
@@ -980,7 +996,7 @@ fn resign_bumps_the_serial_and_keeps_validating() {
         std::thread::sleep(Duration::from_millis(200));
     }
     assert_eq!(soa_serial(s.dns), serial + 1);
-    let (_, cl) = s.api("GET", "/api/changelog?limit=100", None);
+    let (_, cl) = s.api("GET", "/rust-dns/api/changelog?limit=100", None);
     let entries = cl["entries"].as_array().cloned().unwrap_or_default();
     assert!(
         entries
@@ -988,14 +1004,18 @@ fn resign_bumps_the_serial_and_keeps_validating() {
             .any(|e| e["payload"]["kind"] == "zone_resigned"),
         "zone_resigned in the changelog: {cl}"
     );
-    let (_, st) = s.api("GET", &format!("/api/zones/{ZONE}/dnssec"), None);
+    let (_, st) = s.api("GET", &format!("/rust-dns/api/zones/{ZONE}/dnssec"), None);
     let inc = chrono::DateTime::parse_from_rfc3339(st["signatures"]["inception"].as_str().unwrap())
         .unwrap();
     assert!(
         chrono::Utc::now() - inc.with_timezone(&chrono::Utc) < chrono::Duration::hours(2),
         "fresh window after the re-sign: {st}"
     );
-    let (_, chk) = s.api("GET", &format!("/api/zones/{ZONE}/dnssec/check"), None);
+    let (_, chk) = s.api(
+        "GET",
+        &format!("/rust-dns/api/zones/{ZONE}/dnssec/check"),
+        None,
+    );
     assert_eq!(chk["ok"], true, "{chk:#}");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1016,7 +1036,7 @@ fn turning_signing_off_is_refused_while_the_parent_publishes_a_ds() {
     child.import(ZONE, &records()[..12]);
     let (_, on) = child.api(
         "PUT",
-        &format!("/api/zones/{ZONE}/dnssec"),
+        &format!("/rust-dns/api/zones/{ZONE}/dnssec"),
         Some(json!({ "enabled": true })),
     );
     let ds = on["ds"][0]["record"].as_str().unwrap().to_string();
@@ -1029,22 +1049,30 @@ fn turning_signing_off_is_refused_while_the_parent_publishes_a_ds() {
     parent.import("test", &parent_recs);
 
     // No DS at the parent yet: absent; turning off would be allowed.
-    let (_, p) = child.api("GET", &format!("/api/zones/{ZONE}/dnssec/parent"), None);
+    let (_, p) = child.api(
+        "GET",
+        &format!("/rust-dns/api/zones/{ZONE}/dnssec/parent"),
+        None,
+    );
     assert_eq!(p["state"], "absent", "{p}");
 
     // Publish the DS at the parent: present; turning off is refused.
     let (st, r) = parent.api(
         "POST",
-        "/api/zones/test/records",
+        "/rust-dns/api/zones/test/records",
         Some(json!({ "name": "wushilin", "type": "DS", "value": ds_value })),
     );
     assert_eq!(st, 201, "{r}");
-    let (_, p) = child.api("GET", &format!("/api/zones/{ZONE}/dnssec/parent"), None);
+    let (_, p) = child.api(
+        "GET",
+        &format!("/rust-dns/api/zones/{ZONE}/dnssec/parent"),
+        None,
+    );
     assert_eq!(p["state"], "present", "{p}");
     assert_eq!(p["parent_ds"].as_array().unwrap().len(), 1);
     let (st, r) = child.api(
         "PUT",
-        &format!("/api/zones/{ZONE}/dnssec"),
+        &format!("/rust-dns/api/zones/{ZONE}/dnssec"),
         Some(json!({ "enabled": false })),
     );
     assert_eq!(st, 409, "{r}");
@@ -1053,11 +1081,11 @@ fn turning_signing_off_is_refused_while_the_parent_publishes_a_ds() {
         .as_str()
         .unwrap()
         .contains("Remove the DS record at your registrar"));
-    let (_, s) = child.api("GET", &format!("/api/zones/{ZONE}/dnssec"), None);
+    let (_, s) = child.api("GET", &format!("/rust-dns/api/zones/{ZONE}/dnssec"), None);
     assert_eq!(s["enabled"], true, "still signing");
 
     // A DS for another key: mismatch, still refused.
-    let (_, recs) = parent.api("GET", "/api/zones/test/records", None);
+    let (_, recs) = parent.api("GET", "/rust-dns/api/zones/test/records", None);
     let ds_id = recs["records"]
         .as_array()
         .unwrap()
@@ -1068,25 +1096,33 @@ fn turning_signing_off_is_refused_while_the_parent_publishes_a_ds() {
         .unwrap();
     let (st, _) = parent.api(
         "PUT",
-        &format!("/api/zones/test/records/{ds_id}"),
+        &format!("/rust-dns/api/zones/test/records/{ds_id}"),
         Some(json!({ "value": format!("1 13 2 {}", "00".repeat(32)) })),
     );
     assert_eq!(st, 200);
-    let (_, p) = child.api("GET", &format!("/api/zones/{ZONE}/dnssec/parent"), None);
+    let (_, p) = child.api(
+        "GET",
+        &format!("/rust-dns/api/zones/{ZONE}/dnssec/parent"),
+        None,
+    );
     assert_eq!(p["state"], "mismatch", "{p}");
     let (st, _) = child.api(
         "PUT",
-        &format!("/api/zones/{ZONE}/dnssec"),
+        &format!("/rust-dns/api/zones/{ZONE}/dnssec"),
         Some(json!({ "enabled": false })),
     );
     assert_eq!(st, 409);
 
     // The DS removed at the parent: turning off is allowed.
-    let (st, _) = parent.api("DELETE", &format!("/api/zones/test/records/{ds_id}"), None);
+    let (st, _) = parent.api(
+        "DELETE",
+        &format!("/rust-dns/api/zones/test/records/{ds_id}"),
+        None,
+    );
     assert_eq!(st, 200);
     let (st, r) = child.api(
         "PUT",
-        &format!("/api/zones/{ZONE}/dnssec"),
+        &format!("/rust-dns/api/zones/{ZONE}/dnssec"),
         Some(json!({ "enabled": false })),
     );
     assert_eq!(st, 200, "{r}");
@@ -1094,7 +1130,7 @@ fn turning_signing_off_is_refused_while_the_parent_publishes_a_ds() {
     // The key is kept: turning on again reuses it (same DS).
     let (_, again) = child.api(
         "PUT",
-        &format!("/api/zones/{ZONE}/dnssec"),
+        &format!("/rust-dns/api/zones/{ZONE}/dnssec"),
         Some(json!({ "enabled": true })),
     );
     assert_eq!(again["ds"][0]["record"].as_str().unwrap(), ds);
@@ -1149,14 +1185,18 @@ fn nsec3_validates_and_switching_denial_keeps_every_answer_valid() {
     let s = Server::new(dir.clone(), "");
     s.import(ZONE, &records());
     let set = |body: Value| -> Value {
-        let (st, r) = s.api("PUT", &format!("/api/zones/{ZONE}/dnssec"), Some(body));
+        let (st, r) = s.api(
+            "PUT",
+            &format!("/rust-dns/api/zones/{ZONE}/dnssec"),
+            Some(body),
+        );
         assert_eq!(st, 200, "{r}");
         r
     };
     // Denial applies only while signing is on.
     let (st, r) = s.api(
         "PUT",
-        &format!("/api/zones/{ZONE}/dnssec"),
+        &format!("/rust-dns/api/zones/{ZONE}/dnssec"),
         Some(json!({ "enabled": false, "denial": "nsec3" })),
     );
     assert_eq!(st, 400, "{r}");
@@ -1331,7 +1371,11 @@ fn nsec3_validates_and_switching_denial_keeps_every_answer_valid() {
         );
     }
     // The self-check of the API understands NSEC3 zones too.
-    let (_, chk) = s.api("GET", &format!("/api/zones/{ZONE}/dnssec/check"), None);
+    let (_, chk) = s.api(
+        "GET",
+        &format!("/rust-dns/api/zones/{ZONE}/dnssec/check"),
+        None,
+    );
     assert_eq!(chk["ok"], true, "{chk:#}");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1348,7 +1392,13 @@ fn ed25519_zone_validates_with_independent_validators() {
     let dir = tmpdir("ed25519");
     let s = Server::new(dir.clone(), "");
     s.import(ZONE, &records());
-    let put = |body: Value| s.api("PUT", &format!("/api/zones/{ZONE}/dnssec"), Some(body));
+    let put = |body: Value| {
+        s.api(
+            "PUT",
+            &format!("/rust-dns/api/zones/{ZONE}/dnssec"),
+            Some(body),
+        )
+    };
     let (st, r) = put(json!({ "enabled": true, "algorithm": 8 }));
     assert_eq!(st, 400, "unsupported algorithm: {r}");
     let (st, r) = put(json!({ "enabled": false, "algorithm": 15 }));
@@ -1401,7 +1451,11 @@ fn ed25519_zone_validates_with_independent_validators() {
             "{what}: answer without DO changed"
         );
     }
-    let (_, chk) = s.api("GET", &format!("/api/zones/{ZONE}/dnssec/check"), None);
+    let (_, chk) = s.api(
+        "GET",
+        &format!("/rust-dns/api/zones/{ZONE}/dnssec/check"),
+        None,
+    );
     assert_eq!(chk["ok"], true, "{chk:#}");
 
     let (Some(dig), Some(verify), Some(delv), Some(dsfromkey)) = (

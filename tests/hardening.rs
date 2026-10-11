@@ -95,7 +95,7 @@ level = "warn"
         let mut child = child;
         let web = format!("http://127.0.0.1:{web_port}");
         let deadline = Instant::now() + Duration::from_secs(20);
-        while ureq::get(&format!("{web}/api/health"))
+        while ureq::get(&format!("{web}/rust-dns/api/health"))
             .timeout(Duration::from_millis(300))
             .call()
             .is_err()
@@ -134,7 +134,7 @@ impl Server {
             .spawn()
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(20);
-        while ureq::get(&format!("{}/api/health", self.web))
+        while ureq::get(&format!("{}/rust-dns/api/health", self.web))
             .timeout(Duration::from_millis(300))
             .call()
             .is_err()
@@ -161,7 +161,7 @@ fn agent() -> ureq::Agent {
 
 fn login(web: &str, user: &str, pw: &str) -> ureq::Agent {
     let a = agent();
-    a.post(&format!("{web}/api/auth/login"))
+    a.post(&format!("{web}/rust-dns/api/auth/login"))
         .send_json(serde_json::json!({ "username": user, "password": pw }))
         .expect("login");
     a
@@ -233,7 +233,7 @@ fn big_zone(web: &str) {
     let (s, v) = call(
         &a,
         "POST",
-        &format!("{web}/api/import"),
+        &format!("{web}/rust-dns/api/import"),
         Some(
             serde_json::json!({ "version": 1, "exported_at": "", "zones": [{ "name": "pin.test", "records": records }] }),
         ),
@@ -487,7 +487,7 @@ fn totp_replay_rejected_after_restart() {
     let (s, e) = call(
         &root,
         "POST",
-        &format!("{web}/api/me/mfa/start"),
+        &format!("{web}/rust-dns/api/me/mfa/start"),
         Some(serde_json::json!({})),
     );
     assert_eq!(s, 200, "{e}");
@@ -495,7 +495,7 @@ fn totp_replay_rejected_after_restart() {
     let (s, v) = call(
         &root,
         "POST",
-        &format!("{web}/api/me/mfa/confirm"),
+        &format!("{web}/rust-dns/api/me/mfa/confirm"),
         Some(serde_json::json!({ "code": totp_at(&secret, step - 1) })),
     );
     assert_eq!(s, 200, "{v}");
@@ -505,14 +505,14 @@ fn totp_replay_rejected_after_restart() {
     let (s, v) = call(
         &a,
         "POST",
-        &format!("{web}/api/auth/login"),
+        &format!("{web}/rust-dns/api/auth/login"),
         Some(serde_json::json!({ "username": "root", "password": "rootpass123" })),
     );
     assert_eq!((s, v["status"].as_str()), (200, Some("mfa_required")));
     let (s, v) = call(
         &a,
         "POST",
-        &format!("{web}/api/auth/mfa"),
+        &format!("{web}/rust-dns/api/auth/mfa"),
         Some(serde_json::json!({ "code": x })),
     );
     assert_eq!(s, 200, "{v}");
@@ -523,7 +523,7 @@ fn totp_replay_rejected_after_restart() {
     let (s, v) = call(
         &b,
         "POST",
-        &format!("{web}/api/auth/login"),
+        &format!("{web}/rust-dns/api/auth/login"),
         Some(serde_json::json!({ "username": "root", "password": "rootpass123" })),
     );
     assert_eq!(
@@ -534,18 +534,18 @@ fn totp_replay_rejected_after_restart() {
     let (s, v) = call(
         &b,
         "POST",
-        &format!("{web}/api/auth/mfa"),
+        &format!("{web}/rust-dns/api/auth/mfa"),
         Some(serde_json::json!({ "code": x })),
     );
     assert_eq!(s, 401, "the code used before the restart is refused: {v}");
     let (s, v) = call(
         &b,
         "POST",
-        &format!("{web}/api/auth/mfa"),
+        &format!("{web}/rust-dns/api/auth/mfa"),
         Some(serde_json::json!({ "code": totp_at(&secret, step + 1) })),
     );
     assert_eq!(s, 200, "the next step's code works: {v}");
-    let (s, _) = call(&b, "GET", &format!("{web}/api/me"), None);
+    let (s, _) = call(&b, "GET", &format!("{web}/rust-dns/api/me"), None);
     assert_eq!(s, 200);
 }
 
@@ -558,7 +558,7 @@ fn login_backoff_survives_a_restart() {
     // (status, Retry-After seconds)
     let attempt = |pw: &str| -> (u16, u64) {
         let r = match agent()
-            .post(&format!("{web}/api/auth/login"))
+            .post(&format!("{web}/rust-dns/api/auth/login"))
             .send_json(serde_json::json!({ "username": "root", "password": pw }))
         {
             Ok(r) | Err(ureq::Error::Status(_, r)) => r,
@@ -637,7 +637,7 @@ fn ws_wait_close(s: &mut TcpStream) -> Option<u16> {
 /// Sign in and return the session cookie as a `name=value` pair.
 fn login_cookie(web: &str, user: &str, pw: &str) -> String {
     agent()
-        .post(&format!("{web}/api/auth/login"))
+        .post(&format!("{web}/rust-dns/api/auth/login"))
         .send_json(serde_json::json!({ "username": user, "password": pw }))
         .unwrap()
         .header("set-cookie")
@@ -658,7 +658,7 @@ fn websocket_closes_when_its_token_is_revoked() {
     let (s, t) = call(
         &root,
         "POST",
-        &format!("{web}/api/tokens"),
+        &format!("{web}/rust-dns/api/tokens"),
         Some(serde_json::json!({ "name": "ws" })),
     );
     assert_eq!(s, 201, "{t}");
@@ -666,7 +666,7 @@ fn websocket_closes_when_its_token_is_revoked() {
     let id = t["info"]["id"].as_i64().unwrap();
     let (mut ws, head) = ws_open(
         &web,
-        "/api/ws?after=0",
+        "/rust-dns/api/ws?after=0",
         &format!("Sec-WebSocket-Protocol: rust-dns, rust-dns.bearer.{token}\r\n"),
     );
     assert!(head.starts_with("HTTP/1.1 101"), "{head}");
@@ -675,7 +675,12 @@ fn websocket_closes_when_its_token_is_revoked() {
             .contains("sec-websocket-protocol: rust-dns\r\n"),
         "the server selects the plain protocol, never echoes the token: {head}"
     );
-    let (s, _) = call(&root, "DELETE", &format!("{web}/api/tokens/{id}"), None);
+    let (s, _) = call(
+        &root,
+        "DELETE",
+        &format!("{web}/rust-dns/api/tokens/{id}"),
+        None,
+    );
     assert_eq!(s, 200);
     let started = Instant::now();
     assert_eq!(
@@ -704,14 +709,14 @@ fn websocket_cut_off_is_immediate() {
     let (s, u) = call(
         &root,
         "POST",
-        &format!("{web}/api/users"),
+        &format!("{web}/rust-dns/api/users"),
         Some(serde_json::json!({ "username": "xena", "password": "xenapass1" })),
     );
     assert_eq!(s, 201, "{u}");
     let cookie = login_cookie(&web, "xena", "xenapass1");
     let (mut ws, head) = ws_open(
         &web,
-        "/api/ws",
+        "/rust-dns/api/ws",
         &format!("Cookie: {cookie}\r\nOrigin: http://{host}\r\n"),
     );
     assert!(head.starts_with("HTTP/1.1 101"), "{head}");
@@ -721,7 +726,7 @@ fn websocket_cut_off_is_immediate() {
     let (s, _) = call(
         &root,
         "POST",
-        &format!("{web}/api/users/{}/sessions/revoke", u["id"]),
+        &format!("{web}/rust-dns/api/users/{}/sessions/revoke", u["id"]),
         None,
     );
     assert_eq!(s, 200);
@@ -743,7 +748,7 @@ fn websocket_origin_and_disabled_account() {
     let (s, u) = call(
         &root,
         "POST",
-        &format!("{web}/api/users"),
+        &format!("{web}/rust-dns/api/users"),
         Some(serde_json::json!({ "username": "wendy", "password": "wendypass1" })),
     );
     assert_eq!(s, 201, "{u}");
@@ -751,7 +756,7 @@ fn websocket_origin_and_disabled_account() {
     let host = web.trim_start_matches("http://");
     let (_, head) = ws_open(
         &web,
-        "/api/ws",
+        "/rust-dns/api/ws",
         &format!("Cookie: {cookie}\r\nOrigin: http://evil.example\r\n"),
     );
     assert!(
@@ -760,14 +765,14 @@ fn websocket_origin_and_disabled_account() {
     );
     let (mut ws, head) = ws_open(
         &web,
-        "/api/ws",
+        "/rust-dns/api/ws",
         &format!("Cookie: {cookie}\r\nOrigin: http://{host}\r\n"),
     );
     assert!(head.starts_with("HTTP/1.1 101"), "{head}");
     let (s, _) = call(
         &root,
         "PUT",
-        &format!("{web}/api/users/{}", u["id"]),
+        &format!("{web}/rust-dns/api/users/{}", u["id"]),
         Some(serde_json::json!({ "disabled": true })),
     );
     assert_eq!(s, 200);
@@ -788,7 +793,7 @@ fn secure_cookie_over_https_via_trusted_proxy() {
     let srv = Server::start("cookie", "", "proxy_trust = \"127.0.0.1/32\"", "");
     let web = srv.web.clone();
     let set_cookie = |proto: Option<&str>| {
-        let mut r = agent().post(&format!("{web}/api/auth/login"));
+        let mut r = agent().post(&format!("{web}/rust-dns/api/auth/login"));
         if let Some(p) = proto {
             r = r.set("X-Forwarded-Proto", p);
         }
@@ -810,7 +815,7 @@ fn secure_cookie_over_https_via_trusted_proxy() {
     // The header from an untrusted peer is ignored.
     let srv = Server::start("cookie2", "", "", "");
     let r = agent()
-        .post(&format!("{}/api/auth/login", srv.web))
+        .post(&format!("{}/rust-dns/api/auth/login", srv.web))
         .set("X-Forwarded-Proto", "https")
         .send_json(serde_json::json!({ "username": "root", "password": "rootpass123" }))
         .unwrap();
@@ -830,7 +835,7 @@ fn slow_web_clients_are_cut_off_and_connections_capped() {
     );
     let host = srv.web.trim_start_matches("http://").to_string();
     let mut slow = TcpStream::connect(&host).unwrap();
-    slow.write_all(b"GET /api/health HTTP/1.1\r\nHost: x\r\n")
+    slow.write_all(b"GET /rust-dns/api/health HTTP/1.1\r\nHost: x\r\n")
         .unwrap();
     slow.set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
@@ -845,13 +850,15 @@ fn slow_web_clients_are_cut_off_and_connections_capped() {
     // Cap: 4 idle connections held open, a fifth is refused at once.
     let held: Vec<TcpStream> = (0..4).map(|_| TcpStream::connect(&host).unwrap()).collect();
     std::thread::sleep(Duration::from_millis(300));
-    let r = ureq::get(&format!("{}/api/health", srv.web))
+    let r = ureq::get(&format!("{}/rust-dns/api/health", srv.web))
         .timeout(Duration::from_secs(1))
         .call();
     assert!(r.is_err(), "over the connection cap");
     drop(held);
     std::thread::sleep(Duration::from_millis(300));
-    assert!(ureq::get(&format!("{}/api/health", srv.web)).call().is_ok());
+    assert!(ureq::get(&format!("{}/rust-dns/api/health", srv.web))
+        .call()
+        .is_ok());
 }
 
 /// L3: the console and the API explorer carry a real Content-Security-Policy
@@ -859,7 +866,7 @@ fn slow_web_clients_are_cut_off_and_connections_capped() {
 #[test]
 fn pages_carry_a_strict_content_security_policy() {
     let srv = Server::start("csp", "", "", "");
-    for path in ["/", "/docs"] {
+    for path in ["/rust-dns/", "/rust-dns/docs"] {
         let r = ureq::get(&format!("{}{path}", srv.web)).call().unwrap();
         let csp = r.header("content-security-policy").unwrap().to_string();
         for d in [
@@ -956,7 +963,7 @@ fn response_rate_limiting_limits_reflection_and_spares_legitimate_traffic() {
     let (st, v) = call(
         &a,
         "POST",
-        &format!("{}/api/zones", s.web),
+        &format!("{}/rust-dns/api/zones", s.web),
         Some(serde_json::json!({ "name": "rrl.test" })),
     );
     assert!(st == 200 || st == 201, "{v}");
@@ -964,7 +971,7 @@ fn response_rate_limiting_limits_reflection_and_spares_legitimate_traffic() {
         let (st, v) = call(
             &a,
             "POST",
-            &format!("{}/api/zones/rrl.test/records", s.web),
+            &format!("{}/rust-dns/api/zones/rrl.test/records", s.web),
             Some(
                 serde_json::json!({ "name": format!("h{i}"), "type": "A", "value": format!("192.0.2.{i}") }),
             ),
@@ -979,7 +986,7 @@ fn response_rate_limiting_limits_reflection_and_spares_legitimate_traffic() {
     let (_, v) = call(
         &a,
         "GET",
-        &format!("{}/api/settings/rate-limit", s.web),
+        &format!("{}/rust-dns/api/settings/rate-limit", s.web),
         None,
     );
     assert_eq!(v["rrl"]["enabled"], false, "{v}");
@@ -995,7 +1002,7 @@ fn response_rate_limiting_limits_reflection_and_spares_legitimate_traffic() {
     let (st, v) = call(
         &a,
         "POST",
-        &format!("{}/api/zones", s.web),
+        &format!("{}/rust-dns/api/zones", s.web),
         Some(serde_json::json!({ "name": "rrl.test" })),
     );
     assert!(st == 200 || st == 201, "{v}");
@@ -1003,7 +1010,7 @@ fn response_rate_limiting_limits_reflection_and_spares_legitimate_traffic() {
         let (st, v) = call(
             &a,
             "POST",
-            &format!("{}/api/zones/rrl.test/records", s.web),
+            &format!("{}/rust-dns/api/zones/rrl.test/records", s.web),
             Some(
                 serde_json::json!({ "name": format!("h{i}"), "type": "A", "value": format!("192.0.2.{i}") }),
             ),
@@ -1072,7 +1079,7 @@ fn response_rate_limiting_limits_reflection_and_spares_legitimate_traffic() {
     let (_, v) = call(
         &a,
         "GET",
-        &format!("{}/api/settings/rate-limit", s.web),
+        &format!("{}/rust-dns/api/settings/rate-limit", s.web),
         None,
     );
     assert_eq!(v["rrl"]["enabled"], true, "{v}");
@@ -1080,7 +1087,7 @@ fn response_rate_limiting_limits_reflection_and_spares_legitimate_traffic() {
     assert!(v["rrl"]["dropped"].as_u64().unwrap() >= 20, "{v}");
     assert!(v["rrl"]["slipped"].as_u64().unwrap() >= 20, "{v}");
     let metrics = a
-        .get(&format!("{}/metrics", s.web))
+        .get(&format!("{}/rust-dns/metrics", s.web))
         .call()
         .unwrap()
         .into_string()
@@ -1099,7 +1106,7 @@ fn response_rate_limiting_limits_reflection_and_spares_legitimate_traffic() {
     let (st, v) = call(
         &a,
         "POST",
-        &format!("{}/api/zones", s.web),
+        &format!("{}/rust-dns/api/zones", s.web),
         Some(serde_json::json!({ "name": "rrl.test" })),
     );
     assert!(st == 200 || st == 201, "{v}");
@@ -1160,7 +1167,7 @@ fn o28_record_types_round_trip_and_bind_reads_them() {
     let (st, v) = call(
         &a,
         "POST",
-        &format!("{}/api/zones", s.web),
+        &format!("{}/rust-dns/api/zones", s.web),
         Some(serde_json::json!({ "name": "rt.test" })),
     );
     assert!(st == 200 || st == 201, "{v}");
@@ -1196,7 +1203,7 @@ fn o28_record_types_round_trip_and_bind_reads_them() {
         let (st, v) = call(
             &a,
             "POST",
-            &format!("{}/api/zones/rt.test/records", s.web),
+            &format!("{}/rust-dns/api/zones/rt.test/records", s.web),
             Some(serde_json::json!({ "name": name, "type": t, "value": input })),
         );
         assert!(st == 200 || st == 201, "{t}: {v}");
@@ -1211,7 +1218,7 @@ fn o28_record_types_round_trip_and_bind_reads_them() {
         let (st, v) = call(
             &a,
             "POST",
-            &format!("{}/api/zones/rt.test/records", s.web),
+            &format!("{}/rust-dns/api/zones/rt.test/records", s.web),
             Some(serde_json::json!({ "name": "bad", "type": t, "value": bad })),
         );
         assert_eq!(st, 400, "{t} {bad}: {v}");
@@ -1220,7 +1227,7 @@ fn o28_record_types_round_trip_and_bind_reads_them() {
     let (st, v) = call(
         &a,
         "POST",
-        &format!("{}/api/zones/rt.test/records", s.web),
+        &format!("{}/rust-dns/api/zones/rt.test/records", s.web),
         Some(serde_json::json!({ "name": "ns1", "type": "A", "value": "192.0.2.53" })),
     );
     assert!(st == 200 || st == 201, "{v}");

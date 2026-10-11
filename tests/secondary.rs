@@ -154,7 +154,7 @@ fn spawn(cfg: PathBuf, dns: u16, web_port: u16) -> Option<Server> {
         .unwrap();
     let web = format!("http://127.0.0.1:{web_port}");
     let deadline = Instant::now() + Duration::from_secs(20);
-    while ureq::get(&format!("{web}/api/health"))
+    while ureq::get(&format!("{web}/rust-dns/api/health"))
         .timeout(Duration::from_millis(300))
         .call()
         .is_err()
@@ -180,7 +180,7 @@ fn spawn(cfg: PathBuf, dns: u16, web_port: u16) -> Option<Server> {
 fn login(web: &str) -> (ureq::Agent, String) {
     let a = ureq::AgentBuilder::new().build();
     let r: Value = a
-        .post(&format!("{web}/api/auth/login"))
+        .post(&format!("{web}/rust-dns/api/auth/login"))
         .set("X-Requested-With", "rust-dns")
         .send_json(json!({ "username": "root", "password": "rootpass123" }))
         .unwrap()
@@ -197,7 +197,7 @@ fn call(
     body: Option<Value>,
 ) -> (u16, Value) {
     let req =
-        s.0.request(method, &format!("{web}/api{path}"))
+        s.0.request(method, &format!("{web}/rust-dns/api{path}"))
             .set("X-Requested-With", "rust-dns")
             .set("X-CSRF-Token", &s.1);
     let r = match body {

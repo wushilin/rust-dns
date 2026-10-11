@@ -38,14 +38,14 @@ def request(path, payload=None, headers=None, method=None):
 
 for _ in range(100):
     try:
-        request("/api/health")
+        request("/rust-dns/api/health")
         break
     except Exception:
         time.sleep(0.15)
 else:
     raise SystemExit("rust-dns did not become healthy")
 
-request("/api/auth/login", {"username": "root", "password": "ci-root-password"})
+request("/rust-dns/api/auth/login", {"username": "root", "password": "ci-root-password"})
 
 zone = {
     "name": "example.test",
@@ -130,7 +130,7 @@ signed = {
 }
 doc = {"version": 1, "exported_at": "2026-01-01T00:00:00Z", "zones": [zone, reverse, signed]}
 status, result = request(
-    "/api/import?mode=replace",
+    "/rust-dns/api/import?mode=replace",
     doc,
     {"X-Requested-With": "rust-dns"},
 )
@@ -138,7 +138,7 @@ if status != 200 or result.get("records_added", 0) < 20:
     raise SystemExit(f"fixture import was incomplete: {result}")
 print(f"seeded {result['records_added']} records in {result['zones_created']} zones")
 
-status, st = request("/api/zones/signed.test/dnssec", {"enabled": True}, {"X-Requested-With": "rust-dns"}, "PUT")
+status, st = request("/rust-dns/api/zones/signed.test/dnssec", {"enabled": True}, {"X-Requested-With": "rust-dns"}, "PUT")
 if status != 200 or st.get("state") != "signing":
     raise SystemExit(f"DNSSEC was not turned on for signed.test: {status} {st}")
 print(f"signed.test: DNSSEC on, key tag {st['key']['key_tag']}")
@@ -152,7 +152,7 @@ TSIG_KEYS = [
      "zones": ["other.test"]},
 ]
 for key in TSIG_KEYS:
-    status, created = request("/api/tsig/keys", key, {"X-Requested-With": "rust-dns"})
+    status, created = request("/rust-dns/api/tsig/keys", key, {"X-Requested-With": "rust-dns"})
     if status != 201 or created.get("secret") != key["secret"]:
         raise SystemExit(f"TSIG key {key['name']} was not created: {status}")
 print(f"created {len(TSIG_KEYS)} TSIG keys")

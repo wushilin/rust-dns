@@ -123,9 +123,9 @@ fn spec() -> Value {
 
 /// The document the running server serves (live checks).
 fn served_spec(web: &str) -> Value {
-    let r = ureq::get(&format!("http://{web}/api/openapi.json"))
+    let r = ureq::get(&format!("http://{web}/rust-dns/api/openapi.json"))
         .call()
-        .expect("GET /api/openapi.json");
+        .expect("GET /rust-dns/api/openapi.json");
     assert_eq!(r.content_type(), "application/json");
     serde_json::from_str(&r.into_string().unwrap()).expect("served spec is JSON")
 }
@@ -716,7 +716,7 @@ rollover_max_wait_secs = 1
     let web = format!("127.0.0.1:{web_port}");
     let srv = Server { child, web, dir };
     let deadline = Instant::now() + Duration::from_secs(15);
-    while ureq::get(&format!("http://{}/api/health", srv.web))
+    while ureq::get(&format!("http://{}/rust-dns/api/health", srv.web))
         .timeout(Duration::from_millis(500))
         .call()
         .is_err()
@@ -2203,7 +2203,7 @@ fn live_api_matches_spec() {
         srv.web
     ));
     let status_of = |web: &str| -> Value {
-        ureq::get(&format!("http://{web}/api/replication/status"))
+        ureq::get(&format!("http://{web}/rust-dns/api/replication/status"))
             .set("Authorization", &format!("Bearer {token}"))
             .timeout(Duration::from_secs(5))
             .call()

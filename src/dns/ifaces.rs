@@ -115,7 +115,7 @@ impl Drop for Bound {
     }
 }
 
-/// The interface follower's state, for `/api/status`.
+/// The interface follower's state, for `/rust-dns/api/status`.
 #[derive(Default)]
 pub struct Follower {
     status: Mutex<Vec<InterfaceStatus>>,

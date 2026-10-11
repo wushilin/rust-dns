@@ -1,4 +1,4 @@
-# Example Prometheus alert rules for rust-dns /metrics.
+# Example Prometheus alert rules for rust-dns /rust-dns/metrics.
 groups:
   - name: rust-dns
     rules:

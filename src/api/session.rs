@@ -190,8 +190,9 @@ impl FromRequestParts<Arc<AppState>> for Caller {
             // Websocket clients cannot set headers. On that path only, accept
             // the token as a subprotocol (`rust-dns.bearer.<token>`, kept out
             // of URLs and proxy logs) or, deprecated, as `?token=`.
-            // The API router is nested under /api, which strips the prefix here.
-            if matches!(parts.uri.path(), "/ws" | "/api/ws") {
+            // The API router is nested under /rust-dns/api, which strips the
+            // prefix here; the full path is accepted too, in case it is not.
+            if matches!(parts.uri.path(), "/ws" | "/rust-dns/api/ws") {
                 ws_protocol_token(&parts.headers).or_else(|| {
                     parts.uri.query().and_then(|q| {
                         q.split('&')
@@ -266,7 +267,7 @@ impl FromRequestParts<Arc<AppState>> for Caller {
                         .unwrap_or_default();
                     if !same(sent.trim(), &want) {
                         return Err(ApiError::forbidden(
-                            "missing or wrong X-CSRF-Token header (the session's csrf_token from sign-in or GET /api/auth/session)",
+                            "missing or wrong X-CSRF-Token header (the session's csrf_token from sign-in or GET /rust-dns/api/auth/session)",
                         )
                         .with_code(ErrorCode::Csrf));
                     }

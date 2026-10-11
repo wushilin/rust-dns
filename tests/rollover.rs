@@ -87,7 +87,7 @@ impl Node {
         format!("http://127.0.0.1:{}", self.web)
     }
     fn api(&self, p: &str) -> String {
-        format!("{}/api{p}", self.url())
+        format!("{}/rust-dns/api{p}", self.url())
     }
     fn configure(&self, extra: &str) {
         std::fs::write(
@@ -145,7 +145,7 @@ dir = ""
                 .spawn()
                 .unwrap();
             let deadline = Instant::now() + Duration::from_secs(30);
-            while ureq::get(&format!("{}/api/health", self.url()))
+            while ureq::get(&format!("{}/rust-dns/api/health", self.url()))
                 .timeout(Duration::from_millis(500))
                 .call()
                 .is_err()

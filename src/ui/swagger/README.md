@@ -1,6 +1,6 @@
 Vendored [swagger-ui-dist](https://www.npmjs.com/package/swagger-ui-dist) 5.33.0
 (Apache-2.0, see LICENSE and NOTICE), embedded in the binary for the console's
-API explorer at /docs so it works without internet access.
+API explorer at /rust-dns/docs so it works without internet access.
 
 Source: https://registry.npmjs.org/swagger-ui-dist/-/swagger-ui-dist-5.33.0.tgz
 Verified against the registry's sha512 integrity before vendoring.

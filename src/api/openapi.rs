@@ -40,7 +40,7 @@ This document is generated from the server's code, so it always matches the runn
 #[derive(OpenApi)]
 #[openapi(
     info(title = "rust-dns API"),
-    servers((url = "/api", description = "This server")),
+    servers((url = "/rust-dns/api", description = "This server")),
     tags(
         (name = "Auth", description = "Sign in and out. Sign in here first (cookie session), or authorize with an API token."),
         (name = "Account", description = "The caller's own profile, password, MFA and sessions."),
@@ -161,13 +161,15 @@ error_response!(
 );
 
 /// Assemble the final document from the operations collected by the API
-/// router (paths relative to `/api`) and the root router (`/metrics`).
+/// router (paths relative to `/rust-dns/api`) and the site router
+/// (`/rust-dns/metrics`).
 pub fn finish(mut api: OpenApiDoc, root: OpenApiDoc) -> OpenApiDoc {
     api.info.description = Some(DESCRIPTION.into());
-    // Root-mounted paths keep the /api server list from being applied to them.
+    // Paths mounted beside the API keep the /rust-dns/api server list from
+    // being applied to them.
     let root_server = ServerBuilder::new()
-        .url("/")
-        .description(Some("Server root (not under /api)"))
+        .url("/rust-dns")
+        .description(Some("rust-dns root (not under /rust-dns/api)"))
         .build();
     for (path, mut item) in root.paths.paths {
         item.servers = Some(vec![root_server.clone()]);
@@ -297,8 +299,8 @@ mod tests {
     fn document_is_openapi_3_1_with_api_server() {
         let v: serde_json::Value = serde_json::from_str(super::spec_json()).unwrap();
         assert_eq!(v["openapi"], "3.1.0");
-        assert_eq!(v["servers"][0]["url"], "/api");
-        assert_eq!(v["paths"]["/metrics"]["servers"][0]["url"], "/");
+        assert_eq!(v["servers"][0]["url"], "/rust-dns/api");
+        assert_eq!(v["paths"]["/metrics"]["servers"][0]["url"], "/rust-dns");
         assert_eq!(v["info"]["version"], env!("CARGO_PKG_VERSION"));
     }
 }

@@ -115,7 +115,7 @@ level = "warn"
             .spawn()
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(20);
-        while ureq::get(&format!("http://127.0.0.1:{web}/api/health"))
+        while ureq::get(&format!("http://127.0.0.1:{web}/rust-dns/api/health"))
             .timeout(Duration::from_millis(300))
             .call()
             .is_err()
@@ -193,7 +193,7 @@ http {{
             if let Ok(Some(_)) = child.try_wait() {
                 break; // the port was taken (or nginx failed): try another
             }
-            if ureq::get(&format!("http://127.0.0.1:{port}/api/health"))
+            if ureq::get(&format!("http://127.0.0.1:{port}/rust-dns/api/health"))
                 .timeout(Duration::from_millis(300))
                 .call()
                 .is_ok()
@@ -295,18 +295,18 @@ fn live_updates_through_nginx() {
     let a = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(10))
         .build();
-    a.post(&format!("{base}/api/auth/login"))
+    a.post(&format!("{base}/rust-dns/api/auth/login"))
         .send_json(serde_json::json!({ "username": "root", "password": "rootpass123" }))
         .unwrap();
     let (s, v) = call(
         &a,
         "POST",
-        &format!("{base}/api/zones"),
+        &format!("{base}/rust-dns/api/zones"),
         Some(serde_json::json!({ "name": "proxied.test" })),
     );
     assert_eq!(s, 201, "{v}");
     // The client address the server saw is nginx's forwarded one (trusted).
-    let (s, me) = call(&a, "GET", &format!("{base}/api/me"), None);
+    let (s, me) = call(&a, "GET", &format!("{base}/rust-dns/api/me"), None);
     assert_eq!(s, 200, "{me}");
 
     // Websocket with the session cookie: Origin and Host as a browser on
@@ -319,7 +319,7 @@ fn live_updates_through_nginx() {
         .join("; ");
     let (mut ws, head) = ws_open(
         port,
-        "/api/ws",
+        "/rust-dns/api/ws",
         &format!("Origin: http://127.0.0.1:{port}\r\nCookie: {cookies}\r\n"),
     );
     assert!(
@@ -330,14 +330,14 @@ fn live_updates_through_nginx() {
     let (s, t) = call(
         &a,
         "POST",
-        &format!("{base}/api/tokens"),
+        &format!("{base}/rust-dns/api/tokens"),
         Some(serde_json::json!({ "name": "proxy" })),
     );
     assert_eq!(s, 201, "{t}");
     let token = t["token"].as_str().unwrap().to_string();
     let (mut ws2, head2) = ws_open(
         port,
-        "/api/ws",
+        "/rust-dns/api/ws",
         &format!("Sec-WebSocket-Protocol: rust-dns, rust-dns.bearer.{token}\r\n"),
     );
     assert!(
@@ -348,7 +348,7 @@ fn live_updates_through_nginx() {
     let (s, v) = call(
         &a,
         "POST",
-        &format!("{base}/api/zones/proxied.test/records"),
+        &format!("{base}/rust-dns/api/zones/proxied.test/records"),
         Some(
             serde_json::json!({ "name": "live-through-nginx", "type": "A", "value": "192.0.2.80" }),
         ),
@@ -360,7 +360,7 @@ fn live_updates_through_nginx() {
     // A cross-site page cannot open it through the proxy either.
     let (_, head3) = ws_open(
         port,
-        "/api/ws",
+        "/rust-dns/api/ws",
         &format!("Origin: http://evil.example\r\nCookie: {cookies}\r\n"),
     );
     assert!(

@@ -72,10 +72,10 @@ def req(path, body):
     tok = next((c.value for c in jar if c.name in ("rdns_csrf", "__Host-rdns_csrf")), "")
     r = urllib.request.Request(base + path, data=json.dumps(body).encode(), headers={"Content-Type": "application/json", "X-Requested-With": "rust-dns", "X-CSRF-Token": tok})
     o.open(r, timeout=5).read()
-req("/api/auth/login", {"username": "root", "password": "ci-root-password"})
-req("/api/zones", {"name": "vpn.signed.test", "override": {"mode": "static"}})
+req("/rust-dns/api/auth/login", {"username": "root", "password": "ci-root-password"})
+req("/rust-dns/api/zones", {"name": "vpn.signed.test", "override": {"mode": "static"}})
 # O28: records of the types hickory's text parser lacks, in a signed zone.
-req("/api/zones", {"name": "rrtypes.test"})
+req("/rust-dns/api/zones", {"name": "rrtypes.test"})
 for name, t, v in [("loc", "LOC", "52 22 23.000 N 4 53 32.000 E -2.00m 0.00m 10000m 10m"),
                    ("rp", "RP", "admin.rrtypes.test. info.rrtypes.test."),
                    ("afs", "AFSDB", "1 afs.rrtypes.test."),
@@ -83,13 +83,13 @@ for name, t, v in [("loc", "LOC", "52 22 23.000 N 4 53 32.000 E -2.00m 0.00m 100
                    ("spf", "SPF", '"v=spf1 -all"'),
                    ("mac", "EUI48", "00-00-5e-00-53-2a"),
                    ("mac", "EUI64", "00-00-5e-ef-10-00-00-2a")]:
-    req("/api/zones/rrtypes.test/records", {"name": name, "type": t, "value": v})
-r = urllib.request.Request(base + "/api/zones/rrtypes.test/dnssec", data=json.dumps({"enabled": True}).encode(), method="PUT",
+    req("/rust-dns/api/zones/rrtypes.test/records", {"name": name, "type": t, "value": v})
+r = urllib.request.Request(base + "/rust-dns/api/zones/rrtypes.test/dnssec", data=json.dumps({"enabled": True}).encode(), method="PUT",
     headers={"Content-Type": "application/json", "X-Requested-With": "rust-dns", "X-CSRF-Token": next((c.value for c in jar if c.name in ("rdns_csrf", "__Host-rdns_csrf")), "")})
 o.open(r, timeout=5).read()
-req("/api/zones/vpn.signed.test/records", {"name": "gw", "type": "A", "value": "10.8.0.1"})
+req("/rust-dns/api/zones/vpn.signed.test/records", {"name": "gw", "type": "A", "value": "10.8.0.1"})
 # O24: a copy of signed.test signed with NSEC3 (CONFORMANCE_NSEC3).
-r = o.open(urllib.request.Request(base + "/api/zones/signed.test/export"), timeout=5).read()
+r = o.open(urllib.request.Request(base + "/rust-dns/api/zones/signed.test/export"), timeout=5).read()
 doc = json.loads(r)
 z = doc["zones"][0]
 z["name"] = "nsec3.test"
@@ -98,8 +98,8 @@ for k in ("soa_mname", "soa_rname"):
 for rec in z["records"]:
     rec["value"] = rec["value"].replace("signed.test", "nsec3.test")
     rec.pop("id", None)
-req("/api/import?mode=merge", doc)
-r = urllib.request.Request(base + "/api/zones/nsec3.test/dnssec", data=json.dumps({"enabled": True, "denial": "nsec3"}).encode(), method="PUT",
+req("/rust-dns/api/import?mode=merge", doc)
+r = urllib.request.Request(base + "/rust-dns/api/zones/nsec3.test/dnssec", data=json.dumps({"enabled": True, "denial": "nsec3"}).encode(), method="PUT",
     headers={"Content-Type": "application/json", "X-Requested-With": "rust-dns", "X-CSRF-Token": next((c.value for c in jar if c.name in ("rdns_csrf", "__Host-rdns_csrf")), "")})
 st = json.loads(o.open(r, timeout=5).read())
 assert st["state"] == "signing" and st["denial"] == "nsec3", st
@@ -109,8 +109,8 @@ for k in ("soa_mname", "soa_rname"):
     z[k] = z[k].replace("nsec3.test", "ed25519.test")
 for rec in z["records"]:
     rec["value"] = rec["value"].replace("nsec3.test", "ed25519.test")
-req("/api/import?mode=merge", doc)
-r = urllib.request.Request(base + "/api/zones/ed25519.test/dnssec", data=json.dumps({"enabled": True, "algorithm": 15}).encode(), method="PUT",
+req("/rust-dns/api/import?mode=merge", doc)
+r = urllib.request.Request(base + "/rust-dns/api/zones/ed25519.test/dnssec", data=json.dumps({"enabled": True, "algorithm": 15}).encode(), method="PUT",
     headers={"Content-Type": "application/json", "X-Requested-With": "rust-dns", "X-CSRF-Token": next((c.value for c in jar if c.name in ("rdns_csrf", "__Host-rdns_csrf")), "")})
 st = json.loads(o.open(r, timeout=5).read())
 assert st["state"] == "signing" and st["key"]["algorithm"] == 15, st

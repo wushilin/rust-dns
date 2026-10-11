@@ -307,7 +307,8 @@ fn body_taking_handlers_document_a_request_body() {
 }
 
 /// API routes must go through `routes!` (which documents them); plain
-/// `.route(...)` is only for the console pages, which stay out of the spec.
+/// `.route(...)` is only for the console pages (and the redirects of `/`
+/// and `/rust-dns` to the console), which stay out of the spec.
 #[test]
 fn only_console_routes_bypass_the_openapi_router() {
     let mut from = 0;
@@ -318,7 +319,11 @@ fn only_console_routes_bypass_the_openapi_router() {
         let q1 = args.find('"').expect("route path literal");
         let path = &args[q1 + 1..q1 + 1 + args[q1 + 1..].find('"').unwrap()];
         assert!(
-            path == "/" || path == "/index.html" || path == "/docs" || path.starts_with("/docs/"),
+            path == "/"
+                || path == "/rust-dns"
+                || path == "/index.html"
+                || path == "/docs"
+                || path.starts_with("/docs/"),
             "src/api/mod.rs mounts {path} with .route(); API routes must use .routes(routes!(handler)) so they are documented"
         );
         n += 1;
@@ -338,10 +343,10 @@ fn only_console_routes_bypass_the_openapi_router() {
 fn servers_and_root_mounted_metrics() {
     let spec = spec();
     assert_eq!(spec["openapi"], "3.1.0");
-    assert_eq!(spec["servers"][0]["url"], "/api");
+    assert_eq!(spec["servers"][0]["url"], "/rust-dns/api");
     assert_eq!(
-        spec["paths"]["/metrics"]["servers"][0]["url"], "/",
-        "/metrics needs a path-level servers override to the root"
+        spec["paths"]["/metrics"]["servers"][0]["url"], "/rust-dns",
+        "/metrics needs a path-level servers override to /rust-dns (it is not under /rust-dns/api)"
     );
     assert!(spec["paths"]["/metrics"]["get"].is_object());
     for scheme in ["bearer", "cookie"] {

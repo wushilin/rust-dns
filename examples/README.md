@@ -62,17 +62,17 @@ All record types use the same endpoints. `name` is relative to the zone
 # add
 curl -H "Authorization: Bearer $RDNS_TOKEN" -H "Content-Type: application/json" \
      -d '{"name":"www","type":"A","value":"192.0.2.10","ttl":300}' \
-     $RDNS_URL/api/zones/example.com/records
+     $RDNS_URL/rust-dns/api/zones/example.com/records
 
 # list / search (paged)
-curl -H "Authorization: Bearer $RDNS_TOKEN" "$RDNS_URL/api/zones/example.com/records?q=www&limit=100"
+curl -H "Authorization: Bearer $RDNS_TOKEN" "$RDNS_URL/rust-dns/api/zones/example.com/records?q=www&limit=100"
 
 # update (send only the fields you change)
 curl -X PUT -H "Authorization: Bearer $RDNS_TOKEN" -H "Content-Type: application/json" \
-     -d '{"value":"192.0.2.11"}' $RDNS_URL/api/zones/example.com/records/<id>
+     -d '{"value":"192.0.2.11"}' $RDNS_URL/rust-dns/api/zones/example.com/records/<id>
 
 # delete
-curl -X DELETE -H "Authorization: Bearer $RDNS_TOKEN" $RDNS_URL/api/zones/example.com/records/<id>
+curl -X DELETE -H "Authorization: Bearer $RDNS_TOKEN" $RDNS_URL/rust-dns/api/zones/example.com/records/<id>
 ```
 
 | Type | `value` example |
@@ -109,4 +109,4 @@ Notes:
   referral (NS in the authority section), not an answer.
 - API tokens need no CSRF header. Browser sessions must send
   `X-Requested-With: rust-dns` on writes.
-- The full API reference is served at `/api/openapi.json`.
+- The full API reference is served at `/rust-dns/api/openapi.json`.

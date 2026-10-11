@@ -1,6 +1,6 @@
 pub const INDEX_HTML: &str = include_str!("index.html");
 
-/// API explorer page (Swagger UI) served at /docs.
+/// API explorer page (Swagger UI) served at /rust-dns/docs.
 pub const DOCS_HTML: &str = include_str!("docs.html");
 /// Vendored Swagger UI assets, stored gzipped (served as-is to clients that
 /// accept gzip, which is every browser).

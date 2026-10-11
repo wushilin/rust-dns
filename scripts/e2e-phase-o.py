@@ -99,7 +99,7 @@ allow = ["127.0.0.0/8"]
         self.write()
         self.proc = subprocess.Popen([binary, "--config", os.path.join(self.dir, "c.toml")], stdin=subprocess.PIPE,
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env={**os.environ, "RUST_DNS_EXIT_WITH_STDIN": "1"})
-        wait(f"{self.name} up", 30, lambda: http_ok(f"http://127.0.0.1:{self.web}/api/health"))
+        wait(f"{self.name} up", 30, lambda: http_ok(f"http://127.0.0.1:{self.web}/rust-dns/api/health"))
 
     def stop(self):
         if self.proc:
@@ -138,7 +138,7 @@ class Api:
     """A browser-like session (cookie + CSRF header) or a bearer token."""
 
     def __init__(self, node, user="root", pw=None, token=None):
-        self.base = f"http://127.0.0.1:{node.web}/api"
+        self.base = f"http://127.0.0.1:{node.web}/rust-dns/api"
         self.jar = http.cookiejar.CookieJar()
         self.o = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.jar))
         self.csrf, self.token = "", token

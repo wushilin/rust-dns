@@ -251,7 +251,7 @@ level = "warn"
         let mut child = child;
         let web = format!("http://127.0.0.1:{web_port}");
         let deadline = Instant::now() + Duration::from_secs(15);
-        while ureq::get(&format!("{web}/api/health"))
+        while ureq::get(&format!("{web}/rust-dns/api/health"))
             .timeout(Duration::from_millis(300))
             .call()
             .is_err()
@@ -277,7 +277,7 @@ fn login(web: &str, user: &str, pw: &str) -> ureq::Agent {
     let a = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(10))
         .build();
-    a.post(&format!("{web}/api/auth/login"))
+    a.post(&format!("{web}/rust-dns/api/auth/login"))
         .send_json(serde_json::json!({ "username": user, "password": pw }))
         .unwrap();
     a
@@ -343,7 +343,7 @@ fn forwarding_is_managed_through_the_api() {
     let mut srv = Server::start(dir.clone(), dns, web_port);
     let web = srv.web.clone();
     let root = login(&web, "root", "rootpass123");
-    let url = format!("{web}/api/settings/forwarding");
+    let url = format!("{web}/rust-dns/api/settings/forwarding");
 
     // From the config file: no upstreams, so foreign names are refused.
     let (s, v) = call(&root, "GET", &url, None);
@@ -414,12 +414,18 @@ fn forwarding_is_managed_through_the_api() {
         answered_by_fake(&query(srv.dns, "forwarded.example.")),
         "queries now go to the new upstream"
     );
-    let status = call(&root, "GET", &format!("{web}/api/status"), None).1;
+    let status = call(&root, "GET", &format!("{web}/rust-dns/api/status"), None).1;
     assert_eq!(
         status["forwarding"]["upstreams"],
         serde_json::json!([upstream])
     );
-    let audit = call(&root, "GET", &format!("{web}/api/audit?limit=20"), None).1;
+    let audit = call(
+        &root,
+        "GET",
+        &format!("{web}/rust-dns/api/audit?limit=20"),
+        None,
+    )
+    .1;
     assert!(audit["entries"]
         .as_array()
         .unwrap()
@@ -431,7 +437,7 @@ fn forwarding_is_managed_through_the_api() {
     let (s, _) = call(
         &root,
         "POST",
-        &format!("{web}/api/users"),
+        &format!("{web}/rust-dns/api/users"),
         Some(serde_json::json!({ "username": "bob", "password": "bobpass123" })),
     );
     assert_eq!(s, 201);
@@ -469,7 +475,13 @@ fn forwarding_is_managed_through_the_api() {
             .response_code,
         ResponseCode::Refused
     );
-    let audit = call(&root, "GET", &format!("{web}/api/audit?limit=20"), None).1;
+    let audit = call(
+        &root,
+        "GET",
+        &format!("{web}/rust-dns/api/audit?limit=20"),
+        None,
+    )
+    .1;
     assert!(audit["entries"]
         .as_array()
         .unwrap()
@@ -502,7 +514,7 @@ fn forward_cache_caps_and_flush() {
     let srv = Server::start(dir.clone(), dns, web_port);
     let web = srv.web.clone();
     let root = login(&web, "root", "rootpass123");
-    let url = format!("{web}/api/settings/forwarding");
+    let url = format!("{web}/rust-dns/api/settings/forwarding");
 
     let (s, v) = call(&root, "GET", &url, None);
     assert_eq!(s, 200);
@@ -566,7 +578,13 @@ fn forward_cache_caps_and_flush() {
         n0 + 1,
         "after a flush the upstream is asked again"
     );
-    let audit = call(&root, "GET", &format!("{web}/api/audit?limit=50"), None).1;
+    let audit = call(
+        &root,
+        "GET",
+        &format!("{web}/rust-dns/api/audit?limit=50"),
+        None,
+    )
+    .1;
     let entries = audit["entries"].as_array().unwrap();
     assert!(entries
         .iter()
@@ -580,7 +598,7 @@ fn forward_cache_caps_and_flush() {
     call(
         &root,
         "POST",
-        &format!("{web}/api/users"),
+        &format!("{web}/rust-dns/api/users"),
         Some(serde_json::json!({ "username": "bob", "password": "bobpass123" })),
     );
     let bob = login(&web, "bob", "bobpass123");
@@ -605,7 +623,7 @@ fn start_forwarding_to(upstream: u16) -> (Server, PathBuf) {
     let (s, v) = call(
         &root,
         "PUT",
-        &format!("{}/api/settings/forwarding", srv.web),
+        &format!("{}/rust-dns/api/settings/forwarding", srv.web),
         Some(
             serde_json::json!({ "upstreams": [format!("127.0.0.1:{upstream}")], "allowed_clients": ["127.0.0.0/8"], "timeout_ms": 800 }),
         ),
@@ -718,7 +736,7 @@ fn query_tcp(port: u16, name: &str, qtype: RecordType) -> Message {
 
 fn metric(web: &str, a: &ureq::Agent, name: &str) -> String {
     let text = a
-        .get(&format!("{web}/metrics"))
+        .get(&format!("{web}/rust-dns/metrics"))
         .call()
         .unwrap()
         .into_string()
@@ -754,7 +772,7 @@ fn open_resolver_mode_and_safeguards() {
     );
     let (web, dns) = (srv.web.clone(), srv.dns);
     let root = login(&web, "root", "rootpass123");
-    let url = format!("{web}/api/settings/forwarding");
+    let url = format!("{web}/rust-dns/api/settings/forwarding");
     let upstream = format!("127.0.0.1:{up}");
     let wide = serde_json::json!(["0.0.0.0/0", "::/0"]);
     let pause = || std::thread::sleep(Duration::from_millis(1100)); // new limiter window
@@ -805,7 +823,7 @@ fn open_resolver_mode_and_safeguards() {
         n > 512 && !r.metadata.truncation && r.answers.len() == 40,
         "{n} {r:?}"
     );
-    let (_, st) = call(&root, "GET", &format!("{web}/api/status"), None);
+    let (_, st) = call(&root, "GET", &format!("{web}/rust-dns/api/status"), None);
     assert_eq!(st["forwarding"]["open_resolver"], false);
     assert_eq!(metric(&web, &root, "rustdns_open_resolver"), "0");
 
@@ -823,10 +841,15 @@ fn open_resolver_mode_and_safeguards() {
     assert_eq!(v["allowed_clients"], wide);
     assert_eq!(v["open_resolver_max_udp_payload"], 512);
     assert_eq!(v["open_resolver_rate_per_second"], 10);
-    let (_, st) = call(&root, "GET", &format!("{web}/api/status"), None);
+    let (_, st) = call(&root, "GET", &format!("{web}/rust-dns/api/status"), None);
     assert_eq!(st["forwarding"]["open_resolver"], true, "{st}");
     assert_eq!(metric(&web, &root, "rustdns_open_resolver"), "1");
-    let (_, audit) = call(&root, "GET", &format!("{web}/api/audit?limit=50"), None);
+    let (_, audit) = call(
+        &root,
+        "GET",
+        &format!("{web}/rust-dns/api/audit?limit=50"),
+        None,
+    );
     let e = audit["entries"]
         .as_array()
         .unwrap()
@@ -894,7 +917,7 @@ fn open_resolver_mode_and_safeguards() {
         }
     }
     assert!((1..=20).contains(&full), "answered {full} of 30");
-    let (_, st) = call(&root, "GET", &format!("{web}/api/status"), None);
+    let (_, st) = call(&root, "GET", &format!("{web}/rust-dns/api/status"), None);
     let d = &st["dns"];
     assert!(
         d["open_resolver_rate_limited"].as_u64().unwrap() >= 10,
@@ -960,7 +983,7 @@ fn open_resolver_from_the_config_file() {
     let (_, v) = call(
         &root,
         "GET",
-        &format!("{}/api/settings/forwarding", srv.web),
+        &format!("{}/rust-dns/api/settings/forwarding", srv.web),
         None,
     );
     assert_eq!(v["source"], "config");
@@ -999,14 +1022,14 @@ fn forwarding_is_capped_and_authoritative_answers_do_not_wait() {
     let (s, v) = call(
         &root,
         "POST",
-        &format!("{web}/api/zones"),
+        &format!("{web}/rust-dns/api/zones"),
         Some(serde_json::json!({ "name": "cap.test" })),
     );
     assert_eq!(s, 201, "{v}");
     let (s, v) = call(
         &root,
         "POST",
-        &format!("{web}/api/zones/cap.test/records"),
+        &format!("{web}/rust-dns/api/zones/cap.test/records"),
         Some(serde_json::json!({ "name": "www", "type": "A", "value": "192.0.2.7" })),
     );
     assert_eq!(s, 201, "{v}");
@@ -1052,7 +1075,7 @@ fn forwarding_is_capped_and_authoritative_answers_do_not_wait() {
         t.elapsed()
     );
     assert_eq!(metric(&web, &root, "rustdns_forward_overflow_total"), "9");
-    let (_, st) = call(&root, "GET", &format!("{web}/api/status"), None);
+    let (_, st) = call(&root, "GET", &format!("{web}/rust-dns/api/status"), None);
     assert_eq!(st["dns"]["forward_overflow"], 9, "{st}");
     assert!(started.elapsed() < Duration::from_millis(2500));
 

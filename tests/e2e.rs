@@ -119,7 +119,7 @@ dir = ""
     let web = format!("http://127.0.0.1:{web_port}");
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        if ureq::get(&format!("{web}/api/health"))
+        if ureq::get(&format!("{web}/rust-dns/api/health"))
             .timeout(Duration::from_millis(500))
             .call()
             .is_ok()
@@ -151,7 +151,7 @@ fn agent() -> ureq::Agent {
 
 fn login(a: &ureq::Agent, web: &str) {
     let r = a
-        .post(&format!("{web}/api/auth/login"))
+        .post(&format!("{web}/rust-dns/api/auth/login"))
         .send_json(serde_json::json!({ "username": "root", "password": "rootpass123" }))
         .expect("login");
     let v: serde_json::Value = r.into_json().unwrap();
@@ -211,7 +211,7 @@ fn api_then_dns_roundtrip() {
     // Unauthenticated access is refused.
     let (s, _) = post(
         &a,
-        &format!("{web}/api/zones"),
+        &format!("{web}/rust-dns/api/zones"),
         serde_json::json!({ "name": "x.test" }),
     );
     assert_eq!(s, 401);
@@ -220,7 +220,7 @@ fn api_then_dns_roundtrip() {
     // Zone + records.
     let (s, z) = post(
         &a,
-        &format!("{web}/api/zones"),
+        &format!("{web}/rust-dns/api/zones"),
         serde_json::json!({ "name": "Example.Test.", "soa_rname": "hostmaster@example.test" }),
     );
     assert_eq!(s, 201, "{z}");
@@ -240,7 +240,7 @@ fn api_then_dns_roundtrip() {
     for (n, t, v) in recs {
         let (s, r) = post(
             &a,
-            &format!("{web}/api/zones/example.test/records"),
+            &format!("{web}/rust-dns/api/zones/example.test/records"),
             serde_json::json!({ "name": n, "type": t, "value": v }),
         );
         assert_eq!(s, 201, "{n} {t} {v}: {r}");
@@ -248,19 +248,19 @@ fn api_then_dns_roundtrip() {
     // Validation and CNAME exclusivity.
     let (s, _) = post(
         &a,
-        &format!("{web}/api/zones/example.test/records"),
+        &format!("{web}/rust-dns/api/zones/example.test/records"),
         serde_json::json!({ "name": "bad", "type": "A", "value": "nope" }),
     );
     assert_eq!(s, 400);
     let (s, _) = post(
         &a,
-        &format!("{web}/api/zones/example.test/records"),
+        &format!("{web}/rust-dns/api/zones/example.test/records"),
         serde_json::json!({ "name": "www", "type": "CNAME", "value": "x.example.test" }),
     );
     assert_eq!(s, 409);
     let (s, _) = post(
         &a,
-        &format!("{web}/api/zones/example.test/records"),
+        &format!("{web}/rust-dns/api/zones/example.test/records"),
         serde_json::json!({ "name": "@", "type": "CNAME", "value": "x.example.test" }),
     );
     assert_eq!(s, 400);
@@ -304,7 +304,7 @@ fn api_then_dns_roundtrip() {
     // Update propagates immediately and bumps the serial.
     let before = query_udp(p, "example.test.", RecordType::SOA);
     let www_id = a
-        .get(&format!("{web}/api/zones/example.test"))
+        .get(&format!("{web}/rust-dns/api/zones/example.test"))
         .call()
         .unwrap()
         .into_json::<serde_json::Value>()
@@ -318,30 +318,36 @@ fn api_then_dns_roundtrip() {
         .unwrap();
     // Cookie-authenticated writes need the CSRF header.
     let r = a
-        .put(&format!("{web}/api/zones/example.test/records/{www_id}"))
+        .put(&format!(
+            "{web}/rust-dns/api/zones/example.test/records/{www_id}"
+        ))
         .send_json(serde_json::json!({ "value": "10.0.0.2" }));
     assert!(
         matches!(r, Err(ureq::Error::Status(403, _))),
         "missing CSRF header rejected"
     );
-    a.put(&format!("{web}/api/zones/example.test/records/{www_id}"))
-        .set("X-Requested-With", "rust-dns")
-        .set("X-CSRF-Token", &csrf_of(&a))
-        .send_json(serde_json::json!({ "value": "10.0.0.2" }))
-        .unwrap();
+    a.put(&format!(
+        "{web}/rust-dns/api/zones/example.test/records/{www_id}"
+    ))
+    .set("X-Requested-With", "rust-dns")
+    .set("X-CSRF-Token", &csrf_of(&a))
+    .send_json(serde_json::json!({ "value": "10.0.0.2" }))
+    .unwrap();
     let r = query_udp(p, "www.example.test.", RecordType::A);
     assert!(
         matches!(&r.answers[0].data, RData::A(a) if a.0 == std::net::Ipv4Addr::new(10, 0, 0, 2))
     );
     // TTL on update: absent keeps it, a number sets it, null resets to the zone default.
     let put = |body: serde_json::Value| -> serde_json::Value {
-        a.put(&format!("{web}/api/zones/example.test/records/{www_id}"))
-            .set("X-Requested-With", "rust-dns")
-            .set("X-CSRF-Token", &csrf_of(&a))
-            .send_json(body)
-            .unwrap()
-            .into_json()
-            .unwrap()
+        a.put(&format!(
+            "{web}/rust-dns/api/zones/example.test/records/{www_id}"
+        ))
+        .set("X-Requested-With", "rust-dns")
+        .set("X-CSRF-Token", &csrf_of(&a))
+        .send_json(body)
+        .unwrap()
+        .into_json()
+        .unwrap()
     };
     assert_eq!(put(serde_json::json!({ "ttl": 120 }))["ttl"], 120);
     assert_eq!(
@@ -363,7 +369,7 @@ fn api_then_dns_roundtrip() {
 
     // Changelog offsets are monotonic and resumable.
     let cl: serde_json::Value = a
-        .get(&format!("{web}/api/changelog?after=0"))
+        .get(&format!("{web}/rust-dns/api/changelog?after=0"))
         .call()
         .unwrap()
         .into_json()
@@ -382,13 +388,13 @@ fn api_then_dns_roundtrip() {
 
     // Export / import round trip into a second zone.
     let mut doc: serde_json::Value = a
-        .get(&format!("{web}/api/export"))
+        .get(&format!("{web}/rust-dns/api/export"))
         .call()
         .unwrap()
         .into_json()
         .unwrap();
     doc["zones"][0]["name"] = serde_json::json!("copy.test");
-    let (s, summary) = post(&a, &format!("{web}/api/import?mode=replace"), doc);
+    let (s, summary) = post(&a, &format!("{web}/rust-dns/api/import?mode=replace"), doc);
     assert_eq!(s, 200, "{summary}");
     assert_eq!(summary["zones_created"], 1);
     let r = query_udp(p, "www.copy.test.", RecordType::A);
@@ -397,12 +403,12 @@ fn api_then_dns_roundtrip() {
     // API token works as bearer auth.
     let (s, t) = post(
         &a,
-        &format!("{web}/api/tokens"),
+        &format!("{web}/rust-dns/api/tokens"),
         serde_json::json!({ "name": "ci" }),
     );
     assert_eq!(s, 201);
     let tok = t["token"].as_str().unwrap();
-    let me: serde_json::Value = ureq::get(&format!("{web}/api/me"))
+    let me: serde_json::Value = ureq::get(&format!("{web}/rust-dns/api/me"))
         .set("Authorization", &format!("Bearer {tok}"))
         .call()
         .unwrap()
@@ -420,7 +426,7 @@ fn api_then_dns_roundtrip() {
     ] {
         let (s, r) = post(
             &a,
-            &format!("{web}/api/zones/example.test/records"),
+            &format!("{web}/rust-dns/api/zones/example.test/records"),
             serde_json::json!({ "name": n, "type": t, "value": v }),
         );
         assert_eq!(s, 201, "{n} {t}: {r}");
@@ -475,7 +481,7 @@ fn api_then_dns_roundtrip() {
     // Config reload endpoint (admin).
     let (s, v) = post(
         &a,
-        &format!("{web}/api/admin/reload"),
+        &format!("{web}/rust-dns/api/admin/reload"),
         serde_json::json!({}),
     );
     assert_eq!(s, 200, "{v}");
@@ -484,7 +490,7 @@ fn api_then_dns_roundtrip() {
     // Record expiry: answers until expires_at, then disappears without any request.
     let (s201, rec) = post(
         &a,
-        &format!("{web}/api/zones/example.test/records"),
+        &format!("{web}/rust-dns/api/zones/example.test/records"),
         serde_json::json!({ "name": "lease", "type": "A", "value": "10.0.0.66", "expires_in": 2 }),
     );
     assert_eq!(s201, 201, "{rec}");
@@ -497,7 +503,7 @@ fn api_then_dns_roundtrip() {
     );
     let (s200, renewed) = post(
         &a,
-        &format!("{web}/api/zones/example.test/records"),
+        &format!("{web}/rust-dns/api/zones/example.test/records"),
         serde_json::json!({ "name": "lease", "type": "A", "value": "10.0.0.66", "expires_in": 2 }),
     );
     assert_eq!(
@@ -513,7 +519,7 @@ fn api_then_dns_roundtrip() {
         "expired record no longer answers"
     );
     let cl: serde_json::Value = a
-        .get(&format!("{web}/api/changelog?limit=5"))
+        .get(&format!("{web}/rust-dns/api/changelog?limit=5"))
         .call()
         .unwrap()
         .into_json()
@@ -532,7 +538,7 @@ fn api_then_dns_roundtrip() {
         let addr = web.trim_start_matches("http://");
         let mut ws = TcpStream::connect(addr).unwrap();
         ws.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-        write!(ws, "GET /api/ws?token={tok} HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n").unwrap();
+        write!(ws, "GET /rust-dns/api/ws?token={tok} HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n").unwrap();
         let mut buf = [0u8; 64];
         let n = ws.read(&mut buf).unwrap();
         assert!(
@@ -543,7 +549,7 @@ fn api_then_dns_roundtrip() {
     }
 
     // Metrics exposed.
-    let metrics = ureq::get(&format!("{web}/metrics"))
+    let metrics = ureq::get(&format!("{web}/rust-dns/metrics"))
         .set("Authorization", &format!("Bearer {tok}"))
         .call()
         .unwrap()
@@ -583,21 +589,21 @@ fn rbac_and_mfa_enrollment() {
     login(&a, &web);
     post(
         &a,
-        &format!("{web}/api/zones"),
+        &format!("{web}/rust-dns/api/zones"),
         serde_json::json!({ "name": "corp.test" }),
     );
     post(
         &a,
-        &format!("{web}/api/zones"),
+        &format!("{web}/rust-dns/api/zones"),
         serde_json::json!({ "name": "other.test" }),
     );
     let (s, _) = post(
         &a,
-        &format!("{web}/api/users"),
+        &format!("{web}/rust-dns/api/users"),
         serde_json::json!({ "username": "bob", "password": "bobpass123", "mfa_required": true }),
     );
     assert_eq!(s, 201);
-    a.put(&format!("{web}/api/zones/corp.test/members/bob"))
+    a.put(&format!("{web}/rust-dns/api/zones/corp.test/members/bob"))
         .set("X-Requested-With", "rust-dns")
         .set("X-CSRF-Token", &csrf_of(&a))
         .send_json(serde_json::json!({ "role": "viewer" }))
@@ -606,19 +612,19 @@ fn rbac_and_mfa_enrollment() {
     let b = agent();
     let (s, v) = post(
         &b,
-        &format!("{web}/api/auth/login"),
+        &format!("{web}/rust-dns/api/auth/login"),
         serde_json::json!({ "username": "bob", "password": "bobpass123" }),
     );
     assert_eq!(s, 200);
     assert_eq!(v["status"], "enroll_required");
     assert!(v["enroll"]["qr_svg"].as_str().unwrap().starts_with("<svg"));
     // Blocked until enrolled.
-    let r = b.get(&format!("{web}/api/zones")).call();
+    let r = b.get(&format!("{web}/rust-dns/api/zones")).call();
     assert!(matches!(r, Err(ureq::Error::Status(401, _))));
     // Wrong code rejected, then compute a valid one from the secret.
     let (s, _) = post(
         &b,
-        &format!("{web}/api/auth/enroll"),
+        &format!("{web}/rust-dns/api/auth/enroll"),
         serde_json::json!({ "code": "000000" }),
     );
     assert_eq!(s, 401);
@@ -626,7 +632,7 @@ fn rbac_and_mfa_enrollment() {
     let code = totp(secret);
     let (s, v2) = post(
         &b,
-        &format!("{web}/api/auth/enroll"),
+        &format!("{web}/rust-dns/api/auth/enroll"),
         serde_json::json!({ "code": code }),
     );
     assert_eq!(s, 200, "{v2}");
@@ -634,13 +640,13 @@ fn rbac_and_mfa_enrollment() {
     let replay = agent();
     let (_, lv) = post(
         &replay,
-        &format!("{web}/api/auth/login"),
+        &format!("{web}/rust-dns/api/auth/login"),
         serde_json::json!({ "username": "bob", "password": "bobpass123" }),
     );
     assert_eq!(lv["status"], "mfa_required");
     let (s, _) = post(
         &replay,
-        &format!("{web}/api/auth/mfa"),
+        &format!("{web}/rust-dns/api/auth/mfa"),
         serde_json::json!({ "code": code }),
     );
     assert_eq!(s, 401, "a TOTP code is accepted only once");
@@ -654,7 +660,7 @@ fn rbac_and_mfa_enrollment() {
 
     // Viewer sees only corp.test and cannot write.
     let zones: serde_json::Value = b
-        .get(&format!("{web}/api/zones"))
+        .get(&format!("{web}/rust-dns/api/zones"))
         .call()
         .unwrap()
         .into_json()
@@ -669,27 +675,29 @@ fn rbac_and_mfa_enrollment() {
     assert_eq!(zones["zones"][0]["role"], "viewer");
     let (s, _) = post(
         &b,
-        &format!("{web}/api/zones/corp.test/records"),
+        &format!("{web}/rust-dns/api/zones/corp.test/records"),
         serde_json::json!({ "name": "x", "type": "A", "value": "10.0.0.1" }),
     );
     assert_eq!(s, 403);
-    let r = b.get(&format!("{web}/api/zones/other.test")).call();
+    let r = b
+        .get(&format!("{web}/rust-dns/api/zones/other.test"))
+        .call();
     assert!(
         matches!(r, Err(ureq::Error::Status(404, _))),
         "invisible zone looks absent"
     );
-    let r = b.get(&format!("{web}/api/users")).call();
+    let r = b.get(&format!("{web}/rust-dns/api/users")).call();
     assert!(matches!(r, Err(ureq::Error::Status(403, _))));
 
     // Promote to editor: writes allowed.
-    a.put(&format!("{web}/api/zones/corp.test/members/bob"))
+    a.put(&format!("{web}/rust-dns/api/zones/corp.test/members/bob"))
         .set("X-Requested-With", "rust-dns")
         .set("X-CSRF-Token", &csrf_of(&a))
         .send_json(serde_json::json!({ "role": "editor" }))
         .unwrap();
     let (s, _) = post(
         &b,
-        &format!("{web}/api/zones/corp.test/records"),
+        &format!("{web}/rust-dns/api/zones/corp.test/records"),
         serde_json::json!({ "name": "x", "type": "A", "value": "10.0.0.1" }),
     );
     assert_eq!(s, 201);
@@ -698,28 +706,28 @@ fn rbac_and_mfa_enrollment() {
     let b2 = agent();
     let (_, v) = post(
         &b2,
-        &format!("{web}/api/auth/login"),
+        &format!("{web}/rust-dns/api/auth/login"),
         serde_json::json!({ "username": "bob", "password": "bobpass123" }),
     );
     assert_eq!(v["status"], "mfa_required");
     let (s, _) = post(
         &b2,
-        &format!("{web}/api/auth/mfa"),
+        &format!("{web}/rust-dns/api/auth/mfa"),
         serde_json::json!({ "code": totp(secret) }),
     );
     assert_eq!(s, 200);
-    assert!(b2.get(&format!("{web}/api/me")).call().is_ok());
+    assert!(b2.get(&format!("{web}/rust-dns/api/me")).call().is_ok());
 
     // A recovery code works once.
     let b3 = agent();
     post(
         &b3,
-        &format!("{web}/api/auth/login"),
+        &format!("{web}/rust-dns/api/auth/login"),
         serde_json::json!({ "username": "bob", "password": "bobpass123" }),
     );
     let (s, v) = post(
         &b3,
-        &format!("{web}/api/auth/mfa"),
+        &format!("{web}/rust-dns/api/auth/mfa"),
         serde_json::json!({ "code": codes[0].to_uppercase() }),
     );
     assert_eq!(s, 200, "{v}");
@@ -728,19 +736,19 @@ fn rbac_and_mfa_enrollment() {
     let b4 = agent();
     post(
         &b4,
-        &format!("{web}/api/auth/login"),
+        &format!("{web}/rust-dns/api/auth/login"),
         serde_json::json!({ "username": "bob", "password": "bobpass123" }),
     );
     let (s, _) = post(
         &b4,
-        &format!("{web}/api/auth/mfa"),
+        &format!("{web}/rust-dns/api/auth/mfa"),
         serde_json::json!({ "code": &codes[0] }),
     );
     assert_eq!(s, 401, "a used recovery code is rejected");
 
     // Sessions: bob sees his sessions and revokes the others; a revoked agent is signed out.
     let me: serde_json::Value = b
-        .get(&format!("{web}/api/me/sessions"))
+        .get(&format!("{web}/rust-dns/api/me/sessions"))
         .call()
         .unwrap()
         .into_json()
@@ -748,20 +756,20 @@ fn rbac_and_mfa_enrollment() {
     assert!(me["sessions"].as_array().unwrap().len() >= 3);
     let (s, v) = post(
         &b,
-        &format!("{web}/api/me/sessions/revoke-others"),
+        &format!("{web}/rust-dns/api/me/sessions/revoke-others"),
         serde_json::json!({}),
     );
     assert_eq!(s, 200);
     assert!(v["revoked"].as_i64().unwrap() >= 2);
     assert!(matches!(
-        b2.get(&format!("{web}/api/me")).call(),
+        b2.get(&format!("{web}/rust-dns/api/me")).call(),
         Err(ureq::Error::Status(401, _))
     ));
-    assert!(b.get(&format!("{web}/api/me")).call().is_ok());
+    assert!(b.get(&format!("{web}/rust-dns/api/me")).call().is_ok());
 
     // Effective rights: generated from the permission table and matching enforcement.
     let bob_me: serde_json::Value = b
-        .get(&format!("{web}/api/me"))
+        .get(&format!("{web}/rust-dns/api/me"))
         .call()
         .unwrap()
         .into_json()
@@ -769,14 +777,16 @@ fn rbac_and_mfa_enrollment() {
     let bob_id = bob_me["user"]["id"].as_i64().unwrap();
     let (s, tok) = post(
         &b,
-        &format!("{web}/api/tokens"),
+        &format!("{web}/rust-dns/api/tokens"),
         serde_json::json!({ "name": "bob-ci" }),
     );
     assert_eq!(s, 201);
     let bob_token = tok["token"].as_str().unwrap().to_string();
     // Editor on corp.test (promoted above).
     let rights: serde_json::Value = a
-        .get(&format!("{web}/api/users/{bob_id}/rights?via=token"))
+        .get(&format!(
+            "{web}/rust-dns/api/users/{bob_id}/rights?via=token"
+        ))
         .call()
         .unwrap()
         .into_json()
@@ -813,31 +823,34 @@ fn rbac_and_mfa_enrollment() {
         ureq::request(m, url).set("Authorization", &format!("Bearer {bob_token}"))
     };
     assert!(
-        with_token("POST", &format!("{web}/api/zones/corp.test/records"))
-            .send_json(serde_json::json!({"name":"t","type":"A","value":"10.0.0.2"}))
-            .is_ok(),
+        with_token(
+            "POST",
+            &format!("{web}/rust-dns/api/zones/corp.test/records")
+        )
+        .send_json(serde_json::json!({"name":"t","type":"A","value":"10.0.0.2"}))
+        .is_ok(),
         "edit_records allowed"
     );
-    let r = with_token("PUT", &format!("{web}/api/zones/corp.test"))
+    let r = with_token("PUT", &format!("{web}/rust-dns/api/zones/corp.test"))
         .send_json(serde_json::json!({"refresh": 100}));
     assert!(
         matches!(r, Err(ureq::Error::Status(403, _))),
         "edit_settings needs owner"
     );
-    let r = with_token("PUT", &format!("{web}/api/me/password")).send_json(
+    let r = with_token("PUT", &format!("{web}/rust-dns/api/me/password")).send_json(
         serde_json::json!({"current_password":"bobpass123","new_password":"whatever123"}),
     );
     assert!(
         matches!(r, Err(ureq::Error::Status(403, _))),
         "password change needs a session"
     );
-    let r = with_token("POST", &format!("{web}/api/me/mfa/disable"))
+    let r = with_token("POST", &format!("{web}/rust-dns/api/me/mfa/disable"))
         .send_json(serde_json::json!({"code":"000000"}));
     assert!(
         matches!(r, Err(ureq::Error::Status(403, _))),
         "MFA changes need a session"
     );
-    let r = with_token("POST", &format!("{web}/api/zones"))
+    let r = with_token("POST", &format!("{web}/rust-dns/api/zones"))
         .send_json(serde_json::json!({"name":"new.test"}));
     assert!(
         matches!(r, Err(ureq::Error::Status(403, _))),
@@ -845,16 +858,18 @@ fn rbac_and_mfa_enrollment() {
     );
     // A user may read their own rights, not someone else's.
     assert!(b
-        .get(&format!("{web}/api/users/{bob_id}/rights"))
+        .get(&format!("{web}/rust-dns/api/users/{bob_id}/rights"))
         .call()
         .is_ok());
     assert!(matches!(
-        b.get(&format!("{web}/api/users/1/rights")).call(),
+        b.get(&format!("{web}/rust-dns/api/users/1/rights")).call(),
         Err(ureq::Error::Status(403, _))
     ));
     // The session view differs only in the session-only permissions.
     let sess: serde_json::Value = b
-        .get(&format!("{web}/api/users/{bob_id}/rights?via=session"))
+        .get(&format!(
+            "{web}/rust-dns/api/users/{bob_id}/rights?via=session"
+        ))
         .call()
         .unwrap()
         .into_json()
@@ -871,7 +886,7 @@ fn rbac_and_mfa_enrollment() {
 
     // Admin signs bob out everywhere.
     let users: serde_json::Value = a
-        .get(&format!("{web}/api/users"))
+        .get(&format!("{web}/rust-dns/api/users"))
         .call()
         .unwrap()
         .into_json()
@@ -886,12 +901,12 @@ fn rbac_and_mfa_enrollment() {
         .unwrap();
     let (s, _) = post(
         &a,
-        &format!("{web}/api/users/{bob}/sessions/revoke"),
+        &format!("{web}/rust-dns/api/users/{bob}/sessions/revoke"),
         serde_json::json!({}),
     );
     assert_eq!(s, 200);
     assert!(matches!(
-        b.get(&format!("{web}/api/me")).call(),
+        b.get(&format!("{web}/rust-dns/api/me")).call(),
         Err(ureq::Error::Status(401, _))
     ));
 }
@@ -904,7 +919,7 @@ fn json_import_and_record_paging() {
     login(&a, &web);
     post(
         &a,
-        &format!("{web}/api/zones"),
+        &format!("{web}/rust-dns/api/zones"),
         serde_json::json!({ "name": "imp.test" }),
     );
     let doc = serde_json::json!({
@@ -924,7 +939,7 @@ fn json_import_and_record_paging() {
         }]
     });
     let r = a
-        .post(&format!("{web}/api/import?mode=replace"))
+        .post(&format!("{web}/rust-dns/api/import?mode=replace"))
         .set("X-Requested-With", "rust-dns")
         .set("X-CSRF-Token", &csrf_of(&a))
         .send_json(doc)
@@ -932,7 +947,7 @@ fn json_import_and_record_paging() {
     let v: serde_json::Value = r.into_json().unwrap();
     assert_eq!(v["records_added"], 7, "{v}");
     let recs: serde_json::Value = a
-        .get(&format!("{web}/api/zones/imp.test/records"))
+        .get(&format!("{web}/rust-dns/api/zones/imp.test/records"))
         .call()
         .unwrap()
         .into_json()
@@ -952,13 +967,13 @@ fn json_import_and_record_paging() {
     for i in 0..30 {
         post(
             &a,
-            &format!("{web}/api/zones/imp.test/records"),
+            &format!("{web}/rust-dns/api/zones/imp.test/records"),
             serde_json::json!({ "name": format!("h{i}"), "type": "A", "value": format!("10.1.0.{i}") }),
         );
     }
     let page: serde_json::Value = a
         .get(&format!(
-            "{web}/api/zones/imp.test/records?limit=10&offset=10"
+            "{web}/rust-dns/api/zones/imp.test/records?limit=10&offset=10"
         ))
         .call()
         .unwrap()
@@ -967,14 +982,14 @@ fn json_import_and_record_paging() {
     assert_eq!(page["records"].as_array().unwrap().len(), 10);
     assert_eq!(page["total"], 37);
     let found: serde_json::Value = a
-        .get(&format!("{web}/api/zones/imp.test/records?q=h2"))
+        .get(&format!("{web}/rust-dns/api/zones/imp.test/records?q=h2"))
         .call()
         .unwrap()
         .into_json()
         .unwrap();
     assert_eq!(found["total"], 11, "h2, h20..h29");
     let z: serde_json::Value = a
-        .get(&format!("{web}/api/zones/imp.test"))
+        .get(&format!("{web}/rust-dns/api/zones/imp.test"))
         .call()
         .unwrap()
         .into_json()
@@ -983,7 +998,7 @@ fn json_import_and_record_paging() {
     assert_eq!(z["records"][0]["name"], "@", "apex sorts first");
 
     // OpenAPI document is served.
-    let spec: serde_json::Value = ureq::get(&format!("{web}/api/openapi.json"))
+    let spec: serde_json::Value = ureq::get(&format!("{web}/rust-dns/api/openapi.json"))
         .call()
         .unwrap()
         .into_json()
@@ -992,7 +1007,7 @@ fn json_import_and_record_paging() {
     // BIND zone-file import and export were removed.
     assert!(spec["paths"]["/zones/{zone}/import-bind"].is_null());
     let gone = a
-        .post(&format!("{web}/api/zones/imp.test/import-bind"))
+        .post(&format!("{web}/rust-dns/api/zones/imp.test/import-bind"))
         .set("X-Requested-With", "rust-dns")
         .set("X-CSRF-Token", &csrf_of(&a))
         .set("Content-Type", "text/plain")
@@ -1002,8 +1017,10 @@ fn json_import_and_record_paging() {
         "import-bind is gone: {gone:?}"
     );
     assert!(matches!(
-        a.get(&format!("{web}/api/zones/imp.test/export?format=bind"))
-            .call(),
+        a.get(&format!(
+            "{web}/rust-dns/api/zones/imp.test/export?format=bind"
+        ))
+        .call(),
         Err(ureq::Error::Status(400, _))
     ));
 }
@@ -1038,7 +1055,7 @@ fn token_tags_and_last_use() {
     let a = agent();
     let web = srv.web.clone();
     login(&a, &web);
-    let api = |p: &str| format!("{web}/api{p}");
+    let api = |p: &str| format!("{web}/rust-dns/api{p}");
 
     // Create with tags: normalized (trimmed, deduped, sorted; case kept).
     let (s, created) = post(
@@ -1318,7 +1335,7 @@ fn early_answers_reach_the_client_and_large_bodies_are_refused() {
         for i in 0..n {
             let body = serde_json::json!({ "name": format!("z{i}.test"), "pad": "x".repeat(i % 50 * 100) });
             match a
-                .post(&format!("{}/api/zones", srv.web))
+                .post(&format!("{}/rust-dns/api/zones", srv.web))
                 .set("X-Requested-With", "rust-dns")
                 .set("X-CSRF-Token", &csrf_of(&a))
                 .send_json(body)
@@ -1341,7 +1358,7 @@ fn early_answers_reach_the_client_and_large_bodies_are_refused() {
     );
     let big = "x".repeat(16 * 1024 * 1024 + 1);
     match a
-        .post(&format!("{}/api/auth/login", srv.web))
+        .post(&format!("{}/rust-dns/api/auth/login", srv.web))
         .set("X-Requested-With", "rust-dns")
         .set("X-CSRF-Token", &csrf_of(&a))
         .set("Content-Type", "application/json")
@@ -1355,7 +1372,7 @@ fn early_answers_reach_the_client_and_large_bodies_are_refused() {
     }
 }
 
-/// O0b: the 404 of unknown paths (under `/api` and outside it) and the
+/// O0b: the 404 of unknown paths (under `/rust-dns/api` and outside it) and the
 /// 405 of root and console routes were answered before the body was read
 /// (`read_body_first` wrapped only the matched API routes), with the same
 /// effect as G2: under load the client sometimes lost the answer (`EINVAL`
@@ -1368,12 +1385,13 @@ fn early_answers_on_unknown_routes_and_wrong_methods_reach_the_client() {
     let srv = start();
     let addr = srv.web.trim_start_matches("http://").to_string();
     let paths = [
-        ("POST", "/api/zones/imp.test/import-bind", 404),
-        ("POST", "/api/no-such-thing", 404),
+        ("POST", "/rust-dns/api/zones/imp.test/import-bind", 404),
+        ("POST", "/rust-dns/api/no-such-thing", 404),
         ("POST", "/no-such-page", 404),
-        ("POST", "/metrics", 405),
+        ("POST", "/rust-dns/metrics", 405),
         ("POST", "/", 405),
-        ("PUT", "/docs", 405),
+        ("POST", "/rust-dns/", 405),
+        ("PUT", "/rust-dns/docs", 405),
     ];
     let body = "$INCLUDE /etc/passwd\n";
     for (method, path, _) in paths {
@@ -1445,6 +1463,54 @@ fn early_answers_on_unknown_routes_and_wrong_methods_reach_the_client() {
     assert!(lost.is_empty(), "{} lost: {:?}", lost.len(), lost.first());
 }
 
+/// Everything is served under `/rust-dns/` (a hard cut): `/` and the bare
+/// prefix redirect (308) to the console; the old root paths are gone (404).
+#[test]
+fn everything_is_under_the_rust_dns_prefix() {
+    let srv = start();
+    let a = ureq::AgentBuilder::new()
+        .redirects(0)
+        .timeout(Duration::from_secs(10))
+        .build();
+    let status = |path: &str| match a.get(&format!("{}{path}", srv.web)).call() {
+        Ok(r) => (r.status(), r.header("location").map(str::to_string)),
+        Err(ureq::Error::Status(s, r)) => (s, r.header("location").map(str::to_string)),
+        Err(e) => panic!("GET {path}: {e}"),
+    };
+    for path in ["/", "/rust-dns"] {
+        assert_eq!(
+            status(path),
+            (308, Some("/rust-dns/".to_string())),
+            "GET {path}"
+        );
+    }
+    for path in [
+        "/rust-dns/",
+        "/rust-dns/index.html",
+        "/rust-dns/docs",
+        "/rust-dns/docs/swagger-ui.css",
+        "/rust-dns/docs/swagger-ui-bundle.js",
+        "/rust-dns/api/health",
+        "/rust-dns/api/openapi.json",
+    ] {
+        assert_eq!(status(path).0, 200, "GET {path}");
+    }
+    for path in [
+        "/index.html",
+        "/docs",
+        "/docs/swagger-ui.css",
+        "/api/health",
+        "/api/openapi.json",
+        "/api/ws",
+        "/ws",
+        "/metrics",
+        "/rust-dns/ws",
+        "/rust-dns-x/",
+    ] {
+        assert_eq!(status(path).0, 404, "GET {path}");
+    }
+}
+
 /// L2: what the console's account dialogs and "Sign this user out
 /// everywhere" do, step by step through the same calls: enable MFA (start,
 /// confirm -> recovery codes dialog), "New recovery codes" (old codes stop
@@ -1457,7 +1523,7 @@ fn account_dialog_flows() {
     let a = agent();
     login(&a, &web);
     let me = |ag: &ureq::Agent| -> serde_json::Value {
-        ag.get(&format!("{web}/api/me"))
+        ag.get(&format!("{web}/rust-dns/api/me"))
             .call()
             .unwrap()
             .into_json()
@@ -1465,7 +1531,7 @@ fn account_dialog_flows() {
     };
     let (s, _) = post(
         &a,
-        &format!("{web}/api/users"),
+        &format!("{web}/rust-dns/api/users"),
         serde_json::json!({ "username": "carol", "password": "carolpass1" }),
     );
     assert_eq!(s, 201);
@@ -1473,7 +1539,7 @@ fn account_dialog_flows() {
         let c = agent();
         let (s, v) = post(
             &c,
-            &format!("{web}/api/auth/login"),
+            &format!("{web}/rust-dns/api/auth/login"),
             serde_json::json!({ "username": "carol", "password": "carolpass1" }),
         );
         assert_eq!(s, 200, "{v}");
@@ -1488,7 +1554,7 @@ fn account_dialog_flows() {
     // Enable: start (no factor yet), confirm -> the recovery codes dialog.
     let (s, e) = post(
         &c,
-        &format!("{web}/api/me/mfa/start"),
+        &format!("{web}/rust-dns/api/me/mfa/start"),
         serde_json::json!({}),
     );
     assert_eq!(s, 200, "{e}");
@@ -1496,13 +1562,13 @@ fn account_dialog_flows() {
     assert!(e["qr_svg"].as_str().unwrap().starts_with("<svg"));
     let (s, v) = post(
         &c,
-        &format!("{web}/api/me/mfa/confirm"),
+        &format!("{web}/rust-dns/api/me/mfa/confirm"),
         serde_json::json!({ "code": "000000" }),
     );
     assert_eq!(s, 401, "wrong code: {v}");
     let (s, v) = post(
         &c,
-        &format!("{web}/api/me/mfa/confirm"),
+        &format!("{web}/rust-dns/api/me/mfa/confirm"),
         serde_json::json!({ "code": totp(&secret) }),
     );
     assert_eq!(s, 200, "{v}");
@@ -1525,13 +1591,13 @@ fn account_dialog_flows() {
     // "New recovery codes": needs a current code; replaces all of them.
     let (s, _) = post(
         &c,
-        &format!("{web}/api/me/mfa/recovery"),
+        &format!("{web}/rust-dns/api/me/mfa/recovery"),
         serde_json::json!({ "code": "000000" }),
     );
     assert_eq!(s, 401);
     let (s, v) = post(
         &c,
-        &format!("{web}/api/me/mfa/recovery"),
+        &format!("{web}/rust-dns/api/me/mfa/recovery"),
         serde_json::json!({ "code": totp(&secret) }),
     );
     assert_eq!(s, 200, "{v}");
@@ -1542,13 +1608,13 @@ fn account_dialog_flows() {
     assert_eq!(v["status"], "mfa_required");
     let (s, _) = post(
         &c2,
-        &format!("{web}/api/auth/mfa"),
+        &format!("{web}/rust-dns/api/auth/mfa"),
         serde_json::json!({ "code": first[0] }),
     );
     assert_eq!(s, 401, "a replaced recovery code no longer works");
     let (s, v) = post(
         &c2,
-        &format!("{web}/api/auth/mfa"),
+        &format!("{web}/rust-dns/api/auth/mfa"),
         serde_json::json!({ "code": second[0] }),
     );
     assert_eq!(s, 200, "{v}");
@@ -1559,13 +1625,13 @@ fn account_dialog_flows() {
     // Disable: needs a current code; afterwards sign-in is one step.
     let (s, _) = post(
         &c,
-        &format!("{web}/api/me/mfa/disable"),
+        &format!("{web}/rust-dns/api/me/mfa/disable"),
         serde_json::json!({ "code": "000000" }),
     );
     assert_eq!(s, 401);
     let (s, v) = post(
         &c,
-        &format!("{web}/api/me/mfa/disable"),
+        &format!("{web}/rust-dns/api/me/mfa/disable"),
         serde_json::json!({ "code": totp(&secret) }),
     );
     assert_eq!(s, 200, "{v}");
@@ -1580,7 +1646,7 @@ fn account_dialog_flows() {
     let carol = me(&c)["user"]["id"].as_i64().unwrap();
     let (s, v) = post(
         &a,
-        &format!("{web}/api/users/{carol}/sessions/revoke"),
+        &format!("{web}/rust-dns/api/users/{carol}/sessions/revoke"),
         serde_json::json!({}),
     );
     assert_eq!(s, 200, "{v}");
@@ -1588,17 +1654,17 @@ fn account_dialog_flows() {
     for (n, ag) in [("c", &c), ("c2", &c2), ("c3", &c3)] {
         assert!(
             matches!(
-                ag.get(&format!("{web}/api/me")).call(),
+                ag.get(&format!("{web}/rust-dns/api/me")).call(),
                 Err(ureq::Error::Status(401, _))
             ),
             "{n} signed out"
         );
     }
     assert!(
-        a.get(&format!("{web}/api/me")).call().is_ok(),
+        a.get(&format!("{web}/rust-dns/api/me")).call().is_ok(),
         "root still in"
     );
     let (c4, v) = carol_login();
     assert_eq!(v["status"], "ok", "carol can sign in again");
-    assert!(c4.get(&format!("{web}/api/me")).call().is_ok());
+    assert!(c4.get(&format!("{web}/rust-dns/api/me")).call().is_ok());
 }
