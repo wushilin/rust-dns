@@ -2755,4 +2755,21 @@ Final
   shadow mode, from a fresh v2 copy = a rebootstrap), then dns1 (keeps its v2
   history). Rollback: previous binaries are kept on each host; a standby
   rolled back to v1 needs --prepare-standby to take a v1 copy again.
+- 2026-10-12: DEPLOYED 3d037bf (changelog v2 replication; GitHub Release run
+  38184181123, linux-x86_64 sha256 0413aee1…) to baba2 (dns2), then
+  milkyway, then gate (dns1). Backups first on each (integrity ok):
+  data/backups/pre-v2-20261012-*.db; rollback binaries rust-dns.old.*.
+  dns2 and milkyway each took a fresh v2 copy (the requested re-bootstrap)
+  from dns1's v2 API, verified ok at txn 9; dns1 kept its v2 history
+  29e47a42… across the upgrade and both standbys reconnected without a new
+  snapshot (rebootstraps stays 1). Verified: config checks, delv 91/91 on
+  dns1 and dns2, milkyway answers its zones authoritatively, dns1's replica
+  list (from v2 clients) shows baba2 and milkyway up_to_date 9/9, v2
+  self-check clean on the standbys. Gate before the push: fmt, clippy,
+  workspace tests (one api_contract failure in ~18 runs not reproduced
+  since the deadlock fix), conformance 158/158, smoke, UI + browser,
+  cargo-audit (only `paste`). Found on the way: a snapshot load could
+  deadlock against status requests (fixed: state reads use a read
+  connection); the follower kept a stale last_error after reconnecting
+  (fixed after the deploy, not yet deployed: display only).
 

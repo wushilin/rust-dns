@@ -201,8 +201,11 @@ impl Node {
             .unwrap_or_else(|p| p.into_inner()) = Some((template, name));
     }
 
+    /// The upstream answered: remember when, and drop an error from an
+    /// earlier attempt (the status must not show a fixed problem).
     fn contact(&self) {
         *self.last_contact.lock().unwrap_or_else(|p| p.into_inner()) = Some(Instant::now());
+        self.fs().last_error = None;
     }
 
     fn fs(&self) -> std::sync::MutexGuard<'_, FollowStatus> {
