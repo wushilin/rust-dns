@@ -188,13 +188,21 @@ impl Mutator {
     }
 
     /// Changelog v2 applied changes on this standby (outside the mutation
-    /// module's transactions): the catalog, the expiry sweeper and the
-    /// console's live views follow.
-    pub async fn replica_applied(&self) {
+    /// module's transactions, already committed): the catalog (`zones`:
+    /// the zones the applied rows touched, as a primary's transaction
+    /// rebuilds them; `None`: everything), the expiry sweeper and, with
+    /// `access`, the console's live views follow.
+    pub async fn replica_applied(&self, zones: Option<Vec<i64>>, access: bool) {
         let _guard = self.lock.lock().await;
-        self.refresh_catalog(Rebuild::Full).await;
+        let what = match zones {
+            Some(ids) => Rebuild::Zones(ids),
+            None => Rebuild::Full,
+        };
+        self.refresh_catalog(what).await;
         self.expiry_wake.notify_one();
-        self.bus.publish_access(crate::events::AccessEvent::All);
+        if access {
+            self.bus.publish_access(crate::events::AccessEvent::All);
+        }
     }
 
     /// Promotion: start a new history whose parent is the current one,

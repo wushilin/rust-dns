@@ -1384,6 +1384,19 @@ impl Storage {
         self.bookkeeping(|c| Ok(c.execute("DELETE FROM sessions", [])?))
     }
 
+    /// Sign these users out (local bookkeeping): a follower's copy of the
+    /// primary revoking their sessions (password changed, account disabled,
+    /// MFA reset, revoked by an administrator) or deleting the account.
+    pub fn delete_sessions_of(&self, user_ids: &[i64]) -> Result<usize> {
+        self.bookkeeping(|c| {
+            let mut n = 0;
+            for id in user_ids {
+                n += c.execute("DELETE FROM sessions WHERE user_id = ?1", params![id])?;
+            }
+            Ok(n)
+        })
+    }
+
     pub fn prune_sessions(&self) -> Result<usize> {
         self.bookkeeping(|c| {
             Ok(c.execute(

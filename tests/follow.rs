@@ -1559,3 +1559,99 @@ fn rebootstrap_repoints_a_standby_to_another_primary() {
     drop((s, p1, p2));
     let _ = std::fs::remove_dir_all(&root_dir);
 }
+
+fn user_id(n: &Node, a: &ureq::Agent, name: &str) -> i64 {
+    get(n, a, "/users")["users"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["username"] == name)
+        .unwrap_or_else(|| panic!("user {name} on {}", n.name))["id"]
+        .as_i64()
+        .unwrap()
+}
+
+/// Sessions are local, so a sign-out on the primary (a new password, an
+/// administrator's revoke) removes only the primary's; the standby sees it
+/// in the replicated audit log and signs the same users out. And the
+/// standby's catalog follows zone by zone: a zone deleted and created
+/// again under the same name, records moved between rounds, answer as on
+/// the primary.
+#[test]
+fn sign_outs_on_the_primary_end_sessions_on_the_standby() {
+    let root_dir = temp_root("follow-signout");
+    let (p, pr, s, sr, _) = pair(&root_dir, "", "");
+    for u in ["dan", "eve", "fay"] {
+        post(
+            &p,
+            &pr,
+            "/users",
+            json!({ "username": u, "password": format!("{u}-password-1") }),
+        );
+    }
+    same_data(&p, &pr, &s, &sr, "users");
+    let me = |a: &ureq::Agent| api(&s, a, "GET", "/me", None).0;
+    let dan = s.login("dan", "dan-password-1");
+    let eve = s.login("eve", "eve-password-1");
+    let fay = s.login("fay", "fay-password-1");
+    for a in [&dan, &eve, &fay] {
+        assert_eq!(me(a), 200, "signed in on the standby");
+    }
+
+    let dan_id = user_id(&p, &pr, "dan");
+    let eve_id = user_id(&p, &pr, "eve");
+    ok(
+        api(
+            &p,
+            &pr,
+            "PUT",
+            &format!("/users/{dan_id}"),
+            Some(json!({ "password": "dan-password-2" })),
+        ),
+        "new password for dan",
+    );
+    post(
+        &p,
+        &pr,
+        &format!("/users/{eve_id}/sessions/revoke"),
+        json!({}),
+    );
+    wait_for("dan and eve signed out on the standby", 10, || {
+        me(&dan) == 401 && me(&eve) == 401
+    });
+    assert_eq!(me(&fay), 200, "other users keep their sessions");
+    assert_eq!(me(&sr), 200, "root keeps its session");
+    let dan = s.login("dan", "dan-password-2");
+    assert_eq!(me(&dan), 200, "the new password works on the standby");
+
+    // Zone by zone: churn, then the same answers on both.
+    post(&p, &pr, "/zones", json!({ "name": "re.test" }));
+    add_record(&p, &pr, "re.test", "www", "192.0.2.21");
+    post(&p, &pr, "/zones", json!({ "name": "keep.test" }));
+    add_record(&p, &pr, "keep.test", "www", "192.0.2.31");
+    ok(
+        api(&p, &pr, "DELETE", "/zones/re.test", None),
+        "delete re.test",
+    );
+    post(&p, &pr, "/zones", json!({ "name": "re.test" }));
+    add_record(&p, &pr, "re.test", "www", "192.0.2.22");
+    add_record(&p, &pr, "keep.test", "mail", "192.0.2.32");
+    same_data(&p, &pr, &s, &sr, "zone churn");
+    for name in ["www.re.test.", "www.keep.test.", "mail.keep.test."] {
+        wait_for(&format!("{name} on the standby"), 10, || {
+            answers(s.dns, name, RecordType::A) == answers(p.dns, name, RecordType::A)
+        });
+    }
+    let www = answers(s.dns, "www.re.test.", RecordType::A).1;
+    assert!(
+        www.len() == 1 && www[0].ends_with("192.0.2.22"),
+        "the recreated zone's record only: {www:?}"
+    );
+    assert_eq!(soa_serial(s.dns, "re.test."), soa_serial(p.dns, "re.test."));
+    assert_eq!(
+        soa_serial(s.dns, "keep.test."),
+        soa_serial(p.dns, "keep.test.")
+    );
+    drop((s, p));
+    let _ = std::fs::remove_dir_all(&root_dir);
+}

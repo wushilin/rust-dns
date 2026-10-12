@@ -1078,52 +1078,188 @@ fn cdc_headers(f: Option<&FollowConfig>) -> reqwest::header::HeaderMap {
     h
 }
 
-/// After the v2 follower changed data: rebuild the catalog, wake the
-/// expiry sweeper, refresh the console's live views, and reload what is
-/// kept in memory from the database (TSIG keys, forwarding, resolver and
-/// blocklist settings).
+/// What the in-memory state still has to catch up on after the v2
+/// follower changed data: collected from every applied batch until the
+/// refresh worker takes it, so batches applied while it is busy are
+/// handled in one run.
+#[derive(Default)]
+struct Pending {
+    /// The data was replaced wholesale (snapshot, rejoin): rebuild and
+    /// reload everything, and sign everyone out.
+    everything: bool,
+    /// Zones whose rows (zone, records, DNSSEC key) changed.
+    zones: std::collections::BTreeSet<i64>,
+    /// Users whose sessions the primary revoked, or who were deleted.
+    sign_out: std::collections::BTreeSet<i64>,
+    tsig: bool,
+    settings: bool,
+    /// Memberships, users, tokens or zones changed: the console's live
+    /// views are rebuilt.
+    access: bool,
+    events: Vec<crate::model::ChangeEvent>,
+}
+
+impl Pending {
+    fn is_empty(&self) -> bool {
+        !self.everything
+            && self.zones.is_empty()
+            && self.sign_out.is_empty()
+            && !self.tsig
+            && !self.settings
+            && !self.access
+            && self.events.is_empty()
+    }
+
+    /// What `txns` touched. Primary actions that sign a user out (a new
+    /// password, a disabled account, an MFA reset, an administrator's
+    /// revoke) remove only the primary's own sessions, which are local;
+    /// the follower sees them as the primary's audit rows and signs those
+    /// users out here too.
+    fn add(&mut self, txns: &[sqlite_cdc::wire::Txn]) {
+        let image = |i: &Option<sqlite_cdc::wire::Raw>| -> serde_json::Value {
+            i.as_ref()
+                .and_then(|i| serde_json::from_str(i.get()).ok())
+                .unwrap_or_default()
+        };
+        for r in txns.iter().flat_map(|t| &t.rows) {
+            let (before, after) = (image(&r.before), image(&r.after));
+            match r.tbl.as_str() {
+                "zones" | "records" | "dnssec_keys" => {
+                    let col = if r.tbl == "zones" { "id" } else { "zone_id" };
+                    // Both images: a record may move to another zone.
+                    for v in [&before, &after] {
+                        if let Some(id) = v[col].as_i64() {
+                            self.zones.insert(id);
+                        }
+                    }
+                    self.access |= r.tbl == "zones";
+                }
+                "tsig_keys" => self.tsig = true,
+                "settings" => self.settings = true,
+                "zone_members" | "api_tokens" => self.access = true,
+                "users" => {
+                    self.access = true;
+                    if r.op == "D" {
+                        if let Some(id) = before["id"].as_i64() {
+                            self.sign_out.insert(id);
+                        }
+                    }
+                }
+                "audit_log" if r.op == "I" => {
+                    if matches!(
+                        after["action"].as_str(),
+                        Some("session.revoke_all" | "session.revoke_others")
+                    ) {
+                        if let Some(id) = after["target_user_id"].as_i64() {
+                            self.sign_out.insert(id);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// After the v2 follower changed data: record what changed and wake the
+/// refresh worker (started with the first batch). One worker, so reloads
+/// never race each other and run in order.
 fn applied_hook(
     storage: Arc<Storage>,
     mutator: Arc<Mutator>,
     dns: Arc<DnsServer>,
     reloader: Arc<crate::reload::Reloader>,
 ) -> sqlite_cdc::node::AppliedHook {
+    let pending = Arc::new(Mutex::new(Pending::default()));
+    let wake = Arc::new(tokio::sync::Notify::new());
+    let started = std::sync::Once::new();
     Arc::new(move |applied| {
-        let (storage, mutator, dns, reloader) = (
-            storage.clone(),
-            mutator.clone(),
-            dns.clone(),
-            reloader.clone(),
-        );
-        let everything = matches!(applied, sqlite_cdc::node::Applied::Everything);
+        started.call_once(|| {
+            tokio::spawn(refresh_worker(
+                pending.clone(),
+                wake.clone(),
+                storage.clone(),
+                mutator.clone(),
+                dns.clone(),
+                reloader.clone(),
+            ));
+        });
         let events = match &applied {
             sqlite_cdc::node::Applied::Txns(txns) => replicated_events(&storage, txns),
             sqlite_cdc::node::Applied::Everything => Vec::new(),
         };
-        tokio::spawn(async move {
-            if everything {
-                // The users were replaced wholesale: a session could now
-                // name another account. Everyone signs in again.
-                match storage.delete_all_sessions() {
-                    Ok(n) => tracing::warn!(
-                        sessions = n,
-                        "replicated data replaced (snapshot): everyone signs in again"
-                    ),
-                    Err(e) => {
-                        tracing::error!(error = %e, "deleting sessions after a snapshot failed")
-                    }
+        {
+            let mut p = pending.lock().unwrap_or_else(|p| p.into_inner());
+            match &applied {
+                sqlite_cdc::node::Applied::Txns(txns) => p.add(txns),
+                sqlite_cdc::node::Applied::Everything => p.everything = true,
+            }
+            p.events.extend(events);
+        }
+        wake.notify_one();
+    })
+}
+
+/// Bring the in-memory state up to date with what was applied: sessions
+/// first (a revoked one must not be used a moment longer than needed),
+/// then the catalog, TSIG keys, console settings, and the console events.
+async fn refresh_worker(
+    pending: Arc<Mutex<Pending>>,
+    wake: Arc<tokio::sync::Notify>,
+    storage: Arc<Storage>,
+    mutator: Arc<Mutator>,
+    dns: Arc<DnsServer>,
+    reloader: Arc<crate::reload::Reloader>,
+) {
+    loop {
+        wake.notified().await;
+        let p = std::mem::take(&mut *pending.lock().unwrap_or_else(|p| p.into_inner()));
+        if p.is_empty() {
+            continue;
+        }
+        if p.everything {
+            // The users were replaced wholesale: a session could now
+            // name another account. Everyone signs in again.
+            match storage.delete_all_sessions() {
+                Ok(n) => tracing::warn!(
+                    sessions = n,
+                    "replicated data replaced (snapshot): everyone signs in again"
+                ),
+                Err(e) => {
+                    tracing::error!(error = %e, "deleting sessions after a snapshot failed")
                 }
             }
-            mutator.replica_applied().await;
-            for ev in events {
-                mutator.publish_replicated(ev);
+        } else if !p.sign_out.is_empty() {
+            let ids: Vec<i64> = p.sign_out.iter().copied().collect();
+            match storage.delete_sessions_of(&ids) {
+                Ok(n) => tracing::info!(
+                    users = ?ids,
+                    sessions = n,
+                    "signed out on the primary: their sessions here are removed too"
+                ),
+                Err(e) => {
+                    tracing::error!(users = ?ids, error = %e, "removing replicated sign-outs failed")
+                }
             }
+        }
+        if p.everything || !p.zones.is_empty() || p.access {
+            let zones = (!p.everything).then(|| p.zones.iter().copied().collect());
+            mutator
+                .replica_applied(zones, p.everything || p.access)
+                .await;
+        }
+        for ev in p.events {
+            mutator.publish_replicated(ev);
+        }
+        if p.everything || p.tsig {
             if let Err(e) = dns.reload_tsig_keys(&storage) {
                 tracing::error!(error = %e, "reloading TSIG keys after replication failed");
             }
+        }
+        if p.everything || p.settings {
             dns.load_console_settings(&storage, &reloader.current.load_full());
-        });
-    })
+        }
+    }
 }
 
 /// Console events for applied v2 transactions: one per (transaction, zone)
