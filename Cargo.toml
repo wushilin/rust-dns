@@ -74,6 +74,10 @@ jsonschema = { version = "0.58", default-features = false }
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"
 
+[[test]]
+name = "compat_dnssec_wushilin_net"
+path = "compat/dnssec/wushilin_net.rs"
+
 [profile.release]
 lto = true
 codegen-units = 1
