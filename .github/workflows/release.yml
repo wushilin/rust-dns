@@ -316,8 +316,11 @@ jobs:
           path: dist
           pattern: "{linux,windows,freebsd}-*"
           merge-multiple: true
+      # Only for a public repository: a private one's source archive is not
+      # downloadable (404 even with the job token), and Homebrew users could
+      # not fetch it either.
       - name: Homebrew formula (O19)
-        if: github.ref_type == 'tag'
+        if: github.ref_type == 'tag' && !github.event.repository.private
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
