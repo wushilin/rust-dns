@@ -192,6 +192,8 @@ class Page {
 }
 
 // ---- checks ---------------------------------------------------------------------------
+// The zone's own page is drawn: the hash alone changes before the old page is replaced.
+const onZone = z => `location.hash === '#/zones/${z}' && document.querySelector('#main h1.zname')?.textContent === '${z}.'`;
 let fails = 0;
 const ok = (name, cond, detail = '') => { if (cond) console.log(`ok   ${name}`); else { fails++; console.log(`FAIL ${name} ${detail}`); } };
 
@@ -215,7 +217,7 @@ async function main() {
   await admin.wait('new zone dialog', `return !!document.querySelector('#modal [name=name]')`);
   await admin.fill('#modal [name=name]', 'ui.test');
   await admin.click('#m-ok');
-  await admin.wait('zone page', `return location.hash === '#/zones/ui.test' && !!document.querySelector('#r-add')`);
+  await admin.wait('zone page', `return ${onZone('ui.test')} && !!document.querySelector('#r-add')`);
   ok('create zone', (await rootApi('GET', '/zones/ui.test')).status === 200);
 
   await admin.click('#r-add');
@@ -238,7 +240,7 @@ async function main() {
   ok('O27: a secondary zone asks for primaries, not SOA fields', await admin.eval(`return document.querySelector('#nz-soa').classList.contains('hidden') && !document.querySelector('#nz-sec').classList.contains('hidden')`));
   await admin.fill('#nz-sec-p', '127.0.0.1:9');
   await admin.click('#m-ok');
-  await admin.wait('secondary zone page', `return location.hash === '#/zones/sec.ui.test' && !!document.querySelector('#z-sec')`);
+  await admin.wait('secondary zone page', `return ${onZone('sec.ui.test')} && !!document.querySelector('#z-sec')`);
   ok('O27: created as a secondary zone', (await rootApi('GET', '/zones/sec.ui.test')).json.secondary?.primaries?.[0] === '127.0.0.1:9');
   await admin.wait('add record disabled', `const b = document.querySelector('#r-add'); return b && b.disabled`);
   const secAdd = await admin.eval(`const b = document.querySelector('#r-add'); return { disabled: b.disabled, title: b.title }`);
@@ -406,7 +408,7 @@ async function phaseO(b, p, rootApi, admin) {
   await admin.click('#s-go');
   await admin.wait('search hit', `return document.querySelectorAll('#s-table [data-hit]').length === 1`);
   await admin.eval(`document.querySelector('#s-table [data-hit]').click(); return true`);
-  await admin.wait('jumped to the record', `return location.hash === '#/zones/other.test' && !!document.querySelector('#records tr.flash')`);
+  await admin.wait('jumped to the record', `return ${onZone('other.test')} && !!document.querySelector('#records tr.flash')`);
   ok('O9: search finds the record and jumps to it', true);
   const vSearch = await (await apiLogin(p, 'vera', 'vera-password-1'))('GET', '/search?q=needle-42');
   ok('O9: a viewer of another zone does not find it', vSearch.status === 200 && vSearch.json.hits.length === 0, JSON.stringify(vSearch.json));
@@ -456,13 +458,13 @@ async function phaseO(b, p, rootApi, admin) {
   await admin.wait('clone dialog', `return !!document.querySelector('#zn-name')`);
   await admin.fill('#zn-name', 'copy.other.test');
   await admin.click('#m-ok');
-  await admin.wait('clone opened', `return location.hash === '#/zones/copy.other.test' && document.querySelectorAll('#records tbody tr').length === 4`);
+  await admin.wait('clone opened', `return ${onZone('copy.other.test')} && document.querySelectorAll('#records tbody tr').length === 4`);
   ok('O11: zone cloned with its records', (await rootApi('GET', '/zones/copy.other.test/records')).json.records.length === 4);
   await admin.click('#z-rename');
   await admin.wait('rename dialog', `return !!document.querySelector('#zn-name')`);
   await admin.fill('#zn-name', 'renamed.test');
   await admin.click('#m-ok');
-  await admin.wait('renamed', `return location.hash === '#/zones/renamed.test'`);
+  await admin.wait('renamed', `return ${onZone('renamed.test')}`);
   ok('O11: zone renamed', (await rootApi('GET', '/zones/renamed.test/records')).json.records.length === 4 && (await rootApi('GET', '/zones/copy.other.test')).status === 404);
 
   // O15: rate limiting from the Server page (empty field = the file's value).

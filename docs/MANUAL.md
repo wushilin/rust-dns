@@ -1113,6 +1113,77 @@ a standby `rustdns_replication_connected`, `rustdns_replication_lag_changes`,
 `rustdns_replication_reconnects_total`, `rustdns_replication_rebootstraps_total`,
 `rustdns_replication_reconcile_mismatches_total`.
 
+## Command-line client (rdns)
+
+`rdns` is a second binary built with the server. It is a client of the API
+only: every change goes through the server, which checks the caller's rights
+and token scope, records the change, and refuses writes on a standby.
+
+**Signing in.** `rdns login https://dns.example.com -u alice` asks for the
+password (and the authenticator code when the account has MFA), creates an
+API token named `rdns@<host>` tagged `rdns-cli` from that short session, and
+saves only the token in a profile: `$RDNS_CONFIG`, else
+`$XDG_CONFIG_HOME/rdns/config.toml` or `~/.config/rdns/config.toml`
+(`%APPDATA%\rdns\config.toml` on Windows), mode 0600. The password is never
+stored. Signing in again to the same profile revokes the token the previous
+login created.
+
+- `--with-token` saves an existing token instead (asked for without echo);
+  `--token-stdin` reads it from stdin. A token is never taken from the
+  command line, where other local users could see it.
+- `--expires 90d` (or an RFC 3339 time) makes the login token expire. The
+  server counts an expiry as a scope, and a scoped token cannot create or
+  revoke tokens: with it, `rdns token add/rm` fail and `rdns logout` cannot
+  revoke it (it says so; revoke it in the console, or let it expire).
+- `--ca-file` trusts a private CA; `--as NAME` names the profile (default:
+  the host).
+
+`rdns logout` revokes the token `rdns login` created (a token you gave with
+`--with-token` is left alone) and forgets the profile. `rdns profile` lists
+the profiles, `rdns profile --use NAME` picks the default, and `-p NAME` one
+for a single command. Scripts can skip the file with `RDNS_SERVER` and
+`RDNS_TOKEN`. An account that still has to enroll MFA signs in to the console
+once first. `rdns token ls` notes tokens that expired, were never used, or
+were not used for 90 days.
+
+**Records** are named by their full name; the zone is the longest of your
+zones that contains it (or `-z ZONE`, with the name relative to it, `@` for
+the apex). The value is the rest of the line, in zone-file form; quote values
+that start with `-` or contain shell characters.
+
+| Command | Does |
+|---|---|
+| `rdns dns ls [ZONE\|NAME\|TEXT] [-t TYPE] [-q TEXT]` | a zone's records, one name's, or a search across your zones |
+| `rdns dns add NAME TYPE VALUE... [--ttl N] [--expires 24h]` | add a record (adding it again with `--expires` renews it) |
+| `rdns dns set NAME TYPE VALUE [--ttl N\|default]` | replace every record of that type at the name with this one, in one transaction; the TTL they shared is kept unless `--ttl` |
+| `rdns dns set NAME TYPE --ttl N\|default` | change only the TTL |
+| `rdns dns rm NAME [TYPE [VALUE...]] [-y]` | delete one record, a type, or the whole name (asks when more than one matches); `--id N -z ZONE` by id |
+| `rdns dns apply ZONE [FILE] [--dry-run]` | add many `name [ttl] [IN] type value` lines in one transaction |
+
+**Zones:** `rdns zone ls`, `show`, `add ZONE [--ns --email --ttl --owner
+--refresh --retry --expire --minimum]`, `set` (the same options), `rename`,
+`clone [--empty]`, `rm [-y]`, `access`, `grant ZONE USER [--role
+editor|viewer]`, `revoke ZONE USER`, `export [ZONE] [-o FILE]`, `import FILE
+[--replace]`.
+
+**Users** (administrators): `rdns user ls`, `show USER` (with the zones the
+user reaches), `add USER [--password P | --password-stdin] [--name]
+[--admin] [--require-mfa]` (asks for the password when not given), `set USER
+[--password P | --password-stdin | --ask-password] [--revoke-tokens]
+[--name] [--admin | --no-admin] [--require-mfa | --no-require-mfa] [--disable
+| --enable]`, `rm USER [-y]` (never yourself, never root), `reset-mfa USER`,
+`signout USER`. `rdns passwd` changes your own password (through a short
+session, as the API requires; tokens keep working). A password given with
+`--password` is visible in the process list to other local users: prefer the
+prompt or `--password-stdin`.
+
+**Tokens:** `rdns token ls [--all]`, `add NAME [--zone Z]... [--role R]
+[--expires 90d|RFC3339] [--tag T]...` (prints the token once), `rm ID`.
+
+Every command takes `--json` for the server's JSON instead of tables, and
+deletions ask first unless `-y` (without a terminal they refuse). Errors are
+the server's message on stderr, with exit status 1.
+
 ## API
 
 Everything the console does goes through `/rust-dns/api`. Authenticate with a session
@@ -1232,6 +1303,7 @@ scripts/dnssec-vectors.py                   # regenerates the DNSSEC known-answe
 scripts/compliance.sh <zone> <ip> <port>    # ISC DNS Compliance Testing (genreport), builds it on first run
 scripts/e2e-dig.sh <zone> <ip> <port>       # human-readable dig walkthrough
 scripts/conformance-local.sh                # starts a temporary server, seeds it, runs all probes
+scripts/interop-local.sh [binary]           # BIND, Knot, ldns, DNSViz, genreport (and Zonemaster: INTEROP_ZONEMASTER=1) check a seeded server in a container (podman or docker; docs/COMPLIANCE.md)
 scripts/load-test-local.sh                  # short UDP load probe; intended for Linux
 scripts/soak.py --bin <binary> ...          # hours-long soak with a standby (see "Soak test")
 ```
@@ -1290,8 +1362,10 @@ Current status: the Rust suite passes (unit tests, end-to-end tests in
 failover, promotion, fencing, rejoin with divergence), `tests/hardening.rs` (security regressions: TCP pinning, init-config,
 password logging, TOTP replay across restarts, websocket revocation and
 origin, cookies, slow clients, CSP), API contract and OpenAPI document
-tests, and `tests/dnssec.rs`). The seeded conformance runner passes 123/123, and ISC genreport reports
-all protocol and record-type probes as `ok`.
+tests, and `tests/dnssec.rs`). The seeded conformance runner passes 164/164,
+and the interop kit passes 50/50: BIND, Knot, ldns, DNSViz, ISC genreport (every
+probe `ok`, on an unsigned and a signed zone) and Zonemaster; see
+[COMPLIANCE.md](COMPLIANCE.md).
 CI runs formatting, clippy, the Rust test suite, conformance, and a short Linux
 UDP load probe.
 

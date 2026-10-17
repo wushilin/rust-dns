@@ -456,6 +456,8 @@ impl DnsServer {
                 self.stats.errors.fetch_add(1, Relaxed);
                 let mut m =
                     Message::error_msg(id, q.request.metadata.op_code, ResponseCode::ServFail);
+                m.metadata.checking_disabled = q.request.metadata.op_code == OpCode::Query
+                    && q.request.metadata.checking_disabled;
                 for x in &q.request.queries {
                     m.add_query(x.clone());
                 }
@@ -543,16 +545,35 @@ impl DnsServer {
     }
 
     /// Finish a response: encode, fit it to UDP, emit the query event.
+    /// Every response to a query carries the query's CD bit (RFC 4035
+    /// §3.1.6: "MUST copy the CD bit from a query into the corresponding
+    /// response"), whichever filter made it; TSIG signs the bytes later.
     fn complete(&self, resp: Response, q: &QueryCtx<'_>) -> Reply {
+        let cd =
+            q.request.metadata.op_code == OpCode::Query && q.request.metadata.checking_disabled;
         match resp {
-            Response::Message(m, source) => Reply::One(self.finish(m, &q.meta, source)),
+            Response::Message(mut m, source) => {
+                m.metadata.checking_disabled = cd;
+                Reply::One(self.finish(m, &q.meta, source))
+            }
             Response::Relayed {
-                bytes,
+                mut bytes,
                 parsed,
                 source,
-            } => Reply::One(self.finish_relayed(bytes, parsed, source, q)),
-            Response::Transfer(ms) => Reply::Many(ms),
-            Response::Bytes(b) => Reply::One(b),
+            } => {
+                set_cd(&mut bytes, cd);
+                Reply::One(self.finish_relayed(bytes, parsed, source, q))
+            }
+            Response::Transfer(mut ms) => {
+                for m in &mut ms {
+                    set_cd(m, cd);
+                }
+                Reply::Many(ms)
+            }
+            Response::Bytes(mut b) => {
+                set_cd(&mut b, cd);
+                Reply::One(b)
+            }
             Response::Drop => Reply::None,
         }
     }
@@ -608,6 +629,17 @@ impl DnsServer {
             source,
         );
         bytes
+    }
+}
+
+/// Set or clear the CD bit in an encoded message's header.
+fn set_cd(msg: &mut [u8], cd: bool) {
+    if let Some(flags) = msg.get_mut(3) {
+        if cd {
+            *flags |= 0x10;
+        } else {
+            *flags &= !0x10;
+        }
     }
 }
 

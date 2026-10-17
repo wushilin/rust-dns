@@ -28,6 +28,9 @@ pub struct Key {
     qtype: RecordType,
     class: DNSClass,
     dnssec_ok: bool,
+    /// The query had CD set: the upstream did not validate the answer, so
+    /// it is never served to a query without CD (RFC 6840 §5.9).
+    checking_disabled: bool,
     /// What else the answer depends on: 0 for the global upstreams; a hash
     /// of the upstream set for an override zone, of the client subnet sent
     /// with EDNS Client Subnet.
@@ -41,8 +44,15 @@ impl Key {
             qtype,
             class,
             dnssec_ok,
+            checking_disabled: false,
             scope: 0,
         }
+    }
+
+    /// The same question asked with CD (see the field).
+    pub fn checking_disabled(mut self, cd: bool) -> Self {
+        self.checking_disabled = cd;
+        self
     }
 
     /// The same question in another scope (see the field).
@@ -313,6 +323,17 @@ mod tests {
             .chain(&m.authorities)
             .map(|r| r.ttl)
             .collect()
+    }
+
+    #[test]
+    fn answers_fetched_with_cd_are_not_served_without_it() {
+        // RFC 6840 §5.9: a CD=1 answer was not validated upstream.
+        let c = ForwardCache::new(10);
+        let t0 = Instant::now();
+        let cd = key("a.").checking_disabled(true);
+        c.store_at(cd.clone(), &positive("a.", &[300]), CAPS, t0);
+        assert!(c.get_at(&key("a."), CAPS, t0).is_none());
+        assert!(c.get_at(&cd, CAPS, t0).is_some());
     }
 
     #[test]

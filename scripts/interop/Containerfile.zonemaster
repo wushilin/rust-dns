@@ -1,0 +1,23 @@
+# Optional: Zonemaster (AFNIC + Internetstiftelsen), the zone/name server
+# test suite whose test cases cite the RFCs. Built from CPAN because the
+# published image is amd64 only. Slow (10-20 minutes) and needs the base
+# image (scripts/interop-local.sh builds it):
+#   podman build -t rust-dns-interop-zonemaster -f scripts/interop/Containerfile.zonemaster scripts/interop
+FROM rust-dns-interop
+RUN dnf -y -q install perl perl-App-cpanminus make gcc-c++ ldns-devel libidn2-devel \
+        openssl-devel perl-devel perl-Module-Install perl-Clone perl-JSON-XS perl-Moose \
+        perl-Readonly perl-YAML perl-Text-CSV perl-Locale-Msgfmt perl-libintl-perl \
+        perl-File-ShareDir perl-Net-IP perl-Mail-RFC822-Address perl-Pod-Coverage \
+        perl-Test-Fatal perl-Test-Differences perl-Test-Exception perl-MooseX-Getopt \
+        perl-Log-Any perl-Try-Tiny perl-List-MoreUtils perl-Text-Reflow perl-IO-Socket-INET6 \
+        perl-Devel-CheckLib perl-Module-Install-XSUtil libtool autoconf automake gettext \
+        crypto-policies-scripts \
+    && dnf clean all
+# Zonemaster::LDNS requires SHA-1 in OpenSSL (to check RSASHA1 and NSEC3
+# hashes), which Fedora's default crypto policy disables.
+RUN update-crypto-policies --set DEFAULT:SHA1
+# Zonemaster::LDNS is linked with Fedora's ldns (the bundled copy needs a
+# git checkout); the libldns.pc search is optional, it falls back to -lldns.
+RUN (cpanm --notest --configure-args="--no-internal-ldns" Zonemaster::LDNS || (tail -60 /root/.cpanm/build.log; false)) \
+    && cpanm --notest --quiet Zonemaster::Engine Zonemaster::CLI \
+    && zonemaster-cli --version

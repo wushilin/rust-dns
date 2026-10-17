@@ -85,7 +85,7 @@ jobs:
         run: |
           name=rust-dns-${{ needs.version.outputs.version }}-linux-${{ matrix.arch }}
           mkdir -p "dist/$name"
-          cp target/${{ matrix.target }}/release/rust-dns README.md "dist/$name/"
+          cp target/${{ matrix.target }}/release/rust-dns target/${{ matrix.target }}/release/rdns README.md "dist/$name/"
           cp -r examples "dist/$name/"
           cp deploy/install.sh "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
