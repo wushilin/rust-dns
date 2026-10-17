@@ -834,7 +834,11 @@ async function route() {
   if (S.panel && !(page === 'zones' && arg === S.panel.zone)) closeDrawer();
   const views = { dashboard: viewDashboard, zones: arg ? () => viewZone(arg) : viewZones, queries: viewQueries, changelog: viewChangelog, audit: arg === 'sign-ins' ? viewSignIns : viewAudit, server: viewServer, blocklists: viewBlocklists, tsig: viewTsig, replication: viewReplication, api: viewApi, users: viewUsers, tokens: viewTokens, account: viewAccount };
   const v = views[page] || viewDashboard;
+  const gen = route.gen = (route.gen || 0) + 1;
   try { await v(); } catch (e) { if (e.code !== 'login_required') { $('#main').innerHTML = `<div class="empty">${esc(e.message)}</div>`; } }
+  // Views draw after awaiting the server: a slower earlier navigation that
+  // finishes after the current one has drawn over it, so draw the current page again.
+  if (gen === route.gen) route.drawn = gen; else if (route.drawn === route.gen) route();
 }
 async function refreshZones() { S.zones = (await GET('/zones')).zones; await loadRights(); }
 
