@@ -392,6 +392,7 @@ impl DnsServer {
             question.query_class(),
             q.meta.dnssec_ok,
         )
+        .checking_disabled(q.request.metadata.checking_disabled)
         .scoped(r.scope);
         if rt.forwarding.cache_entries > 0 {
             let hit = self.fwd_cache.get(&key, rt.cache_caps()).or_else(|| {
