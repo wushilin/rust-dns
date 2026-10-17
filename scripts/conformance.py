@@ -223,27 +223,41 @@ r = q("www", "A")
 check("server still answering after malformed input", r.answer)
 
 # --- Rate limiting (per-address) ------------------------------------------------------
+# Paced: a burst of 700 datagrams at once overflows the server socket's
+# receive buffer (kernel RcvbufErrors), so the limiter never saw the excess
+# and these checks passed or failed by kernel drops, not by the limiter.
+# 1400 queries in small bursts, replies read in between, over well under a
+# second: at most two 1-second windows, so at most 2 x 500 answered.
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.settimeout(0.3)
 wire = dns.message.make_query(f"www.{ZONE}.", "A").to_wire()
-sent = 700
-for _ in range(sent):
-    s.sendto(wire, (IP, PORT))
+sent = 1400
 got = 0
 slipped = 0
-try:
-    while True:
-        data, _ = s.recvfrom(4096)
-        # Rate-limit "slip" replies: TC=1, no answer records ([rate_limit].slip).
-        if len(data) >= 12 and data[2] & 0x02 and data[6:8] == b"\x00\x00":
-            slipped += 1
-        else:
-            got += 1
-except socket.timeout:
-    pass
+
+
+def drain(timeout):
+    global got, slipped
+    s.settimeout(timeout)
+    try:
+        while True:
+            data, _ = s.recvfrom(4096)
+            # Rate-limit "slip" replies: TC=1, no answer records ([rate_limit].slip).
+            if len(data) >= 12 and data[2] & 0x02 and data[6:8] == b"\x00\x00":
+                slipped += 1
+            else:
+                got += 1
+    except (socket.timeout, BlockingIOError):
+        pass
+
+
+for i in range(0, sent, 20):
+    for _ in range(20):
+        s.sendto(wire, (IP, PORT))
+    drain(0.002)
+drain(0.3)
 s.close()
-check("per-address rate limit drops UDP beyond 500/s", 0 < got <= 520, f"got {got} of {sent}")
-check("rate limit slip: some limited queries get an empty TC=1 reply (retry over TCP)", 0 < slipped <= sent - got, f"{slipped} slip replies")
+check("per-address rate limit drops UDP beyond 500/s", 0 < got <= 2 * 520, f"got {got} of {sent}")
+check("rate limit slip: some limited queries get an empty TC=1 reply (retry over TCP)", 0 < slipped <= sent - got, f"{slipped} slip replies, {got} answers")
 time.sleep(1.1)
 r = q("www", "A")
 check("rate limit window resets", r.answer)
@@ -446,6 +460,31 @@ try:
 except Exception as e:
     err = repr(e)
 check("4034 §2 / 6605: DNSKEY at the apex (flags 257, algorithm 13), self-signature validates", dnskey is not None and not err and all(k.flags == 257 and k.algorithm == 13 for k in dnskey), err)
+
+
+def cd_query(name, rtype, edns=True, tcp=False):
+    m = dns.message.make_query(name, rtype, want_dnssec=edns)
+    if not edns:
+        m.use_edns(False)
+    m.flags |= dns.flags.CD
+    fn = dns.query.tcp if tcp else dns.query.udp
+    return fn(m, IP, port=PORT, timeout=3)
+
+
+# RFC 4035 §3.1.6: "MUST copy the CD bit from a query into the corresponding
+# response", for every kind of answer.
+r = cd_query(SZ, "SOA")
+check("4035 §3.1.6: CD copied into a signed zone's answer (DO, UDP)", r.flags & dns.flags.CD, dns.flags.to_text(r.flags))
+r = cd_query(SZ, "SOA", tcp=True)
+check("4035 §3.1.6: CD copied over TCP", r.flags & dns.flags.CD, dns.flags.to_text(r.flags))
+r = cd_query(dns.name.from_text("nope.signed.test."), "A")
+check("4035 §3.1.6: CD copied into NXDOMAIN", r.rcode() == dns.rcode.NXDOMAIN and r.flags & dns.flags.CD, dns.flags.to_text(r.flags))
+r = cd_query(dns.name.from_text(f"{ZONE}."), "SOA", edns=False)
+check("4035 §3.1.6: CD copied for an unsigned zone without EDNS", r.flags & dns.flags.CD, dns.flags.to_text(r.flags))
+r = cd_query(dns.name.from_text("not-served.example."), "A", edns=False)
+check("4035 §3.1.6: CD copied into REFUSED", r.rcode() == dns.rcode.REFUSED and r.flags & dns.flags.CD, f"{dns.rcode.to_text(r.rcode())} {dns.flags.to_text(r.flags)}")
+r = sq(SZ, "SOA", tcp=False)
+check("4035 §3.1.6: no CD in the answer to a query without CD", not r.flags & dns.flags.CD, dns.flags.to_text(r.flags))
 
 
 def validate_sections(r, sections=("answer", "authority"), skip_referral_ns=True):

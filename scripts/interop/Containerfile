@@ -1,0 +1,21 @@
+# Third-party DNS implementations used to check rust-dns against the
+# standards (scripts/interop-local.sh). Every tool here is an independent,
+# open source implementation: BIND 9 (ISC), Knot DNS (CZ.NIC), ldns (NLnet
+# Labs), DNSViz (Sandia / Verisign Labs), dnspython, and ISC's DNS
+# Compliance Testing tool (genreport, the DNS Flag Day tool).
+FROM registry.fedoraproject.org/fedora:42
+# bind: DNSViz runs a local named to stand in for the parent zone (-N/-D).
+RUN dnf -y -q install bind bind-utils bind-dnssec-utils knot knot-utils ldns-utils \
+        dnsviz python3 python3-dns python3-cryptography \
+        gcc openssl-devel tar diffutils procps-ng python3-pip \
+    && dnf clean all
+# DNSViz 0.11.0 (Fedora 42) fails with dnspython 2.7 (CookieOption.data);
+# 0.11.2 from PyPI works, on Fedora's dependencies.
+RUN pip3 install --no-cache-dir --no-deps dnsviz==0.11.2
+# genreport, pinned to a commit of the ISC repository.
+ARG GENREPORT_REF=master
+RUN mkdir -p /opt/genreport && cd /opt/genreport \
+    && curl -fsSL "https://gitlab.isc.org/isc-projects/DNS-Compliance-Testing/-/archive/${GENREPORT_REF}/DNS-Compliance-Testing-${GENREPORT_REF}.tar.gz" \
+       | tar xz --strip-components=1 \
+    && printf '#define HAVE_STRLCPY 1\n#define HAVE_STRLCAT 1\n#define HAVE_SYS_TYPES_H 1\n#define HAVE_NETINET_IN_H 1\n#define HAVE_ARPA_NAMESER_H 1\n#define HAVE_RESOLV_H 1\n' > config.h \
+    && cc -O2 -I. -o /usr/local/bin/genreport genreport.c -lresolv -lcrypto

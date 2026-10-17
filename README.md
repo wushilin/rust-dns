@@ -44,6 +44,10 @@ users with MFA, DNSSEC and a hot standby.
 - **The home-network features you expect from dnsmasq**, set from the
   console: local names, conditional forwarding, blocklists, rebinding
   protection, domain-needed, bogus-priv, hosts-file import.
+- **Standards compliant, and checked by others.** rust-dns is tested against
+  the RFCs by independent implementations: BIND 9, Knot DNS, NLnet Labs
+  ldns, DNSViz, ISC's DNS Compliance Testing tool and Zonemaster all pass
+  it. See [Standards compliance](#standards-compliance).
 - **Built for the internet too.** Per-client rate limiting and response rate
   limiting (RRL), DNS cookies, TSIG-secured zone transfers and NOTIFY,
   secondary zones, DNS over TLS and DNS over HTTPS, PROXY protocol,
@@ -103,6 +107,46 @@ Apple M3 Max. Median of 3 runs of 15 seconds each:
 Run it yourself: `scripts/bench-dnsmasq/run.sh <linux rust-dns binary>`
 (needs podman or docker). Benchmarks on macOS directly are misleading: the
 loopback path caps UDP at a few thousand queries/s for any server.
+
+## Standards compliance
+
+rust-dns follows the DNS standards, and it doesn't grade its own homework:
+independent, open source DNS implementations check its zones and its live
+answers. Every check below passes on the current code.
+
+| Checked by | What it checks | RFCs |
+|---|---|---|
+| [ISC DNS Compliance Testing](https://gitlab.isc.org/isc-projects/DNS-Compliance-Testing) (genreport, the tool behind DNS Flag Day) | EDNS versions, options and flags, DNS cookies, NSID, unknown opcodes, TCP, DO and CD on a signed zone: every probe `ok` | 1035, 4035, 5001, 6891, 7766, 7873 |
+| [Zonemaster](https://github.com/zonemaster/zonemaster) (AFNIC, Internetstiftelsen) | Name server behaviour, DNSSEC, consistency, syntax: nothing at WARNING or above | the RFCs each test cites |
+| [DNSViz](https://github.com/dnsviz/dnsviz) | Full DNSSEC chain and delegation analysis with EDNS probes: SECURE, no errors or warnings | 4033-4035, 5155, 6891 |
+| BIND 9 (`delv`, `dnssec-verify`, `named-checkzone`, `dig`) | Every signature valid, NSEC/NSEC3 chains complete, zone structure, and 158 live answers validated over UDP and TCP (positive, CNAME, DNAME, wildcards, NXDOMAIN, NODATA, DS) | 1034, 1035, 2181, 4035, 4592, 5155, 5936, 6672 |
+| [Knot DNS](https://www.knot-dns.cz/) (`knotc zone-check`, `kdig`) | Zone semantics with warnings fatal, DNSSEC validation, AXFR | 1034, 1035, 4033-4035, 5936 |
+| [ldns](https://nlnetlabs.nl/projects/ldns/) (`ldns-verify-zone`) | Every RRset signed, every signature valid, denial chains complete | 4033-4035, 5155 |
+| `scripts/conformance.py` with dnspython | 164 checks written from the RFC text, each named after the section it tests, signatures validated by dnspython | 1034/1035, 2308, 4592, 5936, 6672, 6891, 7873, 8945 (TSIG), 4033-4035, 5155, 6605, 8080 |
+
+The zones cover ECDSA P-256 and Ed25519 signing, NSEC and NSEC3, DNAME,
+wildcards, and the newer record types (CAA, HTTPS/SVCB, TLSA, SSHFP).
+The test server runs on 127.0.0.1 with one name server per zone, so the few
+findings about a public deployment (a private address, no PTR for it, a
+second name server) don't apply there and are the only ones ignored; they
+are listed in COMPLIANCE.md.
+
+These checks found two real deviations, both now fixed: the CD bit was not
+copied into responses (RFC 4035 §3.1.6), and the forwarding cache could
+serve an answer fetched with CD set to a client that wanted validated data
+(RFC 6840 §5.9).
+
+Run them yourself (needs podman or docker):
+
+```sh
+scripts/interop-local.sh                        # BIND, Knot, ldns, DNSViz, genreport
+INTEROP_ZONEMASTER=1 scripts/interop-local.sh   # ... and Zonemaster
+scripts/conformance-local.sh                    # the RFC checks (needs Python dnspython)
+```
+
+[docs/COMPLIANCE.md](docs/COMPLIANCE.md) lists every check, the RFC sections
+covered and the tools considered. (dnsmasq, for comparison, ships no test
+suite.)
 
 ## Replication and failover
 
@@ -178,6 +222,27 @@ curl -H "Authorization: Bearer $TOKEN" $API/zones/example.com/records
 Every endpoint, with examples you can run, is in the API explorer at
 `http://127.0.0.1:8053/rust-dns/docs`; the document itself is at
 `/rust-dns/api/openapi.json` (snapshot: [docs/openapi.json](docs/openapi.json)).
+
+## The command line in one minute
+
+`rdns` (built next to `rust-dns`) manages a server from a terminal through
+the same API, with your own rights:
+
+```sh
+rdns login https://dns.example.com -u alice     # asks for the password (and MFA code)
+rdns dns add www.example.com A 192.0.2.10 --ttl 300
+rdns dns add example.com MX 10 mail.example.com.
+rdns dns set www.example.com A 192.0.2.20       # replace, in one transaction
+rdns dns ls example.com
+rdns dns rm www.example.com A
+rdns zone add example.org --ns ns1.example.org. --email hostmaster@example.org
+rdns zone grant example.org bob --role viewer
+rdns user add bob --password 'correct-horse-battery'
+rdns user rm bob
+```
+
+`rdns --help` and `rdns <command> --help` list the rest; the
+[manual](docs/MANUAL.md#command-line-client-rdns) has the details.
 
 ## Learn more
 
