@@ -672,15 +672,19 @@ $('#logout').onclick = async e => { e.preventDefault(); await POST('/auth/logout
 // ---------------------------------------------------------------------------
 // app shell + routing
 // ---------------------------------------------------------------------------
+// The app is shown once the rights are loaded and the first page is drawn:
+// nothing can be used while a control is still "Checking your permissions…"
+// or a page is about to be drawn over.
 async function enterApp() {
-  $('#login').classList.add('hidden'); $('#app').classList.remove('hidden');
+  $('#login').classList.add('hidden');
   $('#who-name').textContent = S.user.username + (S.user.is_admin ? ' · admin' : '');
   $$('[data-admin]').forEach(a => a.classList.toggle('hidden', !S.user.is_admin));
   await pollRepl();
   clearInterval(enterApp.replTimer); enterApp.replTimer = setInterval(pollRepl, 10000);
   await refreshZones();
   connectWs();
-  route();
+  await route();
+  if ($('#login').classList.contains('hidden')) $('#app').classList.remove('hidden'); // not if the session ended meanwhile
 }
 
 // ---------------------------------------------------------------------------
@@ -2044,7 +2048,7 @@ function zoneServerSettingsModal() {
     <div class="error" id="m-err"></div>
     <div class="foot"><button class="btn" data-close>Cancel</button>${z.settings ? '<button class="btn" id="zs-clear" data-perm="server_admin">Use the server\'s settings</button>' : ''}<button class="btn primary" id="m-ok" data-perm="server_admin">Save</button></div>`, m => {
     const triVal = id => { const v = m.querySelector(id).value; return v === '' ? undefined : v === 'on'; };
-    const save = async body => { try { await PUT('/zones/' + encodeURIComponent(z.name) + '/settings', body); closeModal(); toast('Zone transfer and PTR settings saved', 'ok'); reloadZone(); } catch (e) { $('#m-err').textContent = e.message; } };
+    const save = async body => { try { await PUT('/zones/' + encodeURIComponent(z.name) + '/settings', body); await reloadZone(); closeModal(); toast('Zone transfer and PTR settings saved', 'ok'); } catch (e) { $('#m-err').textContent = e.message; } };
     $('#m-ok').onclick = () => {
       const b = {};
       const ptr = triVal('#zs-ptr'), tsig = triVal('#zs-tsig');
