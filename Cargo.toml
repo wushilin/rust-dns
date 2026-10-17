@@ -4,6 +4,7 @@ version = "0.3.0"
 edition = "2021"
 description = "Lightweight SQLite-backed authoritative DNS server with a realtime web UI and secure API"
 license = "Apache-2.0"
+default-run = "rust-dns"
 
 [workspace]
 members = ["crates/sqlite-cdc"]
