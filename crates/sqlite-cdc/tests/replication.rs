@@ -322,6 +322,91 @@ async fn divergence_halts_and_reset_refollows() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_delete_of_a_missing_row_is_skipped_and_resume_refollows() {
+    let d = tempfile::tempdir().unwrap();
+    let l = start(d.path(), "l.db", true, poll_cfg()).await;
+    l.node
+        .store
+        .write(json!({}), |tx| {
+            Ok(tx.execute_batch(
+                "INSERT INTO settings VALUES ('a', '1'); INSERT INTO settings VALUES ('b', '1');",
+            )?)
+        })
+        .unwrap();
+    work(&l, 21, 20).await;
+    let f = start(d.path(), "f.db", false, poll_cfg()).await;
+    f.node.start_follow(&l.url).await.unwrap();
+    caught_up(&l, &f).await;
+    // The verify after the snapshot is done before anything is changed.
+    wait_for("the verify after the snapshot", 10, || {
+        f.node.follow_status().last_verify.is_some()
+    })
+    .await;
+
+    // The follower lost a row the leader then deletes: the row is gone
+    // either way, so the delete is skipped and following goes on.
+    f.node
+        .store
+        .corrupt_for_test("DELETE FROM settings WHERE key = 'a'")
+        .unwrap();
+    l.node
+        .store
+        .write(json!({}), |tx| {
+            Ok(tx.execute("DELETE FROM settings WHERE key = 'a'", [])?)
+        })
+        .unwrap();
+    work(&l, 22, 10).await;
+    caught_up(&l, &f).await;
+    assert!(f.node.store.state().unwrap().halted.is_none());
+    assert_eq!(dump(&l.node.store), dump(&f.node.store));
+
+    // Any other difference still halts.
+    f.node
+        .store
+        .corrupt_for_test("UPDATE settings SET value = 'X' WHERE key = 'b'")
+        .unwrap();
+    let before = f.last();
+    l.node
+        .store
+        .write(json!({}), |tx| {
+            Ok(tx.execute("UPDATE settings SET value = '2' WHERE key = 'b'", [])?)
+        })
+        .unwrap();
+    wait_for("halt", 10, || {
+        f.node.store.state().unwrap().halted.is_some()
+    })
+    .await;
+    let h = f.node.store.state().unwrap().halted.unwrap();
+    assert!(
+        h["options"][1].as_str().unwrap().contains("/admin/resume"),
+        "{h}"
+    );
+    // Resuming keeps every check: the row still differs, so it halts again.
+    let r = f.client().resume().await.unwrap();
+    assert_eq!(r["cleared"]["kind"], "diverged", "{r}");
+    wait_for("halt again", 10, || {
+        f.node.store.state().unwrap().halted.is_some()
+    })
+    .await;
+    assert_eq!(f.last(), before, "nothing of the bad batch applied");
+    // Once the cause is fixed, resume follows on from the same position.
+    f.node
+        .store
+        .corrupt_for_test("UPDATE settings SET value = '1' WHERE key = 'b'")
+        .unwrap();
+    f.client().resume().await.unwrap();
+    caught_up(&l, &f).await;
+    assert!(f.node.store.state().unwrap().halted.is_none());
+    assert_eq!(dump(&l.node.store), dump(&f.node.store));
+    // Nothing to resume now.
+    let e = f.client().resume().await.unwrap_err();
+    assert!(e.detail.contains("not halted"), "{e}");
+    // ... and refusing it leaves following alone.
+    work(&l, 23, 5).await;
+    caught_up(&l, &f).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn wrong_upstream_is_refused() {
     let d = tempfile::tempdir().unwrap();
     let a = start(d.path(), "a.db", true, poll_cfg()).await;

@@ -711,6 +711,22 @@ impl Node {
         self.start_follow(&up).await
     }
 
+    /// Clear this follower's halt, keep its data, and follow its upstream
+    /// again from the stored position (see [`Store::resume`]). An explicit
+    /// operator action; every check still applies, so a real divergence
+    /// halts it again. Returns the halt it cleared.
+    pub async fn resume(self: &Arc<Node>) -> Result<Value, CdcError> {
+        let Some(up) = self.store.state()?.upstream else {
+            return Err(err(Kind::Refused, "no upstream to follow"));
+        };
+        // A refused resume leaves the follow loop as it is (a halted node's
+        // loop has already ended; `start_follow` replaces any other).
+        let store = self.store.clone();
+        let cleared = blocking(move || store.resume()).await?;
+        self.start_follow(&up).await?;
+        Ok(cleared)
+    }
+
     /// Compare every table with the upstream as of this node's current
     /// transaction. A mismatch halts this node (divergence is never
     /// repaired silently); the report names the rows.

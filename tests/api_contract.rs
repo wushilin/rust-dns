@@ -106,6 +106,7 @@ const DEDICATED: &[&str] = &[
     // Need a second server following this one (see the promotion flow).
     "promote_standby",
     "rebootstrap_standby",
+    "resume_standby",
     // O11: needs an unsigned zone and no standby without the feature.
     "rename_zone",
     // O5/O6: change who can sign in; exercised in their own flow.
@@ -2245,6 +2246,62 @@ fn live_api_matches_spec() {
         Body::Json(&serde_json::json!({ "username": "root", "password": "rootpass123" })),
     );
     c.expect("standby root login (the primary's account)", &r, 200);
+    // Resume (the spec's example): a row changed behind the standby's back,
+    // then on the primary, halts it; resume clears the halt and keeps the
+    // data (it halts again, the row still differs; the rebootstrap below
+    // rebuilds it).
+    c.web = saved.clone();
+    let r = c.call(
+        Auth::Session(&admin),
+        "post",
+        "/tokens",
+        &[],
+        "",
+        Body::Json(&serde_json::json!({ "name": "contract-halt" })),
+    );
+    c.expect("a token to diverge on", &r, 201);
+    let halt_id = r.json()["info"]["id"].as_i64().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let sdb = rusqlite::Connection::open(standby.dir.join("test.db")).unwrap();
+    sdb.busy_timeout(Duration::from_secs(5)).unwrap();
+    while sdb
+        .execute(
+            "UPDATE api_tokens SET name = 'changed behind its back' WHERE id = ?1",
+            [halt_id],
+        )
+        .unwrap()
+        == 0
+    {
+        assert!(Instant::now() < deadline, "the token did not reach the standby");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    drop(sdb);
+    let r = c.call(
+        Auth::Session(&admin),
+        "put",
+        "/tokens/{id}",
+        &[("id", halt_id.to_string())],
+        "",
+        Body::Json(&json!({ "tags": ["halt"] })),
+    );
+    c.expect("change the token on the primary", &r, 200);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while status_of(&standby.web)["follow"]["state"] != "halted" {
+        assert!(Instant::now() < deadline, "the standby did not halt");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    c.web = standby.web.clone();
+    let ex = c.example("/replication/resume", "post");
+    let r = c.send_example(
+        Auth::Session(&sroot),
+        "post",
+        "/replication/resume",
+        &[],
+        "",
+        &ex,
+    );
+    c.expect("resume the standby", &r, 200);
+    c.capture("/replication/resume", &r);
     let ex = c.example("/replication/rebootstrap", "post");
     let r = c.send_example(
         Auth::Session(&sroot),

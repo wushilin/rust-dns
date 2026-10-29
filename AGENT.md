@@ -22,7 +22,7 @@ They exist because of how replication works: a standby rebuilds its data only fr
 ## 2. The log is accurate
 
 - **Facts, not intents.** The log records what SQLite wrote (whole rows), so applying it reproduces identical rows. Values are carried exactly: BLOBs as hex, REALs as their shortest exact decimal.
-- **The follower checks every row.** A follower applies rows generically, and its own triggers capture the result. That capture must equal the received rows byte for byte, which also checks every `before` image. Any difference is a divergence.
+- **The follower checks every row.** A follower applies rows generically, and its own triggers capture the result. That capture must equal the received rows byte for byte, which also checks every `before` image. Any difference is a divergence, with one exception: a delete of a row the follower does not have is skipped with a warning (the row is gone either way, so the result is the primary's).
 - **The chain.**
   - Transactions form one ordered sequence and are never split across batches.
   - Each one carries `hash = blake3(previous hash ‖ transaction)`. The chain starts from a random history id, and every promotion starts a new epoch with a random nonce.
@@ -43,6 +43,7 @@ They exist because of how replication works: a standby rebuilds its data only fr
 - **No local writes.** A standby **never writes replicated data by itself**. Every write path is closed on it: the `WriteGate`, the API's `STANDBY_WRITABLE` allowlist, the console's default-deny controls, and its config root is not synced. Its only writer is the v2 apply path.
 - **Divergence halts.** Any divergence is a bug, never something to repair silently: a row that does not match, a chain mismatch, another history, a standby ahead of its primary. It puts the standby in a persistent `halted` state, and the standby keeps serving its last good data.
   - The operator rebuilds it with **Rebootstrap** (console or `POST /replication/rebootstrap`), which replaces all replicated data with a fresh snapshot in one transaction, or offline with `rust-dns --prepare-standby --yes`.
+  - Once the cause is understood and fixed, the operator may instead **Resume** it (console, `POST /replication/resume`, or offline `rust-dns --resume-standby --yes`): the halt is cleared, the data is kept, and it follows again from its stored position with every check as before, so a divergence that is still there halts it again.
   - Do not add automatic re-bootstrapping or self-healing.
 - **The only automatic snapshot** is a gap in the same history: the rows it needs were pruned, the position is still on the primary's chain, nothing deviated.
 - **Who may start following.** Only a fresh database, or one already in this primary's history, may start following. Discarding data is always an explicit operator action.

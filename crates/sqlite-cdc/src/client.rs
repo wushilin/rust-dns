@@ -426,6 +426,9 @@ impl Client {
         self.post("/admin/rebootstrap", json!({"upstream": upstream}))
             .await
     }
+    pub async fn resume(&self) -> Result<Value, CdcError> {
+        self.post("/admin/resume", json!({})).await
+    }
     pub async fn follow(&self, upstream: &str) -> Result<Value, CdcError> {
         self.post("/admin/follow", json!({"upstream": upstream}))
             .await

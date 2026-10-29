@@ -148,8 +148,9 @@ pub type Result<T, E = CdcError> = std::result::Result<T, E>;
 
 /// What an operator can do about a halt. Divergence is never repaired in
 /// place: the node is rebuilt from a snapshot, which takes about a second
-/// per 100k rows.
+/// per 100k rows, or (when the cause is understood and fixed) resumed.
 pub const REBOOTSTRAP_HINT: &str = "rebootstrap: POST <api>/admin/rebootstrap (optional {\"upstream\": url}) discards this node's replicated data and loads a fresh snapshot from the upstream";
+pub const RESUME_HINT: &str = "resume: POST <api>/admin/resume keeps this node's data and follows again from its position (every check still applies)";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -869,7 +870,9 @@ impl Store {
 
     /// Apply a batch of transactions in one SQLite transaction, together
     /// with the new position. Any mismatch fails the whole batch with a
-    /// divergence error; nothing is applied.
+    /// divergence error; nothing is applied. One exception: a delete of a
+    /// row this node does not have is skipped with a warning (the row is
+    /// gone either way, so the result is the same as the leader's).
     pub fn apply(&self, txns: &[Txn]) -> Result<u64> {
         let mut w = self.lock();
         let fk = fk_off(&w)?;
@@ -922,34 +925,47 @@ impl Store {
                     ));
                 }
             }
+            let mut expected: Vec<Captured> = Vec::with_capacity(t.rows.len());
             {
                 let _g = ModeGuard::set(mode, MODE_CAPTURE);
                 for r in &t.rows {
-                    self.apply_row(
-                        &tx,
-                        &r.op,
-                        &r.tbl,
-                        r.pk.get(),
-                        r.after.as_ref().map(|a| a.get()),
-                    )
-                    .map_err(|e| {
-                        err(
-                            Kind::Diverged,
-                            format!(
-                                "txn {} seq {} ({} {} {}): {}",
-                                t.txn_id,
-                                r.seq,
-                                r.op,
-                                r.tbl,
-                                r.pk.get(),
-                                e.detail
-                            ),
+                    let applied = self
+                        .apply_row(
+                            &tx,
+                            &r.op,
+                            &r.tbl,
+                            r.pk.get(),
+                            r.after.as_ref().map(|a| a.get()),
                         )
-                    })?;
+                        .map_err(|e| {
+                            err(
+                                Kind::Diverged,
+                                format!(
+                                    "txn {} seq {} ({} {} {}): {}",
+                                    t.txn_id,
+                                    r.seq,
+                                    r.op,
+                                    r.tbl,
+                                    r.pk.get(),
+                                    e.detail
+                                ),
+                            )
+                        })?;
+                    if applied {
+                        expected.push(Captured::of(r));
+                    } else {
+                        // Nothing was deleted, so nothing was captured.
+                        tracing::warn!(
+                            txn = t.txn_id,
+                            seq = r.seq,
+                            table = %r.tbl,
+                            pk = r.pk.get(),
+                            "delete of a row this node does not have: skipped"
+                        );
+                    }
                 }
             }
             let captured = take_pending(&tx)?;
-            let expected: Vec<Captured> = t.rows.iter().map(Captured::of).collect();
             if captured != expected {
                 return Err(err(
                     Kind::Diverged,
@@ -974,7 +990,7 @@ impl Store {
         tbl: &str,
         pk: &str,
         after: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let spec = self.spec(tbl)?;
         let need = || err(Kind::Diverged, "row image missing");
         let n = match op {
@@ -987,13 +1003,18 @@ impl Store {
             "D" => tx.prepare_cached(&spec.delete_sql())?.execute([pk])?,
             o => return Err(err(Kind::Diverged, format!("unknown op {o}"))),
         };
+        // The row to delete is already gone: the outcome is the leader's.
+        // `Ok(false)`: nothing changed (and nothing was captured).
+        if op == "D" && n == 0 {
+            return Ok(false);
+        }
         if n != 1 {
             return Err(err(
                 Kind::Diverged,
                 format!("{n} rows affected, expected 1 (row missing)"),
             ));
         }
-        Ok(())
+        Ok(true)
     }
 
     /// After the application's code ran: no schema change inside the
@@ -1017,11 +1038,42 @@ impl Store {
             "kind": kind.as_str(),
             "detail": detail,
             "at": now(),
-            "options": [REBOOTSTRAP_HINT],
+            "options": [REBOOTSTRAP_HINT, RESUME_HINT],
         });
         sset(&w, "halted", Some(&v.to_string()))?;
         tracing::error!(kind = kind.as_str(), detail, "halted");
         Ok(())
+    }
+
+    /// Clear a follower's halt and keep its data: it follows again from
+    /// its stored position, with every check as before (a real divergence
+    /// halts it again at once). An explicit operator action. Refused when
+    /// nothing is halted, and for a former leader (it may hold changes the
+    /// new leader lacks: rebootstrap it). Returns the halt it cleared.
+    pub fn resume(&self) -> Result<Value> {
+        let w = self.lock();
+        let st = read_state(&w)?;
+        if st.role != Role::Follower {
+            return Err(err(
+                Kind::Refused,
+                format!(
+                    "only a follower can resume; this node is {}",
+                    st.role.as_str()
+                ),
+            ));
+        }
+        let Some(h) = st.halted else {
+            return Err(err(Kind::Refused, "not halted: nothing to resume"));
+        };
+        if h["kind"] == "former_leader" {
+            return Err(err(
+                Kind::Refused,
+                "a former leader may hold changes its new leader does not have: rebootstrap it",
+            ));
+        }
+        sset(&w, "halted", None)?;
+        tracing::warn!(kind = %h["kind"], at = %h["at"], txn = st.last_txn, "halt cleared by an operator: following again");
+        Ok(h)
     }
 
     pub fn set_upstream(&self, upstream: Option<&str>) -> Result<()> {

@@ -15,7 +15,8 @@
 //! included), members, users with MFA, tokens, TSIG keys, settings,
 //! DNSSEC, secondary-zone definitions; a read-only standby; a restart that
 //! resumes without a snapshot; a standby's own audit events; divergence
-//! (halt, keep serving, rebootstrap); failover with a fenced old primary
+//! (halt, keep serving, rebootstrap, resume); a standby that never prunes
+//! by itself; failover with a fenced old primary
 //! rebootstrapped onto the new one; rebootstrap repointing to another
 //! primary.
 //!
@@ -1281,6 +1282,212 @@ fn a_diverged_standby_halts_and_rebootstrap_rebuilds_it() {
     assert!(
         audit.contains("replication.rebootstrap"),
         "the rebootstrap is audited: {audit}"
+    );
+    drop((s, p));
+    let _ = std::fs::remove_dir_all(&root_dir);
+}
+
+/// `rust-dns --resume-standby` on `s` (stopped): its exit code and output.
+fn resume_cli(s: &Node, yes: bool) -> (i32, String) {
+    let mut c = Command::new(env!("CARGO_BIN_EXE_rust-dns"));
+    c.arg("--config")
+        .arg(s.config_path())
+        .arg("--resume-standby");
+    if yes {
+        c.arg("--yes");
+    }
+    let out = c.output().expect("run --resume-standby");
+    (
+        out.status.code().unwrap_or(-1),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    )
+}
+
+/// 5b: a standby never writes replicated data by itself, and a halt whose
+/// cause is fixed resumes without a rebootstrap. The audit log is pruned
+/// on the primary only (its deletes reach the standby through the
+/// stream): an audit row old enough to prune stays on the standby. A
+/// delete of a row the standby does not have is skipped, and following
+/// goes on. A halt (a row that differs) is cleared by `--resume-standby`
+/// (server stopped) or `POST /replication/resume`, keeping the data; it
+/// halts again while the row still differs, and follows on from the same
+/// position once it is fixed.
+#[test]
+fn a_standby_does_not_prune_by_itself_and_a_fixed_halt_resumes() {
+    let root_dir = temp_root("follow-resume");
+    let (p, pr, mut s, sr, _) = pair(&root_dir, "", "");
+    post(&p, &pr, "/zones", json!({ "name": "r.test" }));
+    add_record(&p, &pr, "r.test", "www", "192.0.2.1");
+    add_record(&p, &pr, "r.test", "gone", "192.0.2.9");
+    same_data(&p, &pr, &s, &sr, "before");
+    drop(sr);
+
+    // ---- retention: the standby does not prune the audit log ------------
+    s.stop();
+    let db = s.db_path();
+    let (id, ts): (i64, String) = {
+        let c = rusqlite::Connection::open(&db).unwrap();
+        let (id, ts) = c
+            .query_row(
+                "SELECT id, ts FROM audit_log ORDER BY id LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        c.execute(
+            "UPDATE audit_log SET ts = '2000-01-01T00:00:00.000Z' WHERE id = ?1",
+            [id],
+        )
+        .unwrap();
+        (id, ts)
+    };
+    s.start();
+    let sr = s.root();
+    wait_following(&s, &sr, "restarted with an old audit row");
+    std::thread::sleep(Duration::from_secs(2)); // retention runs at startup
+    let kept: i64 = rusqlite::Connection::open(&db)
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM audit_log WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(kept, 1, "the standby pruned audit_log row {id} by itself");
+    drop(sr);
+
+    // ---- a delete of a row the standby does not have is harmless --------
+    s.stop();
+    {
+        let c = rusqlite::Connection::open(&db).unwrap();
+        c.execute(
+            "UPDATE audit_log SET ts = ?1 WHERE id = ?2",
+            rusqlite::params![ts, id],
+        )
+        .unwrap();
+        assert_eq!(
+            c.execute("DELETE FROM records WHERE name = 'gone'", [])
+                .unwrap(),
+            1
+        );
+    }
+    s.start();
+    let sr = s.root();
+    wait_following(&s, &sr, "restarted without 'gone'");
+    let gone = record_id(&p, &pr, "r.test", "gone");
+    ok(
+        api(
+            &p,
+            &pr,
+            "DELETE",
+            &format!("/zones/r.test/records/{gone}"),
+            None,
+        ),
+        "delete gone on the primary",
+    );
+    same_data(&p, &pr, &s, &sr, "after deleting a row the standby lacked");
+    wait_following(&s, &sr, "after deleting a row the standby lacked");
+    drop(sr);
+
+    // ---- a halt, resumed from the command line while still wrong --------
+    s.stop();
+    {
+        let c = rusqlite::Connection::open(&db).unwrap();
+        c.execute(
+            "UPDATE records SET value = '192.0.2.250' WHERE name = 'www'",
+            [],
+        )
+        .unwrap();
+    }
+    s.start();
+    let sr = s.root();
+    let www = record_id(&p, &pr, "r.test", "www");
+    ok(
+        api(
+            &p,
+            &pr,
+            "PUT",
+            &format!("/zones/r.test/records/{www}"),
+            Some(json!({ "value": "192.0.2.2" })),
+        ),
+        "update www on the primary",
+    );
+    wait_for("the standby halts", 20, || {
+        follow_state(&s, &sr)["state"] == "halted"
+    });
+    let at = follow_state(&s, &sr)["last_applied_offset"].clone();
+    drop(sr);
+    s.stop();
+    let (code, out) = resume_cli(&s, false);
+    assert_eq!(code, 2, "a dry run changes nothing: {out}");
+    assert!(out.contains("--yes"), "{out}");
+    let (code, out) = resume_cli(&s, true);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("halt cleared"), "{out}");
+    let (code, out) = resume_cli(&s, true);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("not halted"), "{out}");
+    // Every check still applies: the row still differs, so it halts again.
+    s.start();
+    let sr = s.root();
+    wait_for("the standby halts again", 20, || {
+        follow_state(&s, &sr)["state"] == "halted"
+    });
+    assert_eq!(follow_state(&s, &sr)["last_applied_offset"], at);
+    drop(sr);
+
+    // ---- fixed, resumed from the console --------------------------------
+    s.stop();
+    {
+        let c = rusqlite::Connection::open(&db).unwrap();
+        c.execute(
+            "UPDATE records SET value = '192.0.2.1' WHERE name = 'www'",
+            [],
+        )
+        .unwrap();
+    }
+    s.start();
+    let sr = s.root();
+    wait_for("still halted after the restart", 15, || {
+        follow_state(&s, &sr)["state"] == "halted"
+    });
+    let (code, v) = api(
+        &s,
+        &sr,
+        "POST",
+        "/replication/resume",
+        Some(json!({ "confirm": false })),
+    );
+    assert_eq!(code, 400, "{v}");
+    let v = post(&s, &sr, "/replication/resume", json!({ "confirm": true }));
+    assert!(v["message"].as_str().unwrap().contains("resumed"), "{v}");
+    same_data(&p, &pr, &s, &sr, "after the resume");
+    wait_following(&s, &sr, "after the resume");
+    assert_eq!(
+        answers(s.dns, "www.r.test.", RecordType::A),
+        answers(p.dns, "www.r.test.", RecordType::A)
+    );
+    let st = status(&s, &sr);
+    assert_eq!(
+        st["follow"]["rebootstraps"], 0,
+        "resumed without a snapshot: {st}"
+    );
+    let (code, v) = api(
+        &s,
+        &sr,
+        "POST",
+        "/replication/resume",
+        Some(json!({ "confirm": true })),
+    );
+    assert_eq!(code, 409, "nothing to resume: {v}");
+    add_record(&p, &pr, "r.test", "after", "192.0.2.7");
+    same_data(&p, &pr, &s, &sr, "following after the resume");
+    let audit = get(&s, &sr, "/audit?limit=2000").to_string();
+    assert!(
+        audit.matches("replication.resume").count() >= 2,
+        "both resumes are audited: {audit}"
     );
     drop((s, p));
     let _ = std::fs::remove_dir_all(&root_dir);

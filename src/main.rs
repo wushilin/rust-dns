@@ -76,7 +76,15 @@ struct Cli {
     /// changelog. Without --yes it only prints what would be deleted.
     #[arg(long)]
     prepare_standby: bool,
-    /// Confirm --prepare-standby.
+    /// Clear this standby's replication halt and keep its data (server
+    /// stopped): the next start follows the primary again from where it
+    /// stopped, with every check as before. For a halt whose cause is
+    /// fixed; otherwise --prepare-standby. Without --yes it only prints the
+    /// halt. (A running standby: the console or POST
+    /// /rust-dns/api/replication/resume.)
+    #[arg(long)]
+    resume_standby: bool,
+    /// Confirm --prepare-standby or --resume-standby.
     #[arg(long)]
     yes: bool,
     /// Windows: register rust-dns as a service (name `rust-dns`, started
@@ -198,6 +206,16 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             Ok(false) => std::process::exit(2),
             Err(e) => {
                 eprintln!("rust-dns: --prepare-standby failed: {e:#}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if cli.resume_standby {
+        match replication::resume_standby_offline(&cli.config, cli.yes).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => std::process::exit(2),
+            Err(e) => {
+                eprintln!("rust-dns: --resume-standby failed: {e:#}");
                 std::process::exit(1);
             }
         }

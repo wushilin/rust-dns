@@ -422,7 +422,7 @@ impl Replication {
                 halted = f.halted.is_some();
                 let problem = if let Some(h) = &f.halted {
                     Some(format!(
-                        "Replication halted ({}): {}. Rebuild with rust-dns --prepare-standby --yes",
+                        "Replication halted ({}): {}. Rebuild with rust-dns --prepare-standby --yes, or once the cause is fixed resume with rust-dns --resume-standby --yes",
                         h.reason, h.detail
                     ))
                 } else if f.state == "refused" {
@@ -823,6 +823,49 @@ impl Replication {
         *self.warning.write().unwrap() = None;
         Ok(format!("rebootstrap started from {primary}: the snapshot loads in the background; follow its progress in the replication status"))
     }
+
+    /// Operator resume (changelog v2): clear this standby's halt, keep its
+    /// data, and follow the primary again from its stored position. Every
+    /// check still applies, so a divergence that is still there halts it
+    /// again at once; when it does not, the next verify compares every
+    /// table with the primary. For a halt whose cause is understood and
+    /// fixed; otherwise rebootstrap. Audited.
+    pub async fn resume(
+        self: &Arc<Self>,
+        actor: Actor,
+    ) -> std::result::Result<String, (u16, String)> {
+        let _g = self.promote_lock.lock().await;
+        let role = self.role();
+        if role != Role::Standby {
+            return Err((
+                409,
+                format!("only a standby can resume; this server is {role:?}").to_lowercase(),
+            ));
+        }
+        let Some(node) = self.cdc.clone() else {
+            return Err((409, "changelog v2 is not attached".into()));
+        };
+        let primary = self.primary_url();
+        tracing::warn!(actor = %actor.name, primary = %primary, "RESUME: clearing the halt and following the primary again from the stored position");
+        let cleared = node
+            .resume()
+            .await
+            .map_err(|e| (409, format!("resume: {e}")))?;
+        let at = node.store.state().map(|s| s.last_txn).unwrap_or(0);
+        if let Err(e) = self
+            .mutator
+            .replica_audit(
+                actor,
+                "replication.resume",
+                primary.clone(),
+                serde_json::json!({"primary": primary, "txn": at, "halt": {"kind": cleared["kind"], "at": cleared["at"]}}),
+            )
+            .await
+        {
+            tracing::error!(error = %e, "auditing the resume failed");
+        }
+        Ok(format!("resumed: following {primary} again from offset {at}; the replication status shows whether it keeps up or halts again"))
+    }
 }
 
 /// `reqwest` errors hide the useful part (connection refused, TLS) in the
@@ -883,6 +926,82 @@ pub async fn promote_offline(config_path: &std::path::Path) -> Result<History> {
         .await
         .map_err(|e| anyhow!("{e}"))?;
     Ok(h)
+}
+
+/// `rust-dns --resume-standby [--yes]` (server stopped): clear this
+/// standby's changelog v2 halt and keep its data; the next start follows
+/// the primary again from the stored position, with every check as
+/// before. Without `yes` it only prints the halt and returns `Ok(false)`.
+/// Audited as `replication.resume`.
+pub async fn resume_standby_offline(config_path: &std::path::Path, yes: bool) -> Result<bool> {
+    let cfg = crate::config::check(config_path)?;
+    let Some(follow) = cfg.follow.clone() else {
+        anyhow::bail!(
+            "{} has no [follow] section: only a standby can resume",
+            config_path.display()
+        );
+    };
+    let db = cfg.database.path.clone();
+    anyhow::ensure!(db.exists(), "{} does not exist", db.display());
+    if let Err(e) = std::net::TcpListener::bind(cfg.web_console.bind) {
+        if e.kind() == std::io::ErrorKind::AddrInUse {
+            anyhow::bail!(
+                "the web console address {} is in use: is rust-dns running? Resume a running standby from the console (Admin -> Replication) or with POST /rust-dns/api/replication/resume, or stop it first",
+                cfg.web_console.bind
+            );
+        }
+    }
+    {
+        let probe = rusqlite::Connection::open(&db)?;
+        probe.busy_timeout(Duration::from_millis(0))?;
+        probe
+            .execute_batch("BEGIN EXCLUSIVE; ROLLBACK;")
+            .with_context(|| {
+                format!("{} is locked or in use; stop rust-dns first", db.display())
+            })?;
+    }
+    let storage = Arc::new(Storage::open(&db)?);
+    let cdc = storage
+        .cdc()
+        .cloned()
+        .ok_or_else(|| anyhow!("changelog v2 is not attached to {}", db.display()))?;
+    let st = cdc.state().map_err(|e| anyhow!("{e}"))?;
+    let Some(h) = &st.halted else {
+        println!("{} is not halted: nothing to resume", db.display());
+        return Ok(true);
+    };
+    println!(
+        "replication halted since {}: {} ({})",
+        h["at"].as_str().unwrap_or("?"),
+        h["kind"].as_str().unwrap_or("?"),
+        h["detail"].as_str().unwrap_or("")
+    );
+    let primary = follow.primary.trim().trim_end_matches('/').to_string();
+    println!(
+        "--resume-standby would clear the halt and keep the data: the next start follows {primary} again from offset {}, with every check as before (a divergence that is still there halts it again).",
+        st.last_txn
+    );
+    if !yes {
+        println!("Nothing was changed. Re-run with --yes to clear the halt.");
+        return Ok(false);
+    }
+    let cleared = cdc.resume().map_err(|e| anyhow!("{e}"))?;
+    let cache = Arc::new(crate::cache::Cache::new(crate::cache::Catalog::empty()));
+    let bus = Arc::new(crate::events::Bus::new(8, 8));
+    let m = Mutator::new(storage, cache, bus, "", "");
+    m.replica_audit(
+        Actor {
+            name: "cli".into(),
+            ip: "local".into(),
+        },
+        "replication.resume",
+        primary.clone(),
+        serde_json::json!({"primary": primary, "txn": st.last_txn, "halt": {"kind": cleared["kind"], "at": cleared["at"]}}),
+    )
+    .await
+    .map_err(|e| anyhow!("{e}"))?;
+    println!("halt cleared: start rust-dns to follow {primary} again");
+    Ok(true)
 }
 
 /// `rust-dns --prepare-standby [--yes]`: discard this server's data on

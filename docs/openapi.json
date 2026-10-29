@@ -4703,6 +4703,53 @@
         }
       }
     },
+    "/replication/resume": {
+      "post": {
+        "tags": [
+          "Replication"
+        ],
+        "summary": "Clear this standby's halt and follow the primary again, keeping its data (admin)",
+        "description": "Changelog v2. For a halt whose cause is understood and fixed: the halt is cleared and the standby follows the primary again from its stored position, with every check as before, so a divergence that is still there halts it again at once; the next periodic verify compares every table with the primary. Nothing is discarded (use `POST /replication/rebootstrap` to replace the data). Refused when the standby is not halted, and for a former primary. Needs `replicate`. Audited as `replication.resume`.",
+        "operationId": "resume_standby",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResumeBody"
+              },
+              "example": {
+                "confirm": true
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Resumed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RebootstrapResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        }
+      }
+    },
     "/metrics": {
       "servers": [
         {
@@ -8849,6 +8896,18 @@
             "format": "int64",
             "description": "Stale answers served since start.",
             "minimum": 0
+          }
+        }
+      },
+      "ResumeBody": {
+        "type": "object",
+        "required": [
+          "confirm"
+        ],
+        "properties": {
+          "confirm": {
+            "type": "boolean",
+            "description": "Must be true."
           }
         }
       },

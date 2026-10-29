@@ -89,6 +89,7 @@ pub const STANDBY_WRITABLE: &[(&str, &str)] = &[
     ("POST", "/tsig/keys/{name}/reveal"),
     ("POST", "/replication/promote"),
     ("POST", "/replication/rebootstrap"),
+    ("POST", "/replication/resume"),
 ];
 
 /// [`STANDBY_WRITABLE`] as published in `GET /status` (`replication.standby_writable`),
@@ -467,6 +468,7 @@ fn api_router() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(replication::list_replicas))
         .routes(routes!(replication::forget_replica))
         .routes(routes!(replication::rebootstrap))
+        .routes(routes!(replication::resume))
 }
 
 /// Documented routes mounted at `/rust-dns/` rather than under `/rust-dns/api`.
