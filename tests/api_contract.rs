@@ -2272,7 +2272,10 @@ fn live_api_matches_spec() {
         .unwrap()
         == 0
     {
-        assert!(Instant::now() < deadline, "the token did not reach the standby");
+        assert!(
+            Instant::now() < deadline,
+            "the token did not reach the standby"
+        );
         std::thread::sleep(Duration::from_millis(200));
     }
     drop(sdb);
