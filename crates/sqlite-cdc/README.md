@@ -44,7 +44,7 @@ These paths are relative to the mount point. rust-dns serves them at `/rust-dns/
 | `GET /clients` | Every follower: position, lag, `up_to_date`. A poll response also carries the server's view of the asking follower. |
 | `GET /hashes`, `/schema`, `/status`, `/self-check` | `/self-check` compares the newest logged image of every row with the live row |
 | `GET /verify/{table}?at&buckets` and `/verify/{table}/rows` | Bucketed row hashes as of a past transaction |
-| `POST /admin/{promote,rejoin,rebootstrap,follow,verify,prune,restart-history}` | Only when `admin` is set |
+| `POST /admin/{promote,rejoin,rebootstrap,resume,follow,verify,prune,restart-history}` | Only when `admin` is set |
 
 Errors:
 
@@ -62,7 +62,8 @@ Responses are gzip-compressed when the client asks for it. The client decodes gz
 
 | Failure | Result |
 |---|---|
-| Row images differ, chain mismatch, wrong history, follower ahead, verify finds differing rows | Persistent halt naming the transaction, table and key, with `options: [rebootstrap]` |
+| Row images differ, chain mismatch, wrong history, follower ahead, verify finds differing rows | Persistent halt naming the transaction, table and key, with `options: [rebootstrap, resume]` (resume keeps the data and follows on with every check; not for a former leader) |
+| A delete of a row the follower does not have | Skipped with a warning (the outcome is the leader's) |
 | A capture trigger dropped or changed, or a table altered while running | Writes and applies are refused until the triggers are regenerated. `/status` `health` lists the problems. |
 
 Nothing is repaired in place. A diverged follower is rebuilt from a snapshot, which takes about 1 s per 100k rows.

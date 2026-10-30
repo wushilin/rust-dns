@@ -272,6 +272,7 @@ pub fn router(node: Arc<Node>, opts: RouterOptions) -> Router {
             .route("/admin/rejoin", post(admin_rejoin))
             .route("/admin/reset", post(admin_reset))
             .route("/admin/rebootstrap", post(admin_rebootstrap))
+            .route("/admin/resume", post(admin_resume))
             .route("/admin/restart-history", post(admin_restart_history))
             .route("/admin/follow", post(admin_follow))
             .route("/admin/verify", post(admin_verify))
@@ -691,6 +692,11 @@ async fn admin_rebootstrap(
     let b = body.map(|Json(b)| b).unwrap_or_default();
     node.rebootstrap(b.upstream.as_deref()).await?;
     Ok(Json(json!({"ok": true})))
+}
+
+async fn admin_resume(State(node): State<Arc<Node>>) -> ApiResult<Json<Value>> {
+    let cleared = node.resume().await?;
+    Ok(Json(json!({"ok": true, "cleared": cleared})))
 }
 
 #[derive(Deserialize)]

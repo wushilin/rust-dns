@@ -2597,7 +2597,7 @@ async function viewReplication() {
   const when = t => t ? `<span title="${esc(fmtTime(t))}">${ago(t)}</span>` : '<span class="hint">never</span>';
   const opt = v => v == null || v === '' ? '<span class="hint">–</span>' : esc(v);
   const stateBadge = s => ({ following: '<span class="badge ok">following</span>', bootstrapping: '<span class="badge warn">loading snapshot</span>', connecting: '<span class="badge warn">connecting</span>', starting: '<span class="badge warn">starting</span>', refused: '<span class="badge bad">refused</span>', error: '<span class="badge bad">error</span>', stopped: '<span class="badge muted">stopped</span>', halted: '<span class="badge bad">halted</span>' }[s] || `<span class="badge">${esc(s)}</span>`);
-  $('#main').innerHTML = `<div class="topbar"><h1>Replication</h1><div class="row" style="gap:8px">${r.role === 'standby' || r.role === 'fenced' ? '<button class="btn" id="rp-rebootstrap" data-perm="replicate" data-ro-ok>Rebootstrap…</button>' : ''}${r.role === 'standby' ? '<button class="btn danger" id="rp-promote" data-perm="replicate" data-ro-ok>Promote to primary…</button>' : ''}</div></div>
+  $('#main').innerHTML = `<div class="topbar"><h1>Replication</h1><div class="row" style="gap:8px">${r.role === 'standby' && f && f.halted ? '<button class="btn" id="rp-resume" data-perm="replicate" data-ro-ok>Resume…</button>' : ''}${r.role === 'standby' || r.role === 'fenced' ? '<button class="btn" id="rp-rebootstrap" data-perm="replicate" data-ro-ok>Rebootstrap…</button>' : ''}${r.role === 'standby' ? '<button class="btn danger" id="rp-promote" data-perm="replicate" data-ro-ok>Promote to primary…</button>' : ''}</div></div>
     ${r.warning ? `<div class="note warn" style="max-width:900px">${ico('warn', 's')}<span>${esc(r.warning)}</span></div>` : ''}
     <div class="grid two" style="max-width:1100px">
       <div class="card panel"><h2>This server</h2><div class="kv">
@@ -2612,7 +2612,7 @@ async function viewReplication() {
       ${f ? `<div class="card panel"><h2>Primary</h2><div class="kv">
         <span class="k">URL</span><span class="mono">${esc(f.primary)}</span>
         <span class="k">This instance</span><span class="mono">${esc(f.instance_id)}</span>
-        ${f.halted ? `<span class="k">Halted</span><span style="color:var(--danger)"><b>${esc(f.halted.reason)}</b> at offset ${num(f.halted.offset)}, ${when(f.halted.at)}: ${esc(f.halted.detail)}${f.halted.report_file ? `<br>Report: <span class="mono">${esc(f.halted.report_file)}</span>` : ''}<br>Rebuild it with <b>Rebootstrap…</b> (above): a fresh copy of the primary replaces this server's data in one step.</span>` : ''}
+        ${f.halted ? `<span class="k">Halted</span><span style="color:var(--danger)"><b>${esc(f.halted.reason)}</b> at offset ${num(f.halted.offset)}, ${when(f.halted.at)}: ${esc(f.halted.detail)}${f.halted.report_file ? `<br>Report: <span class="mono">${esc(f.halted.report_file)}</span>` : ''}<br>Rebuild it with <b>Rebootstrap…</b> (above): a fresh copy of the primary replaces this server's data in one step. Or, once the cause is fixed, <b>Resume…</b>: it keeps its data and follows again from offset ${num(f.last_applied_offset)}.</span>` : ''}
         <span class="k">State</span><span>${stateBadge(f.state)} ${f.connected ? '<span class="badge ok">connected</span>' : '<span class="badge bad">not connected</span>'}</span>
         ${f.disconnected_since ? `<span class="k">Unreachable since</span><span>${esc(fmtTime(f.disconnected_since))}</span>` : ''}
         ${f.last_error ? `<span class="k">Last error</span><span style="color:var(--danger)">${esc(f.last_error)}</span>` : ''}
@@ -2640,6 +2640,7 @@ async function viewReplication() {
       ${snip(`[peer]\nurl = "https://standby.example.net:8053"`, 'Copy example')}</div>` : ''}`;
   const pb = $('#rp-promote'); if (pb) pb.onclick = () => promoteModal(r);
   const rb = $('#rp-rebootstrap'); if (rb) rb.onclick = () => rebootstrapModal(r);
+  const rs = $('#rp-resume'); if (rs) rs.onclick = () => resumeModal(r);
   $$('[data-forget]').forEach(b => b.onclick = async () => {
     if (b.dataset.armed !== '1') { b.dataset.armed = '1'; b.textContent = 'Click again to forget'; return; }
     try { await DEL('/replication/replicas/' + encodeURIComponent(b.dataset.forget)); toast('Replica forgotten', 'ok'); viewReplication(); } catch (e) { toast(e.message, 'err'); }
@@ -2670,6 +2671,26 @@ function rebootstrapModal(r) {
         toast(res.message || 'Rebootstrap started', 'ok');
         viewReplication().catch(() => {});
       } catch (e) { $('#m-err').textContent = e.message; $('#rb-go').disabled = false; }
+    };
+  });
+}
+function resumeModal(r) {
+  const f = r.follow;
+  openModal(`<h2>Resume this standby</h2>
+    <p>The halt is cleared and this server follows <span class="mono">${esc(f.primary)}</span> again from offset <b>${num(f.last_applied_offset)}</b>, <b>keeping its data</b>. Every check still applies: if the difference that halted it is still there, it halts again at once. The next verify compares every table with the primary.</p>
+    <div class="note warn">${ico('warn', 's')}<span>Resume only when the cause of the halt is understood and fixed. If this server's data may be wrong, use <b>Rebootstrap…</b> instead.</span></div>
+    <p class="hint">Halted: <b>${esc(f.halted.reason)}</b> at ${esc(fmtTime(f.halted.at))}: ${esc(f.halted.detail)}</p>
+    <div class="error" id="m-err"></div>
+    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="rs-go" data-perm="replicate" data-ro-ok>Resume</button></div>`, m => {
+    $('#rs-go').onclick = async () => {
+      $('#m-err').textContent = '';
+      $('#rs-go').disabled = true;
+      try {
+        const res = await POST('/replication/resume', { confirm: true });
+        closeModal();
+        toast(res.message || 'Resumed', 'ok');
+        viewReplication().catch(() => {});
+      } catch (e) { $('#m-err').textContent = e.message; $('#rs-go').disabled = false; }
     };
   });
 }

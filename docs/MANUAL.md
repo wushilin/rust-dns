@@ -1081,6 +1081,12 @@ Network errors, timeouts and 5xx are ordinary reconnects, and a pruned
 offset (`gap`) within the same history is the automatic snapshot case; none
 of those halt.
 
+One difference does not halt: a change from the primary that deletes a row
+the standby does not have. The row is gone either way, so the standby skips
+that delete with a warning in its log and follows on. (The audit log is
+pruned by `[changelog].retention_days` on the primary only; a standby gets
+those deletes through the stream.)
+
 When halted, the standby stops talking to the primary except to report the
 halt once (at the halt and at each start; the primary then lists it as
 `halted` with the reason), keeps answering DNS from its last applied state,
@@ -1096,6 +1102,17 @@ To rebuild: stop the standby and run `rust-dns --prepare-standby --yes`
 (backs up the database, empties it); at the next start it copies the primary
 again. Promoting a halted standby is possible but promotes its diverged
 data; rebuild it first unless the primary is gone.
+
+To resume without rebuilding, once the cause of the halt is understood and
+fixed: **Resume…** on the console's Replication page,
+`POST /rust-dns/api/replication/resume` with `{"confirm": true}`, or, with
+the standby stopped, `rust-dns --resume-standby --yes` (without `--yes` it
+only prints the halt). The halt is cleared, the data is kept, and the
+standby follows again from its stored offset with every check as before:
+if the difference is still there, it halts again at once; the next verify
+compares every table with the primary. Audited as `replication.resume`.
+A former primary cannot be resumed (it may hold changes the new primary
+lacks): rebootstrap it.
 
 ### Replication API
 

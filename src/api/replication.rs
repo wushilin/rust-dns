@@ -229,3 +229,47 @@ pub async fn rebootstrap(
         Err((_, m)) => Err(ApiError::new(axum::http::StatusCode::BAD_GATEWAY, m)),
     }
 }
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct ResumeBody {
+    /// Must be true.
+    pub confirm: bool,
+}
+
+#[utoipa::path(
+    post,
+    path = "/replication/resume",
+    tag = "Replication",
+    operation_id = "resume_standby",
+    summary = "Clear this standby's halt and follow the primary again, keeping its data (admin)",
+    description = "Changelog v2. For a halt whose cause is understood and fixed: the halt is cleared and the standby follows the primary again from its stored position, with every check as before, so a divergence that is still there halts it again at once; the next periodic verify compares every table with the primary. Nothing is discarded (use `POST /replication/rebootstrap` to replace the data). Refused when the standby is not halted, and for a former primary. Needs `replicate`. Audited as `replication.resume`.",
+    request_body(content = ResumeBody, example = json!({ "confirm": true })),
+    responses(
+        (status = 200, description = "Resumed.", body = RebootstrapResult),
+        (status = 400, response = InvalidRequest),
+        (status = 401, response = Unauthorized),
+        (status = 403, response = Forbidden),
+        (status = 409, response = Conflict),
+    ),
+)]
+pub async fn resume(
+    State(s): St,
+    caller: Caller,
+    Json(body): Json<ResumeBody>,
+) -> ApiResult<Json<RebootstrapResult>> {
+    s.require(&caller, GlobalPerm::Replicate)?;
+    if !body.confirm {
+        return Err(ApiError::bad_request(
+            "set \"confirm\": true to resume this standby",
+        ));
+    }
+    let actor = Actor {
+        name: caller.user.username.clone(),
+        ip: caller.ip.to_string(),
+    };
+    match s.repl.resume(actor).await {
+        Ok(message) => Ok(Json(RebootstrapResult { message })),
+        Err((400, m)) => Err(ApiError::bad_request(m)),
+        Err((_, m)) => Err(ApiError::conflict(m)),
+    }
+}

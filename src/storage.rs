@@ -1281,8 +1281,17 @@ impl Storage {
     }
 
     pub fn prune_audit(&self, older_than: DateTime<Utc>) -> Result<usize> {
-        // Captured by changelog v2 (the audit log is part of it): a follower
-        // prunes with its leader.
+        // Captured by changelog v2 (the audit log is part of it): only the
+        // leader prunes, and a follower gets those deletes from its stream
+        // (pruning on its own clock, it wrote replicated data by itself).
+        if let Some(c) = &self.cdc {
+            let leader = c
+                .state()
+                .is_ok_and(|s| s.role == sqlite_cdc::store::Role::Leader);
+            if !leader {
+                return Ok(0);
+            }
+        }
         let cutoff = older_than.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         set_cdc_meta(serde_json::json!({"command": "prune_audit", "actor": "retention"}));
         blocking(|| {
