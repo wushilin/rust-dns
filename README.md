@@ -77,36 +77,62 @@ If you need DHCP, keep dnsmasq for DHCP and let rust-dns answer DNS.
 
 ## Benchmarks
 
-rust-dns and dnsmasq 2.90 answering the same 1,000 local names, measured
-with dnsperf 2.10 (UDP, 16 clients, 500 queries in flight; 80% existing
-names, 10% NODATA, 10% NXDOMAIN). Each server was pinned to its cores and
-dnsperf to 4 other cores, in a Linux 6.18 arm64 container (8 vCPUs) on an
-Apple M3 Max. Median of 3 runs of 15 seconds each:
+### One core: rust-dns against dnsmasq
 
-| Server cores | rust-dns | dnsmasq |
+rust-dns 0.4.0 and dnsmasq 2.90 answering the same 1,000 local names over
+UDP, measured with dnsperf 2.10 (16 clients, 500 queries in flight; 80%
+existing names, 10% NODATA, 10% NXDOMAIN). Each server ran alone on one core
+(its hyperthread sibling left idle) and dnsperf on the other three cores, in
+a Debian 12 container on an Intel Core i5-10400 (6 cores, Linux 6.12). The
+servers ran one at a time, in a different order each round, 5 rounds of 15
+seconds:
+
+| One core | rust-dns | dnsmasq |
 |---|---|---|
-| 1 core | 46,000 queries/s | **61,000 queries/s** |
-| 4 cores | **126,000 queries/s** (1.3 ms average latency) | 62,000 queries/s (2.6 ms) |
-| Memory (RSS) | 32–49 MB | 5 MB |
+| UDP, best round | **92,700 queries/s** (2.8 ms average latency) | 64,700 queries/s (2.6 ms) |
+| UDP, median round | **89,100 queries/s** | 61,300 queries/s |
+| TCP, best round | 81,100 queries/s | no number (see below) |
+| Memory (RSS) | 36–42 MB | 4 MB |
 
-- **On one core, dnsmasq is faster.** It is a small single-threaded C
-  program doing very little per query.
-- **Given more cores, rust-dns keeps scaling and dnsmasq does not.**
-  dnsmasq is single-threaded, so extra cores don't help it. rust-dns answered
-  about twice as many queries on 4 cores, at half the latency, and was not
-  at its limit there (the 4-core dnsperf client may have been).
-- **Over TCP rust-dns answered 79,000 queries/s on 4 cores** (28,000 on one).
-  dnsmasq forks a process per TCP connection, and dnsperf over TCP got almost
-  no answers from it, so there is no TCP number for dnsmasq.
-- **Why it scales:** rust-dns answers from an immutable in-memory snapshot
-  of your zones, read without locks, so every core answers on its own. A
-  change builds a new snapshot and swaps it in, and no query waits for a
-  write. (The forwarding cache and the rate limiters do use ordinary locks.
-  Forwarded queries and queries during changes were not part of this test.)
+- **rust-dns is faster even on a single core**, by about 45%.
+- **dnsmasq uses far less memory.** It is a small C program; rust-dns keeps
+  your zones, its caches and the web console in memory.
+- **dnsmasq has no TCP number.** It forks a process per TCP connection, and
+  dnsperf over TCP got almost no answers from it.
+- The host was not idle (other jobs, and its CPU clock varied between
+  runs), so treat the absolute numbers as approximate. Every round ran all
+  three servers back to back, so the comparison between them is fair.
 
-Run it yourself: `scripts/bench-dnsmasq/run.sh <linux rust-dns binary>`
-(needs podman or docker). Benchmarks on macOS directly are misleading: the
-loopback path caps UDP at a few thousand queries/s for any server.
+### More cores
+
+rust-dns answers from an immutable in-memory snapshot of your zones, read
+without locks, so each core answers on its own; a change builds a new
+snapshot and swaps it in, and no query waits for a write. dnsmasq is
+single-threaded, so extra cores don't help it.
+
+Measured on an Apple M3 Max (10 performance cores), macOS, release build,
+the same data and query mix over TCP, dnsperf 2.16 with 8 threads and 1,000
+queries in flight, the server limited to N worker threads
+(`TOKIO_WORKER_THREADS`):
+
+| Worker threads | 1 | 2 | 4 | 6 | 8 |
+|---|---|---|---|---|---|
+| TCP queries/s | 182,000 | 249,000 | **468,000** | 461,000 | 441,000 |
+| Average latency | 5.5 ms | 4.0 ms | 2.0 ms | 2.0 ms | 2.1 ms |
+
+From 1 to 4 workers rust-dns answered 2.6 times as many queries at a third
+of the latency. Above 4 workers the server and dnsperf share the machine's
+cores, so that is where this test stops measuring the server.
+
+Not measured yet: multi-core UDP on Linux. macOS's loopback caps UDP at
+about 75,000 queries/s whatever the server, and the Linux host above lowered
+its clock under multi-core load. Forwarded queries and queries during
+changes were not part of these tests (the forwarding cache and the rate
+limiters use ordinary locks).
+
+Run the comparison yourself: `scripts/bench-dnsmasq/run.sh <linux rust-dns
+binary>` (needs podman or docker; the container uses your machine's
+architecture).
 
 ## Standards compliance
 
